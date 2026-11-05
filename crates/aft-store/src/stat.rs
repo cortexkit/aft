@@ -187,7 +187,7 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         let (usn, journal) = match (file_usn(handle), journal_id(handle)) {
-            (Some(usn), Some(journal)) => (Some(usn), Some(journal)),
+            (Ok(usn), Ok(journal)) => (Some(usn), Some(journal)),
             _ => (None, None),
         };
         Ok(StatEvidence {
@@ -203,9 +203,23 @@ mod platform {
         })
     }
 
-    /// The file's current USN, or `None` when the volume keeps no journal
-    /// or the read is refused.
-    fn file_usn(handle: HANDLE) -> Option<u64> {
+    /// The file's USN and its volume's journal id, each with the error that
+    /// kept it from being read, for tests to tell an absent journal from a
+    /// refused read.
+    #[cfg(test)]
+    pub(super) fn journal_reads(path: &Path) -> io::Result<(io::Result<u64>, io::Result<u64>)> {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let handle = file.as_raw_handle() as HANDLE;
+        Ok((file_usn(handle), journal_id(handle)))
+    }
+
+    /// The file's current USN. Fails when the volume keeps no journal or
+    /// the read is refused.
+    fn file_usn(handle: HANDLE) -> io::Result<u64> {
         let request = READ_FILE_USN_DATA {
             MinMajorVersion: 2,
             MaxMajorVersion: 2,
@@ -227,19 +241,25 @@ mod platform {
                 std::ptr::null_mut(),
             )
         };
-        if ok == 0 || (returned as usize) < size_of::<USN_RECORD_V2>() {
-            return None;
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (returned as usize) < size_of::<USN_RECORD_V2>() {
+            return Err(io::Error::other("the USN record is shorter than a V2 record"));
         }
         // SAFETY: the call wrote at least a whole V2 record into the
         // 8-byte-aligned buffer.
         let record = unsafe { &*buffer.as_ptr().cast::<USN_RECORD_V2>() };
-        (record.MajorVersion == 2).then(|| record.Usn.cast_unsigned())
+        if record.MajorVersion != 2 {
+            return Err(io::Error::other("the USN record is not version 2"));
+        }
+        Ok(record.Usn.cast_unsigned())
     }
 
     /// The id of the change journal of the file's volume. A journal deleted
     /// and created again gets a new id, which invalidates every USN taken
     /// under the old one.
-    fn journal_id(handle: HANDLE) -> Option<u64> {
+    fn journal_id(handle: HANDLE) -> io::Result<u64> {
         let mut data = USN_JOURNAL_DATA_V0::default();
         let mut returned = 0u32;
         // SAFETY: the output buffer outlives the call and its size is
@@ -256,7 +276,10 @@ mod platform {
                 std::ptr::null_mut(),
             )
         };
-        (ok != 0).then_some(data.UsnJournalID)
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(data.UsnJournalID)
     }
 }
 
@@ -314,5 +337,139 @@ mod tests {
         assert!(!old.proves_unchanged(&rewritten));
 
         assert!(observe(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_changed_or_missing_journal_proves_nothing() {
+        let recorded = StatEvidence {
+            size: 3,
+            mtime_ns: 1_000,
+            ctime_ns: 1_000,
+            birth_ns: Some(1_000),
+            file_id: 7,
+            device: 9,
+            usn: Some(40),
+            journal: Some(1),
+            observed_ns: 1_000 + RACY_WINDOW_NS,
+        };
+        assert!(recorded.proves_unchanged(&recorded));
+        // The journal was deleted and created again: its USNs restart, so an
+        // equal number means nothing.
+        assert!(!recorded.proves_unchanged(&StatEvidence {
+            journal: Some(2),
+            ..recorded
+        }));
+        assert!(!recorded.proves_unchanged(&StatEvidence {
+            usn: Some(41),
+            ..recorded
+        }));
+        // The journal is gone now.
+        let unjournaled = StatEvidence {
+            usn: None,
+            journal: None,
+            ..recorded
+        };
+        assert!(!recorded.proves_unchanged(&unjournaled));
+        // Without a journal only Unix times prove anything.
+        assert_eq!(unjournaled.proves_unchanged(&unjournaled), cfg!(unix));
+    }
+
+    /// NTFS can keep every time of a same-length rewrite, and a program can
+    /// set them back on purpose; the USN still moves. Run natively: the
+    /// temporary folder's volume must keep a change journal (Windows keeps
+    /// one on the system volume), and the reads must work for the user the
+    /// tests run as.
+    #[cfg(windows)]
+    #[test]
+    fn windows_evidence_reads_the_journal_and_catches_a_rewrite_that_keeps_every_time() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
+            GetFileInformationByHandleEx, SetFileInformationByHandle,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one").unwrap();
+        let (usn, journal) = platform::journal_reads(&path).unwrap();
+        assert!(
+            usn.is_ok() && journal.is_ok(),
+            "{}: USN {usn:?}, journal {journal:?}",
+            path.display()
+        );
+        let first = observe(&path).unwrap().unwrap();
+        assert_eq!(first.usn, usn.ok());
+        assert_eq!(first.journal, journal.ok());
+
+        let old = StatEvidence {
+            observed_ns: first.observed_ns + RACY_WINDOW_NS,
+            ..first
+        };
+        assert!(old.proves_unchanged(&observe(&path).unwrap().unwrap()));
+
+        let attributes = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .open(&path)
+            .unwrap();
+        let mut times = FILE_BASIC_INFO::default();
+        let size = u32::try_from(size_of::<FILE_BASIC_INFO>()).unwrap();
+        // SAFETY: the handle is open and `times` is a FILE_BASIC_INFO of the
+        // size passed.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                attributes.as_raw_handle() as HANDLE,
+                FileBasicInfo,
+                (&raw mut times).cast(),
+                size,
+            )
+        };
+        assert_ne!(read, 0, "{}", io::Error::last_os_error());
+        drop(attributes);
+
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"two").unwrap();
+        drop(writer);
+        let attributes = std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(&path)
+            .unwrap();
+        // SAFETY: as above; the call only reads `times`.
+        let written = unsafe {
+            SetFileInformationByHandle(
+                attributes.as_raw_handle() as HANDLE,
+                FileBasicInfo,
+                (&raw const times).cast(),
+                size,
+            )
+        };
+        assert_ne!(written, 0, "{}", io::Error::last_os_error());
+        drop(attributes);
+
+        let rewritten = observe(&path).unwrap().unwrap();
+        // Everything but the USN says the file is as it was.
+        assert_eq!(
+            (
+                rewritten.size,
+                rewritten.mtime_ns,
+                rewritten.ctime_ns,
+                rewritten.birth_ns,
+                rewritten.file_id,
+                rewritten.journal
+            ),
+            (
+                old.size,
+                old.mtime_ns,
+                old.ctime_ns,
+                old.birth_ns,
+                old.file_id,
+                old.journal
+            )
+        );
+        assert_ne!(rewritten.usn, old.usn);
+        assert!(!old.proves_unchanged(&rewritten));
     }
 }
