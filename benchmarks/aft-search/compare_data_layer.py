@@ -15,6 +15,15 @@ counted as `process_noise`, apart from `differences`, and `--noise` runs
 today's path a second time to show those parts move between two runs of the
 same binary too.
 
+One difference is reviewed and allowed by name, `anchored_examined_count`:
+the anchored lane's "N of M candidate files" disclosure and
+`anchored_admission_gap.candidates_examined` carry the data layer's true
+candidate count, which is far smaller than the legacy planner's near-total
+count for a case-insensitive run. A reply is put in that class only when
+everything else is identical, the excluded count included, and each side's
+"shown" count is its examined count less the excluded ones; the class lists
+every such reply with both counts.
+
 Every process first answers the same warm-up request, which no row repeats;
 the data-layer process serves from the view only after its first build has
 published, so it then waits until the build's log line appears. Every
@@ -98,6 +107,34 @@ def mask(response: JsonObject) -> JsonObject:
         if isinstance(node, dict) and path[-1] in node:
             node[path[-1]] = "<masked>"
     return reply
+
+
+ANCHORED_CUT = re.compile(r"Anchored verification cut short: (\d+) of (\d+) candidate files")
+ANCHORED_SHOWN = re.compile(r"shown (\d+) of (\d+) candidate files verified")
+
+
+def anchored_counts(reply: JsonObject) -> Optional[tuple[JsonObject, JsonObject]]:
+    """The reply with its anchored examined count blanked, and the counts;
+    `None` when it has no anchored disclosure or its counts disagree."""
+    reply = json.loads(json.dumps(reply))
+    text = reply.get("text")
+    gap = reply.get("anchored_admission_gap")
+    if not isinstance(text, str) or not isinstance(gap, dict):
+        return None
+    cut = ANCHORED_CUT.findall(text)
+    shown = ANCHORED_SHOWN.findall(text)
+    if len(cut) != 1 or len(shown) != 1:
+        return None
+    excluded, examined = (int(value) for value in cut[0])
+    verified, total = (int(value) for value in shown[0])
+    if total != examined or verified != examined - excluded:
+        return None
+    if gap.get("candidates_examined") != examined or gap.get("files_excluded") != excluded:
+        return None
+    text = ANCHORED_CUT.sub(f"Anchored verification cut short: {excluded} of <examined> candidate files", text)
+    reply["text"] = ANCHORED_SHOWN.sub("shown <verified> of <examined> candidate files verified", text)
+    gap["candidates_examined"] = "<examined>"
+    return reply, {"examined": examined, "excluded": excluded}
 
 
 def without_process_noise(left: JsonObject, right: JsonObject) -> tuple[JsonObject, JsonObject]:
@@ -246,6 +283,7 @@ def replay(process: Process, rows: Sequence[JsonObject], send: Any) -> list[Json
 def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Sequence[JsonObject]) -> JsonObject:
     differences = []
     noise = []
+    anchored = []
     for row, a, b in zip(rows, left, right):
         if a["reply"] == b["reply"]:
             continue
@@ -259,16 +297,35 @@ def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Seque
         }
         if a_clean == b_clean:
             noise.append(entry)
-        else:
-            entry["first"] = a["reply"]
-            entry["second"] = b["reply"]
-            differences.append(entry)
+            continue
+        a_counts, b_counts = anchored_counts(a_clean), anchored_counts(b_clean)
+        if (
+            a_counts is not None
+            and b_counts is not None
+            and a_counts[0] == b_counts[0]
+            and a_counts[1]["excluded"] == b_counts[1]["excluded"]
+        ):
+            anchored.append(
+                {
+                    "id": row["id"],
+                    "request": row["request"],
+                    "excluded": a_counts[1]["excluded"],
+                    "first_examined": a_counts[1]["examined"],
+                    "second_examined": b_counts[1]["examined"],
+                }
+            )
+            continue
+        entry["first"] = a["reply"]
+        entry["second"] = b["reply"]
+        differences.append(entry)
     return {
         "rows": len(rows),
         "differing": len(differences),
         "process_noise": len(noise),
+        "anchored_examined_count": len(anchored),
         "differences": differences,
         "noise": noise,
+        "anchored_examined_count_rows": anchored,
     }
 
 
@@ -468,7 +525,8 @@ def main() -> int:
         unread = family["data_rows_without_a_view_read"]
         print(
             f"{args.family}: {compared['differing']} of {compared['rows']} replies differ, "
-            f"{compared['process_noise']} only in process noise; "
+            f"{compared['process_noise']} only in process noise, "
+            f"{compared['anchored_examined_count']} only in the anchored examined count; "
             f"{len(unread)} data-layer replies read no view; latency {json.dumps(family['latency'])}"
         )
         if "legacy_vs_legacy_again" in family:

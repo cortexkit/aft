@@ -1304,7 +1304,7 @@ mod tests {
             (anchored(&data_anchored, false), data_time),
         ));
         found.push((
-            "anchored_reply_counts",
+            "measure_anchored_examined_count",
             (anchored(&legacy_anchored, true), zero),
             (anchored(&data_anchored, true), zero),
         ));
