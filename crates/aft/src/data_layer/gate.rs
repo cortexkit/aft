@@ -548,7 +548,7 @@ pub(crate) fn compare_readers(
             }
         }
     };
-    let show = |value: &dyn std::fmt::Debug| format!("{value:#?}");
+    let show = |value: &dyn std::fmt::Debug| without_entry_facts(&format!("{value:#?}"));
 
     // A deterministic sample of symbols: every 20th node in path order.
     let mut symbols = Vec::new();
@@ -881,6 +881,9 @@ pub(crate) fn compare_readers(
 
     // The public operations, as the commands compose them from the
     // primitives above: what an agent's call-graph reply is built from.
+    // `impact` and `trace_to` are left out: they label the roots they reach
+    // from entry facts only the data layer records, so they answer
+    // differently from today's views by design.
     // Every 400th symbol in path order; each operation runs at the depth
     // the commands default to and with tests both left out and included.
     use crate::commands::callgraph_store_adapter as adapter;
@@ -915,28 +918,6 @@ pub(crate) fn compare_readers(
                 &mut examples,
             );
             compare(
-                "impact (public)",
-                &mut || {
-                    show(&adapter::impact_result(
-                        ours,
-                        path,
-                        scoped,
-                        2,
-                        include_tests,
-                    ))
-                },
-                &mut || {
-                    show(&adapter::impact_result(
-                        theirs,
-                        path,
-                        scoped,
-                        2,
-                        include_tests,
-                    ))
-                },
-                &mut examples,
-            );
-            compare(
                 "call_tree (public)",
                 &mut || {
                     show(&adapter::call_tree_result(
@@ -953,28 +934,6 @@ pub(crate) fn compare_readers(
                         path,
                         scoped,
                         2,
-                        include_tests,
-                    ))
-                },
-                &mut examples,
-            );
-            compare(
-                "trace_to (public)",
-                &mut || {
-                    show(&adapter::trace_to_result(
-                        ours,
-                        path,
-                        scoped,
-                        4,
-                        include_tests,
-                    ))
-                },
-                &mut || {
-                    show(&adapter::trace_to_result(
-                        theirs,
-                        path,
-                        scoped,
-                        4,
                         include_tests,
                     ))
                 },
@@ -1207,6 +1166,29 @@ fn compare_tables(
     Ok(())
 }
 
+/// `text`, a value's pretty `Debug` form, without the `entry` facts of its
+/// call-graph nodes: only the data layer's graph records them, so today's
+/// views always differ there.
+fn without_entry_facts(text: &str) -> String {
+    let mut kept = Vec::new();
+    let mut skipping: Option<usize> = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if let Some(open) = skipping {
+            if indent == open && line.trim_start().starts_with('}') {
+                skipping = None;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("entry: EntryFacts {") {
+            skipping = Some(indent);
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
 /// How much more sparsely than the default the query comparison samples.
 fn sample_scale() -> usize {
     std::env::var("GATE_SAMPLE_SCALE")
@@ -1255,5 +1237,36 @@ mod unknown_receiver_tests {
             .filter(|(_, (_, _, differing))| *differing > 0)
             .collect::<Vec<_>>();
         assert!(differing.is_empty(), "{differing:?}\n{report:#?}");
+    }
+}
+
+#[cfg(test)]
+mod entry_facts_tests {
+    /// Node comparisons leave out the entry facts only the data layer
+    /// records, and keep every other field.
+    #[test]
+    fn debug_text_drops_entry_facts_only() {
+        let node = crate::callgraph_store::StoreNode::from_parts(
+            "id".into(),
+            "src/main.rs".into(),
+            "main".into(),
+            "main".into(),
+            "function".into(),
+            1,
+            3,
+            None,
+            false,
+            false,
+            crate::parser::LangId::Rust,
+        );
+        let plain = format!("{:#?}", Some(node.clone()));
+        let with_facts = node.with_entry(crate::callgraph_store::EntryFacts {
+            program_start: true,
+            ..Default::default()
+        });
+        let text = super::without_entry_facts(&format!("{:#?}", Some(with_facts)));
+        assert_eq!(text, super::without_entry_facts(&plain));
+        assert!(!text.contains("program_start"), "{text}");
+        assert!(text.contains("lang: Rust"), "{text}");
     }
 }
