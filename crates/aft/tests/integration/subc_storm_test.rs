@@ -588,7 +588,6 @@ fn rename_pair() {
 }
 
 #[test]
-#[ignore = "data-layer defect: a watcher rescan (RescanRequired) never reaches the data layer's checkout, so a file changed during the overflow stays invisible to grep; runtime_drain::tests::a_watcher_rescan_reaches_the_data_layer shows it"]
 fn overflow_control() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch(
         "overflow_control",
