@@ -75,7 +75,11 @@ struct SnapshotPlan {
 
 /// Builds the data layer's checkout at a root (the first path), with its
 /// family store under a storage folder (the second), in the foreground.
-type DataLayerBuild = fn(&Path, &Path) -> Result<aft::data_layer::surfaces::IndexOutcome, String>;
+type DataLayerBuild = fn(
+    &Path,
+    &Path,
+    aft::data_layer::checkout::Planes,
+) -> Result<aft::data_layer::surfaces::IndexOutcome, String>;
 
 struct SnapshotUnit {
     entry: StandingRootEntry,
@@ -527,7 +531,11 @@ fn build_data_layer_unit(
             let root = std::fs::canonicalize(&unit.entry.resolved_target)
                 .unwrap_or_else(|_| unit.entry.resolved_target.clone());
             let storage = aft::bash_background::storage_dir(config.storage_dir.as_deref());
-            build(&root, &storage)
+            build(
+                &root,
+                &storage,
+                aft::data_layer::standing::planes(&unit.entry.indexes),
+            )
         });
     match (outcome, unit.kind) {
         (Err(error), _) => UnitResult::gap(error.clone()),
@@ -965,7 +973,11 @@ mod tests {
 
     #[test]
     fn data_layer_snapshot_with_an_unparsed_file_is_partial_and_keeps_its_strict_state() {
-        fn one_unparsed(_root: &Path, _storage: &Path) -> Result<IndexOutcome, String> {
+        fn one_unparsed(
+            _root: &Path,
+            _storage: &Path,
+            _planes: aft::data_layer::checkout::Planes,
+        ) -> Result<IndexOutcome, String> {
             Ok(IndexOutcome {
                 files: 3,
                 parsed_files: 1,

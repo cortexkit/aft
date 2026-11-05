@@ -16,6 +16,8 @@ use std::path::Path;
 
 use crate::config::IndexKind;
 
+use super::checkout::Planes;
+
 /// Whether the data layer builds a standing root's `kind`: its text
 /// (`search`) and its call graph (`callgraph`), which one build publishes.
 #[must_use]
@@ -23,8 +25,19 @@ pub const fn builds(kind: IndexKind) -> bool {
     matches!(kind, IndexKind::Search | IndexKind::Callgraph)
 }
 
-/// Brings the data layer's checkout at `root`, with its family store under
-/// `storage`, up to date with the files on disk, in the foreground, and
+/// The planes the data layer builds for a standing root that asks for
+/// `kinds`: a root that asks only for text search builds no call graph.
+#[must_use]
+pub fn planes(kinds: &[IndexKind]) -> Planes {
+    Planes {
+        text: kinds.contains(&IndexKind::Search),
+        callgraph: kinds.contains(&IndexKind::Callgraph),
+    }
+}
+
+/// Brings the data layer's `planes` of the checkout at `root`, with its
+/// family store under `storage`, up to date with the files on disk, in the
+/// foreground, and
 /// returns whether it now holds exactly them: the bind's scan found
 /// nothing changed since the publication, or a build scanned the whole
 /// checkout and published. `still_wanted` is asked before the work and
@@ -32,10 +45,15 @@ pub const fn builds(kind: IndexKind) -> bool {
 /// published. A standing pass passes one that turns `false` when a session
 /// binds the root or the pass's job is cancelled, so such a pass never
 /// clears the root's strict-verification flag.
-pub(crate) fn verify_current(root: &Path, storage: &Path, still_wanted: impl Fn() -> bool) -> bool {
+pub(crate) fn verify_current(
+    root: &Path,
+    storage: &Path,
+    planes: Planes,
+    still_wanted: impl Fn() -> bool,
+) -> bool {
     if !still_wanted() {
         return false;
     }
-    let current = super::surfaces::index_root(root, storage).is_ok();
+    let current = super::surfaces::index_root(root, storage, planes).is_ok();
     current && still_wanted()
 }

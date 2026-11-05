@@ -776,10 +776,14 @@ pub(crate) fn block_cache_stats() -> Option<aft_store::cache::CacheStats> {
 ///
 /// When Git could not tell the repository's identity, or the family store
 /// cannot be opened.
-pub(crate) fn bind_foreground(root: &Path, storage: &Path) -> Result<Checkout, DataError> {
+pub(crate) fn bind_foreground(
+    root: &Path,
+    storage: &Path,
+    planes: Planes,
+) -> Result<Checkout, DataError> {
     let family = family_of(root)?;
     let family_dir = storage.join("data").join(family.digest().to_string());
-    Checkout::bind(layer(), &family_dir, family, root)
+    Checkout::bind_planes(layer(), &family_dir, family, root, planes)
 }
 
 /// The last failed build or call-graph refresh of a checkout.

@@ -711,6 +711,7 @@ impl StandingActor {
                         crate::data_layer::standing::verify_current(
                             &entry.resolved_target,
                             &ctx.storage_dir(),
+                            crate::data_layer::standing::planes(&entry.indexes),
                             || {
                                 !admission.cancellation_requested()
                                     && !crate::executor::current_job_cancelled()
@@ -2144,9 +2145,12 @@ mod tests {
         /// The paths the data layer's publication of the root holds, with
         /// whether it still matches the files on disk.
         fn published(&self) -> (usize, bool) {
-            let checkout =
-                crate::data_layer::runtime::bind_foreground(&self.root, self.storage.path())
-                    .unwrap();
+            let checkout = crate::data_layer::runtime::bind_foreground(
+                &self.root,
+                self.storage.path(),
+                crate::data_layer::standing::planes(&self.entry.indexes),
+            )
+            .unwrap();
             let view = checkout.view().expect("a publication");
             (view.state().paths().len(), view.changed_paths().is_empty())
         }

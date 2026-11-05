@@ -543,26 +543,36 @@ pub struct IndexOutcome {
     pub published: bool,
 }
 
-/// Builds and publishes the data layer's text and call-graph planes for
-/// the checkout at `root`, with its family store under `storage`, in the
-/// foreground; nothing is published when the store already holds exactly
-/// what is on disk.
+/// Builds and publishes the data layer's `planes` for the checkout at
+/// `root`, with its family store under `storage`, in the foreground;
+/// nothing is published when the store already holds exactly what is on
+/// disk.
 ///
 /// # Errors
 ///
 /// When the store cannot be opened, the build fails, or other AFT
 /// processes kept publishing the checkout first.
-pub fn index_root(root: &Path, storage: &Path) -> Result<IndexOutcome, String> {
+pub fn index_root(
+    root: &Path,
+    storage: &Path,
+    planes: super::checkout::Planes,
+) -> Result<IndexOutcome, String> {
     /// Builds that may stand down for another process's publication before
     /// this one gives up.
     const ATTEMPTS: usize = 3;
-    let checkout =
-        super::runtime::bind_foreground(root, storage).map_err(|error| error.to_string())?;
+    let checkout = super::runtime::bind_foreground(root, storage, planes)
+        .map_err(|error| error.to_string())?;
     // Binding compares the files on disk with the publication and records
     // any difference, so a current store has a view with nothing changed.
     let current = |checkout: &super::checkout::Checkout| {
         checkout.view().is_some_and(|view| {
-            view.changed_paths().is_empty() && view.status().callgraph == PlaneStatus::Ready
+            let status = view.status();
+            let ready = if planes.callgraph {
+                status.callgraph
+            } else {
+                status.text
+            };
+            view.changed_paths().is_empty() && ready == PlaneStatus::Ready
         })
     };
     let mut published = false;
@@ -1213,7 +1223,8 @@ mod tests {
         let ctx = context(&root, storage.path());
 
         // `aft index` builds in the foreground, then finds the store current.
-        let first = index_root(&root, storage.path()).unwrap();
+        let all = crate::data_layer::checkout::Planes::ALL;
+        let first = index_root(&root, storage.path(), all).unwrap();
         assert_eq!(
             first,
             IndexOutcome {
@@ -1223,11 +1234,25 @@ mod tests {
                 published: true
             }
         );
-        let again = index_root(&root, storage.path()).unwrap();
+        let again = index_root(&root, storage.path(), all).unwrap();
         assert!(!again.published, "nothing changed, nothing published");
         write(&root, "src/extra.rs", "pub fn other() {}\n");
-        let changed = index_root(&root, storage.path()).unwrap();
+        let changed = index_root(&root, storage.path(), all).unwrap();
         assert_eq!((changed.files, changed.published), (4, true));
+
+        // A standing root that asks only for text search builds no call
+        // graph, in a store of its own.
+        let text_storage = tempfile::tempdir().unwrap();
+        let text_only = index_root(
+            &root,
+            text_storage.path(),
+            crate::data_layer::standing::planes(&[crate::config::IndexKind::Search]),
+        )
+        .unwrap();
+        assert_eq!(
+            (text_only.files, text_only.parsed_files, text_only.published),
+            (4, 0, true)
+        );
 
         // `aft warmup` binds; the publication `aft index` left serves at once.
         crate::data_layer::runtime::force_on_for_test();
