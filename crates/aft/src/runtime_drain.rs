@@ -7201,7 +7201,6 @@ mod tests {
     /// must reach the data layer, or a file changed only during the overflow
     /// stays out of grep until the root is bound again.
     #[test]
-    #[ignore = "data-layer defect: a watcher rescan (RescanRequired) never reaches the data layer's checkout, so a file changed during the overflow stays invisible to grep"]
     fn a_watcher_rescan_reaches_the_data_layer() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
