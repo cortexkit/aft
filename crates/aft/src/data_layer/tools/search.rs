@@ -759,6 +759,52 @@ mod tests {
         SearchIndex::query_trigrams_from_tokens(&refs)
     }
 
+    /// An exact pass as its callers see it: sorted in the exact tier's
+    /// canonical order, with the content digest of each file read.
+    fn exact(
+        index: TextIndex<'_>,
+        query: &str,
+        root: &Path,
+        filter: Option<&dyn Fn(&Path) -> bool>,
+        scope: &ExactEvidenceScope,
+    ) -> String {
+        let matches = match index.whole_corpus_exact_pass_scoped(query, root, filter, scope) {
+            Ok(matches) => matches,
+            Err(error) => return format!("error: {error}"),
+        };
+        let mut digests = matches
+            .iter()
+            .map(|found| (found.path.clone(), found.content_digest.clone()))
+            .collect::<Vec<_>>();
+        digests.sort();
+        digests.dedup();
+        let mut results = matches
+            .into_iter()
+            .map(|found| {
+                crate::commands::semantic_search::comparator::CandidateResult::new_exact(
+                    found.path,
+                    found.symbol_range,
+                    found.evidence,
+                )
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(crate::commands::semantic_search::comparator::score_free_r3_cmp);
+        format!("{results:?}\n{digests:?}")
+    }
+
+    /// The files that may hold a phrase, as a set; the order is reported
+    /// apart, since callers only read them until one holds the phrase.
+    fn holders(index: TextIndex<'_>, phrase: &str, root: &Path) -> (String, String) {
+        match index.files_possibly_holding_phrase(phrase, root) {
+            Ok(Some(paths)) => {
+                let order = format!("{paths:?}");
+                let set = paths.into_iter().collect::<BTreeSet<_>>();
+                (format!("{set:?}"), order)
+            }
+            other => (format!("{other:?}"), String::new()),
+        }
+    }
+
     /// The lexical lane's canonical order, with each score's bits.
     fn lane(index: TextIndex<'_>, trigrams: &[u32], include_tests: bool, root: &Path) -> String {
         let filter = |path: &Path| {
@@ -816,20 +862,16 @@ mod tests {
                 ExactEvidenceScope::Phrase,
             ] {
                 assert_eq!(
-                    legacy
-                        .whole_corpus_exact_pass_scoped(query, &pair.root, None, &scope)
-                        .unwrap(),
-                    data.whole_corpus_exact_pass_scoped(query, &pair.root, None, &scope)
-                        .unwrap(),
+                    exact(legacy, query, &pair.root, None, &scope),
+                    exact(data, query, &pair.root, None, &scope),
                     "{query} {scope:?}"
                 );
             }
+            // The legacy index lists them in the order it first indexed the
+            // files, the view in byte order.
             assert_eq!(
-                legacy
-                    .files_possibly_holding_phrase(query, &pair.root)
-                    .unwrap(),
-                data.files_possibly_holding_phrase(query, &pair.root)
-                    .unwrap(),
+                holders(legacy, query, &pair.root).0,
+                holders(data, query, &pair.root).0,
                 "{query}"
             );
         }
@@ -953,50 +995,74 @@ mod tests {
         let legacy = TextIndex::Snapshot(&snapshot);
         let data = TextIndex::Data(&pair.data);
         let root = pair.root.clone();
+        let view_paths = pair.data.view.state().paths().len();
+        let legacy_files = snapshot
+            .file_entries()
+            .iter()
+            .filter(|file| !file.path.as_os_str().is_empty())
+            .count();
+        eprintln!(
+            "built both indexes in {:.0} ms; {view_paths} paths in the view, {legacy_files} files in the legacy index",
+            build.as_secs_f64() * 1000.0,
+        );
 
-        let mut lanes = Tally::default();
-        let mut lanes_with_tests = Tally::default();
-        let mut picks_by_frequency = Tally::default();
-        let mut picks_as_sets = Tally::default();
-        let mut pool_by_file_rarity = Tally::default();
-        let mut unpooled = Tally::default();
-        let mut exact = Tally::default();
-        let mut phrase_holders = Tally::default();
-        let mut anchored = Tally::default();
+        let mut tallies = std::collections::BTreeMap::<&'static str, Tally>::new();
+        let report = |tallies: &std::collections::BTreeMap<&'static str, Tally>, done: usize| {
+            let mut report = serde_json::json!({
+                "root": root,
+                "distinct_queries_done": done,
+                "build_ms_legacy_and_data": build.as_secs_f64() * 1000.0,
+                "view_paths": view_paths,
+                "legacy_files": legacy_files,
+            });
+            for (name, tally) in tallies {
+                report[*name] = tally.summary();
+            }
+            std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        };
         let mut seen = HashSet::new();
-        let mut distinct = 0usize;
+        let started = Instant::now();
         for query in queries.lines().map(str::trim).filter(|query| !query.is_empty()) {
             if !seen.insert(query.to_string()) {
                 continue;
             }
-            distinct += 1;
+            let done = seen.len();
+            if done % 200 == 0 {
+                report(&tallies, done);
+                eprintln!("{done} queries in {:.0} s", started.elapsed().as_secs_f64());
+            }
+            let mut record = |name: &'static str,
+                              legacy: (String, Duration),
+                              data: (String, Duration)| {
+                tallies.entry(name).or_default().record(query, legacy, data);
+            };
             let trigrams = trigrams(query);
-            lanes.record(
-                query,
+            record(
+                "lexical_lane",
                 timed(|| lane(legacy, &trigrams, false, &root)),
                 timed(|| lane(data, &trigrams, false, &root)),
             );
-            lanes_with_tests.record(
-                query,
+            record(
+                "lexical_lane_include_tests",
                 timed(|| lane(legacy, &trigrams, true, &root)),
                 timed(|| lane(data, &trigrams, true, &root)),
             );
 
-            // Which three trigrams each rarity picks, and what the pool would
-            // be if the data layer ranked rarity by files.
+            // Which three trigrams each rarity picks, and how large a pool
+            // each pick selects.
             let unique = unique_trigrams(&trigrams);
             let postings = pair.data.postings(&unique).unwrap();
             let by_files = rarest(&pair.data, &unique, &postings, Rarity::Files).unwrap();
             let by_frequency = rarest(&pair.data, &unique, &postings, Rarity::Frequency).unwrap();
             let zero = Duration::ZERO;
-            picks_by_frequency.record(
-                query,
+            record(
+                "rarest_three_in_order",
                 (format!("{by_files:06x?}"), zero),
                 (format!("{by_frequency:06x?}"), zero),
             );
             let as_set = |picks: &[u32]| picks.iter().copied().collect::<BTreeSet<u32>>();
-            picks_as_sets.record(
-                query,
+            record(
+                "rarest_three_as_a_set",
                 (format!("{:06x?}", as_set(&by_files)), zero),
                 (format!("{:06x?}", as_set(&by_frequency)), zero),
             );
@@ -1007,105 +1073,76 @@ mod tests {
                     .collect::<BTreeSet<_>>()
                     .len()
             };
-            pool_by_file_rarity.record(
-                query,
+            record(
+                "pool_size_files_vs_frequency",
                 (format!("{}", pool(&by_files)), zero),
                 (format!("{}", pool(&by_frequency)), zero),
             );
-            unpooled.record(
-                query,
+            record(
+                "unpooled_rank",
                 timed(|| format!("{:?}", legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
                 timed(|| format!("{:?}", data.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
             );
-
-            if exact.queries < exact_limit {
-                let filter = |path: &Path| {
-                    crate::commands::semantic_search::path_allowed_by_include_tests(
-                        path, &root, false,
-                    )
-                };
-                for scope in [
-                    ExactEvidenceScope::All,
-                    ExactEvidenceScope::PhraseAndWindow,
-                    ExactEvidenceScope::Phrase,
-                ] {
-                    exact.record(
-                        &format!("{scope:?} {query}"),
-                        timed(|| {
-                            format!(
-                                "{:?}",
-                                legacy.whole_corpus_exact_pass_scoped(
-                                    query,
-                                    &root,
-                                    Some(&filter),
-                                    &scope
-                                )
-                            )
-                        }),
-                        timed(|| {
-                            format!(
-                                "{:?}",
-                                data.whole_corpus_exact_pass_scoped(
-                                    query,
-                                    &root,
-                                    Some(&filter),
-                                    &scope
-                                )
-                            )
-                        }),
-                    );
-                }
-                let phrase = exact_lane::exact_phrase(query);
-                phrase_holders.record(
-                    query,
-                    timed(|| format!("{:?}", legacy.files_possibly_holding_phrase(phrase, &root))),
-                    timed(|| format!("{:?}", data.files_possibly_holding_phrase(phrase, &root))),
-                );
-                let runs = split_query(query).retained_runs;
-                anchored.record(
-                    query,
-                    timed(|| {
-                        let candidates =
-                            discover_anchored_candidate_files(&pair.legacy, &root, &runs, false);
-                        let executed = AnchoredLane::new()
-                            .execute_with_admission_report(&pair.legacy, &root, query, false);
-                        format!("{:?}\n{executed:?}", candidates.map(|files| files.len()))
-                    }),
-                    timed(|| {
-                        let candidates = anchored_candidate_files(&pair.data, &root, &runs, false);
-                        let executed =
-                            AnchoredLane::new().execute_on_data_view(&pair.data, &root, query, false);
-                        format!("{:?}\n{executed:?}", candidates.map(|files| files.len()))
-                    }),
+            if done > exact_limit {
+                continue;
+            }
+            let filter = |path: &Path| {
+                crate::commands::semantic_search::path_allowed_by_include_tests(path, &root, false)
+            };
+            for (name, scope) in [
+                ("exact_pass_all", ExactEvidenceScope::All),
+                ("exact_pass_phrase_and_window", ExactEvidenceScope::PhraseAndWindow),
+                ("exact_pass_phrase", ExactEvidenceScope::Phrase),
+            ] {
+                record(
+                    name,
+                    timed(|| exact(legacy, query, &root, Some(&filter), &scope)),
+                    timed(|| exact(data, query, &root, Some(&filter), &scope)),
                 );
             }
+            let phrase = exact_lane::exact_phrase(query);
+            let (legacy_holders, legacy_time) = timed(|| holders(legacy, phrase, &root));
+            let (data_holders, data_time) = timed(|| holders(data, phrase, &root));
+            record(
+                "files_possibly_holding_phrase",
+                (legacy_holders.0, legacy_time),
+                (data_holders.0, data_time),
+            );
+            record(
+                "files_possibly_holding_phrase_order",
+                (legacy_holders.1, zero),
+                (data_holders.1, zero),
+            );
+            let runs = split_query(query).retained_runs;
+            record(
+                "anchored_candidates",
+                timed(|| {
+                    format!(
+                        "{:?}",
+                        discover_anchored_candidate_files(&pair.legacy, &root, &runs, false)
+                    )
+                }),
+                timed(|| format!("{:?}", anchored_candidate_files(&pair.data, &root, &runs, false))),
+            );
+            record(
+                "anchored_lane",
+                timed(|| {
+                    format!(
+                        "{:?}",
+                        AnchoredLane::new()
+                            .execute_with_admission_report(&pair.legacy, &root, query, false)
+                    )
+                }),
+                timed(|| {
+                    format!(
+                        "{:?}",
+                        AnchoredLane::new().execute_on_data_view(&pair.data, &root, query, false)
+                    )
+                }),
+            );
         }
-        let report = serde_json::json!({
-            "root": root,
-            "distinct_queries": distinct,
-            "build_ms_legacy_and_data": build.as_secs_f64() * 1000.0,
-            "lexical_lane": lanes.summary(),
-            "lexical_lane_include_tests": lanes_with_tests.summary(),
-            "rarest_three_in_order": picks_by_frequency.summary(),
-            "rarest_three_as_a_set": picks_as_sets.summary(),
-            "pool_size_files_vs_frequency": pool_by_file_rarity.summary(),
-            "unpooled_rank": unpooled.summary(),
-            "exact_pass": exact.summary(),
-            "files_possibly_holding_phrase": phrase_holders.summary(),
-            "anchored": anchored.summary(),
-        });
-        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-        for (name, tally) in [
-            ("lexical_lane", &lanes),
-            ("lexical_lane_include_tests", &lanes_with_tests),
-            ("rarest_three_in_order", &picks_by_frequency),
-            ("rarest_three_as_a_set", &picks_as_sets),
-            ("pool_size_files_vs_frequency", &pool_by_file_rarity),
-            ("unpooled_rank", &unpooled),
-            ("exact_pass", &exact),
-            ("files_possibly_holding_phrase", &phrase_holders),
-            ("anchored", &anchored),
-        ] {
+        report(&tallies, seen.len());
+        for (name, tally) in &tallies {
             println!(
                 "{name}: {} of {} differ; legacy {:.3} ms, data {:.3} ms per call",
                 tally.differing,
