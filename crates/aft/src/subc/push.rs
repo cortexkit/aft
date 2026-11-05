@@ -686,6 +686,34 @@ pub(super) fn replay_buffered_push_frames(
     trust: BindTrust,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
+    // Tasks saved without launching_identity can still replay within the same
+    // root, harness and session without matching the caller's principal.
+    if trust.allows_bash_observation() {
+        let legacy_keys: Vec<_> = push_buffer
+            .keys()
+            .filter(|candidate| {
+                candidate.root == key.root
+                    && candidate.harness == key.harness
+                    && candidate.session == key.session
+                    && *candidate != key
+            })
+            .cloned()
+            .collect();
+        for legacy_key in legacy_keys {
+            let queue = push_buffer.get_mut(&legacy_key).unwrap();
+            let (legacy, owned): (VecDeque<_>, VecDeque<_>) =
+                std::mem::take(queue).into_iter().partition(|frame| {
+                    frame_is_bash_observation(frame) && frame_task_identity(frame).is_none()
+                });
+            *queue = owned;
+            if queue.is_empty() {
+                push_buffer.remove(&legacy_key);
+            }
+            for frame in legacy {
+                buffer_push_frame(metrics, push_buffer, key.clone(), frame);
+            }
+        }
+    }
     let mut sent = 0;
     let remove_empty;
 
@@ -1712,6 +1740,31 @@ mod tests {
         assert_eq!((replay.header.channel, replay.header.epoch), (3, 9));
         assert!(writer_rx.try_recv().is_err());
         assert!(buffered.is_empty());
+
+        if other_harness == "opencode" {
+            buffer_push_frame(
+                &metrics,
+                &mut buffered,
+                ReplayKey::from_identity(&other),
+                completion_frame_with_session("legacy-task", "moved-session"),
+            );
+            assert_eq!(
+                replay_buffered_push_frames(
+                    &writer_tx,
+                    &metrics,
+                    route_key(3, 9),
+                    &mut buffered,
+                    &ReplayKey::from_identity(&reconnect),
+                    BindTrust::FirstParty,
+                    None
+                ),
+                1
+            );
+            assert_eq!(
+                push_frame_task_id(&writer_rx.try_recv().unwrap()).as_deref(),
+                Some("legacy-task")
+            );
+        }
     }
 
     #[test]

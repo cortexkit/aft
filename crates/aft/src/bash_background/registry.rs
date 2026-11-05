@@ -3989,18 +3989,16 @@ impl BgTaskRegistry {
     /// One project root is shared by routes from several harnesses, and each
     /// configure replaces `db_harness` with its own. A session's task rows are
     /// written under the harness of the route that started them, so this
-    /// prefers the calling route's harness. Internal maintenance without a
-    /// route falls back to the recorded session harness and root configuration.
+    /// prefers the harness recorded for the session's tasks, then the calling
+    /// route's harness, and finally the root configuration. Task-specific work
+    /// uses the task's own stored harness instead.
     fn db_harness_for_session(&self, session_id: &str) -> Option<String> {
-        super::route_harness()
-            .map(|harness| harness.storage_segment())
-            .or_else(|| {
-                self.inner
-                    .session_harnesses
-                    .lock()
-                    .ok()
-                    .and_then(|harnesses| harnesses.get(session_id).cloned())
-            })
+        self.inner
+            .session_harnesses
+            .lock()
+            .ok()
+            .and_then(|harnesses| harnesses.get(session_id).cloned())
+            .or_else(|| super::route_harness().map(|harness| harness.storage_segment()))
             .or_else(|| self.fallback_db_harness())
     }
 
@@ -4034,6 +4032,27 @@ impl BgTaskRegistry {
             .ok()
             .and_then(|slot| slot.clone())?;
         Some((self.db_harness_for_task(task)?, pool))
+    }
+
+    fn db_harness_and_pool_for_task_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        if let Some(task) = self.task(task_id) {
+            return self.db_harness_and_pool_for_task(&task);
+        }
+        let (fallback, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let stored = {
+            let conn = pool.lock().ok()?;
+            conn.query_row(
+                "SELECT harness FROM bash_tasks WHERE task_id = ?1 AND session_id = ?2 LIMIT 1",
+                rusqlite::params![task_id, session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+        Some((stored.unwrap_or(fallback), pool))
     }
 
     /// Whether a response-data status names a finished task. Kept next to the
@@ -4131,55 +4150,68 @@ impl BgTaskRegistry {
         session_id: &str,
         identity: Option<&super::TaskIdentity>,
     ) -> Vec<BashPatternMatchFrame> {
-        let Some((mut harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((default_harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
+        let mut harnesses = vec![default_harness];
         if let Some(identity) = identity {
             let Ok(owner_harness) = identity.harness.parse::<crate::harness::Harness>() else {
                 return Vec::new();
             };
-            harness = owner_harness.storage_segment();
+            harnesses.push(owner_harness.storage_segment());
+            // Tasks saved without launching_identity retain session-only notice
+            // visibility. Newer tasks must match the caller's attested principal,
+            // harness and session below, even when several harnesses share a session.
+            if let Some((seen, _)) = self.db_seen_harnesses_and_pool() {
+                harnesses.extend(seen);
+            }
         }
+        harnesses.sort();
+        harnesses.dedup();
         let rows = {
             let Ok(conn) = pool.lock() else {
                 return Vec::new();
             };
-            match crate::db::bash_watches::list_bash_pattern_watches_for_session(
-                &conn, &harness, session_id,
-            ) {
-                Ok(mut rows) => {
-                    match crate::db::bash_watches::list_delivery_gaps(
-                        &conn,
-                        &harness,
-                        Some(session_id),
-                    ) {
-                        Ok(gaps) => rows.extend(gaps),
-                        Err(error) => crate::slog_warn!(
+            let mut retained = Vec::new();
+            for harness in harnesses {
+                match crate::db::bash_watches::list_bash_pattern_watches_for_session(
+                    &conn, &harness, session_id,
+                ) {
+                    Ok(mut rows) => {
+                        match crate::db::bash_watches::list_delivery_gaps(
+                            &conn,
+                            &harness,
+                            Some(session_id),
+                        ) {
+                            Ok(gaps) => rows.extend(gaps),
+                            Err(error) => crate::slog_warn!(
                             "failed to load retained watch gaps for session {session_id}: {error}"
                         ),
+                        }
+                        retained.extend(rows.into_iter().map(|row| (harness.clone(), row)));
                     }
-                    rows
-                }
-                Err(error) => {
-                    crate::slog_warn!(
-                        "failed to load pending bash watches for session {session_id}: {error}"
-                    );
-                    return Vec::new();
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to load pending bash watches for session {session_id}: {error}"
+                        );
+                        return Vec::new();
+                    }
                 }
             }
+            retained
         };
 
         rows.into_iter()
-            .filter(|row| row.pending_match)
-            .filter(|row| {
-                self.task_launching_identity_record(session_id, &row.task_id, Some(&harness))
+            .filter(|(_, row)| row.pending_match)
+            .filter(|(harness, row)| {
+                self.task_launching_identity_record(session_id, &row.task_id, Some(harness))
                     .map_or(identity.is_none(), |owner| {
                         owner
                             .as_ref()
                             .is_none_or(|owner| identity.is_none_or(|caller| caller == owner))
                     })
             })
-            .filter_map(|row| {
+            .filter_map(|(harness, row)| {
                 let launching_identity = self.task_launching_identity_in_harness(
                     session_id,
                     &row.task_id,
@@ -4238,7 +4270,7 @@ impl BgTaskRegistry {
         task_id: &str,
         storage_dir: &Path,
     ) -> Option<BgTaskSnapshot> {
-        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
         let conn = pool.lock().ok()?;
         let row =
             crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id).ok()??;
@@ -4246,6 +4278,9 @@ impl BgTaskRegistry {
             return None;
         }
         let metadata = PersistedTask::from(row.clone());
+        if !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref()) {
+            return None;
+        }
         metadata
             .status
             .is_terminal()
@@ -4407,7 +4442,8 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4441,7 +4477,8 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watch(&self, session_id: &str, task_id: &str, watch_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4455,7 +4492,8 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watches_for_task(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4722,7 +4760,8 @@ impl BgTaskRegistry {
         // Save that presentation verbatim so replay does not need task secrets.
         let (stdout_offset, stderr_offset, pty_offset) =
             self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4834,7 +4873,8 @@ impl BgTaskRegistry {
         {
             return;
         }
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4919,7 +4959,7 @@ impl BgTaskRegistry {
             .persisted_task_is_terminal(session_id, task_id)
             .unwrap_or(false);
         let (harness, pool) = self
-            .db_harness_and_pool_for_session(session_id)
+            .db_harness_and_pool_for_task_id(session_id, task_id)
             .ok_or_else(|| "watch persistence unavailable".to_string())?;
         let (removed, settled) = {
             let conn = pool.lock().map_err(|error| error.to_string())?;
@@ -5024,7 +5064,8 @@ impl BgTaskRegistry {
     /// Task-wide ack: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -11578,7 +11619,7 @@ impl BgTaskRegistry {
     }
 
     fn persisted_task_is_terminal(&self, session_id: &str, task_id: &str) -> Option<bool> {
-        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
         let conn = pool.lock().ok()?;
         let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
             .ok()
@@ -11590,7 +11631,8 @@ impl BgTaskRegistry {
     }
 
     fn mark_persisted_completion_delivered(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         // Drain already queued snapshots before applying the ack. The upsert
@@ -14903,7 +14945,9 @@ impl BgTaskRegistry {
     }
 
     fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(&frame.session_id) else {
+        let Some((harness, pool)) =
+            self.db_harness_and_pool_for_task_id(&frame.session_id, &frame.task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -15210,13 +15254,15 @@ impl BgTaskRegistry {
         if let Some(task) = self.task(task_id) {
             return (task.session_id == session_id).then(|| task.launching_identity.clone());
         }
-        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
         let harness = harness_override.unwrap_or(&harness);
         let conn = pool.lock().ok()?;
         let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
             .ok()
             .flatten()?;
-        Some(PersistedTask::from(row).launching_identity)
+        serde_json::from_str::<PersistedTask>(&row.metadata)
+            .ok()
+            .map(|task| task.launching_identity)
     }
 
     fn task_identity_allows_current(&self, session_id: &str, task_id: &str) -> bool {
@@ -26801,11 +26847,16 @@ mod tests {
             .launching_identity
             .clone()
             .expect("launch identity captured");
+        assert!(registry.ensure_task_row(&task));
+        let (pattern_task_id, pattern_task) = with_authenticated_principal(owner.clone(), || {
+            insert_terminal_piped_task(&registry, &dir, "printf ready", "ready\n", "", false)
+        });
+        assert!(registry.ensure_task_row(&pattern_task));
         registry.record_live_delivery_session("session");
         with_authenticated_principal(owner.clone(), || {
             registry
                 .register_watch(
-                    task_id.clone(),
+                    pattern_task_id,
                     WatchPattern::Substring("ready".into()),
                     true,
                 )
@@ -26894,7 +26945,7 @@ mod tests {
                 assert!(registry
                     .ack_pattern_match_for_session(
                         "session",
-                        &task_id,
+                        &matched.task_id,
                         &matched.watch_id,
                         matched.match_offset
                     )
@@ -26912,7 +26963,7 @@ mod tests {
             state.metadata.status = BgTaskStatus::Running;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
-        with_authenticated_principal(other, || {
+        with_authenticated_principal(other.clone(), || {
             assert!(registry
                 .owned_running_task_ids(dir.path(), dir.path(), "session", None)
                 .unwrap()
@@ -26936,7 +26987,7 @@ mod tests {
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
         let reconnect = task_caller(dir.path(), "reserved:thalamus-harness", "opencode", 99);
-        with_authenticated_principal(reconnect, || {
+        with_authenticated_principal(reconnect.clone(), || {
             assert_eq!(
                 registry
                     .drain_completions_for_session(Some("session"))
@@ -26953,6 +27004,18 @@ mod tests {
             );
         });
         assert!(read_task(&task.paths.json).unwrap().completion_delivered);
+        registry.inner.tasks.lock().unwrap().remove(&task_id);
+        delete_task_bundle(&task.paths).unwrap();
+        with_authenticated_principal(other, || {
+            assert!(registry
+                .terminal_db_status_for_session("session", &task_id, dir.path())
+                .is_none());
+        });
+        with_authenticated_principal(reconnect, || {
+            assert!(registry
+                .terminal_db_status_for_session("session", &task_id, dir.path())
+                .is_some());
+        });
     }
 
     #[test]
@@ -27018,6 +27081,17 @@ mod tests {
             .insert_rehydrated_task(legacy.clone(), task.paths.clone(), true)
             .unwrap();
         upgraded.enqueue_completion_if_needed(&legacy, Some(&task.paths), false);
+        with_authenticated_principal(task_caller(dir.path(), "direct", "pi", 3), || {
+            assert_eq!(
+                upgraded
+                    .drain_completions_for_session(Some("session"))
+                    .len(),
+                1
+            );
+            assert!(upgraded
+                .observed_status(&task_id, "session", 1024)
+                .is_some());
+        });
         with_authenticated_principal(other, || {
             assert_eq!(
                 upgraded
