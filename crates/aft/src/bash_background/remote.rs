@@ -2295,12 +2295,21 @@ fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
     });
     let paths: Vec<_> = paths
         .into_iter()
-        .filter(|path| {
-            if returned.contains(path) {
+        .filter(|target| {
+            if returned.contains(&target.path) {
                 return false;
             }
-            runon_snapshot_write_target(checkout, path, deadline)
+            // Other formatter outputs remain protected by the server's read-only checkout.
+            if target.formatter_directory
+                && returned
+                    .iter()
+                    .any(|path| path != &target.path && path.starts_with(&target.path))
+            {
+                return false;
+            }
+            runon_snapshot_write_target(checkout, &target.path, deadline)
         })
+        .map(|target| target.path)
         .collect();
     let first = paths.first()?;
     let mut display = first.display().to_string();
