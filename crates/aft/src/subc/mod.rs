@@ -232,6 +232,8 @@ mod health;
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
+#[cfg(test)]
+mod ledger_lane_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
