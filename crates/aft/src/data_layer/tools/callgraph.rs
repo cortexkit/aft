@@ -19,7 +19,7 @@ use crate::data_layer::runtime::Fresh;
 /// all of them in one update (seconds at worst on AFT's own checkout); the
 /// command waits for it rather than answering from a graph that misses
 /// them, and gives up only if the update takes far longer than that.
-const READ_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const READ_WAIT: Duration = Duration::from_secs(30);
 
 /// The data layer's call-graph reader.
 pub(crate) type DataGraph = SliceReader<Arc<dyn SliceSource + Send + Sync>>;

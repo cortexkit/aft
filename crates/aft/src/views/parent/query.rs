@@ -3,6 +3,7 @@
 //! root, and names every child (or area outside the children) it could not
 //! answer for.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use crate::context::AppContext;
 use crate::grep_executor::{GrepExecutionPhaseTimings, GrepParams, GrepScope};
 use crate::pattern_compile::CompiledPattern;
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{GrepResult, IndexStatus, PathFilters};
+use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
 use super::{display_relative, read, Child, ParentSession, Plane, TrigramSource};
 
@@ -159,6 +160,126 @@ fn overlapping(session: &ParentSession, scope: &Path) -> Vec<Arc<Child>> {
         .collect()
 }
 
+/// One child's text index as grep and glob read it.
+enum ChildText {
+    /// The trigram snapshot the session's worker loaded, and whether it
+    /// projects the child's published v3 lexical view.
+    Snapshot {
+        snapshot: SearchIndexSnapshot,
+        from_view: bool,
+    },
+    /// The child's checkout in the data layer, scoped to the part of the
+    /// search root inside the child.
+    Data(crate::data_layer::tools::grep::ViewScope),
+}
+
+impl ChildText {
+    /// Whether the child holds any file under `search_root`.
+    fn has_files(&self, search_root: &Path) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => snapshot.has_file_in_scope(search_root),
+            Self::Data(scope) => scope.has_files(),
+        }
+    }
+
+    /// Whether the child holds any file under `search_root` that passes
+    /// `filters`, which match paths relative to the child's root.
+    fn has_files_matching(&self, search_root: &Path, filters: &PathFilters) -> bool {
+        match self {
+            Self::Snapshot { snapshot, .. } => {
+                snapshot.has_file_in_scope_with_filters(search_root, filters)
+            }
+            Self::Data(scope) => scope.has_files_matching(filters),
+        }
+    }
+
+    /// A snapshot holding every file of the child that may match `pattern`.
+    fn candidates(
+        &self,
+        pattern: &CompiledPattern,
+    ) -> Result<Cow<'_, SearchIndexSnapshot>, String> {
+        match self {
+            Self::Snapshot { snapshot, .. } => Ok(Cow::Borrowed(snapshot)),
+            Self::Data(scope) => scope
+                .candidates(pattern)
+                .map(Cow::Owned)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// A snapshot listing the child's files, for glob.
+    fn listing(&self) -> Cow<'_, SearchIndexSnapshot> {
+        match self {
+            Self::Snapshot { snapshot, .. } => Cow::Borrowed(snapshot),
+            Self::Data(scope) => Cow::Owned(scope.listing()),
+        }
+    }
+
+    fn from_view(&self) -> bool {
+        matches!(
+            self,
+            Self::Snapshot {
+                from_view: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Each child overlapping `search_root`, with its text index or the reason
+/// it cannot answer: from the child's own checkout in the data layer when
+/// the process runs the data layer, otherwise as the session's worker
+/// loaded it.
+fn child_texts(
+    ctx: &AppContext,
+    session: &ParentSession,
+    search_root: &Path,
+) -> Vec<(Arc<Child>, Result<ChildText, String>)> {
+    let children = overlapping(session, search_root);
+    // A plane the user turned off is the worker's named gap either way.
+    if !(crate::data_layer::runtime::enabled() && session.planes.trigram) {
+        return children
+            .into_iter()
+            .filter_map(|child| {
+                let text = match read(&child.trigram).clone() {
+                    Plane::Ready(trigram) => Ok(ChildText::Snapshot {
+                        snapshot: trigram.index.snapshot(),
+                        from_view: matches!(trigram.source, TrigramSource::View(_)),
+                    }),
+                    plane => Err(plane.gap_reason("trigram")?),
+                };
+                Some((child, text))
+            })
+            .collect();
+    }
+    let roots = children
+        .iter()
+        .map(|child| child.root.as_path())
+        .collect::<Vec<_>>();
+    let planes = crate::data_layer::parent::text_planes(ctx, session.root(), &roots);
+    children
+        .into_iter()
+        .zip(planes)
+        .filter_map(|(child, plane)| {
+            let text = match plane {
+                Plane::Ready(view) => {
+                    // The whole child when the search root holds it.
+                    let scope = if search_root.starts_with(&child.root) {
+                        search_root
+                    } else {
+                        child.root.as_path()
+                    };
+                    Ok(ChildText::Data(
+                        crate::data_layer::tools::grep::ViewScope::of((*view).clone(), scope)?,
+                    ))
+                }
+                plane => Err(plane.gap_reason("trigram")?),
+            };
+            Some((child, text))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // grep and glob
 // ---------------------------------------------------------------------------
@@ -204,30 +325,44 @@ pub(crate) fn grep_fan_out(
         } else {
             params.max_results
         };
-        let mut snapshots = Vec::new();
-        for child in overlapping(&session, search_root) {
-            let trigram = read(&child.trigram).clone();
-            let Plane::Ready(trigram) = trigram else {
-                if let Some(reason) = trigram.gap_reason("trigram") {
+        let mut sources = Vec::new();
+        for (child, text) in child_texts(ctx, &session, search_root) {
+            let text = match text {
+                Ok(text) => text,
+                Err(reason) => {
                     gaps.child(&child, reason);
+                    continue;
                 }
-                continue;
             };
-            let snapshot = trigram.index.snapshot();
-            if snapshot.has_file_in_scope(search_root) {
-                from_views |= matches!(trigram.source, TrigramSource::View(_));
-                snapshots.push(snapshot);
+            if text.has_files(search_root) {
+                from_views |= text.from_view();
+                sources.push((child, text));
             }
         }
         // Children are independent indexes, so they are searched in parallel:
         // the parent's latency then tracks its largest child, not the sum.
         // Their path-ordered scans run at once, so they share one row budget.
-        let row_budget = crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET / snapshots.len().max(1);
+        let row_budget = crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET / sources.len().max(1);
         use rayon::prelude::*;
-        let answers = snapshots
+        let answers = sources
             .par_iter()
-            .map(|snapshot| {
-                let has_files = snapshot.has_file_in_scope_with_filters(search_root, filters);
+            .map(|(child, text)| {
+                let has_files = text.has_files_matching(search_root, filters);
+                let snapshot = match text.candidates(pattern) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        // A child view that cannot be read fails the call
+                        // with its cause, as a single checkout's does.
+                        let error = session.note_child_failure(child, "parent_trigram", &error);
+                        return (
+                            has_files,
+                            crate::grep_executor::failed_index_grep(std::io::Error::other(
+                                crate::context::view_load_failure_message(error),
+                            )),
+                            crate::search_index::GrepQueryPhaseTimings::default(),
+                        );
+                    }
+                };
                 let (result, timings) = match snapshot
                     .search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
                         pattern,
@@ -323,20 +458,17 @@ pub(crate) fn glob_fan_out(
             );
             continue;
         }
-        for child in overlapping(&session, &search_root) {
-            let trigram = read(&child.trigram).clone();
-            let Plane::Ready(trigram) = trigram else {
-                if let Some(reason) = trigram.gap_reason("trigram") {
+        for (child, text) in child_texts(ctx, &session, &search_root) {
+            let text = match text {
+                Ok(text) => text,
+                Err(reason) => {
                     gaps.child(&child, reason);
+                    continue;
                 }
-                continue;
             };
             let (files, scope_has_files, visited) =
-                trigram
-                    .index
-                    .snapshot()
-                    .glob_profiled(pattern, &search_root, false);
-            from_views |= matches!(trigram.source, TrigramSource::View(_));
+                text.listing().glob_profiled(pattern, &search_root, false);
+            from_views |= text.from_view();
             answer.scope_has_files |= scope_has_files;
             answer.entries_visited += visited;
             answer.files.extend(files);
@@ -511,6 +643,9 @@ fn callgraph(
         );
         return gap_response(req, operation, gaps);
     };
+    if crate::data_layer::runtime::enabled() && session.planes.callgraph {
+        return data_layer_callgraph(req, ctx, session, operation, &child, &file, symbol);
+    }
     let plane = read(&child.callgraph).clone();
     let Plane::Ready(callgraph) = plane else {
         if let Some(reason) = plane.gap_reason("call graph") {
@@ -518,34 +653,108 @@ fn callgraph(
         }
         return gap_response(req, operation, gaps);
     };
-    let store = callgraph.store.as_ref();
+    match run_operation(
+        req,
+        ctx,
+        session,
+        operation,
+        callgraph.store.as_ref(),
+        &child,
+        &file,
+        symbol,
+    ) {
+        Ok(mut value) => {
+            prefix_paths(&mut value, &child.relative);
+            // The child's own session is the only one that claims its graph
+            // is current; the parent answers as of the child's publication.
+            if let Some(object) = value.as_object_mut() {
+                object.insert("as_of".into(), callgraph.published.as_of(&child));
+            }
+            session.note_view_route(CALLGRAPH_ROUTE);
+            Response::success(&req.id, value)
+        }
+        Err(response) => response,
+    }
+}
+
+/// [`callgraph`] answered from the child's own checkout in the data layer.
+/// The parent keeps that checkout current itself and waits for its
+/// recorded edits as a single checkout's query does, so the answer is
+/// current and names no publication it is as of.
+fn data_layer_callgraph(
+    req: &RawRequest,
+    ctx: &AppContext,
+    session: &ParentSession,
+    operation: &str,
+    child: &Child,
+    file: &Path,
+    symbol: &str,
+) -> Response {
+    let plane = crate::data_layer::parent::callgraph_plane(ctx, session.root(), &child.root);
+    let Plane::Ready(view) = plane else {
+        let mut gaps = Gaps::default();
+        if let Some(reason) = plane.gap_reason("call graph") {
+            gaps.child(child, reason);
+        }
+        return gap_response(req, operation, gaps);
+    };
+    let reader = view.callgraph();
+    let answer = run_operation(req, ctx, session, operation, &reader, child, file, symbol);
+    // A file whose part of the call graph could not be read was seen as
+    // absent, so the answer cannot be trusted.
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, operation, Some(&view))
+    {
+        return response;
+    }
+    match answer {
+        Ok(mut value) => {
+            prefix_paths(&mut value, &child.relative);
+            Response::success(&req.id, value)
+        }
+        Err(response) => response,
+    }
+}
+
+/// Runs call-graph `operation` for `symbol` in `file` over `store`, the
+/// call graph of `child`: the reply's value, with paths relative to the
+/// child, or the response to send instead.
+#[allow(clippy::too_many_arguments)]
+fn run_operation(
+    req: &RawRequest,
+    ctx: &AppContext,
+    session: &ParentSession,
+    operation: &str,
+    store: &impl crate::callgraph_store::CallGraphRead,
+    child: &Child,
+    file: &Path,
+    symbol: &str,
+) -> Result<Value, Response> {
     let tests = include_tests(req);
     let value = match operation {
-        "callers" => adapter::callers_result(store, &file, symbol, depth_param(req, 1, 100), tests)
+        "callers" => adapter::callers_result(store, file, symbol, depth_param(req, 1, 100), tests)
             .map(|result| adapter::serialized_value(&req.id, operation, &result)),
         "call_tree" => {
-            adapter::call_tree_result(store, &file, symbol, depth_param(req, 5, 100), tests)
+            adapter::call_tree_result(store, file, symbol, depth_param(req, 5, 100), tests)
                 .map(|result| adapter::serialized_value(&req.id, operation, &result))
         }
-        "impact" => adapter::impact_result(store, &file, symbol, depth_param(req, 5, 100), tests)
+        "impact" => adapter::impact_result(store, file, symbol, depth_param(req, 5, 100), tests)
             .map(|result| adapter::serialized_value(&req.id, operation, &result)),
         "trace_to" => {
-            adapter::trace_to_result(store, &file, symbol, depth_param(req, 10, 100), tests)
+            adapter::trace_to_result(store, file, symbol, depth_param(req, 10, 100), tests)
                 .map(|result| adapter::serialized_value(&req.id, operation, &result))
         }
         "trace_to_symbol" => {
             let Some(to_symbol) = string_param(req, "toSymbol") else {
-                return missing(req, operation, "toSymbol");
+                return Err(missing(req, operation, "toSymbol"));
             };
             let to_file = match string_param(req, "toFile") {
-                Some(raw) => match resolve_path(req, ctx, session, raw) {
-                    Ok(path) => Some(path),
-                    Err(response) => return response,
-                },
+                Some(raw) => Some(resolve_path(req, ctx, session, raw)?),
                 None => None,
             };
             if let Some(to_file) = to_file.as_deref() {
                 if !to_file.starts_with(&child.root) {
+                    let mut gaps = Gaps::default();
                     gaps.push(
                         "parent_cross_repository",
                         display_relative(session.root(), to_file),
@@ -554,12 +763,12 @@ fn callgraph(
                             child.display()
                         ),
                     );
-                    return gap_response(req, operation, gaps);
+                    return Err(gap_response(req, operation, gaps));
                 }
             }
             adapter::trace_to_symbol_result(
                 store,
-                &file,
+                file,
                 symbol,
                 to_symbol,
                 to_file.as_deref(),
@@ -570,11 +779,11 @@ fn callgraph(
         }
         "trace_data" => {
             let Some(expression) = string_param(req, "expression") else {
-                return missing(req, operation, "expression");
+                return Err(missing(req, operation, "expression"));
             };
             adapter::trace_data_result(
                 store,
-                &file,
+                file,
                 symbol,
                 expression,
                 depth_param(req, 5, 100),
@@ -582,21 +791,17 @@ fn callgraph(
             )
             .map(|result| adapter::serialized_value(&req.id, operation, &result))
         }
-        _ => return Response::error(&req.id, "unknown_command", operation.to_string()),
+        _ => {
+            return Err(Response::error(
+                &req.id,
+                "unknown_command",
+                operation.to_string(),
+            ))
+        }
     };
     match value {
-        Ok(Ok(mut value)) => {
-            prefix_paths(&mut value, &child.relative);
-            // The child's own session is the only one that claims its graph
-            // is current; the parent answers as of the child's publication.
-            if let Some(object) = value.as_object_mut() {
-                object.insert("as_of".into(), callgraph.published.as_of(&child));
-            }
-            session.note_view_route(CALLGRAPH_ROUTE);
-            Response::success(&req.id, value)
-        }
-        Ok(Err(response)) => response,
-        Err(error) => adapter::store_error_response(&req.id, operation, error),
+        Ok(value) => value,
+        Err(error) => Err(adapter::store_error_response(&req.id, operation, error)),
     }
 }
 

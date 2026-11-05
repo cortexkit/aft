@@ -4826,6 +4826,10 @@ pub struct AppContext {
     /// Why the last attempt to bind `data_checkout` failed, until one
     /// succeeds; status and health report it.
     data_bind_failure: parking_lot::Mutex<Option<String>>,
+    /// When this root is a parent folder of repositories, its children's
+    /// checkouts in the data layer; empty otherwise (see
+    /// `data_layer::parent`).
+    data_children: crate::data_layer::parent::ChildCheckouts,
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
@@ -5814,6 +5818,7 @@ impl AppContext {
             lexical_view: parking_lot::Mutex::new(None),
             data_checkout: parking_lot::Mutex::new(None),
             data_bind_failure: parking_lot::Mutex::new(None),
+            data_children: Default::default(),
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
@@ -9928,12 +9933,23 @@ impl AppContext {
 
     /// This root's checkout in the data layer, bound on first use, when
     /// the process runs it (`AFT_DATA_LAYER=1`); `None` otherwise, or when
-    /// no root is configured or its store cannot be opened.
+    /// no root is configured, the root is a parent folder of repositories,
+    /// or its store cannot be opened.
     pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
         if !crate::data_layer::runtime::enabled() || self.data_layer_withheld().is_some() {
             return None;
         }
         let root = self.canonical_cache_root_opt()?;
+        // A parent folder of repositories builds nothing of its own: each
+        // child repository has a checkout of its own instead, which this
+        // context keeps only while it is bound to that parent folder.
+        let parent = crate::views::parent::session_for(self);
+        self.data_children
+            .keep_only(parent.as_ref().map(|session| session.root()));
+        if parent.is_some() {
+            self.data_checkout.lock().take();
+            return None;
+        }
         let planes = self.data_layer_planes();
         let mut slot = self.data_checkout.lock();
         // The index switches take effect at the next bind, as they do for
@@ -10060,6 +10076,19 @@ impl AppContext {
         if let Some(checkout) = checkout {
             checkout.note_paths(paths);
         }
+        self.data_children.note_paths(paths);
+    }
+
+    /// The data-layer checkouts of this parent folder's child repositories
+    /// (see `data_layer::parent`).
+    pub(crate) fn data_children(&self) -> &crate::data_layer::parent::ChildCheckouts {
+        &self.data_children
+    }
+
+    /// The executor this root's background work runs on as its maintenance,
+    /// once the daemon installed one; `None` in a standalone AFT.
+    pub(crate) fn data_executor(&self) -> Option<crate::executor::RootMaintenanceExecutor> {
+        self.callgraph_executor.lock().clone()
     }
 
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
@@ -13242,8 +13271,9 @@ impl AppContext {
     ) {
         *self.callgraph_executor.lock() = Some(executor.clone());
         if let Some(checkout) = self.data_checkout.lock().as_ref() {
-            checkout.set_executor(executor);
+            checkout.set_executor(executor.clone());
         }
+        self.data_children.set_executor(&executor);
         let retired = self.callgraph_view.lock().take();
         if let Some(view) = retired {
             view.shutdown();

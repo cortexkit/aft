@@ -17,6 +17,7 @@ pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
 pub(crate) mod overlay;
+pub(crate) mod parent;
 pub(crate) mod query;
 pub mod reuse;
 pub(crate) mod runtime;
