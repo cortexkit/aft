@@ -10034,7 +10034,7 @@ impl AppContext {
 
     /// The planes this root's checkout builds: the text index and the call
     /// graph, as `indexes.trigram` and `indexes.callgraph` switch them.
-    fn data_layer_planes(&self) -> crate::data_layer::checkout::Planes {
+    pub(crate) fn data_layer_planes(&self) -> crate::data_layer::checkout::Planes {
         let config = self.config();
         crate::data_layer::checkout::Planes {
             text: config.indexes.trigram,

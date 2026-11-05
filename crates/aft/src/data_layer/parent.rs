@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::AppContext;
-use crate::data_layer::checkout::{CheckoutView, PlaneStatus};
+use crate::data_layer::checkout::{CheckoutView, PlaneStatus, Planes};
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::executor::RootMaintenanceExecutor;
 use crate::views::parent::Plane;
@@ -123,6 +123,7 @@ fn bind(
     child: &Path,
     storage: &Path,
     executor: Option<RootMaintenanceExecutor>,
+    planes: Planes,
 ) -> Result<Arc<DataCheckout>, String> {
     let mut slot = slot.lock();
     if let Some(checkout) = slot.as_ref() {
@@ -130,8 +131,8 @@ fn bind(
     }
     // A failed bind is not retried before its backoff ends: the runtime
     // answers with the same error until then.
-    let checkout =
-        DataCheckout::open(child, storage, executor).map_err(|error| error.to_string())?;
+    let checkout = DataCheckout::open_planes(child, storage, executor, planes)
+        .map_err(|error| error.to_string())?;
     *slot = Some(Arc::clone(&checkout));
     Ok(checkout)
 }
@@ -148,6 +149,7 @@ fn checkouts(
     use rayon::prelude::*;
     let storage = ctx.storage_dir();
     let executor = ctx.data_executor();
+    let planes = ctx.data_layer_planes();
     let slots = children
         .iter()
         .map(|child| ctx.data_children().slot(parent, child))
@@ -155,7 +157,7 @@ fn checkouts(
     slots
         .par_iter()
         .zip(children.par_iter())
-        .map(|(slot, child)| bind(slot, child, &storage, executor.clone()))
+        .map(|(slot, child)| bind(slot, child, &storage, executor.clone(), planes))
         .collect()
 }
 
