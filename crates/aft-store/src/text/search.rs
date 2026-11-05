@@ -331,6 +331,11 @@ impl TextOverlay {
         self.entries.remove(path);
     }
 
+    /// The changed paths, in byte order.
+    pub fn paths(&self) -> impl Iterator<Item = &[u8]> {
+        self.entries.keys().map(Vec::as_slice)
+    }
+
     /// Keeps only the paths `keep` accepts.
     pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
         self.entries.retain(|path, _| keep(path));

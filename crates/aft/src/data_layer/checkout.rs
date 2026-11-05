@@ -732,7 +732,9 @@ impl CheckoutView {
     /// the changes rather than from [`state`](Self::state).
     #[must_use]
     pub fn changed_paths(&self) -> Vec<Vec<u8>> {
-        self.callgraph_pending.iter().cloned().collect()
+        // Every recorded change stays in the text changes until a build
+        // covers it, whether or not the call graph has resolved it since.
+        self.text.paths().map(<[u8]>::to_vec).collect()
     }
 
     /// How each plane stands in this view.
@@ -1178,6 +1180,13 @@ mod tests {
             .expect("two files changed");
         assert!(stats.resolved >= 2, "{stats:?}");
         assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let view = checkout.view().unwrap();
+        assert_eq!(
+            view.changed_paths(),
+            vec![b"src/extra.rs".to_vec(), b"src/lib.rs".to_vec()],
+            "a refresh resolves the call graph but the paths are still changed since the publication"
+        );
+        drop(view);
         let after = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
         assert!(after.contains("src/extra.rs"), "{after}");
         assert!(!after.contains("src/lib.rs"), "{after}");

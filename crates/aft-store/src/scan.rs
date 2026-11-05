@@ -155,10 +155,7 @@ pub fn scan(
             return false;
         }
         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-        if is_dir
-            && entry.depth() > 0
-            && skip_dirs.iter().any(|skip| OsStr::new(skip) == name)
-        {
+        if is_dir && entry.depth() > 0 && skip_dirs.iter().any(|skip| OsStr::new(skip) == name) {
             return false;
         }
         !(is_dir
