@@ -238,32 +238,14 @@ impl TextIndex<'_> {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
     ) -> io::Result<Vec<(PathBuf, f32)>> {
-        let text = match self {
+        match self {
             Self::Snapshot(snapshot) => {
-                return snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
+                snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
             }
-            Self::Data(text) => text,
-        };
-        let unique = unique_trigrams(query_trigrams);
-        let postings = text.postings(&unique)?;
-        let picked = rarest(text, &unique, &postings, Rarity::Frequency)?;
-        let selected = picked
-            .iter()
-            .flat_map(|trigram| postings[trigram].iter())
-            .collect::<BTreeSet<_>>();
-        let mut ranked = Vec::new();
-        for relative in selected {
-            let path = text.absolute(relative);
-            if candidate_filter.is_some_and(|include| !include(&path)) {
-                continue;
-            }
-            let score = text.score(relative, &unique, &postings)?;
-            if score > 0.0 {
-                ranked.push((path, score));
+            Self::Data(text) => {
+                selected_pool(text, query_trigrams, candidate_filter, Rarity::Frequency)
             }
         }
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(ranked)
     }
 
     /// Every file holding one of the rarest query trigrams, widened by the
@@ -345,6 +327,36 @@ impl TextIndex<'_> {
             Ok(Some(PathText::Excluded) | None) | Err(_) => "absent",
         }
     }
+}
+
+/// The lexical lane's scored pool from the data layer's view, picking the
+/// three rarest query trigrams by `rarity`.
+fn selected_pool(
+    text: &DataText,
+    query_trigrams: &[u32],
+    candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+    rarity: Rarity,
+) -> io::Result<Vec<(PathBuf, f32)>> {
+    let unique = unique_trigrams(query_trigrams);
+    let postings = text.postings(&unique)?;
+    let picked = rarest(text, &unique, &postings, rarity)?;
+    let selected = picked
+        .iter()
+        .flat_map(|trigram| postings[trigram].iter())
+        .collect::<BTreeSet<_>>();
+    let mut ranked = Vec::new();
+    for relative in selected {
+        let path = text.absolute(relative);
+        if candidate_filter.is_some_and(|include| !include(&path)) {
+            continue;
+        }
+        let score = text.score(relative, &unique, &postings)?;
+        if score > 0.0 {
+            ranked.push((path, score));
+        }
+    }
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(ranked)
 }
 
 /// How the lexical lane ranks query trigrams by rarity.
@@ -769,61 +781,164 @@ mod tests {
         SearchIndex::query_trigrams_from_tokens(&refs)
     }
 
-    /// An exact pass as its callers see it: sorted in the exact tier's
-    /// canonical order, with the content digest of each file read.
+    /// Which exact evidence a caller of the pass keeps, as `run_engine_ranking`
+    /// filters each scope's results.
+    #[derive(Clone, Copy, Debug)]
+    enum Caller {
+        /// Identifier queries and the not-found check keep everything.
+        Identifier,
+        /// Queries without identifier words drop declarations.
+        PhraseAndWindow,
+        /// Identifier-fact passes keep phrase evidence only.
+        Phrase,
+        /// Natural-language queries naming identifiers keep declarations
+        /// only of a named identifier.
+        DefinitionsMentioning,
+    }
+
+    impl Caller {
+        const ALL: [Self; 4] = [
+            Self::Identifier,
+            Self::PhraseAndWindow,
+            Self::Phrase,
+            Self::DefinitionsMentioning,
+        ];
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Identifier => "exact_identifier_scope_all",
+                Self::PhraseAndWindow => "exact_phrase_and_window",
+                Self::Phrase => "exact_phrase",
+                Self::DefinitionsMentioning => "exact_definitions_mentioning",
+            }
+        }
+
+        fn scope(self, query: &str) -> ExactEvidenceScope {
+            match self {
+                Self::Identifier => ExactEvidenceScope::All,
+                Self::PhraseAndWindow => ExactEvidenceScope::PhraseAndWindow,
+                Self::Phrase => ExactEvidenceScope::Phrase,
+                Self::DefinitionsMentioning => ExactEvidenceScope::DefinitionsMentioning(
+                    crate::commands::semantic_search::definition_identifier_tokens(query)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            }
+        }
+
+        fn keeps(
+            self,
+            candidate: &crate::commands::semantic_search::comparator::CandidateResult,
+            query: &str,
+        ) -> bool {
+            use crate::commands::semantic_search::evidence_descriptor::EvidenceKind;
+            match self {
+                Self::Identifier => true,
+                Self::PhraseAndWindow => candidate.evidence.kind != EvidenceKind::Definition,
+                Self::Phrase => candidate.evidence.kind == EvidenceKind::E1,
+                Self::DefinitionsMentioning => {
+                    candidate.evidence.kind != EvidenceKind::Definition
+                        || crate::commands::semantic_search::definition_matches_identifier_token(
+                            candidate, query,
+                        )
+                }
+            }
+        }
+    }
+
+    /// An exact pass as its caller keeps it, one line per result in the
+    /// exact tier's canonical order, then each file's content digest; and
+    /// the raw pass, before the caller's filter.
     fn exact(
         index: TextIndex<'_>,
         query: &str,
         root: &Path,
         filter: Option<&dyn Fn(&Path) -> bool>,
-        scope: &ExactEvidenceScope,
-    ) -> String {
-        let matches = match index.whole_corpus_exact_pass_scoped(query, root, filter, scope) {
+        caller: Caller,
+    ) -> (String, String) {
+        let scope = caller.scope(query);
+        let matches = match index.whole_corpus_exact_pass_scoped(query, root, filter, &scope) {
             Ok(matches) => matches,
-            Err(error) => return format!("error: {error}"),
+            Err(error) => return (format!("error: {error}"), String::new()),
         };
-        let mut digests = matches
-            .iter()
-            .map(|found| (found.path.clone(), found.content_digest.clone()))
-            .collect::<Vec<_>>();
-        digests.sort();
-        digests.dedup();
         let mut results = matches
-            .into_iter()
+            .iter()
             .map(|found| {
-                crate::commands::semantic_search::comparator::CandidateResult::new_exact(
-                    found.path,
-                    found.symbol_range,
-                    found.evidence,
+                (
+                    crate::commands::semantic_search::comparator::CandidateResult::new_exact(
+                        found.path.clone(),
+                        found.symbol_range,
+                        found.evidence.clone(),
+                    ),
+                    found.content_digest.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        results.sort_by(crate::commands::semantic_search::comparator::score_free_r3_cmp);
-        format!("{results:?}\n{digests:?}")
+        results.sort_by(|a, b| {
+            crate::commands::semantic_search::comparator::score_free_r3_cmp(&a.0, &b.0)
+        });
+        let raw = results
+            .iter()
+            .map(|(result, _)| format!("{result:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let kept = results
+            .iter()
+            .filter(|(result, _)| caller.keeps(result, query))
+            .map(|(result, digest)| format!("{result:?} {digest}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (kept, raw)
     }
 
-    /// The files that may hold a phrase, as a set; the order is reported
-    /// apart, since callers only read them until one holds the phrase.
-    fn holders(index: TextIndex<'_>, phrase: &str, root: &Path) -> (String, String) {
+    /// The files that may hold a phrase: those that do hold it (what the
+    /// missing-literal check decides on), the whole set, and its order.
+    fn holders(index: TextIndex<'_>, phrase: &str, root: &Path) -> [String; 3] {
         match index.files_possibly_holding_phrase(phrase, root) {
             Ok(Some(paths)) => {
-                let order = format!("{paths:?}");
-                let set = paths.into_iter().collect::<BTreeSet<_>>();
-                (format!("{set:?}"), order)
+                let normalized = exact_lane::normalize_exact_phrase(phrase);
+                let holding = paths
+                    .iter()
+                    .filter(|path| {
+                        crate::search_index::read_searchable_text(path).is_some_and(|text| {
+                            exact_lane::normalize_exact_phrase(&text).contains(&normalized)
+                        })
+                    })
+                    .map(|path| path.display().to_string())
+                    .collect::<BTreeSet<_>>();
+                let order = paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                let set = order.iter().cloned().collect::<BTreeSet<_>>();
+                [
+                    holding.into_iter().collect::<Vec<_>>().join("\n"),
+                    set.into_iter().collect::<Vec<_>>().join("\n"),
+                    order.join("\n"),
+                ]
             }
-            other => (format!("{other:?}"), String::new()),
+            other => {
+                let other = format!("{other:?}");
+                [other.clone(), other.clone(), other]
+            }
         }
     }
 
-    /// The lexical lane's canonical order, with each score's bits.
-    fn lane(index: TextIndex<'_>, trigrams: &[u32], include_tests: bool, root: &Path) -> String {
-        let filter = |path: &Path| {
+    fn include_filter(root: &Path, include_tests: bool) -> impl Fn(&Path) -> bool + '_ {
+        move |path: &Path| {
             crate::commands::semantic_search::path_allowed_by_include_tests(
                 path,
                 root,
                 include_tests,
             )
-        };
+        }
+    }
+
+    /// The lexical lane's canonical order, one candidate and its score's
+    /// bits per line, after the pool size.
+    fn lane(index: TextIndex<'_>, trigrams: &[u32], include_tests: bool, root: &Path) -> String {
+        let filter = include_filter(root, include_tests);
         let lane = CanonicalLexicalLane::from_text_index(
             index,
             trigrams,
@@ -831,12 +946,38 @@ mod tests {
             LEXICAL_ENUMERATION_LIMIT,
         )
         .unwrap();
-        let order = lane
-            .canonical_order()
-            .iter()
-            .map(|candidate| (candidate.result.path.clone(), candidate.raw_score.to_bits()))
-            .collect::<Vec<_>>();
-        format!("{}:{order:?}", lane.selected_pool_size())
+        render_lane(&lane)
+    }
+
+    /// [`lane`] from the data layer with rarity counted by files, as the
+    /// legacy index counts it.
+    fn lane_by_file_rarity(text: &DataText, trigrams: &[u32], root: &Path) -> String {
+        let filter = include_filter(root, false);
+        let pool = selected_pool(text, trigrams, Some(&filter), Rarity::Files).unwrap();
+        let lane = CanonicalLexicalLane::from_scored_candidates(
+            pool.into_iter()
+                .map(|(path, score)| {
+                    crate::commands::semantic_search::lexical_lane::LexicalCandidate::file(
+                        path, score,
+                    )
+                })
+                .collect(),
+            LEXICAL_ENUMERATION_LIMIT,
+        )
+        .unwrap();
+        render_lane(&lane)
+    }
+
+    fn render_lane(lane: &CanonicalLexicalLane) -> String {
+        let mut lines = vec![format!("pool {}", lane.selected_pool_size())];
+        lines.extend(lane.canonical_order().iter().map(|candidate| {
+            format!(
+                "{} {:08x}",
+                candidate.result.path.display(),
+                candidate.raw_score.to_bits()
+            )
+        }));
+        lines.join("\n")
     }
 
     #[test]
@@ -866,24 +1007,18 @@ mod tests {
                 data.lexical_rank_at_depth(&trigrams, None, usize::MAX).unwrap(),
                 "{query}"
             );
-            for scope in [
-                ExactEvidenceScope::All,
-                ExactEvidenceScope::PhraseAndWindow,
-                ExactEvidenceScope::Phrase,
-            ] {
+            for caller in Caller::ALL {
                 assert_eq!(
-                    exact(legacy, query, &pair.root, None, &scope),
-                    exact(data, query, &pair.root, None, &scope),
-                    "{query} {scope:?}"
+                    exact(legacy, query, &pair.root, None, caller),
+                    exact(data, query, &pair.root, None, caller),
+                    "{query} {caller:?}"
                 );
             }
             // The legacy index lists them in the order it first indexed the
             // files, the view in byte order.
-            assert_eq!(
-                holders(legacy, query, &pair.root).0,
-                holders(data, query, &pair.root).0,
-                "{query}"
-            );
+            let legacy_holders = holders(legacy, query, &pair.root);
+            let data_holders = holders(data, query, &pair.root);
+            assert_eq!(legacy_holders[..2], data_holders[..2], "{query}");
         }
         for path in ["src/upload.rs", "data.bin", "missing.rs"] {
             let path = pair.root.join(path);
@@ -925,8 +1060,8 @@ mod tests {
         );
     }
 
-    /// Statistics of one comparison over a query list.
-    #[derive(Default, serde::Serialize)]
+    /// What one comparison found over a query list.
+    #[derive(Default)]
     struct Tally {
         queries: usize,
         differing: usize,
@@ -935,35 +1070,50 @@ mod tests {
         examples: Vec<serde_json::Value>,
     }
 
+    /// One query's answer from either source, with what it cost.
+    type Answer = (String, Duration);
+
     impl Tally {
-        fn record(
-            &mut self,
-            query: &str,
-            legacy: (String, Duration),
-            data: (String, Duration),
-        ) {
+        fn record(&mut self, query: &str, legacy: Answer, data: Answer) {
             self.queries += 1;
             self.legacy += legacy.1;
             self.data += data.1;
-            if legacy.0 != data.0 {
-                self.differing += 1;
-                if self.examples.len() < 20 {
-                    self.examples.push(serde_json::json!({
-                        "query": query,
-                        "legacy": legacy.0.chars().take(4000).collect::<String>(),
-                        "data": data.0.chars().take(4000).collect::<String>(),
-                    }));
-                }
+            if legacy.0 == data.0 {
+                return;
             }
+            self.differing += 1;
+            if self.examples.len() >= 25 {
+                return;
+            }
+            // Lines only one side gives, each once; and the first line at
+            // which they part, for an order difference.
+            let left = legacy.0.lines().collect::<Vec<_>>();
+            let right = data.0.lines().collect::<Vec<_>>();
+            let left_set = left.iter().copied().collect::<BTreeSet<_>>();
+            let right_set = right.iter().copied().collect::<BTreeSet<_>>();
+            let parted = left.iter().zip(&right).position(|(a, b)| a != b);
+            let clip = |lines: Vec<&str>| {
+                lines
+                    .into_iter()
+                    .take(12)
+                    .map(|line| line.chars().take(400).collect::<String>())
+                    .collect::<Vec<_>>()
+            };
+            self.examples.push(serde_json::json!({
+                "query": query,
+                "legacy_lines": left.len(),
+                "data_lines": right.len(),
+                "only_legacy": clip(left_set.difference(&right_set).copied().collect()),
+                "only_data": clip(right_set.difference(&left_set).copied().collect()),
+                "first_parting_line": parted,
+                "legacy_at_parting": parted.map(|index| left[index].chars().take(400).collect::<String>()),
+                "data_at_parting": parted.map(|index| right[index].chars().take(400).collect::<String>()),
+            }));
         }
 
         fn summary(&self) -> serde_json::Value {
             let per_call = |total: Duration| {
-                if self.queries == 0 {
-                    0.0
-                } else {
-                    total.as_secs_f64() * 1000.0 / self.queries as f64
-                }
+                total.as_secs_f64() * 1000.0 / self.queries.max(1) as f64
             };
             serde_json::json!({
                 "queries": self.queries,
@@ -981,6 +1131,176 @@ mod tests {
         (value, started.elapsed())
     }
 
+    /// Every comparison for one query: its name, and each source's answer.
+    fn compare_query(
+        pair: &Pair,
+        legacy: TextIndex<'_>,
+        data: TextIndex<'_>,
+        query: &str,
+        exact_too: bool,
+    ) -> Vec<(&'static str, Answer, Answer)> {
+        let root = &pair.root;
+        let zero = Duration::ZERO;
+        let mut found = Vec::new();
+        let trigrams = trigrams(query);
+        found.push((
+            "lexical_lane",
+            timed(|| lane(legacy, &trigrams, false, root)),
+            timed(|| lane(data, &trigrams, false, root)),
+        ));
+        found.push((
+            "lexical_lane_include_tests",
+            timed(|| lane(legacy, &trigrams, true, root)),
+            timed(|| lane(data, &trigrams, true, root)),
+        ));
+        found.push((
+            "lexical_lane_with_file_rarity",
+            (lane(legacy, &trigrams, false, root), zero),
+            timed(|| lane_by_file_rarity(&pair.data, &trigrams, root)),
+        ));
+
+        // Which three trigrams each rarity picks.
+        let unique = unique_trigrams(&trigrams);
+        let postings = pair.data.postings(&unique).unwrap();
+        let by_files = rarest(&pair.data, &unique, &postings, Rarity::Files).unwrap();
+        let by_frequency = rarest(&pair.data, &unique, &postings, Rarity::Frequency).unwrap();
+        let render = |picks: &[u32]| {
+            picks
+                .iter()
+                .map(|trigram| {
+                    let bytes = [(trigram >> 16) as u8, (trigram >> 8) as u8, *trigram as u8];
+                    format!(
+                        "{:?} files={} frequency={}",
+                        String::from_utf8_lossy(&bytes),
+                        postings[trigram].len(),
+                        pair.data.frequency(*trigram).unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        found.push((
+            "rarest_three_in_order",
+            (render(&by_files), zero),
+            (render(&by_frequency), zero),
+        ));
+        let as_set = |picks: &[u32]| {
+            let mut picks = picks.to_vec();
+            picks.sort_unstable();
+            format!("{picks:06x?}")
+        };
+        found.push((
+            "rarest_three_as_a_set",
+            (as_set(&by_files), zero),
+            (as_set(&by_frequency), zero),
+        ));
+        let rank_lines = |ranked: io::Result<Vec<(PathBuf, f32)>>| match ranked {
+            Ok(ranked) => ranked
+                .iter()
+                .map(|(path, score)| format!("{} {:08x}", path.display(), score.to_bits()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => format!("error: {error}"),
+        };
+        let (legacy_ranked, legacy_time) =
+            timed(|| rank_lines(legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX)));
+        let (data_ranked, data_time) =
+            timed(|| rank_lines(data.lexical_rank_at_depth(&trigrams, None, usize::MAX)));
+        let sorted = |lines: &str| {
+            let mut lines = lines.lines().collect::<Vec<_>>();
+            lines.sort_unstable();
+            lines.join("\n")
+        };
+        found.push((
+            "unpooled_rank_scores",
+            (sorted(&legacy_ranked), legacy_time),
+            (sorted(&data_ranked), data_time),
+        ));
+        found.push(("unpooled_rank_order", (legacy_ranked, zero), (data_ranked, zero)));
+        if !exact_too {
+            return found;
+        }
+
+        let filter = include_filter(root, false);
+        for caller in Caller::ALL {
+            let (legacy_pass, legacy_time) =
+                timed(|| exact(legacy, query, root, Some(&filter), caller));
+            let (data_pass, data_time) = timed(|| exact(data, query, root, Some(&filter), caller));
+            found.push((caller.name(), (legacy_pass.0, legacy_time), (data_pass.0, data_time)));
+            if !matches!(caller, Caller::Identifier) {
+                found.push((
+                    match caller {
+                        Caller::PhraseAndWindow => "exact_phrase_and_window_unfiltered",
+                        Caller::Phrase => "exact_phrase_unfiltered",
+                        _ => "exact_definitions_mentioning_unfiltered",
+                    },
+                    (legacy_pass.1, zero),
+                    (data_pass.1, zero),
+                ));
+            }
+        }
+        let phrase = exact_lane::exact_phrase(query);
+        let (legacy_holders, legacy_time) = timed(|| holders(legacy, phrase, root));
+        let (data_holders, data_time) = timed(|| holders(data, phrase, root));
+        let [legacy_holding, legacy_set, legacy_order] = legacy_holders;
+        let [data_holding, data_set, data_order] = data_holders;
+        found.push((
+            "phrase_holders_that_hold_it",
+            (legacy_holding, legacy_time),
+            (data_holding, data_time),
+        ));
+        found.push(("phrase_possible_holders", (legacy_set, zero), (data_set, zero)));
+        found.push(("phrase_possible_holders_order", (legacy_order, zero), (data_order, zero)));
+
+        let runs = split_query(query).retained_runs;
+        let count = |files: io::Result<Vec<PathBuf>>| match files {
+            Ok(files) => format!("{} candidate files", files.len()),
+            Err(error) => format!("error: {error}"),
+        };
+        found.push((
+            "anchored_candidate_count",
+            timed(|| count(discover_anchored_candidate_files(&pair.legacy, root, &runs, false))),
+            timed(|| count(anchored_candidate_files(&pair.data, root, &runs, false))),
+        ));
+        type Anchored = (
+            Vec<crate::commands::semantic_search::comparator::CandidateResult>,
+            usize,
+            usize,
+        );
+        let anchored = |executed: &io::Result<Anchored>, with_examined: bool| {
+            match executed {
+                Ok((results, examined, excluded)) => {
+                    let mut lines = results
+                        .iter()
+                        .map(|result| format!("{result:?}"))
+                        .collect::<Vec<_>>();
+                    lines.push(format!("excluded {excluded}"));
+                    if with_examined {
+                        lines.push(format!("examined {examined}"));
+                    }
+                    lines.join("\n")
+                }
+                Err(error) => format!("error: {error}"),
+            }
+        };
+        let (legacy_anchored, legacy_time) = timed(|| {
+            AnchoredLane::new().execute_with_admission_report(&pair.legacy, root, query, false)
+        });
+        let (data_anchored, data_time) =
+            timed(|| AnchoredLane::new().execute_on_data_view(&pair.data, root, query, false));
+        found.push((
+            "anchored_results_and_exclusions",
+            (anchored(&legacy_anchored, false), legacy_time),
+            (anchored(&data_anchored, false), data_time),
+        ));
+        found.push((
+            "anchored_reply_counts",
+            (anchored(&legacy_anchored, true), zero),
+            (anchored(&data_anchored, true), zero),
+        ));
+        found
+    }
+
     /// Runs every lane question for each query of a real query list against
     /// the legacy index and the data layer's view of one checkout, and
     /// writes what differs and what each costs. The gate for wiring
@@ -989,22 +1309,26 @@ mod tests {
     /// `AFT_SEARCH_PARITY_ROOT=<checkout> AFT_SEARCH_PARITY_QUERIES=<one
     /// query per line> AFT_SEARCH_PARITY_OUT=<report.json> cargo test -p
     /// agent-file-tools --lib -- --ignored lanes_match_the_legacy_index`
+    ///
+    /// `AFT_SEARCH_PARITY_EXACT_LIMIT` caps how many queries also run the
+    /// exact, missing-literal and anchored comparisons (they read files);
+    /// `AFT_SEARCH_PARITY_THREADS` spreads the queries over threads.
     #[test]
     #[ignore = "reads the checkout and query list named by AFT_SEARCH_PARITY_*"]
     fn lanes_match_the_legacy_index_on_real_queries() {
-        let root = PathBuf::from(std::env::var("AFT_SEARCH_PARITY_ROOT").unwrap());
-        let queries = std::fs::read_to_string(std::env::var("AFT_SEARCH_PARITY_QUERIES").unwrap())
-            .unwrap();
-        let out = PathBuf::from(std::env::var("AFT_SEARCH_PARITY_OUT").unwrap());
-        let exact_limit = std::env::var("AFT_SEARCH_PARITY_EXACT_LIMIT")
-            .ok()
+        let variable = |name: &str| std::env::var(name).ok();
+        let root = PathBuf::from(variable("AFT_SEARCH_PARITY_ROOT").unwrap());
+        let queries = std::fs::read_to_string(variable("AFT_SEARCH_PARITY_QUERIES").unwrap()).unwrap();
+        let out = PathBuf::from(variable("AFT_SEARCH_PARITY_OUT").unwrap());
+        let exact_limit = variable("AFT_SEARCH_PARITY_EXACT_LIMIT")
             .and_then(|limit| limit.parse::<usize>().ok())
             .unwrap_or(usize::MAX);
+        let threads = variable("AFT_SEARCH_PARITY_THREADS")
+            .and_then(|threads| threads.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
         let (pair, build) = timed(|| pair(&root));
         let snapshot = pair.legacy.snapshot();
-        let legacy = TextIndex::Snapshot(&snapshot);
-        let data = TextIndex::Data(&pair.data);
-        let root = pair.root.clone();
         let view_paths = pair.data.view.state().paths().len();
         let legacy_files = snapshot
             .file_entries()
@@ -1016,143 +1340,62 @@ mod tests {
             build.as_secs_f64() * 1000.0,
         );
 
-        let mut tallies = std::collections::BTreeMap::<&'static str, Tally>::new();
-        let report = |tallies: &std::collections::BTreeMap<&'static str, Tally>, done: usize| {
-            let mut report = serde_json::json!({
-                "root": root,
-                "distinct_queries_done": done,
-                "build_ms_legacy_and_data": build.as_secs_f64() * 1000.0,
-                "view_paths": view_paths,
-                "legacy_files": legacy_files,
-            });
-            for (name, tally) in tallies {
-                report[*name] = tally.summary();
-            }
-            std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-        };
         let mut seen = HashSet::new();
+        let queries = queries
+            .lines()
+            .map(str::trim)
+            .filter(|query| !query.is_empty() && seen.insert(query.to_string()))
+            .collect::<Vec<_>>();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
         let started = Instant::now();
-        for query in queries.lines().map(str::trim).filter(|query| !query.is_empty()) {
-            if !seen.insert(query.to_string()) {
-                continue;
-            }
-            let done = seen.len();
-            if done % 200 == 0 {
-                report(&tallies, done);
-                eprintln!("{done} queries in {:.0} s", started.elapsed().as_secs_f64());
-            }
-            let mut record = |name: &'static str,
-                              legacy: (String, Duration),
-                              data: (String, Duration)| {
-                tallies.entry(name).or_default().record(query, legacy, data);
-            };
-            let trigrams = trigrams(query);
-            record(
-                "lexical_lane",
-                timed(|| lane(legacy, &trigrams, false, &root)),
-                timed(|| lane(data, &trigrams, false, &root)),
-            );
-            record(
-                "lexical_lane_include_tests",
-                timed(|| lane(legacy, &trigrams, true, &root)),
-                timed(|| lane(data, &trigrams, true, &root)),
-            );
+        let mut answers = std::thread::scope(|scope| {
+            let workers = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let legacy = TextIndex::Snapshot(&snapshot);
+                        let data = TextIndex::Data(&pair.data);
+                        let mut answered = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(query) = queries.get(index) else {
+                                break;
+                            };
+                            let found = compare_query(&pair, legacy, data, query, index < exact_limit);
+                            answered.push((index, found));
+                            let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if finished % 500 == 0 {
+                                eprintln!("{finished} queries in {:.0} s", started.elapsed().as_secs_f64());
+                            }
+                        }
+                        answered
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        answers.sort_by_key(|(index, _)| *index);
 
-            // Which three trigrams each rarity picks, and how large a pool
-            // each pick selects.
-            let unique = unique_trigrams(&trigrams);
-            let postings = pair.data.postings(&unique).unwrap();
-            let by_files = rarest(&pair.data, &unique, &postings, Rarity::Files).unwrap();
-            let by_frequency = rarest(&pair.data, &unique, &postings, Rarity::Frequency).unwrap();
-            let zero = Duration::ZERO;
-            record(
-                "rarest_three_in_order",
-                (format!("{by_files:06x?}"), zero),
-                (format!("{by_frequency:06x?}"), zero),
-            );
-            let as_set = |picks: &[u32]| picks.iter().copied().collect::<BTreeSet<u32>>();
-            record(
-                "rarest_three_as_a_set",
-                (format!("{:06x?}", as_set(&by_files)), zero),
-                (format!("{:06x?}", as_set(&by_frequency)), zero),
-            );
-            let pool = |picks: &[u32]| {
-                picks
-                    .iter()
-                    .flat_map(|trigram| postings[trigram].iter())
-                    .collect::<BTreeSet<_>>()
-                    .len()
-            };
-            record(
-                "pool_size_files_vs_frequency",
-                (format!("{}", pool(&by_files)), zero),
-                (format!("{}", pool(&by_frequency)), zero),
-            );
-            record(
-                "unpooled_rank",
-                timed(|| format!("{:?}", legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
-                timed(|| format!("{:?}", data.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
-            );
-            if done > exact_limit {
-                continue;
+        let mut tallies = std::collections::BTreeMap::<&'static str, Tally>::new();
+        for (index, found) in answers {
+            for (name, legacy, data) in found {
+                tallies.entry(name).or_default().record(queries[index], legacy, data);
             }
-            let filter = |path: &Path| {
-                crate::commands::semantic_search::path_allowed_by_include_tests(path, &root, false)
-            };
-            for (name, scope) in [
-                ("exact_pass_all", ExactEvidenceScope::All),
-                ("exact_pass_phrase_and_window", ExactEvidenceScope::PhraseAndWindow),
-                ("exact_pass_phrase", ExactEvidenceScope::Phrase),
-            ] {
-                record(
-                    name,
-                    timed(|| exact(legacy, query, &root, Some(&filter), &scope)),
-                    timed(|| exact(data, query, &root, Some(&filter), &scope)),
-                );
-            }
-            let phrase = exact_lane::exact_phrase(query);
-            let (legacy_holders, legacy_time) = timed(|| holders(legacy, phrase, &root));
-            let (data_holders, data_time) = timed(|| holders(data, phrase, &root));
-            record(
-                "files_possibly_holding_phrase",
-                (legacy_holders.0, legacy_time),
-                (data_holders.0, data_time),
-            );
-            record(
-                "files_possibly_holding_phrase_order",
-                (legacy_holders.1, zero),
-                (data_holders.1, zero),
-            );
-            let runs = split_query(query).retained_runs;
-            record(
-                "anchored_candidates",
-                timed(|| {
-                    format!(
-                        "{:?}",
-                        discover_anchored_candidate_files(&pair.legacy, &root, &runs, false)
-                    )
-                }),
-                timed(|| format!("{:?}", anchored_candidate_files(&pair.data, &root, &runs, false))),
-            );
-            record(
-                "anchored_lane",
-                timed(|| {
-                    format!(
-                        "{:?}",
-                        AnchoredLane::new()
-                            .execute_with_admission_report(&pair.legacy, &root, query, false)
-                    )
-                }),
-                timed(|| {
-                    format!(
-                        "{:?}",
-                        AnchoredLane::new().execute_on_data_view(&pair.data, &root, query, false)
-                    )
-                }),
-            );
         }
-        report(&tallies, seen.len());
+        let mut report = serde_json::json!({
+            "root": root,
+            "distinct_queries": queries.len(),
+            "threads": threads,
+            "exact_limit": exact_limit.min(queries.len()),
+            "build_ms_legacy_and_data": build.as_secs_f64() * 1000.0,
+            "view_paths": view_paths,
+            "legacy_files": legacy_files,
+        });
         for (name, tally) in &tallies {
+            report[*name] = tally.summary();
             println!(
                 "{name}: {} of {} differ; legacy {:.3} ms, data {:.3} ms per call",
                 tally.differing,
@@ -1161,5 +1404,6 @@ mod tests {
                 tally.data.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
             );
         }
+        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }

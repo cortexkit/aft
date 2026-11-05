@@ -5108,7 +5108,7 @@ fn definition_line_from_source(
     line_at_offset(&source, symbol_range.start)
 }
 
-fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
+pub(crate) fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
     let Some(range) = candidate.symbol_range else {
         return false;
     };
@@ -5131,7 +5131,7 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
 
 /// The identifier-shaped words of `query` that a declaration's text must
 /// contain for a natural-language query to keep it as exact evidence.
-fn definition_identifier_tokens(query: &str) -> Vec<&str> {
+pub(crate) fn definition_identifier_tokens(query: &str) -> Vec<&str> {
     query
         .split_whitespace()
         .map(|token| {
