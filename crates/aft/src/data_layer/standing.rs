@@ -28,8 +28,10 @@ pub const fn builds(kind: IndexKind) -> bool {
 /// returns whether it now holds exactly them: the bind's scan found
 /// nothing changed since the publication, or a build scanned the whole
 /// checkout and published. `still_wanted` is asked before the work and
-/// after it; once it says no, the result is `false`, whatever was
-/// published, so a pass a session took over never clears the flag.
+/// again after it: once it returns `false`, so does this, even if the work
+/// published. A standing pass passes one that turns `false` when a session
+/// binds the root or the pass's job is cancelled, so such a pass never
+/// clears the root's strict-verification flag.
 pub(crate) fn verify_current(root: &Path, storage: &Path, still_wanted: impl Fn() -> bool) -> bool {
     if !still_wanted() {
         return false;
