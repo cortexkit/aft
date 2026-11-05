@@ -121,14 +121,42 @@ impl DataText {
 
     /// The paths whose indexed content holds each of `trigrams`, read once
     /// per distinct trigram.
-    fn postings(&self, trigrams: &[u32]) -> io::Result<HashMap<u32, Vec<Vec<u8>>>> {
+    fn postings(&self, trigrams: &[u32]) -> io::Result<HashMap<u32, Holders>> {
+        let published = self.view.state().paths().len();
         let mut postings = HashMap::with_capacity(trigrams.len());
         for &trigram in trigrams {
             if let std::collections::hash_map::Entry::Vacant(entry) = postings.entry(trigram) {
-                entry.insert(self.view.paths_with_trigram(trigram).map_err(store_error)?);
+                let holders = self.view.trigram_holders(trigram).map_err(store_error)?;
+                entry.insert(Holders::new(holders, published));
             }
         }
         Ok(postings)
+    }
+
+    /// The relative path of `candidate`.
+    fn candidate_path<'a>(&'a self, candidate: &Candidate<'a>) -> &'a [u8] {
+        match candidate {
+            Candidate::Published(index) => self.view.published_path(*index),
+            Candidate::Changed(path) => path,
+        }
+    }
+
+    /// The union of `trigrams`' holders, in byte order of their paths.
+    fn union<'a>(&'a self, trigrams: impl IntoIterator<Item = &'a Holders>) -> Vec<Candidate<'a>> {
+        let mut published = vec![0u64; self.view.state().paths().len().div_ceil(64)];
+        let mut changed = BTreeSet::new();
+        for holders in trigrams {
+            for (word, bits) in published.iter_mut().zip(&holders.bits) {
+                *word |= bits;
+            }
+            changed.extend(holders.changed.iter().map(Vec::as_slice));
+        }
+        let published = published.iter().enumerate().flat_map(|(word, bits)| {
+            (0..64)
+                .filter(move |bit| bits & (1 << bit) != 0)
+                .map(move |bit| word * 64 + bit)
+        });
+        merge_in_path_order(self, published, changed.into_iter())
     }
 
     #[cfg(test)]
@@ -141,9 +169,9 @@ impl DataText {
     /// trigram count.
     fn score(
         &self,
-        relative: &[u8],
+        candidate: &Candidate<'_>,
         query_trigrams: &[u32],
-        postings: &HashMap<u32, Vec<Vec<u8>>>,
+        postings: &HashMap<u32, Holders>,
     ) -> io::Result<f32> {
         if query_trigrams.is_empty() {
             return Ok(0.0);
@@ -151,21 +179,109 @@ impl DataText {
         let hits = query_trigrams
             .iter()
             .filter(|trigram| {
-                postings.get(trigram).is_some_and(|paths| {
-                    paths
-                        .binary_search_by(|path| path.as_slice().cmp(relative))
-                        .is_ok()
-                })
+                postings
+                    .get(trigram)
+                    .is_some_and(|holders| holders.holds(candidate))
             })
             .count() as u32;
         if hits == 0 {
             return Ok(0.0);
         }
-        let distinct = match self.view.path_text(relative).map_err(store_error)? {
+        let text = match candidate {
+            Candidate::Published(index) => Some(self.view.published_path_text(*index)),
+            Candidate::Changed(path) => self.view.path_text(path).transpose(),
+        };
+        let distinct = match text.transpose().map_err(store_error)? {
             Some(PathText::Indexed { distinct }) => distinct,
             _ => 1,
         };
         Ok((hits as f32) / (1.0 + (distinct.max(1) as f32).ln()))
+    }
+}
+
+/// One query trigram's holders in a view, kept as positions so scoring tests
+/// membership with a bit instead of comparing path bytes: a lexical query
+/// scores thousands of candidates against dozens of trigrams.
+pub(crate) struct Holders {
+    /// A bit per published path, by position.
+    bits: Vec<u64>,
+    /// How many published paths hold the trigram.
+    published: usize,
+    /// Paths changed since the publication that hold it, in byte order.
+    changed: Vec<Vec<u8>>,
+}
+
+impl Holders {
+    fn new(holders: aft_store::text::TrigramHolders, paths: usize) -> Self {
+        let mut bits = vec![0u64; paths.div_ceil(64)];
+        for &index in &holders.published {
+            bits[index / 64] |= 1 << (index % 64);
+        }
+        Self {
+            bits,
+            published: holders.published.len(),
+            changed: holders.changed,
+        }
+    }
+
+    /// How many paths hold the trigram.
+    pub(crate) fn len(&self) -> usize {
+        self.published + self.changed.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn holds(&self, candidate: &Candidate<'_>) -> bool {
+        match candidate {
+            Candidate::Published(index) => self
+                .bits
+                .get(index / 64)
+                .is_some_and(|word| word & (1 << (index % 64)) != 0),
+            Candidate::Changed(path) => self
+                .changed
+                .binary_search_by(|held| held.as_slice().cmp(path))
+                .is_ok(),
+        }
+    }
+}
+
+/// A path the lexical lane may score: a published path by its position, or
+/// a path changed since the publication. No path is both (see
+/// [`aft_store::text::TrigramHolders`]).
+enum Candidate<'a> {
+    Published(usize),
+    Changed(&'a [u8]),
+}
+
+/// `published` positions (ascending) and `changed` paths (in byte order)
+/// as one list in byte order of their paths, as the lanes rank ties.
+fn merge_in_path_order<'a>(
+    text: &'a DataText,
+    published: impl Iterator<Item = usize>,
+    changed: impl Iterator<Item = &'a [u8]>,
+) -> Vec<Candidate<'a>> {
+    let mut published = published.peekable();
+    let mut changed = changed.peekable();
+    let mut merged = Vec::new();
+    loop {
+        let next = match (published.peek(), changed.peek()) {
+            (Some(&index), Some(path)) => {
+                if text.view.published_path(index) <= *path {
+                    published.next().map(Candidate::Published)
+                } else {
+                    changed.next().map(Candidate::Changed)
+                }
+            }
+            (Some(_), None) => published.next().map(Candidate::Published),
+            (None, Some(_)) => changed.next().map(Candidate::Changed),
+            (None, None) => None,
+        };
+        let Some(next) = next else {
+            return merged;
+        };
+        merged.push(next);
     }
 }
 
@@ -273,24 +389,26 @@ impl TextIndex<'_> {
         }
         non_zero.sort_unstable_by_key(|(_, count)| *count);
         let initial = non_zero.len().min(3);
-        let mut candidates = BTreeSet::new();
-        for (trigram, _) in non_zero.iter().take(initial) {
-            candidates.extend(postings[trigram].iter());
-        }
+        let mut picked = non_zero[..initial]
+            .iter()
+            .map(|(trigram, _)| &postings[trigram])
+            .collect::<Vec<_>>();
+        let mut candidates = text.union(picked.iter().copied());
         for (trigram, _) in non_zero.iter().skip(initial) {
             if candidates.len() >= depth {
                 break;
             }
-            candidates.extend(postings[trigram].iter());
+            picked.push(&postings[trigram]);
+            candidates = text.union(picked.iter().copied());
         }
         let mut ranked = Vec::new();
         let admitted = candidates
-            .into_iter()
-            .map(|relative| (relative, text.absolute(relative)))
+            .iter()
+            .map(|candidate| (candidate, text.absolute(text.candidate_path(candidate))))
             .filter(|(_, path)| candidate_filter.is_none_or(|include| include(path)))
             .take(depth);
-        for (relative, path) in admitted {
-            let score = text.score(relative, query_trigrams, &postings)?;
+        for (candidate, path) in admitted {
+            let score = text.score(candidate, query_trigrams, &postings)?;
             if score > 0.0 {
                 ranked.push((path, score));
             }
@@ -325,22 +443,19 @@ fn selected_pool(
     text: &DataText,
     query_trigrams: &[u32],
     candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    rarity: impl Fn(u32, &[Vec<u8>]) -> io::Result<u64>,
+    rarity: impl Fn(u32, &Holders) -> io::Result<u64>,
 ) -> io::Result<Vec<(PathBuf, f32)>> {
     let unique = unique_trigrams(query_trigrams);
     let postings = text.postings(&unique)?;
     let picked = rarest(&unique, &postings, rarity)?;
-    let selected = picked
-        .iter()
-        .flat_map(|trigram| postings[trigram].iter())
-        .collect::<BTreeSet<_>>();
+    let selected = text.union(picked.iter().map(|trigram| &postings[trigram]));
     let mut ranked = Vec::new();
-    for relative in selected {
-        let path = text.absolute(relative);
+    for candidate in &selected {
+        let path = text.absolute(text.candidate_path(candidate));
         if candidate_filter.is_some_and(|include| !include(&path)) {
             continue;
         }
-        let score = text.score(relative, &unique, &postings)?;
+        let score = text.score(candidate, &unique, &postings)?;
         if score > 0.0 {
             ranked.push((path, score));
         }
@@ -357,8 +472,8 @@ fn selected_pool(
 /// three trigrams for 113 of 6,700 recorded aft_search queries on aft's own
 /// checkout and moved their lexical ranking; the legacy index counts files,
 /// as this does.
-fn paths_holding(_trigram: u32, paths: &[Vec<u8>]) -> io::Result<u64> {
-    Ok(paths.len() as u64)
+fn paths_holding(_trigram: u32, holders: &Holders) -> io::Result<u64> {
+    Ok(holders.len() as u64)
 }
 
 /// The (at most) three rarest of `unique` that some path holds, by
@@ -366,16 +481,16 @@ fn paths_holding(_trigram: u32, paths: &[Vec<u8>]) -> io::Result<u64> {
 /// smaller trigram.
 fn rarest(
     unique: &[u32],
-    postings: &HashMap<u32, Vec<Vec<u8>>>,
-    rarity: impl Fn(u32, &[Vec<u8>]) -> io::Result<u64>,
+    postings: &HashMap<u32, Holders>,
+    rarity: impl Fn(u32, &Holders) -> io::Result<u64>,
 ) -> io::Result<Vec<u32>> {
     let mut held = Vec::new();
     for &trigram in unique {
-        let paths = &postings[&trigram];
-        if paths.is_empty() {
+        let holders = &postings[&trigram];
+        if holders.is_empty() {
             continue;
         }
-        held.push((rarity(trigram, paths)?, trigram));
+        held.push((rarity(trigram, holders)?, trigram));
     }
     held.sort_unstable();
     Ok(held

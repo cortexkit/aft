@@ -2301,22 +2301,64 @@ impl CheckoutView {
     pub fn paths_with_trigram(&self, trigram: u32) -> Result<Vec<Vec<u8>>, DataError> {
         let published = &self.published;
         let texts = published.texts()?;
-        let members = self.text_members.get_or_init(|| {
-            aft_store::text::TextMembers::build(
-                &published.state,
-                &published.membership,
-                texts.len(),
-                &self.text,
-            )
-        });
         aft_store::text::paths_with_trigram_among(
             &published.state,
-            members,
+            self.members(&texts),
             &texts,
             &self.text,
             trigram,
         )
         .map_err(DataError::store)
+    }
+
+    /// [`Self::paths_with_trigram`] without copying a path: the published
+    /// paths by their position in [`Self::published_path`]'s list, and the
+    /// paths changed since the publication by name. For a caller that asks
+    /// about many trigrams and many paths, such as lexical scoring.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn trigram_holders(
+        &self,
+        trigram: u32,
+    ) -> Result<aft_store::text::TrigramHolders, DataError> {
+        let texts = self.published.texts()?;
+        aft_store::text::trigram_holders_among(self.members(&texts), &texts, &self.text, trigram)
+            .map_err(DataError::store)
+    }
+
+    /// The published path at `index`, a position
+    /// [`Self::trigram_holders`] gives.
+    #[must_use]
+    pub fn published_path(&self, index: usize) -> &[u8] {
+        &self.published.state.paths()[index].path
+    }
+
+    /// What the text plane holds for the published path at `index`, a
+    /// position [`Self::trigram_holders`] gives (so one the changes since
+    /// the publication have not replaced).
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn published_path_text(&self, index: usize) -> Result<PathText, DataError> {
+        let texts = self.published.texts()?;
+        aft_store::text::published_path_text(&self.published.membership, &texts, index)
+            .map_err(DataError::store)
+    }
+
+    /// The publication's indexed paths not in this view's changes, grouped
+    /// by segment, built on the first trigram lookup.
+    fn members(&self, texts: &[TextSegment<'_>]) -> &aft_store::text::TextMembers {
+        self.text_members.get_or_init(|| {
+            aft_store::text::TextMembers::build(
+                &self.published.state,
+                &self.published.membership,
+                texts.len(),
+                &self.text,
+            )
+        })
     }
 
     #[cfg(test)]

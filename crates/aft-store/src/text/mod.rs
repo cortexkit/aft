@@ -14,7 +14,8 @@ mod trigrams;
 pub use plan::{Query, plan, plan_pattern};
 pub use search::{
     Located, OverlayEntry, PathText, Scope, TextLocator, TextMembers, TextMembership, TextOverlay,
-    candidates, path_text, paths_with_trigram, paths_with_trigram_among, trigram_frequency,
+    TrigramHolders, candidates, path_text, paths_with_trigram, paths_with_trigram_among,
+    published_path_text, trigram_frequency, trigram_holders_among,
 };
 pub use sections::{KNOWN, TextSections, TextSectionsBuilder, TextSegment, TextStatus, TextUnit};
 pub use trigrams::{ContentTrigrams, fold, next_bit, pack};

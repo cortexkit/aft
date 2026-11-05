@@ -304,7 +304,57 @@ pub fn paths_with_trigram_among(
     overlay: &TextOverlay,
     trigram: u32,
 ) -> Result<Vec<Vec<u8>>, SegmentError> {
-    let mut found = Vec::new();
+    let holders = trigram_holders_among(members, segments, overlay, trigram)?;
+    let mut found = holders
+        .published
+        .iter()
+        .map(|&index| state.paths()[index].path.clone())
+        .chain(holders.changed)
+        .collect::<Vec<_>>();
+    found.sort_unstable();
+    Ok(found)
+}
+
+/// The paths of one checkout state, with an overlay's changes, whose content
+/// holds a trigram, without copying a path: [`TrigramHolders::published`]
+/// are positions in the state's path list and [`TrigramHolders::changed`]
+/// the overlay's paths. A published path the overlay changed is only among
+/// the changed ones, so no path is in both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrigramHolders {
+    /// Positions in the state's path list, ascending (so in byte order).
+    pub published: Vec<usize>,
+    /// The overlay's paths, in byte order.
+    pub changed: Vec<Vec<u8>>,
+}
+
+impl TrigramHolders {
+    /// How many paths hold the trigram.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.published.len() + self.changed.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// [`paths_with_trigram_among`] as positions and changed paths (see
+/// [`TrigramHolders`]), with `members` built from the same state, membership
+/// and `overlay`.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn trigram_holders_among(
+    members: &TextMembers,
+    segments: &[TextSegment<'_>],
+    overlay: &TextOverlay,
+    trigram: u32,
+) -> Result<TrigramHolders, SegmentError> {
+    let mut published = Vec::new();
     for (segment, (members, ordinals)) in members.segments.iter().enumerate() {
         if members.is_empty() {
             continue;
@@ -316,20 +366,42 @@ pub fn paths_with_trigram_among(
                 hits.next();
             }
             if hits.peek() == Some(&ordinal) {
-                found.push(state.paths()[index].path.clone());
+                published.push(index);
             }
         }
     }
-    for (path, entry) in &overlay.entries {
-        if let OverlayEntry::Content(trigrams) = entry
-            && trigrams.get(trigram).is_some()
-        {
-            found.push(path.clone());
-        }
-    }
-    found.sort_unstable();
-    found.dedup();
-    Ok(found)
+    // Members are grouped by segment, so positions from several segments
+    // interleave.
+    published.sort_unstable();
+    let changed = overlay
+        .entries
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(entry, OverlayEntry::Content(trigrams) if trigrams.get(trigram).is_some())
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    Ok(TrigramHolders { published, changed })
+}
+
+/// What the text plane holds for the published path at position `index` of
+/// `state`, which the overlay has not changed.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn published_path_text(
+    membership: &TextMembership,
+    segments: &[TextSegment<'_>],
+    index: usize,
+) -> Result<PathText, SegmentError> {
+    Ok(match membership.places[index] {
+        Place::Indexed { segment, ordinal } => PathText::Indexed {
+            distinct: segments[segment as usize].unit(ordinal)?.distinct,
+        },
+        Place::Unchecked => PathText::Unindexed,
+        Place::Excluded => PathText::Excluded,
+    })
 }
 
 /// Which paths a search covers.
