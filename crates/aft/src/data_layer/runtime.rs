@@ -166,6 +166,7 @@ enum Publish {
 /// Executor request ids of a checkout's background work.
 const BUILD_REQUEST: &str = "data-layer-build";
 const REFRESH_REQUEST: &str = "data-layer-refresh";
+const RESCAN_REQUEST: &str = "data-layer-rescan";
 
 /// Where a checkout's background work runs. Under the daemon it runs as the
 /// root's maintenance on its executor: the executor runs none while the root
@@ -230,6 +231,8 @@ struct Work {
     building: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
+    /// A rescan is queued or running.
+    rescanning: Arc<AtomicBool>,
     retry: std::sync::Mutex<BuildRetry>,
     /// Told when a build or refresh ends (see
     /// [`DataCheckout::on_status_change`]).
@@ -422,7 +425,44 @@ impl Work {
     }
 
     fn running(&self) -> bool {
-        self.building.load(Ordering::Acquire) || self.refreshing.load(Ordering::Acquire)
+        self.building.load(Ordering::Acquire)
+            || self.refreshing.load(Ordering::Acquire)
+            || self.rescanning.load(Ordering::Acquire)
+    }
+
+    /// Compares the checkout's files with its state, records what changed
+    /// unreported, then catches up as a bind does. The checkout reports its
+    /// call graph building from now until the rescan ends, so a query made
+    /// right after the bind waits for it.
+    fn start_rescan(self: &Arc<Self>) {
+        if self.rescanning.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.checkout.begin_rescan();
+        // Ends the rescan even when the executor refuses the job (the root
+        // unbound before it ran), so the call graph is not left building.
+        struct Ended(Arc<Work>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.checkout.end_rescan();
+                self.0.rescanning.store(false, Ordering::Release);
+            }
+        }
+        let ended = Ended(Arc::clone(self));
+        self.runner
+            .run(RESCAN_REQUEST, Lane::MaintenanceCommit, move || {
+                let work = Arc::clone(&ended.0);
+                if let Err(error) = work.checkout.rescan() {
+                    if !matches!(error, DataError::Cancelled) {
+                        crate::slog_warn!(
+                            "data layer could not compare {} with its files: {error}",
+                            work.checkout.root().display()
+                        );
+                    }
+                }
+                drop(ended);
+                work.catch_up(Publish::WhenMany);
+            });
     }
 
     /// Tells the status listener, if any, that the checkout's status may
@@ -443,6 +483,9 @@ impl Work {
 pub(crate) struct DataCheckout {
     work: Arc<Work>,
     quiet: Arc<QuietTimer>,
+    /// Set once a bind has used the scan that opening the checkout made;
+    /// every later bind compares the files again (see [`root_bound`]).
+    bound_once: AtomicBool,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
@@ -528,6 +571,7 @@ impl DataCheckout {
             checkout,
             building: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
+            rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
         });
@@ -550,6 +594,7 @@ impl DataCheckout {
         Ok(Arc::new(Self {
             work,
             quiet,
+            bound_once: AtomicBool::new(false),
             _listener: listener,
         }))
     }
@@ -724,22 +769,28 @@ impl QuietTimer {
 /// published there is nothing to refresh: the build that makes it covers
 /// every change recorded before its scan.
 fn pending(checkout: &Checkout) -> bool {
+    // Pending changes, not the plane's word: a rescan in progress also
+    // reports the call graph building, with nothing yet for a refresh.
     let status = checkout.status();
-    status.callgraph_published
-        && matches!(
-            status.callgraph,
-            super::checkout::PlaneStatus::Building { .. }
-        )
+    status.callgraph_published && status.callgraph_pending > 0
 }
 
 /// Has a root's checkout catch up as a configure binds the root: binds it on
 /// the root's first bind, then builds it or refreshes its call graph as its
 /// root's maintenance. A configure tail calls it, so the work starts when
-/// the root is bound rather than at the first query, and again on each
-/// rebind for what changed while the root was unbound.
+/// the root is bound rather than at the first query.
+///
+/// Opening the checkout compared its files with what was published. A later
+/// bind of the same checkout compares them again: files can change while the
+/// root is unbound and nothing watches it, or just before a configure whose
+/// watcher event has not arrived yet.
 pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
     if let Some(checkout) = ctx.data_checkout() {
-        checkout.request_refresh();
+        if checkout.bound_once.swap(true, Ordering::AcqRel) {
+            checkout.work.start_rescan();
+        } else {
+            checkout.request_refresh();
+        }
     }
 }
 

@@ -206,6 +206,10 @@ struct Live {
     /// Paths changed since the publication whose call graph is not
     /// resolved yet.
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
+    /// A rescan is comparing the files with the checkout's state, so
+    /// changes nobody reported may be found: until it ends, the call graph
+    /// is not reported ready.
+    rescanning: bool,
     /// Whether a build is running.
     building: bool,
     /// Counts recorded changes; each changed path keeps the count of its
@@ -539,6 +543,7 @@ impl Checkout {
             text: Arc::clone(&live.text),
             text_members: Arc::clone(&live.text_members),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
+            rescanning: live.rescanning,
             graph,
             refreshed: live.refreshed.clone(),
             sequence: live.sequence,
@@ -653,6 +658,50 @@ impl Checkout {
             .published
             .as_ref()
             .is_none_or(|published| self.planes.callgraph && !published.graph_built)
+    }
+
+    /// Marks a rescan as started: until [`Self::end_rescan`], the call
+    /// graph is reported building, so a reader that needs exact answers
+    /// waits for what the rescan finds instead of answering without it.
+    pub fn begin_rescan(&self) {
+        self.write_live().rescanning = true;
+    }
+
+    /// Ends what [`Self::begin_rescan`] started.
+    pub fn end_rescan(&self) {
+        self.write_live().rescanning = false;
+    }
+
+    /// Compares the checkout's files with its current state and records
+    /// every difference as a change: files edited, added or removed while no
+    /// watcher reported them, because the root was unbound or the event had
+    /// not arrived yet. Like a bind, it reads only files whose stat no longer
+    /// proves their recorded content. Returns how many paths it recorded.
+    ///
+    /// # Errors
+    ///
+    /// When the checkout cannot be scanned.
+    pub fn rescan(&self) -> Result<usize, DataError> {
+        let current = {
+            let live = self.live.read().expect("no panics while holding it");
+            match (&live.state, &live.published) {
+                (Some(state), _) => Arc::clone(state),
+                (None, Some(published)) => Arc::new(published.state.clone()),
+                (None, None) => return Ok(0),
+            }
+        };
+        let scanned = scan(
+            &self.root,
+            &self.layer.policy,
+            Some(&current),
+            &ChangeSink::default(),
+        )
+        .map_err(|error| DataError::Scan(error.to_string()))?;
+        let changed = changed_members(&current, &scanned.state);
+        // Recording scans each path again under the same rules, so a change
+        // recorded meanwhile is taken from the disk once more, not lost.
+        self.record_paths(&changed)?;
+        Ok(changed.len())
     }
 
     /// Records that `paths` (relative to the root, such as a watcher or an
@@ -2135,6 +2184,9 @@ pub struct CheckoutView {
     /// built on the first trigram lookup and shared by this view's clones.
     text_members: Arc<std::sync::OnceLock<aft_store::text::TextMembers>>,
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
+    /// A rescan was running when the view was taken (see
+    /// [`Checkout::rescan`]).
+    rescanning: bool,
     graph: Arc<dyn SliceSource + Send + Sync>,
     /// What the call graph resolved since the publication.
     refreshed: Option<Arc<Refreshed>>,
@@ -2261,6 +2313,10 @@ impl CheckoutView {
         };
         let callgraph = match self.callgraph_pending.len() {
             _ if !self.published.graph_built => PlaneStatus::Building {
+                done: 0,
+                total: None,
+            },
+            0 if self.rescanning => PlaneStatus::Building {
                 done: 0,
                 total: None,
             },
@@ -3685,6 +3741,50 @@ pub fn other() { callee(); }
         assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
         let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
         assert!(callers.contains("src/extra.rs"), "{callers}");
+    }
+
+    #[test]
+    fn a_rescan_records_what_changed_unreported_while_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        assert_eq!(checkout.rescan().unwrap(), 0, "nothing changed yet");
+
+        // Changed with the checkout bound but nothing recorded, as when the
+        // root was unbound or a watcher event has not arrived.
+        write(root.path(), "notes.txt", "newneedle\n");
+        write(
+            root.path(),
+            "src/extra.rs",
+            "use crate::util;\npub fn other() { util::callee(); }\n",
+        );
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod extra;\npub fn caller() { util::callee(); }\n",
+        );
+        assert!(candidates_for(&checkout.view().unwrap(), "newneedle").is_empty());
+
+        // While a rescan runs, the call graph is not reported ready.
+        checkout.begin_rescan();
+        assert!(matches!(
+            checkout.status().callgraph,
+            PlaneStatus::Building { .. }
+        ));
+        assert_eq!(checkout.rescan().unwrap(), 3);
+        checkout.end_rescan();
+        let view = checkout.view().unwrap();
+        assert_eq!(candidates_for(&view, "newneedle"), vec!["notes.txt"]);
+        drop(view);
+        checkout.refresh_callgraph().unwrap();
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("src/extra.rs"), "{callers}");
+        // A second rescan finds nothing new.
+        assert_eq!(checkout.rescan().unwrap(), 0);
     }
 
     #[test]
