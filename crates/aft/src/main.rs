@@ -1654,7 +1654,13 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
         "add_import" => aft::commands::add_import::handle_add_import(&req, ctx),
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
-        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "configure" => {
+            let response = aft::commands::configure::handle_configure(&req, ctx);
+            if response.success {
+                aft::runtime_drain::standalone_root_configured(ctx);
+            }
+            response
+        }
         "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),

@@ -627,6 +627,12 @@ impl DataCheckout {
         *self.work.runner.executor.lock() = Some(executor);
     }
 
+    /// Compares the checkout's files with its state and records what
+    /// changed, for a watcher that lost events (see [`Work::start_rescan`]).
+    pub(crate) fn rescan(&self) {
+        self.work.start_rescan();
+    }
+
     /// Records the watcher's changed `paths` (absolute).
     pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
         let root = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().to_path_buf());

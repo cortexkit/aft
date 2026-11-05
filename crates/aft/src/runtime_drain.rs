@@ -504,6 +504,15 @@ fn delay_watcher_receive_for_test() {
 #[cfg(not(test))]
 fn delay_watcher_receive_for_test() {}
 
+/// Called by the standalone loop after each successful configure, as the
+/// daemon's configure tail does: the data layer binds the root's checkout and
+/// catches up, so its build starts at the configure rather than at the first
+/// query, and a rebind compares its files with the disk again.
+pub fn standalone_root_configured(ctx: &AppContext) {
+    crate::data_layer::runtime::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx);
+}
+
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     crate::data_layer::runtime::root_bound(ctx);
@@ -541,17 +550,7 @@ impl StandaloneConfigureMaintenance {
         // A view publication scheduled here detaches instead of running on the
         // standalone request thread; see `install_standalone_scope`.
         let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
-        let ran =
-            crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner);
-        if ran {
-            // As the daemon's configure tail does: the data layer binds the
-            // root's checkout and catches up, and a rebind rescans it, before
-            // the next request runs. Without this, a standalone checkout was
-            // bound only by its first query and never rescanned on rebind.
-            crate::data_layer::runtime::root_bound(ctx);
-            crate::data_layer::outline::root_bound(ctx);
-        }
-        ran
+        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
     }
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
@@ -3857,6 +3856,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
                     ctx.record_checkout_watcher_overflow();
+                    // The individual changed paths are lost, so the data
+                    // layer compares every file with its checkout's state.
+                    ctx.data_rescan();
                     state.view_publication_reason.events |=
                         crate::views::publication_reason::Reason::RESCAN;
                     state.view_publication_full = true;
@@ -3897,6 +3899,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.view_publication_reason.events |=
                         crate::views::publication_reason::Reason::IGNORE;
                     dispatch_events_received += 1;
+                    // The watcher filter drops an ignore file that ignores
+                    // itself from the changed paths, so the data layer hears
+                    // of it only here; recording it rescans its folder.
+                    ctx.data_note_paths(&paths);
                     ctx.lsp_note_watcher_ignore_change();
                     if state.rescan_required {
                         state.rescan_ignore_checked = false;

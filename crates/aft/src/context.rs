@@ -10079,6 +10079,17 @@ impl AppContext {
         self.data_children.note_paths(paths);
     }
 
+    /// Tells the data layer the watcher lost events: each bound checkout,
+    /// this root's and its child repositories', compares its files with its
+    /// state again.
+    pub(crate) fn data_rescan(&self) {
+        let checkout = self.data_checkout.lock().clone();
+        if let Some(checkout) = checkout {
+            checkout.rescan();
+        }
+        self.data_children.rescan();
+    }
+
     /// The data-layer checkouts of this parent folder's child repositories
     /// (see `data_layer::parent`).
     pub(crate) fn data_children(&self) -> &crate::data_layer::parent::ChildCheckouts {

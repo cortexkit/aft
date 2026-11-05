@@ -888,7 +888,6 @@ fn parent_applies_child_edits_from_its_watcher_and_never_writes_child_artifacts(
 /// layer hears only the watcher's changed-path batches, so it never rescans
 /// and the child checkout keeps serving the old file.
 #[test]
-#[ignore = "data-layer defect: a watcher RescanRequired (lost events) never reaches the data layer, so edits in the lost batch stay invisible"]
 fn parent_rescan_after_lost_watcher_events_reaches_child_edits() {
     fast_refresh();
     let folder = folder(2);

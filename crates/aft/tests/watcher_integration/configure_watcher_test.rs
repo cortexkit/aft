@@ -123,7 +123,6 @@ fn root_gitignore_reload_updates_search_index() {
 /// (`data_note_paths` in the watcher drain), so its checkout keeps serving the
 /// file the new rule ignores.
 #[test]
-#[ignore = "data-layer defect: an ignore-rule change the watcher reports without a changed path (a self-ignoring .gitignore) never reaches the data layer"]
 fn self_matching_root_gitignore_reload_updates_search_index() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     assert_root_gitignore_reload_updates_search_index("self-matching", "*-old*.json\n.gitignore\n");

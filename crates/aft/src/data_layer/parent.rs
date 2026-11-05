@@ -104,6 +104,14 @@ impl ChildCheckouts {
         }
     }
 
+    /// Has every bound child compare its files with its state again, after
+    /// the parent's watcher lost events.
+    pub(crate) fn rescan(&self) {
+        for checkout in self.bound() {
+            checkout.rescan();
+        }
+    }
+
     /// Runs the children's background work on `executor` from now on: the
     /// parent root's executor, installed after some children were bound.
     pub(crate) fn set_executor(&self, executor: &RootMaintenanceExecutor) {

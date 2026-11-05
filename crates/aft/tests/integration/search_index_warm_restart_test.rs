@@ -96,7 +96,6 @@ fn bind_search_index(aft: &mut AftProcess) {
 /// ready with no query sent. A standalone AFT never asks: status reports the
 /// index off (`not_bound`) until a query arrives.
 #[test]
-#[ignore = "data-layer defect: a standalone configure never binds the data-layer checkout, so status reports search_index off until the first query"]
 fn standalone_configure_builds_the_search_index_without_a_query() {
     let project = setup_project(&[("src/lib.rs", "pub fn searchable_symbol() -> usize { 7 }\n")]);
     let mut aft = AftProcess::spawn();
