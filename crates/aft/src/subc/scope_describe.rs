@@ -570,15 +570,21 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
     let mut keys = Vec::new();
     let mut complete = true;
     for (root, _) in entries {
-        let stamp = stamp.clone();
         #[cfg(feature = "test-timing-hooks")]
         let submitted_at = std::time::Instant::now();
         let (result, receiver) = oneshot::channel();
+        // The database part runs on the call-ledger lane, where keyed
+        // admissions also run, one job at a time in submission order. Every
+        // admission queued on this root before the scope ended has therefore
+        // committed its row by now, so `end_scope` settles it as not started
+        // instead of leaving a held row that a later approval could dispatch.
+        let ledger_stamp = stamp.clone();
         let job = executor.submit_async(
-            root,
-            Lane::Mutating,
+            root.clone(),
+            Lane::CallLedger,
             "scope-ended".into(),
             Box::new(move |ctx| {
+                let stamp = ledger_stamp;
                 #[cfg(feature = "test-timing-hooks")]
                 crate::slog_info!(
                     "scope diagnostic phase=revoke_admitted scope_epoch={} queue_ms={}",
@@ -629,15 +635,6 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                         Vec::new()
                     }
                 };
-                // Drop the ledger lock before killing: terminal task writes use
-                // the actor's same connection and must not deadlock on it.
-                ctx.bash_background().kill_scope(&stamp);
-                #[cfg(feature = "test-timing-hooks")]
-                crate::slog_info!(
-                    "scope diagnostic phase=revoke_finished scope_epoch={} elapsed_ms={}",
-                    stamp.scope_epoch,
-                    submitted_at.elapsed().as_millis()
-                );
                 let complete = failures.is_empty();
                 let _ = result.send(ScopeRevokeResult { keys, complete });
                 if complete {
@@ -659,6 +656,30 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                 log::warn!("scope-ended cleanup result was lost: {error}");
             }
         }
+        // Kill the scope's shell tasks after the ledger work, as before, even
+        // when that work failed. This stays a separate job on the mutating
+        // lane because it changes task state, not the call ledger. The ledger
+        // job has released the database lock by now, which matters: terminal
+        // task writes use the same connection and must not deadlock on it.
+        let kill_stamp = stamp.clone();
+        let kill = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "scope-ended-kill".into(),
+            Box::new(move |ctx| {
+                ctx.bash_background().kill_scope(&kill_stamp);
+                #[cfg(feature = "test-timing-hooks")]
+                crate::slog_info!(
+                    "scope diagnostic phase=revoke_finished scope_epoch={} elapsed_ms={}",
+                    kill_stamp.scope_epoch,
+                    submitted_at.elapsed().as_millis()
+                );
+                Response::success("scope-ended-kill", json!({}))
+            }),
+        );
+        complete &= await_executor_response(kill, "scope-ended-kill".into())
+            .await
+            .success;
     }
     ScopeRevokeResult { keys, complete }
 }
@@ -666,6 +687,148 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A held keyed call admitted for a scope just before that scope ends must
+    /// not keep a Prepared row once the end is processed: an approval could
+    /// then still move it to DispatchStarted. The admission is queued first on
+    /// the call-ledger lane (held up by another job there), then the scope
+    /// ends, so the end's ledger work must run after the admission commits.
+    #[tokio::test]
+    async fn scope_end_settles_a_keyed_admission_queued_before_it() {
+        use crate::db::call_ledger::{self as ledger, State};
+        use tool_provider::{LedgerEdge, RouteRole};
+        let (dir, root) = test_support::test_root("scope-end-after-admission");
+        let ctx = test_support::test_ctx();
+        let db = Arc::new(StdMutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(db.clone());
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let stamp: ScopeStamp = serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+            "ref":"run:ended-after-admission", "scope_epoch":4,
+            "kind":"ephemeral", "owner_authorized":true
+        }))
+        .unwrap();
+        // An untrusted, elicitation-capable route: its keyed bash call is held
+        // for permission, so admission records it as Prepared.
+        let mut identity = test_support::route_identity(&root, "scoped-runner");
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = RouteRole::ToolProviderV1;
+        data.trust = BindTrust::Untrusted;
+        data.consumer_elicitation_capable = true;
+        data.scope = Some(stamp.clone());
+        let key = LedgerEdge::key(&identity, "held-before-end");
+        let routes = HashMap::from([(route_key(42, 1), identity)]);
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = executor.submit_async(
+            root.clone(),
+            Lane::CallLedger,
+            "held-call-ledger-lane".into(),
+            Box::new(move |_| {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-call-ledger-lane", json!({}))
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the call-ledger holder never started")
+            .unwrap();
+
+        let body = json!({
+            "name":"bash", "arguments":{"command":"true"},
+            "call_key":"held-before-end", "preset":"head"
+        });
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            launch_restore: None,
+            codemode_policies: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: crate::run_tool_call::PhaseTrace::new(Instant::now()),
+        };
+        let (edge, mut ready) = LedgerEdge::new();
+        let (writer, _replies) = mpsc::channel(8);
+        assert!(edge
+            .defer(
+                decoded,
+                &routes,
+                &executor,
+                &writer,
+                &Arc::new(DispatchPathMetrics::new())
+            )
+            .is_ok());
+        assert_eq!(
+            executor.queued_lane_for_test(&root, "ledger-42-7"),
+            Some(Lane::CallLedger),
+            "the admission must be queued behind the holder"
+        );
+
+        let revoking = tokio::spawn({
+            let executor = executor.clone();
+            let stamp = stamp.clone();
+            async move { revoke(executor, &stamp).await }
+        });
+        // Let the end queue its ledger work, or finish if it does not wait
+        // for the call-ledger lane, before the admission is released.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor
+                .queued_lane_for_test(&root, "scope-ended")
+                .is_none()
+                && !revoking.is_finished()
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the scope end neither queued its ledger work nor finished");
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+        let revoked = tokio::time::timeout(Duration::from_secs(10), revoking)
+            .await
+            .expect("the scope end did not finish")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ready.recv())
+            .await
+            .expect("the admission did not finish")
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let row = ledger::get(&conn, &key).unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            State::Settled,
+            "the admission committed after the scope end and left a row an approval could dispatch"
+        );
+        assert_eq!(row.outcome.as_deref(), Some("not_started"));
+        let recorded: Value = serde_json::from_slice(
+            &row.frame
+                .as_ref()
+                .expect("a settled row keeps its frame")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(recorded["detail"]["reason"], "scope_ended");
+        assert!(revoked.complete);
+        assert_eq!(revoked.keys, vec![key.clone()]);
+        assert!(
+            !ledger::transition(&conn, &key, State::Prepared, State::Authorized).unwrap(),
+            "an approval must not be able to advance the settled row"
+        );
+        assert!(!ledger::begin_approved(&conn, &key).unwrap());
+    }
 
     #[tokio::test]
     async fn failed_scope_settlement_stays_fenced_in_health_and_retries() {

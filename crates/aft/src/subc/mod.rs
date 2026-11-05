@@ -232,6 +232,8 @@ mod health;
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
+#[cfg(test)]
+mod ledger_lane_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
@@ -12857,11 +12859,13 @@ async fn deliver_resolved_subc_response(
                 .unwrap_or("unknown")
                 .to_string()
         };
-        // Queue before terminal settlement on the same actor. The frame loop
-        // never locks or writes SQLite, including for deferred responses.
+        // Queue before terminal settlement on the same actor: both run on the
+        // call-ledger lane, one at a time in submission order, so the outcome
+        // lands while the row is still open. The frame loop never locks or
+        // writes SQLite, including for deferred responses.
         drop(executor.submit_async(
             entry.root.clone(),
-            Lane::Mutating,
+            Lane::CallLedger,
             "ledger-deferred-outcome".into(),
             Box::new(move |ctx| {
                 let response = if outcome == "ok" {
