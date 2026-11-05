@@ -519,6 +519,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::data_layer::outline::root_bound(ctx);
 }
 
+/// What follows a standalone configure's tail once it is drained: with the
+/// data layer on, the root's checkout binds and catches up (see
+/// [`crate::data_layer::runtime::root_bound`]). Does nothing with it off.
+pub fn configure_tail_finished(ctx: &AppContext) {
+    crate::data_layer::runtime::root_bound(ctx);
+}
+
 /// Executor-maintenance form of [`drain_deferred_configure_maintenance`]:
 /// returns `true` when the drain stepped aside for a queued interactive
 /// writer on the same root and left the rest parked for a requeued drain.
