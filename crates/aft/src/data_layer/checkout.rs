@@ -61,7 +61,6 @@ pub enum DataError {
     /// built over it, reclaimed or written in its place, and what needs it
     /// fails with this until a build that reads it runs.
     NewerFormat(aft_store::family::NewerFormat),
-    Store(String),
     /// The checkout could not be scanned.
     Scan(String),
     /// The call graph could not be resolved.
