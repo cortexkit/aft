@@ -258,48 +258,101 @@ fn assert_status_lists(ctx: &AppContext, store: PersistedStore) -> Value {
     status
 }
 
+/// The data layer's index store (`<storage>/data/<family>/`): a manifest a
+/// newer build published is refused, left as it is, and named on status.
 #[test]
-fn future_search_index_is_refused_by_name_and_left_byte_identical() {
+fn future_index_store_manifest_is_refused_by_name_and_left_byte_identical() {
     let fixture = Fixture::new();
-    let cache = fixture.artifact("index", "cache.bin");
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&0x3144_4958_u32.to_le_bytes()); // trigram cache magic
-    bytes.extend_from_slice(&FUTURE.to_le_bytes());
-    bytes.extend_from_slice(&[0xA5; 64]);
-    fs::write(&cache, &bytes).unwrap();
+    // Publish the store as this build writes it, then plant the next
+    // generation's manifest as a newer build would write it.
+    aft::data_layer::surfaces::index_root(
+        &fixture.project,
+        &fixture.storage,
+        aft::data_layer::checkout::Planes::ALL,
+    )
+    .expect("index the fixture");
+    let families = fs::read_dir(fixture.storage.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(families.len(), 1, "one family store: {families:?}");
+    let family_dir = &families[0];
+    let listing = |dir: &Path| {
+        let mut names = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let newest = listing(family_dir)
+        .iter()
+        .filter_map(|name| name.strip_prefix("MANIFEST-")?.parse::<u64>().ok())
+        .max()
+        .expect("index_root published a manifest");
+    // A record is a 48-byte header (magic, kind, the kind's format version
+    // at bytes 10..12, flags, family, the number in its name at bytes
+    // 32..40, payload length), the payload, and a BLAKE3-128 checksum of
+    // everything before it; see aft-store's family/record.rs.
+    let mut bytes = fs::read(family_dir.join(format!("MANIFEST-{newest}"))).unwrap();
+    let future_version = u16::try_from(FUTURE).unwrap();
+    bytes[10..12].copy_from_slice(&future_version.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(newest + 1).to_le_bytes());
+    let body = bytes.len() - aft_store::ids::Digest128::LEN;
+    let checksum = aft_store::ids::Digest128::of(&bytes[..body]);
+    bytes[body..].copy_from_slice(checksum.as_bytes());
+    let planted = family_dir.join(format!("MANIFEST-{}", newest + 1));
+    fs::write(&planted, &bytes).unwrap();
+    let family_before = listing(family_dir);
+    let segments_before = listing(&family_dir.join("segments"));
 
-    let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
-    // The configure worker settles on a build-denied (empty) index instead of
-    // building and persisting over the newer cache.
-    settle(&ctx, "search index", search_settled);
+    let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": true }));
+    // A query binds the root's checkout, which reads the newest manifest.
+    let grep: RawRequest = serde_json::from_value(json!({
+        "id": "grep-rollback-safety",
+        "command": "grep",
+        "pattern": "greet",
+    }))
+    .expect("grep request");
+    let response = aft::commands::grep::handle_grep(&grep, &ctx);
+    assert!(
+        response.success,
+        "grep still answers, by walking: {:?}",
+        response.data
+    );
+    settle(&ctx, "index store", |ctx| {
+        ctx.build_status_snapshot()["search_index"]["status"] == "unavailable"
+    });
 
     assert_eq!(
-        fs::read(&cache).unwrap(),
+        fs::read(&planted).unwrap(),
         bytes,
-        "newer search cache was changed"
+        "newer manifest was changed"
+    );
+    assert_eq!(
+        listing(family_dir),
+        family_before,
+        "a new generation was published or a file removed"
+    );
+    assert_eq!(
+        listing(&family_dir.join("segments")),
+        segments_before,
+        "a segment was written or removed"
+    );
+    let status = ctx.build_status_snapshot();
+    for plane in ["search_index", "callgraph_store"] {
+        assert_eq!(status[plane]["status"], "unavailable", "{plane}: {status:#}");
+        assert_eq!(status[plane]["reason"], "bind_failed", "{plane}: {status:#}");
+    }
+    let error = status["data_store"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&planted.display().to_string()),
+        "the refusal must name {}: {error}",
+        planted.display()
     );
     assert!(
-        ctx.search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.build_denied),
-        "the search build must be denied, not run"
-    );
-    assert_plane_refused(
-        &ctx,
-        IndexPlane::Trigram,
-        PersistedStore::SearchIndex,
-        &cache,
-    );
-    let status = assert_status_lists(&ctx, PersistedStore::SearchIndex);
-    assert_eq!(status["search_index"]["status"], "unavailable");
-    assert_named(
-        status["search_index"]["reason"]
-            .as_str()
-            .unwrap_or_default(),
-        PersistedStore::SearchIndex,
-        &cache,
+        error.contains(&FUTURE.to_string()),
+        "the refusal must carry the version: {error}"
     );
 }
 
