@@ -1,9 +1,9 @@
 //! The data layer inside a running AFT, while it is built beside the stores
 //! it replaces.
 //!
-//! It is off unless the process runs with `AFT_DATA_LAYER=1`, an
-//! undocumented switch for development: tools read from it only where they
-//! have been wired to, and only when it is on. When it is on, the first
+//! It is on unless the process runs with `AFT_DATA_LAYER=0`, an undocumented
+//! switch that lasts only while the cutover removes today's stores: tools
+//! read from it where they have been wired to. When it is on, the first
 //! query of a root binds the root's checkout and, if the checkout has no
 //! publication yet, builds it on a thread of its own. AFT's own edits reach
 //! it through the edit-intent listener, and outside changes through the
@@ -40,7 +40,9 @@ pub(crate) fn enabled() -> bool {
     if FORCED_ON.with(std::cell::Cell::get) {
         return true;
     }
-    std::env::var_os("AFT_DATA_LAYER").is_some_and(|value| value == "1")
+    // On by default while the cutover removes today's stores; `AFT_DATA_LAYER=0`
+    // runs today's route, so a test run can tell a new failure from an old one.
+    std::env::var_os("AFT_DATA_LAYER").is_none_or(|value| value != "0")
 }
 
 #[cfg(test)]
