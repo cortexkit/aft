@@ -116,7 +116,9 @@ impl<'a> Decoder<'a> {
             strings: Vec::new(),
         };
         let count = decoder.usize()?;
-        if count > input.len() {
+        // Each table entry takes at least its one-byte length, so the bytes
+        // after the count bound how many there can be.
+        if count > input.len() - decoder.position {
             return Err(DecodeError("string table count"));
         }
         let mut strings = Vec::with_capacity(count);
@@ -210,11 +212,25 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
 
-    /// A count of items still to come, checked against the bytes left so a
-    /// damaged count cannot ask for a huge allocation.
+    /// A count of items still to come, each at least one byte long; see
+    /// [`count_of`](Self::count_of).
     pub fn count(&mut self) -> Result<usize, DecodeError> {
+        self.count_of(1)
+    }
+
+    /// A count of items still to come, each taking at least `min_len` bytes,
+    /// checked against the bytes left. A count the bytes cannot hold fails
+    /// here, before the caller reserves room for that many items, so a
+    /// damaged or hostile count cannot ask for an allocation larger than a
+    /// real record of the same size would need.
+    pub fn count_of(&mut self, min_len: usize) -> Result<usize, DecodeError> {
+        debug_assert!(min_len > 0, "every item takes at least one byte");
         let count = self.usize()?;
-        if count > self.input.len() - self.position {
+        let left = self.input.len() - self.position;
+        if count
+            .checked_mul(min_len)
+            .is_none_or(|needed| needed > left)
+        {
             return Err(DecodeError("count exceeds the bytes left"));
         }
         Ok(count)
@@ -226,5 +242,65 @@ impl<'a> Decoder<'a> {
         } else {
             Err(DecodeError("bytes after the record"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record with an empty string table, `count` as its first field, and
+    /// `filler` zero bytes after it.
+    fn counted(count: u64, filler: usize) -> Vec<u8> {
+        let mut out = Encoder::default();
+        out.u64(count);
+        for _ in 0..filler {
+            out.byte(0);
+        }
+        out.finish()
+    }
+
+    #[test]
+    fn a_count_is_bounded_by_the_bytes_its_items_need() {
+        let bytes = counted(4, 12);
+        // Twelve bytes follow the count: four items of three bytes fit, four
+        // items of four bytes do not.
+        assert_eq!(Decoder::new(&bytes).unwrap().count_of(3), Ok(4));
+        assert_eq!(
+            Decoder::new(&bytes).unwrap().count_of(4),
+            Err(DecodeError("count exceeds the bytes left"))
+        );
+        // A count whose byte total overflows is refused, not wrapped around.
+        let bytes = counted(u64::MAX / 2, 12);
+        assert_eq!(
+            Decoder::new(&bytes).unwrap().count_of(4),
+            Err(DecodeError("count exceeds the bytes left"))
+        );
+    }
+
+    #[test]
+    fn a_string_table_longer_than_its_bytes_is_refused() {
+        // A table count followed by 64 KiB of one-byte (empty) strings.
+        let table = |count: u64| {
+            let mut out = Encoder::default();
+            out.u64(count);
+            let mut bytes = out.out;
+            bytes.resize(bytes.len() + 64 * 1024, 0);
+            bytes
+        };
+        assert_eq!(
+            Decoder::new(&table(1 << 31)).unwrap_err(),
+            DecodeError("string table count")
+        );
+        // A count as large as the whole input, its own bytes included, is
+        // still more strings than the bytes after it can hold.
+        let whole = table(64 * 1024 + 3);
+        assert_eq!(whole.len(), 64 * 1024 + 3);
+        assert_eq!(
+            Decoder::new(&whole).unwrap_err(),
+            DecodeError("string table count")
+        );
+        // Exactly as many strings as bytes after the count decode.
+        assert!(Decoder::new(&table(64 * 1024)).is_ok());
     }
 }

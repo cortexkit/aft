@@ -24,7 +24,7 @@ use super::score::{ScanParams, mean, quantize};
 use crate::ids::{ContentKey, Digest128};
 use crate::le::u32_at;
 use crate::segment::{
-    Alignment, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
+    Alignment, BLOCK_LEN, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
     SectionKind, SectionSpec, Segment, SegmentError, SegmentWriter,
 };
 use crate::table::{UnitLocation, UnitTable, UnitTableBuilder};
@@ -324,7 +324,8 @@ pub struct VectorSegment<'s> {
 }
 
 impl<'s> VectorSegment<'s> {
-    /// The segment's vector sections, or `None` when it has none.
+    /// The segment's vector sections, or `None` when it has none. Opening
+    /// reads every scan row once, to check the values each search relies on.
     ///
     /// # Errors
     ///
@@ -387,6 +388,7 @@ impl<'s> VectorSegment<'s> {
                 "vector rows do not match the vector unit table",
             ));
         }
+        check_scan_rows(segment, scan, count, dimensions)?;
         let maps = UnitTable::open(segment, maps)?;
         if segment.info(map_data).item_count != u64::from(maps.len()) {
             return Err(malformed(
@@ -550,10 +552,13 @@ impl<'s> VectorSegment<'s> {
         let Some((_, location)) = self.maps.get(&key.to_bytes())? else {
             return Ok(None);
         };
-        let bytes = self.segment.read_range(
-            self.map_data,
-            location.offset..location.offset + u64::from(location.len),
-        )?;
+        let end = location
+            .offset
+            .checked_add(u64::from(location.len))
+            .ok_or_else(|| self.malformed("a chunk map's range overflows"))?;
+        let bytes = self
+            .segment
+            .read_range(self.map_data, location.offset..end)?;
         let (stored_path, chunks) = self.decode_map(&bytes)?;
         if stored_path != path {
             // Two paths with one digest: astronomically unlikely, and never
@@ -570,11 +575,12 @@ impl<'s> VectorSegment<'s> {
         }
         let path_len = u32_at(bytes, 0) as usize;
         let count_at = 4usize.checked_add(path_len).ok_or_else(fail)?;
-        if bytes.len() < count_at + 4 {
-            return Err(fail());
-        }
+        let entries_at = count_at
+            .checked_add(4)
+            .filter(|at| *at <= bytes.len())
+            .ok_or_else(fail)?;
         let count = u32_at(bytes, count_at) as usize;
-        let entries = &bytes[count_at + 4..];
+        let entries = &bytes[entries_at..];
         if Some(entries.len()) != count.checked_mul(CHUNK_ENTRY_LEN) {
             return Err(fail());
         }
@@ -607,6 +613,38 @@ fn malformed(segment: &Segment, reason: &'static str) -> SegmentError {
     SegmentError::new(segment.path(), ErrorKind::Malformed(reason))
 }
 
+/// Refuses a segment any of whose `count` scan rows holds a value no writer
+/// produces (see [`ScanParams::is_sound`]). Every search trusts those values
+/// to bound its scores, so they are checked once when the segment is opened,
+/// a block at a time.
+fn check_scan_rows(
+    segment: &Segment,
+    scan: SectionHandle,
+    count: u64,
+    dimensions: usize,
+) -> Result<(), SegmentError> {
+    let row_len = scan_row_len(dimensions);
+    let rows_per_read = (BLOCK_LEN / row_len).max(1);
+    let mut rows = Vec::new();
+    let mut first = 0u64;
+    while first < count {
+        let take = rows_per_read.min(usize::try_from(count - first).unwrap_or(usize::MAX));
+        rows.resize(take * row_len, 0);
+        segment.read(scan, first * row_len as u64, &mut rows)?;
+        if rows
+            .chunks_exact(row_len)
+            .any(|row| !scan_params(row).is_sound())
+        {
+            return Err(malformed(
+                segment,
+                "a scan row holds a negative or non-finite value",
+            ));
+        }
+        first += take as u64;
+    }
+    Ok(())
+}
+
 /// Decodes a scan row's per-vector values.
 pub(crate) fn scan_params(row: &[u8]) -> ScanParams {
     let value = |at| f32::from_le_bytes(crate::le::array(row, at));
@@ -631,4 +669,193 @@ pub(crate) fn f32s(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::cache::BlockCache;
+    use crate::ids::{FamilyId, SegmentId, WriterIncarnation};
+    use crate::segment::SegmentMeta;
+
+    const DIMENSIONS: u32 = 4;
+    const PATH: &[u8] = b"src/a.rs";
+
+    fn family() -> FamilyId {
+        FamilyId::from_digest(Digest128::of(b"forged vector sections"))
+    }
+
+    fn model() -> ModelIdentity {
+        ModelIdentity {
+            name: "test/forged".to_string(),
+            revision: "r1".to_string(),
+            dimensions: DIMENSIONS,
+            normalized: true,
+            text_template: 1,
+            chunk_template: 1,
+        }
+    }
+
+    fn content() -> ContentKey {
+        ContentKey::of(b"fn a() {}")
+    }
+
+    fn le_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    /// Sound scan values for the forged vector: what a writer would store.
+    const SOUND: [f32; 4] = [0.01, 0.001, 1.0, 0.0005];
+
+    /// A segment holding one vector whose scan row carries `params` and one
+    /// chunk map, for `PATH`, located at `map` (`None`: where it really is).
+    /// Its checksums are valid, so only a buggy or hostile writer could have
+    /// stored these values.
+    fn write_forged(path: &Path, params: [f32; 4], map: Option<UnitLocation>) -> Segment {
+        let dimensions = DIMENSIONS as usize;
+        let mut writer = SegmentWriter::create(
+            path,
+            SegmentMeta {
+                family: family(),
+                segment: SegmentId::new(1),
+                incarnation: WriterIncarnation::new(1),
+                created_unix_ms: 0,
+            },
+        )
+        .unwrap();
+        writer
+            .write_section(spec(FINGERPRINT, Alignment::Word), &model().encode(), 1)
+            .unwrap();
+        let mut units = UnitTableBuilder::new(Digest128::LEN);
+        units.push(
+            TextDigest::of(b"chunk").digest().as_bytes(),
+            UnitLocation {
+                offset: 0,
+                len: DIMENSIONS * 4,
+            },
+        );
+        let (units, count) = units.finish();
+        writer
+            .write_section(spec(UNITS, Alignment::Word), &units, count)
+            .unwrap();
+        writer
+            .write_section(
+                spec(CENTER, Alignment::Word),
+                &le_bytes(&[0.0; DIMENSIONS as usize]),
+                u64::from(DIMENSIONS),
+            )
+            .unwrap();
+        let mut row = le_bytes(&params);
+        row.resize(scan_row_len(dimensions), 0);
+        writer
+            .write_section(spec(SCAN, Alignment::Vector), &row, 1)
+            .unwrap();
+        writer
+            .write_section(
+                spec(VECTORS, Alignment::Vector),
+                &le_bytes(&[1.0, 0.0, 0.0, 0.0]),
+                1,
+            )
+            .unwrap();
+        // The map: the path, then no chunks.
+        let mut data = u32::try_from(PATH.len()).unwrap().to_le_bytes().to_vec();
+        data.extend_from_slice(PATH);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let mut maps = UnitTableBuilder::new(ChunkMapKey::LEN);
+        maps.push(
+            &ChunkMapKey::new(content(), PATH).to_bytes(),
+            map.unwrap_or(UnitLocation {
+                offset: 0,
+                len: u32::try_from(data.len()).unwrap(),
+            }),
+        );
+        let (maps, count) = maps.finish();
+        writer
+            .write_section(spec(CHUNK_MAPS, Alignment::Word), &maps, count)
+            .unwrap();
+        writer
+            .write_section(spec(CHUNK_MAP_DATA, Alignment::Word), &data, count)
+            .unwrap();
+        writer.finish().unwrap();
+        Segment::open(
+            path,
+            family(),
+            &KNOWN,
+            Arc::new(BlockCache::new(4 * BLOCK_LEN)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_scan_row_no_writer_produces_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let sound = write_forged(&dir.path().join("sound.seg"), SOUND, None);
+        let opened = VectorSegment::open(&sound).unwrap().unwrap();
+        assert_eq!(opened.chunk_map(content(), PATH).unwrap(), Some(Vec::new()));
+        // Each value in turn made negative, then not finite. A negative
+        // residual or norm would shrink the vector's score interval.
+        let mut cases = Vec::new();
+        for field in 0..4 {
+            for bad in [-0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut params = SOUND;
+                params[field] = bad;
+                cases.push(params);
+            }
+        }
+        for (index, params) in cases.into_iter().enumerate() {
+            let segment = write_forged(&dir.path().join(format!("{index}.seg")), params, None);
+            let error = VectorSegment::open(&segment).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::Malformed("a scan row holds a negative or non-finite value")
+                ),
+                "{params:?}: {error}"
+            );
+            assert!(error.is_corruption(), "{params:?}");
+        }
+    }
+
+    #[test]
+    fn a_chunk_map_range_past_u64_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = write_forged(
+            &dir.path().join("overflow.seg"),
+            SOUND,
+            Some(UnitLocation {
+                offset: u64::MAX - 3,
+                len: 16,
+            }),
+        );
+        let opened = VectorSegment::open(&segment).unwrap().unwrap();
+        let error = opened.chunk_map(content(), PATH).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::Malformed("a chunk map's range overflows")
+            ),
+            "{error}"
+        );
+        assert!(error.is_corruption());
+    }
+
+    #[test]
+    fn a_chunk_map_whose_path_runs_past_its_bytes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = write_forged(&dir.path().join("short.seg"), SOUND, None);
+        let opened = VectorSegment::open(&segment).unwrap().unwrap();
+        // A path length that leaves no room for the chunk count, and one that
+        // reaches the top of the address range.
+        for path_len in [5u32, u32::MAX] {
+            let mut bytes = path_len.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0; 8]);
+            assert!(opened.decode_map(&bytes).unwrap_err().is_corruption());
+        }
+    }
 }

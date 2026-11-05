@@ -234,6 +234,19 @@ pub(crate) struct ScanParams {
     pub(crate) max_residual: f32,
 }
 
+impl ScanParams {
+    /// Whether every value is finite and not negative, as [`quantize`]
+    /// writes them for any vector the builder accepts. The error bound of
+    /// [`QueryTerms::dot_bounds`] holds only then: a negative residual or norm
+    /// would shrink a vector's score interval below its real error, and a
+    /// search could then exclude a vector that belongs in the answer.
+    pub(crate) fn is_sound(&self) -> bool {
+        [self.scale, self.residual, self.norm, self.max_residual]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+    }
+}
+
 /// Width of the lane-wise accumulation in [`approx_dot`]: wide enough for
 /// the compiler to use full vector registers.
 const LANES: usize = 16;

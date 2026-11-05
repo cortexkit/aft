@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use crate::ids::Digest128;
 use crate::packed::{self, PackedBuilder};
-use crate::postings::{PostingCursor, PostingLayout, PostingsBuilder};
+use crate::postings::{BLOCK_ENTRIES, PostingCursor, PostingLayout, PostingList, PostingsBuilder};
 use crate::segment::{
     Alignment, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
     SectionKind, SectionSpec, Segment, SegmentError, SegmentWriter,
@@ -117,6 +117,22 @@ fn term_hash(term: &[u8]) -> u64 {
 
 fn layout() -> PostingLayout {
     PostingLayout::new(&[])
+}
+
+/// The fewest bytes one posting block takes in [`layout`], which has no
+/// payload columns: the 12-byte block header alone (first and last ordinal,
+/// entry count, delta width, a reserved byte), when every delta in the block
+/// is zero bits wide. A block holds at most [`BLOCK_ENTRIES`] entries.
+const MIN_POSTING_BLOCK_LEN: u64 = 12;
+
+/// Whether the posting section, `section_len` bytes long, can hold `list`:
+/// the blocks its count needs, each at least [`MIN_POSTING_BLOCK_LEN`]
+/// bytes, must fit between its offset and the section's end.
+fn fits(list: PostingList, section_len: u64) -> bool {
+    let needed = u64::from(list.count).div_ceil(BLOCK_ENTRIES as u64) * MIN_POSTING_BLOCK_LEN;
+    list.offset
+        .checked_add(needed)
+        .is_some_and(|end| end <= section_len)
 }
 
 /// A fragment's bytes and the hashes of its terms.
@@ -324,6 +340,14 @@ impl<'s> GraphSegment<'s> {
         let Some(list) = lookup.get(term_hash(term))? else {
             return Ok(Vec::new());
         };
+        // The count is stored, so it is checked against the bytes its blocks
+        // would occupy before room is reserved for that many ordinals.
+        if !fits(list, self.segment.info(*postings).len) {
+            return Err(malformed(
+                self.segment,
+                "a term's posting count needs more bytes than its section holds",
+            ));
+        }
         let mut cursor = PostingCursor::new(self.segment, *postings, layout(), list);
         let mut ordinals = Vec::with_capacity(list.count as usize);
         while let Some(block) = cursor.next_block()? {
@@ -355,8 +379,8 @@ mod tests {
         FamilyId::from_digest(Digest128::of(b"repo"))
     }
 
-    fn write(path: &Path, builder: Option<GraphSectionsBuilder>) -> Segment {
-        let mut writer = SegmentWriter::create(
+    fn create(path: &Path) -> SegmentWriter {
+        SegmentWriter::create(
             path,
             SegmentMeta {
                 family: family(),
@@ -365,11 +389,10 @@ mod tests {
                 created_unix_ms: 0,
             },
         )
-        .unwrap();
-        if let Some(builder) = builder {
-            builder.write(&mut writer).unwrap();
-        }
-        writer.finish().unwrap();
+        .unwrap()
+    }
+
+    fn open(path: &Path) -> Segment {
         Segment::open(
             path,
             family(),
@@ -377,6 +400,56 @@ mod tests {
             Arc::new(BlockCache::new(16 * BLOCK_LEN)),
         )
         .unwrap()
+    }
+
+    fn write(path: &Path, builder: Option<GraphSectionsBuilder>) -> Segment {
+        let mut writer = create(path);
+        if let Some(builder) = builder {
+            builder.write(&mut writer).unwrap();
+        }
+        writer.finish().unwrap();
+        open(path)
+    }
+
+    /// Graph sections holding one fragment and one call-target term, `t`,
+    /// whose lookup entry says `list` while its postings hold one block with
+    /// one ordinal. The segment's checksums are valid: only a writer could
+    /// have stored such a list.
+    fn write_forged(path: &Path, list: PostingList) -> Segment {
+        let mut writer = create(path);
+        let mut table = UnitTableBuilder::new(Digest128::LEN);
+        table.push(key(1).0.as_bytes(), UnitLocation { offset: 0, len: 0 });
+        let (table, units) = table.finish();
+        writer
+            .write_section(spec(UNITS, UNIT_KEY_SPACE), &table, units)
+            .unwrap();
+        let mut data = PackedBuilder::with_capacity(1);
+        data.push(b"one");
+        let (data, index) = data.finish();
+        writer
+            .write_section(spec(DATA, UNIT_KEY_SPACE), &data, units)
+            .unwrap();
+        writer
+            .write_section(spec(INDEX, UNIT_KEY_SPACE), &index, units)
+            .unwrap();
+        for kind in TermKind::ALL {
+            let mut postings = PostingsBuilder::new(layout());
+            let mut lookup = LookupTableBuilder::new();
+            if kind == TermKind::CallTarget {
+                postings.add_list(&[0], &[]);
+                lookup.push(term_hash(b"t"), list);
+            }
+            let (lookup, terms) = lookup.finish();
+            writer
+                .write_section(spec(TERM_LOOKUP, kind.key_space()), &lookup, terms)
+                .unwrap();
+            let (postings, entries) = postings.finish();
+            writer
+                .write_section(spec(TERM_POSTINGS, kind.key_space()), &postings, entries)
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        open(path)
     }
 
     #[test]
@@ -445,5 +518,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let segment = write(&dir.path().join("empty.seg"), None);
         assert!(GraphSegment::open(&segment).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_posting_count_its_section_cannot_hold_is_refused_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        // The honest list: the forged segment is otherwise well formed.
+        let segment = write_forged(
+            &dir.path().join("honest.seg"),
+            PostingList {
+                offset: 0,
+                count: 1,
+            },
+        );
+        let graph = GraphSegment::open(&segment).unwrap().unwrap();
+        assert_eq!(graph.candidates(TermKind::CallTarget, b"t").unwrap(), [0]);
+        for (name, list) in [
+            // 2^32 - 1 ordinals, 16 GiB, from a 12-byte section.
+            (
+                "huge",
+                PostingList {
+                    offset: 0,
+                    count: u32::MAX,
+                },
+            ),
+            // One entry more than a block holds needs a second block.
+            (
+                "two blocks",
+                PostingList {
+                    offset: 0,
+                    count: u32::try_from(BLOCK_ENTRIES).unwrap() + 1,
+                },
+            ),
+            // An offset whose end does not fit in 64 bits.
+            (
+                "overflow",
+                PostingList {
+                    offset: u64::MAX - 4,
+                    count: 1,
+                },
+            ),
+        ] {
+            let segment = write_forged(&dir.path().join(format!("{name}.seg")), list);
+            let graph = GraphSegment::open(&segment).unwrap().unwrap();
+            let error = graph.candidates(TermKind::CallTarget, b"t").unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::Malformed(
+                        "a term's posting count needs more bytes than its section holds"
+                    )
+                ),
+                "{name}: {error}"
+            );
+            assert!(error.is_corruption(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_smallest_block_is_the_bound_the_count_check_assumes() {
+        // A full block of equal ordinals has zero-width deltas: the shortest
+        // block the layout can store. If the format ever stored less, the
+        // count check would refuse real lists.
+        let mut postings = PostingsBuilder::new(layout());
+        let list = postings.add_list(&[7; BLOCK_ENTRIES], &[]);
+        let (bytes, _) = postings.finish();
+        assert_eq!(bytes.len() as u64, MIN_POSTING_BLOCK_LEN);
+        assert!(fits(list, MIN_POSTING_BLOCK_LEN));
+        assert!(!fits(list, MIN_POSTING_BLOCK_LEN - 1));
     }
 }

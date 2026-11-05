@@ -306,7 +306,7 @@ impl CheckoutState {
                 .try_into()
                 .map_err(|_| RecordError::Invalid("conversion digest length"))?,
         );
-        let count = input.count().map_err(invalid)?;
+        let count = input.count_of(MIN_PATH_RECORD_LEN).map_err(invalid)?;
         let mut paths = Vec::<PathRecord>::with_capacity(count);
         for _ in 0..count {
             let shared = input.usize().map_err(invalid)?;
@@ -403,6 +403,14 @@ impl CheckoutState {
 
 /// The version of [`CheckoutState::encode`]'s layout, its first byte.
 const STATE_FORMAT: u8 = 2;
+
+/// The fewest bytes one path record takes in [`CheckoutState::encode`]'s
+/// layout: the 16-byte content key and its length byte, plus one byte for
+/// each of the other fifteen fields (a varint, flag, kind byte, string index
+/// or empty blob length). A decoded path count is checked against it before
+/// anything is reserved, so a payload cannot claim more paths than its bytes
+/// could hold.
+const MIN_PATH_RECORD_LEN: usize = Digest128::LEN + 1 + 15;
 
 const fn zigzag(value: i64) -> u64 {
     ((value << 1) ^ (value >> 63)).cast_unsigned()
@@ -537,5 +545,67 @@ mod tests {
         assert_eq!(inside("a/c"), ["a/c/d"]);
         assert_eq!(inside("").len(), 5);
         assert!(inside("zz").is_empty());
+    }
+
+    /// A state payload whose header is well formed, with `count` as its path
+    /// count and `filler` zero bytes after it.
+    fn claiming(count: u64, filler: usize) -> Vec<u8> {
+        let mut out = Encoder::default();
+        out.byte(STATE_FORMAT);
+        out.blob(b"");
+        out.blob(Digest128::of(b"").as_bytes());
+        out.u64(count);
+        for _ in 0..filler {
+            out.byte(0);
+        }
+        out.finish()
+    }
+
+    #[test]
+    fn a_path_count_its_bytes_cannot_hold_fails_before_any_record() {
+        const FILLER: usize = 64 * 1024;
+        // 2^31 paths, about 400 GiB of records in memory, from 64 KiB.
+        // One path per byte, which a bound of one byte per item let through.
+        // And one path more than the bytes hold at the smallest record size.
+        for count in [
+            1 << 31,
+            FILLER as u64,
+            (FILLER / MIN_PATH_RECORD_LEN) as u64 + 1,
+        ] {
+            assert!(
+                matches!(
+                    CheckoutState::decode(&claiming(count, FILLER)),
+                    Err(RecordError::Invalid("count exceeds the bytes left"))
+                ),
+                "{count} paths in {FILLER} bytes"
+            );
+        }
+        // A count the bytes can hold gets as far as its first record, which
+        // zero bytes do not make.
+        assert!(matches!(
+            CheckoutState::decode(&claiming((FILLER / MIN_PATH_RECORD_LEN) as u64, FILLER)),
+            Err(RecordError::Invalid("content key length"))
+        ));
+    }
+
+    #[test]
+    fn records_of_the_smallest_size_still_decode() {
+        // Every field as short as the layout allows: no path count of a real
+        // state is ever refused by the bound.
+        let smallest = |path: Vec<u8>| PathRecord {
+            path,
+            mode: 0,
+            kind: PathKind::Text,
+            content: ContentKey::of(b""),
+            link: Vec::new(),
+            stat: StatEvidence::default(),
+            language: String::new(),
+        };
+        let paths = std::iter::once(Vec::new())
+            .chain((1..=200u8).map(|byte| vec![byte]))
+            .map(smallest)
+            .collect();
+        let state = CheckoutState::new(Vec::new(), Digest128::of(b""), paths).unwrap();
+        assert_eq!(CheckoutState::decode(&state.encode()).unwrap(), state);
     }
 }
