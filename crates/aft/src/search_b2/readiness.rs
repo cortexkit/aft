@@ -97,7 +97,7 @@ fn semantic_ready(state: &SemanticReadiness<'_>) -> bool {
 
 fn trigram_ready(state: &TrigramReadiness) -> bool {
     state.status == IndexStatus::Ready
-        && (state.snapshot.is_some() || state.data_text.is_some())
+        && (state.snapshot.is_some() || state.data_view)
         && !state.evicted
         && !state.lock_contended
 }

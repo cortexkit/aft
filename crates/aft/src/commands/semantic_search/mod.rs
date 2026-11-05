@@ -407,7 +407,7 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
-                    data_text: None,
+                    data_view: false,
                 },
                 symbol: SymbolReadiness {
                     status: SymbolIndexStatus::Disabled,
@@ -426,7 +426,7 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                     snapshot: Some(Arc::new(index.snapshot())),
                     evicted: false,
                     lock_contended: false,
-                    data_text: None,
+                    data_view: false,
                 }
             }
             ReadOnlyArtifact::Degraded(_) | ReadOnlyArtifact::Absent => TrigramReadiness {
@@ -434,14 +434,14 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                 snapshot: None,
                 evicted: false,
                 lock_contended: false,
-                data_text: None,
+                data_view: false,
             },
             ReadOnlyArtifact::Cancelled => TrigramReadiness {
                 status: IndexStatus::Building,
                 snapshot: None,
                 evicted: false,
                 lock_contended: false,
-                data_text: None,
+                data_view: false,
             },
         };
         let semantic =
@@ -623,12 +623,11 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             },
         };
 
-        let data_text = crate::data_layer::tools::search::DataText::ready(self.ctx);
-        let trigram = if let Some(text) = data_text {
+        let trigram = if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
             TrigramReadiness {
                 status: IndexStatus::Ready,
                 snapshot: None,
-                data_text: Some(Arc::new(text)),
+                data_view: true,
                 evicted: false,
                 lock_contended: false,
             }
@@ -640,7 +639,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: Some(Arc::new(snapshot)),
                         evicted: false,
                         lock_contended: false,
-                        data_text: None,
+                        data_view: false,
                     }
                 }
                 Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
@@ -649,7 +648,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: None,
                         evicted: false,
                         lock_contended: false,
-                        data_text: None,
+                        data_view: false,
                     }
                 }
                 Err(_) => TrigramReadiness {
@@ -657,7 +656,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
-                    data_text: None,
+                    data_view: false,
                 },
             }
         } else {
@@ -668,7 +667,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: index.as_ref().map(SearchIndex::snapshot).map(Arc::new),
                         evicted: false,
                         lock_contended: false,
-                        data_text: None,
+                        data_view: false,
                     }
                 }
                 Some(index) if index.is_some() => TrigramReadiness {
@@ -676,7 +675,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
-                    data_text: None,
+                    data_view: false,
                 },
                 Some(_) => {
                     let receiver = try_read_with_budget(
@@ -689,21 +688,21 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                             snapshot: None,
                             evicted: false,
                             lock_contended: false,
-                            data_text: None,
+                            data_view: false,
                         },
                         Some(_) => TrigramReadiness {
                             status: IndexStatus::Fallback,
                             snapshot: None,
                             evicted: false,
                             lock_contended: false,
-                            data_text: None,
+                            data_view: false,
                         },
                         None => TrigramReadiness {
                             status: IndexStatus::Building,
                             snapshot: None,
                             evicted: false,
                             lock_contended: true,
-                            data_text: None,
+                            data_view: false,
                         },
                     }
                 }
@@ -712,7 +711,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: true,
-                    data_text: None,
+                    data_view: false,
                 },
             }
         };

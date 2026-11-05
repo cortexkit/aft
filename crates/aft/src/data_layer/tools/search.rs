@@ -344,7 +344,8 @@ pub(crate) enum Rarity {
     /// segments.
     Frequency,
     /// By the checkout's files holding the trigram, as the legacy index
-    /// ranks them.
+    /// ranks them; the parity test measures what the difference moves.
+    #[cfg(test)]
     Files,
 }
 
@@ -364,6 +365,7 @@ fn rarest(
         }
         let count = match rarity {
             Rarity::Frequency => text.frequency(trigram)?,
+            #[cfg(test)]
             Rarity::Files => paths.len() as u64,
         };
         held.push((count, trigram));
@@ -697,4 +699,420 @@ fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
     crate::inspect::job::normalize_path(path)
         .starts_with(crate::inspect::job::normalize_path(search_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use aft_store::ids::{Digest128, FamilyId};
+
+    use crate::commands::semantic_search::anchored_lane::{
+        discover_anchored_candidate_files, split_query, AnchoredLane,
+    };
+    use crate::commands::semantic_search::lexical_lane::{
+        CanonicalLexicalLane, LEXICAL_ENUMERATION_LIMIT,
+    };
+    use crate::data_layer::checkout::{Checkout, DataLayer};
+    use crate::search_index::{SearchIndex, DEFAULT_MAX_FILE_SIZE};
+
+    /// A checkout's legacy index and its data-layer view, built from the
+    /// same files.
+    struct Pair {
+        root: PathBuf,
+        legacy: SearchIndex,
+        data: DataText,
+        _checkout: Checkout,
+        _store: tempfile::TempDir,
+    }
+
+    fn pair(root: &Path) -> Pair {
+        let root = std::fs::canonicalize(root).unwrap();
+        let legacy = SearchIndex::build(&root);
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(64 << 20, 4));
+        let family = FamilyId::from_digest(Digest128::of(b"search-parity"));
+        let checkout = Checkout::bind(layer, store.path(), family, &root).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().text, PlaneStatus::Ready);
+        Pair {
+            data: DataText::from_view(view, DEFAULT_MAX_FILE_SIZE),
+            root,
+            legacy,
+            _checkout: checkout,
+            _store: store,
+        }
+    }
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn trigrams(query: &str) -> Vec<u32> {
+        let tokens = crate::query_shape::extract_content_tokens(query);
+        let refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        SearchIndex::query_trigrams_from_tokens(&refs)
+    }
+
+    /// The lexical lane's canonical order, with each score's bits.
+    fn lane(index: TextIndex<'_>, trigrams: &[u32], include_tests: bool, root: &Path) -> String {
+        let filter = |path: &Path| {
+            crate::commands::semantic_search::path_allowed_by_include_tests(
+                path,
+                root,
+                include_tests,
+            )
+        };
+        let lane = CanonicalLexicalLane::from_text_index(
+            index,
+            trigrams,
+            Some(&filter),
+            LEXICAL_ENUMERATION_LIMIT,
+        )
+        .unwrap();
+        let order = lane
+            .canonical_order()
+            .iter()
+            .map(|candidate| (candidate.result.path.clone(), candidate.raw_score.to_bits()))
+            .collect::<Vec<_>>();
+        format!("{}:{order:?}", lane.selected_pool_size())
+    }
+
+    #[test]
+    fn the_view_answers_each_lane_question_as_the_legacy_index_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/upload.rs", "pub fn retry_upload() {}\n// retries the upload\n");
+        write(root, "src/client.rs", "fn send() { retry_upload(); }\nstruct Client;\n");
+        write(root, "docs/notes.md", "The upload is retried with a backoff.\n");
+        write(root, "tests/upload_test.rs", "fn upload_test() { retry_upload(); }\n");
+        write(root, "data.bin", "\0\0binary retry_upload\0");
+        let pair = pair(root);
+        let legacy = pair.legacy.snapshot();
+        let legacy = TextIndex::Snapshot(&legacy);
+        let data = TextIndex::Data(&pair.data);
+        for query in ["retry upload", "retry_upload", "Client send", "backoff", "zz"] {
+            let trigrams = trigrams(query);
+            for include_tests in [false, true] {
+                assert_eq!(
+                    lane(legacy, &trigrams, include_tests, &pair.root),
+                    lane(data, &trigrams, include_tests, &pair.root),
+                    "{query}"
+                );
+            }
+            assert_eq!(
+                legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX).unwrap(),
+                data.lexical_rank_at_depth(&trigrams, None, usize::MAX).unwrap(),
+                "{query}"
+            );
+            for scope in [
+                ExactEvidenceScope::All,
+                ExactEvidenceScope::PhraseAndWindow,
+                ExactEvidenceScope::Phrase,
+            ] {
+                assert_eq!(
+                    legacy
+                        .whole_corpus_exact_pass_scoped(query, &pair.root, None, &scope)
+                        .unwrap(),
+                    data.whole_corpus_exact_pass_scoped(query, &pair.root, None, &scope)
+                        .unwrap(),
+                    "{query} {scope:?}"
+                );
+            }
+            assert_eq!(
+                legacy
+                    .files_possibly_holding_phrase(query, &pair.root)
+                    .unwrap(),
+                data.files_possibly_holding_phrase(query, &pair.root)
+                    .unwrap(),
+                "{query}"
+            );
+        }
+        for path in ["src/upload.rs", "data.bin", "missing.rs"] {
+            let path = pair.root.join(path);
+            assert_eq!(
+                legacy.audit_index_state(&path),
+                data.audit_index_state(&path),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// The legacy index ranks query trigrams by the files holding them; the
+    /// data layer by `trigram_frequency`, which counts one content once.
+    /// Two files with the same content therefore make a trigram rarer to the
+    /// data layer than to the legacy index, and the three picked trigrams
+    /// can differ.
+    #[test]
+    fn a_duplicated_content_counts_once_in_the_data_layers_rarity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "x1.txt", "xxx\n");
+        write(root, "x2.txt", "xxx\n");
+        for (name, text) in [("a", "aaa"), ("b", "bbb"), ("c", "ccc")] {
+            write(root, &format!("{name}1.txt"), &format!("{text} one\n"));
+            write(root, &format!("{name}2.txt"), &format!("{text} two\n"));
+        }
+        let pair = pair(root);
+        let unique = unique_trigrams(&trigrams("xxx aaa bbb ccc"));
+        let postings = pair.data.postings(&unique).unwrap();
+        let pack = |text: &[u8]| aft_store::text::pack(text[0], text[1], text[2]);
+        assert_eq!(
+            rarest(&pair.data, &unique, &postings, Rarity::Files).unwrap(),
+            vec![pack(b"aaa"), pack(b"bbb"), pack(b"ccc")]
+        );
+        assert_eq!(
+            rarest(&pair.data, &unique, &postings, Rarity::Frequency).unwrap(),
+            vec![pack(b"xxx"), pack(b"aaa"), pack(b"bbb")]
+        );
+    }
+
+    /// Statistics of one comparison over a query list.
+    #[derive(Default, serde::Serialize)]
+    struct Tally {
+        queries: usize,
+        differing: usize,
+        legacy: Duration,
+        data: Duration,
+        examples: Vec<serde_json::Value>,
+    }
+
+    impl Tally {
+        fn record(
+            &mut self,
+            query: &str,
+            legacy: (String, Duration),
+            data: (String, Duration),
+        ) {
+            self.queries += 1;
+            self.legacy += legacy.1;
+            self.data += data.1;
+            if legacy.0 != data.0 {
+                self.differing += 1;
+                if self.examples.len() < 20 {
+                    self.examples.push(serde_json::json!({
+                        "query": query,
+                        "legacy": legacy.0.chars().take(4000).collect::<String>(),
+                        "data": data.0.chars().take(4000).collect::<String>(),
+                    }));
+                }
+            }
+        }
+
+        fn summary(&self) -> serde_json::Value {
+            let per_call = |total: Duration| {
+                if self.queries == 0 {
+                    0.0
+                } else {
+                    total.as_secs_f64() * 1000.0 / self.queries as f64
+                }
+            };
+            serde_json::json!({
+                "queries": self.queries,
+                "differing": self.differing,
+                "legacy_ms_per_call": per_call(self.legacy),
+                "data_ms_per_call": per_call(self.data),
+                "examples": self.examples,
+            })
+        }
+    }
+
+    fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+        let started = Instant::now();
+        let value = work();
+        (value, started.elapsed())
+    }
+
+    /// Runs every lane question for each query of a real query list against
+    /// the legacy index and the data layer's view of one checkout, and
+    /// writes what differs and what each costs. The gate for wiring
+    /// aft_search onto the data layer runs it on aft's own checkout:
+    ///
+    /// `AFT_SEARCH_PARITY_ROOT=<checkout> AFT_SEARCH_PARITY_QUERIES=<one
+    /// query per line> AFT_SEARCH_PARITY_OUT=<report.json> cargo test -p
+    /// agent-file-tools --lib -- --ignored lanes_match_the_legacy_index`
+    #[test]
+    #[ignore = "reads the checkout and query list named by AFT_SEARCH_PARITY_*"]
+    fn lanes_match_the_legacy_index_on_real_queries() {
+        let root = PathBuf::from(std::env::var("AFT_SEARCH_PARITY_ROOT").unwrap());
+        let queries = std::fs::read_to_string(std::env::var("AFT_SEARCH_PARITY_QUERIES").unwrap())
+            .unwrap();
+        let out = PathBuf::from(std::env::var("AFT_SEARCH_PARITY_OUT").unwrap());
+        let exact_limit = std::env::var("AFT_SEARCH_PARITY_EXACT_LIMIT")
+            .ok()
+            .and_then(|limit| limit.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let (pair, build) = timed(|| pair(&root));
+        let snapshot = pair.legacy.snapshot();
+        let legacy = TextIndex::Snapshot(&snapshot);
+        let data = TextIndex::Data(&pair.data);
+        let root = pair.root.clone();
+
+        let mut lanes = Tally::default();
+        let mut lanes_with_tests = Tally::default();
+        let mut picks_by_frequency = Tally::default();
+        let mut picks_as_sets = Tally::default();
+        let mut pool_by_file_rarity = Tally::default();
+        let mut unpooled = Tally::default();
+        let mut exact = Tally::default();
+        let mut phrase_holders = Tally::default();
+        let mut anchored = Tally::default();
+        let mut seen = HashSet::new();
+        let mut distinct = 0usize;
+        for query in queries.lines().map(str::trim).filter(|query| !query.is_empty()) {
+            if !seen.insert(query.to_string()) {
+                continue;
+            }
+            distinct += 1;
+            let trigrams = trigrams(query);
+            lanes.record(
+                query,
+                timed(|| lane(legacy, &trigrams, false, &root)),
+                timed(|| lane(data, &trigrams, false, &root)),
+            );
+            lanes_with_tests.record(
+                query,
+                timed(|| lane(legacy, &trigrams, true, &root)),
+                timed(|| lane(data, &trigrams, true, &root)),
+            );
+
+            // Which three trigrams each rarity picks, and what the pool would
+            // be if the data layer ranked rarity by files.
+            let unique = unique_trigrams(&trigrams);
+            let postings = pair.data.postings(&unique).unwrap();
+            let by_files = rarest(&pair.data, &unique, &postings, Rarity::Files).unwrap();
+            let by_frequency = rarest(&pair.data, &unique, &postings, Rarity::Frequency).unwrap();
+            let zero = Duration::ZERO;
+            picks_by_frequency.record(
+                query,
+                (format!("{by_files:06x?}"), zero),
+                (format!("{by_frequency:06x?}"), zero),
+            );
+            let as_set = |picks: &[u32]| picks.iter().collect::<BTreeSet<_>>();
+            picks_as_sets.record(
+                query,
+                (format!("{:06x?}", as_set(&by_files)), zero),
+                (format!("{:06x?}", as_set(&by_frequency)), zero),
+            );
+            let pool = |picks: &[u32]| {
+                picks
+                    .iter()
+                    .flat_map(|trigram| postings[trigram].iter())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+            };
+            pool_by_file_rarity.record(
+                query,
+                (format!("{}", pool(&by_files)), zero),
+                (format!("{}", pool(&by_frequency)), zero),
+            );
+            unpooled.record(
+                query,
+                timed(|| format!("{:?}", legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
+                timed(|| format!("{:?}", data.lexical_rank_at_depth(&trigrams, None, usize::MAX))),
+            );
+
+            if exact.queries < exact_limit {
+                let filter = |path: &Path| {
+                    crate::commands::semantic_search::path_allowed_by_include_tests(
+                        path, &root, false,
+                    )
+                };
+                for scope in [
+                    ExactEvidenceScope::All,
+                    ExactEvidenceScope::PhraseAndWindow,
+                    ExactEvidenceScope::Phrase,
+                ] {
+                    exact.record(
+                        &format!("{scope:?} {query}"),
+                        timed(|| {
+                            format!(
+                                "{:?}",
+                                legacy.whole_corpus_exact_pass_scoped(
+                                    query,
+                                    &root,
+                                    Some(&filter),
+                                    &scope
+                                )
+                            )
+                        }),
+                        timed(|| {
+                            format!(
+                                "{:?}",
+                                data.whole_corpus_exact_pass_scoped(
+                                    query,
+                                    &root,
+                                    Some(&filter),
+                                    &scope
+                                )
+                            )
+                        }),
+                    );
+                }
+                let phrase = exact_lane::exact_phrase(query);
+                phrase_holders.record(
+                    query,
+                    timed(|| format!("{:?}", legacy.files_possibly_holding_phrase(phrase, &root))),
+                    timed(|| format!("{:?}", data.files_possibly_holding_phrase(phrase, &root))),
+                );
+                let runs = split_query(query).retained_runs;
+                anchored.record(
+                    query,
+                    timed(|| {
+                        let candidates =
+                            discover_anchored_candidate_files(&pair.legacy, &root, &runs, false);
+                        let executed = AnchoredLane::new()
+                            .execute_with_admission_report(&pair.legacy, &root, query, false);
+                        format!("{:?}\n{executed:?}", candidates.map(|files| files.len()))
+                    }),
+                    timed(|| {
+                        let candidates = anchored_candidate_files(&pair.data, &root, &runs, false);
+                        let executed =
+                            AnchoredLane::new().execute_on_data_view(&pair.data, &root, query, false);
+                        format!("{:?}\n{executed:?}", candidates.map(|files| files.len()))
+                    }),
+                );
+            }
+        }
+        let report = serde_json::json!({
+            "root": root,
+            "distinct_queries": distinct,
+            "build_ms_legacy_and_data": build.as_secs_f64() * 1000.0,
+            "lexical_lane": lanes.summary(),
+            "lexical_lane_include_tests": lanes_with_tests.summary(),
+            "rarest_three_in_order": picks_by_frequency.summary(),
+            "rarest_three_as_a_set": picks_as_sets.summary(),
+            "pool_size_files_vs_frequency": pool_by_file_rarity.summary(),
+            "unpooled_rank": unpooled.summary(),
+            "exact_pass": exact.summary(),
+            "files_possibly_holding_phrase": phrase_holders.summary(),
+            "anchored": anchored.summary(),
+        });
+        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        for (name, tally) in [
+            ("lexical_lane", &lanes),
+            ("lexical_lane_include_tests", &lanes_with_tests),
+            ("rarest_three_in_order", &picks_by_frequency),
+            ("rarest_three_as_a_set", &picks_as_sets),
+            ("pool_size_files_vs_frequency", &pool_by_file_rarity),
+            ("unpooled_rank", &unpooled),
+            ("exact_pass", &exact),
+            ("files_possibly_holding_phrase", &phrase_holders),
+            ("anchored", &anchored),
+        ] {
+            println!(
+                "{name}: {} of {} differ; legacy {:.3} ms, data {:.3} ms per call",
+                tally.differing,
+                tally.queries,
+                tally.legacy.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
+                tally.data.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
+            );
+        }
+    }
 }
