@@ -460,9 +460,48 @@ struct Members {
     /// holds no vectors of the model.
     set: Option<MemberSet>,
     coverage: Coverage,
+    /// The last subset a search kept, with which files it kept: searches
+    /// mostly ask for the same files (aft_search leaves tests out unless
+    /// asked), and preparing a subset sorts every member.
+    subset: Mutex<Option<(Vec<bool>, Arc<Subset>)>>,
+}
+
+/// The members of some of the files, prepared for searching, and each one's
+/// position among all members.
+struct Subset {
+    set: MemberSet,
+    positions: Vec<usize>,
 }
 
 impl Members {
+    /// The members of the files `included` names, by file, prepared for
+    /// `index`; kept for the next search that names the same files.
+    fn subset(
+        &self,
+        index: &VectorIndex<'_>,
+        included: Vec<bool>,
+    ) -> Result<Arc<Subset>, DataError> {
+        let mut kept = self.subset.lock().expect("no panics while holding it");
+        if let Some((files, subset)) = kept.as_ref().filter(|(files, _)| *files == included) {
+            debug_assert_eq!(files.len(), self.files.len());
+            return Ok(Arc::clone(subset));
+        }
+        let mut members = Vec::new();
+        let mut positions = Vec::new();
+        for (position, (member, file)) in self.members.iter().zip(&self.file_of).enumerate() {
+            if included[*file as usize] {
+                members.push(*member);
+                positions.push(position);
+            }
+        }
+        let subset = Arc::new(Subset {
+            set: index.member_set(members).map_err(store_error)?,
+            positions,
+        });
+        *kept = Some((included, Arc::clone(&subset)));
+        Ok(subset)
+    }
+
     fn build(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
         let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
         let surveyed = survey(view.current_state(), loaded, index.as_ref(), max_files)?;
@@ -478,6 +517,7 @@ impl Members {
             file_of: Vec::new(),
             chunk_of: Vec::new(),
             set: None,
+            subset: Mutex::new(None),
             coverage: Coverage {
                 files: surveyed.len(),
                 ..Coverage::default()
@@ -675,18 +715,8 @@ impl MeaningSnapshot {
         let (set, positions) = if included.iter().all(|included| *included) {
             (all, None)
         } else {
-            let mut kept = Vec::new();
-            let mut positions = Vec::new();
-            for (position, (member, file)) in
-                members.members.iter().zip(&members.file_of).enumerate()
-            {
-                if included[*file as usize] {
-                    kept.push(*member);
-                    positions.push(position);
-                }
-            }
-            subset = index.member_set(kept).map_err(store_error)?;
-            (&subset, Some(positions))
+            subset = members.subset(&index, included)?;
+            (&subset.set, Some(&subset.positions))
         };
         let found = index
             .search(
@@ -770,7 +800,72 @@ const ROUND_BYTES: usize = 64 << 20;
 /// writer, as a build does.
 const WRITER_WAIT: Duration = Duration::from_secs(60);
 
-/// How far a fill has come, reported after each round it publishes.
+/// How long a fill round waits for another fill of the same repository
+/// before it stops and is tried again later. Another round holds the lock
+/// while it embeds up to a round of files, which a slow local model can
+/// take minutes over.
+const FILL_WAIT: Duration = Duration::from_secs(600);
+
+/// The file in a family's folder whose lock a fill round holds while it
+/// embeds and publishes (see [`FillLock`]). The store ignores names it does
+/// not write.
+const FILL_LOCK: &str = "vector-fill.lock";
+
+/// One fill round's hold on its repository: while one round, in any
+/// process, embeds texts and publishes them, every other round of the
+/// repository waits, and then reads what it published before choosing what
+/// to embed. So two checkouts of one repository, in one process or two,
+/// never send the same text to the embedder. Released when dropped.
+struct FillLock {
+    _file: std::fs::File,
+}
+
+impl FillLock {
+    /// Takes the lock of the family in `dir`, waiting up to [`FILL_WAIT`];
+    /// `waiting` hears once if it has to wait.
+    fn take(dir: &Path, waiting: &mut dyn FnMut()) -> Result<Self, DataError> {
+        let path = dir.join(FILL_LOCK);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))?;
+        let deadline = Instant::now() + FILL_WAIT;
+        let mut told = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(DataError::Store(format!("{}: {error}", path.display())));
+                }
+            }
+            if !told {
+                waiting();
+                told = true;
+            }
+            if crate::executor::current_job_cancelled() {
+                return Err(DataError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(DataError::Busy(format!(
+                    "another fill of this repository held {} for over {} s",
+                    path.display(),
+                    FILL_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// How far a fill has come, reported after each round it publishes, and
+/// when a round starts and stops waiting for another process's fill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct FillProgress {
     /// Files this fill has finished, of the files it set out to fill.
@@ -778,6 +873,9 @@ pub struct FillProgress {
     pub files_total: usize,
     /// Texts embedded so far.
     pub chunks_embedded: usize,
+    /// The round is waiting for another fill of the same repository, in
+    /// this process or another, to publish what it is embedding.
+    pub waiting: bool,
 }
 
 /// What one fill did.
@@ -813,6 +911,11 @@ pub struct FillReport {
     pub chunk_ms: f64,
     pub embed_ms: f64,
     pub publish_ms: f64,
+    /// Files another fill of the repository published while this one
+    /// waited for it, which this one then left alone.
+    pub files_filled_elsewhere: usize,
+    /// Time spent waiting for other fills of the repository.
+    pub wait_ms: f64,
     /// Why the fill stopped before finishing; what it published stands.
     pub error: Option<String>,
 }
@@ -1063,6 +1166,85 @@ impl VectorPlane {
                 break;
             }
             rounds_run += 1;
+
+            // Cut the round's files, and collect the texts no segment holds.
+            let mut round = Vec::new();
+            let mut wanted: Vec<(TextDigest, String)> = Vec::new();
+            {
+                let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
+                let stored = |digest: &TextDigest| {
+                    index
+                        .as_ref()
+                        .is_some_and(|index| index.locate(*digest).is_some())
+                };
+                let mut seen = HashSet::new();
+                while round.len() < budget.files_per_round.max(1)
+                    && wanted.len().saturating_mul(per_vector) < ROUND_BYTES
+                {
+                    let Some((path, content)) = queue.next() else {
+                        break;
+                    };
+                    let started = Instant::now();
+                    let bytes = native_path(&path)
+                        .map(|relative| crate::project_content::read(parts.root.join(relative)));
+                    report.read_ms += elapsed_ms(started);
+                    let bytes = match bytes {
+                        Some(Ok(bytes)) if ContentKey::of(&bytes) == content => bytes,
+                        _ => {
+                            report.files_changed += 1;
+                            files_done += 1;
+                            continue;
+                        }
+                    };
+                    let started = Instant::now();
+                    let cut = cut_file(parts.root, &path, &bytes, self.producer.caps);
+                    report.chunk_ms += elapsed_ms(started);
+                    let chunks = match cut {
+                        Cut::Failed(reason) => Err(reason),
+                        Cut::Chunks(chunks) => Ok(chunks
+                            .into_iter()
+                            .map(|chunk| {
+                                let digest = TextDigest::of(chunk.text.as_bytes());
+                                report.chunks += 1;
+                                if stored(&digest) {
+                                    report.chunks_reused += 1;
+                                } else if seen.insert(digest) {
+                                    wanted.push((digest, chunk.text.clone()));
+                                }
+                                (digest, chunk)
+                            })
+                            .collect()),
+                    };
+                    round.push(RoundFile {
+                        path,
+                        content,
+                        chunks,
+                    });
+                }
+            }
+
+            // Wait for any other fill of the repository to publish, then
+            // leave out what it published: its texts' vectors, and the files
+            // whose chunk maps it finished.
+            let _lock = if wanted.is_empty() {
+                None
+            } else {
+                let started = Instant::now();
+                let waiting = FillProgress {
+                    files_done,
+                    files_total: report.files_queued,
+                    chunks_embedded: report.chunks_embedded,
+                    waiting: true,
+                };
+                let lock = FillLock::take(self.checkout.family_dir(), &mut || progress(waiting))?;
+                report.wait_ms += elapsed_ms(started);
+                loaded = self.load()?;
+                progress(FillProgress {
+                    waiting: false,
+                    ..waiting
+                });
+                Some(lock)
+            };
             let current = Arc::clone(&loaded);
             let index = current.shared.as_ref().map(SharedVectorIndex::index);
             let stored = |digest: &TextDigest| {
@@ -1070,53 +1252,29 @@ impl VectorPlane {
                     .as_ref()
                     .is_some_and(|index| index.locate(*digest).is_some())
             };
-
-            // Cut the round's files, and collect the texts no segment holds.
-            let mut round = Vec::new();
-            let mut wanted: Vec<(TextDigest, String)> = Vec::new();
-            let mut seen = HashSet::new();
-            while round.len() < budget.files_per_round.max(1)
-                && wanted.len().saturating_mul(per_vector) < ROUND_BYTES
-            {
-                let Some((path, content)) = queue.next() else {
-                    break;
-                };
-                let started = Instant::now();
-                let bytes = native_path(&path)
-                    .map(|relative| crate::project_content::read(parts.root.join(relative)));
-                report.read_ms += elapsed_ms(started);
-                let bytes = match bytes {
-                    Some(Ok(bytes)) if ContentKey::of(&bytes) == content => bytes,
-                    _ => {
-                        report.files_changed += 1;
-                        files_done += 1;
-                        continue;
+            let asked = wanted.len();
+            wanted.retain(|(digest, _)| !stored(digest));
+            report.chunks_reused += asked - wanted.len();
+            if asked > wanted.len() {
+                if let Some(index) = &index {
+                    let mut kept = Vec::with_capacity(round.len());
+                    for file in round {
+                        let done = current
+                            .chunk_map(index, file.content, &file.path)?
+                            .is_some_and(|(_, chunks)| {
+                                chunks
+                                    .iter()
+                                    .all(|chunk| chunk.failed || stored(&chunk.text))
+                            });
+                        if done {
+                            report.files_filled_elsewhere += 1;
+                            files_done += 1;
+                        } else {
+                            kept.push(file);
+                        }
                     }
-                };
-                let started = Instant::now();
-                let cut = cut_file(parts.root, &path, &bytes, self.producer.caps);
-                report.chunk_ms += elapsed_ms(started);
-                let chunks = match cut {
-                    Cut::Failed(reason) => Err(reason),
-                    Cut::Chunks(chunks) => Ok(chunks
-                        .into_iter()
-                        .map(|chunk| {
-                            let digest = TextDigest::of(chunk.text.as_bytes());
-                            report.chunks += 1;
-                            if stored(&digest) {
-                                report.chunks_reused += 1;
-                            } else if seen.insert(digest) {
-                                wanted.push((digest, chunk.text.clone()));
-                            }
-                            (digest, chunk)
-                        })
-                        .collect()),
-                };
-                round.push(RoundFile {
-                    path,
-                    content,
-                    chunks,
-                });
+                    round = kept;
+                }
             }
 
             // Embed them, each distinct text once.
@@ -1229,6 +1387,7 @@ impl VectorPlane {
                 files_done,
                 files_total: report.files_queued,
                 chunks_embedded: report.chunks_embedded,
+                waiting: false,
             });
             if report.error.is_some() {
                 report.files_left += queue.count();

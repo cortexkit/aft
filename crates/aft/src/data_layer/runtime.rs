@@ -1078,6 +1078,11 @@ impl DataCheckout {
     pub(crate) fn filling(&self) -> bool {
         self.work.filling.load(Ordering::Acquire)
     }
+
+    /// What the last fill round reported, if a fill ran.
+    pub(crate) fn meaning_progress(&self) -> Option<super::vectors::FillProgress> {
+        self.work.meaning.progress()
+    }
 }
 
 #[cfg(test)]

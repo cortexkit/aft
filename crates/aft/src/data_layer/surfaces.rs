@@ -388,9 +388,16 @@ fn meaning_json(checkout: &DataCheckout) -> Option<Value> {
         DataSemantic::NotServing(SemanticIndexStatus::Disabled) => json!({ "status": "disabled" }),
         DataSemantic::NotServing(SemanticIndexStatus::Ready { .. }) => json!({ "status": READY }),
     };
+    // A fill round waiting for another fill of the repository, in this
+    // process or another, embeds nothing until that one publishes.
+    let waiting = filling && checkout.meaning_progress().is_some_and(|step| step.waiting);
+    if waiting {
+        value["stage"] = json!(super::meaning::WAITING_STAGE);
+    }
     value["state"] = value["status"].clone();
     value["refreshing_count"] = json!(0);
     value["filling"] = json!(filling);
+    value["waiting_for_another_fill"] = json!(waiting);
     Some(value)
 }
 

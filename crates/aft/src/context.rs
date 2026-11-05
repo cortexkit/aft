@@ -10048,6 +10048,18 @@ impl AppContext {
             .then(|| config.semantic.clone())
     }
 
+    /// Whether the data layer's meaning plane serves this root's semantic
+    /// search: the data layer runs, binds this root (it is not withheld,
+    /// nor a parent folder of repositories), and semantic search is on and
+    /// admitted for it. Today's semantic index is then not built, so each
+    /// chunk is embedded once per repository rather than once per index.
+    pub(crate) fn data_layer_serves_meaning(&self) -> bool {
+        crate::data_layer::runtime::enabled()
+            && self.data_layer_withheld().is_none()
+            && crate::views::parent::session_for(self).is_none()
+            && self.data_meaning_config().is_some()
+    }
+
     /// The planes this root's checkout builds: the text index and the call
     /// graph, as `indexes.trigram` and `indexes.callgraph` switch them.
     pub(crate) fn data_layer_planes(&self) -> crate::data_layer::checkout::Planes {

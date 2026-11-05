@@ -6460,6 +6460,24 @@ fn schedule_artifact_loads_admitted(
         } else {
             load_semantic
         };
+    // With the data layer on, its meaning plane serves this root's semantic
+    // search and its checkout fills it (see `data_layer::meaning`); today's
+    // index is not built or loaded, so no chunk is embedded twice.
+    let load_semantic = if load_semantic && !views_enabled && ctx.data_layer_serves_meaning() {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: crate::data_layer::tools::search::DATA_LAYER_BUILD_STAGE.to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        // No legacy build will finish to release work held for it.
+        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
+        false
+    } else {
+        load_semantic
+    };
 
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.

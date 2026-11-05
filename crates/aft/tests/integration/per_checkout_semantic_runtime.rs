@@ -771,6 +771,207 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
     );
 }
 
+/// The same three scenarios on the data layer (`AFT_DATA_LAYER=1`), whose
+/// vector plane is filled per repository store: while one process's fill
+/// round embeds a chunk, a fill of the same repository in another process
+/// waits for it and then finds the vector stored, so the chunk is paid for
+/// once. The waiting process reports `stage: waiting_for_another_fill` and
+/// `waiting_for_another_fill: true` on status where the views lane reported
+/// `pending_reason` and `coordination_error`.
+#[test]
+fn data_layer_two_processes_single_flight_checkout_chunk() {
+    data_layer_two_process_single_flight(false, false);
+}
+
+#[test]
+fn data_layer_two_processes_single_flight_separate_base_scopes() {
+    data_layer_two_process_single_flight(true, true);
+}
+
+#[test]
+fn data_layer_two_processes_single_flight_inherited_and_checkout_chunk() {
+    data_layer_two_process_single_flight(true, false);
+}
+
+/// A standalone AFT process running the data layer over `storage`.
+fn data_layer_process(storage: &Path) -> crate::helpers::AftProcess {
+    crate::helpers::AftProcess::spawn_with_semantic_env(&[
+        ("AFT_STORAGE_DIR", storage.as_os_str()),
+        ("AFT_DATA_LAYER", std::ffi::OsStr::new("1")),
+    ])
+}
+
+/// Configures `process` on `root` with the mock embedder, views off.
+fn configure_data_layer(
+    process: &mut crate::helpers::AftProcess,
+    root: &Path,
+    storage: &Path,
+    server: &MockEmbedder,
+) {
+    let configured =
+        process.send(&configure_payload(root, storage, server, false, MODEL, 120_000).to_string());
+    assert_eq!(configured["success"], true, "{configured:?}");
+}
+
+/// Waits until the process's data layer has published its text plane and
+/// filled its meaning plane, and returns that status.
+fn wait_data_layer_filled(process: &mut crate::helpers::AftProcess) -> Value {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = process.send(r#"{"id":"data-layer-ready","command":"status"}"#);
+        if status["search_index"]["status"] == "ready"
+            && status["semantic_index"]["status"] == "ready"
+        {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the data layer never filled: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn data_layer_search(process: &mut crate::helpers::AftProcess, id: &str) -> Value {
+    process.send(
+        &json!({"id": id, "command": "semantic_search", "query": COMPLETION_QUERY, "top_k": 100})
+            .to_string(),
+    )
+}
+
+fn data_layer_two_process_single_flight(commit_main: bool, commit_linked: bool) {
+    let _settings = crate::test_helpers::without_storage_override();
+    let gate = Arc::new(EmbeddingGate::default());
+    let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    {
+        let mut warm = data_layer_process(storage.path());
+        configure_data_layer(&mut warm, &repo.main, storage.path(), &server);
+        wait_data_layer_filled(&mut warm);
+        assert_eq!(
+            server.texts(),
+            chunks,
+            "the data layer embeds each chunk once and builds no second index"
+        );
+    }
+    // The same new function in both worktrees, uncommitted unless a
+    // scenario commits it in one or both.
+    for root in [&repo.main, &repo.linked] {
+        write(
+            root,
+            "src/concurrent.rs",
+            "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
+        );
+    }
+    if commit_main {
+        git(&repo.main, &["add", "src/concurrent.rs"]);
+        git(&repo.main, &["commit", "-m", "new inherited chunk"]);
+    }
+    if commit_linked {
+        write(&repo.linked, ".gitignore", "# distinct base tree\n");
+        git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
+        git(
+            &repo.linked,
+            &["commit", "-m", "different base with shared chunk"],
+        );
+    }
+    let mut main = data_layer_process(storage.path());
+    let mut linked = data_layer_process(storage.path());
+    let _release = ReleaseEmbeddingGate(Arc::clone(&gate));
+    eprintln!(
+        "two-process data-layer fill: main_pid={} linked_pid={} storage={}",
+        main.pid(),
+        linked.pid(),
+        storage.path().display()
+    );
+    configure_data_layer(&mut main, &repo.main, storage.path(), &server);
+    let requests = gate.wait_for_first();
+    assert_eq!(requests[0].len(), 1, "one new function is one chunk");
+    configure_data_layer(&mut linked, &repo.linked, storage.path(), &server);
+    let deadline = Instant::now() + DEADLINE;
+    let waiting = loop {
+        let status = linked.send(r#"{"id":"contention","command":"status"}"#);
+        assert_eq!(
+            server.texts() - chunks,
+            1,
+            "the second process embedded the chunk the first is embedding"
+        );
+        if status["semantic_index"]["waiting_for_another_fill"] == true {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second process never waited for the first one's fill: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    eprintln!("waiting process status: {}", waiting["semantic_index"]);
+    assert_eq!(
+        waiting["semantic_index"]["stage"], "waiting_for_another_fill",
+        "{waiting}"
+    );
+    assert_eq!(waiting["semantic_index"]["status"], "building", "{waiting}");
+    assert_eq!(gate.state.lock().unwrap().0.len(), 1);
+    // Waiting is not an outage: the stored vectors still serve, and the
+    // new file is named as waiting.
+    let pending = data_layer_search(&mut linked, "pending-query");
+    assert_eq!(pending["complete"], false, "{pending}");
+    assert!(
+        pending["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "stored vectors stopped serving while the fill waited: {pending}"
+    );
+    assert!(
+        pending["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("src/concurrent.rs")),
+        "{pending}"
+    );
+    gate.release();
+    for process in [&mut main, &mut linked] {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let answer = data_layer_search(process, "ready-query");
+            if answer["complete"] == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the meaning plane never filled: {answer}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert_eq!(
+        server.texts() - chunks,
+        1,
+        "the second process embedded the chunk after the first published it"
+    );
+    drop(main);
+    drop(linked);
+
+    // Later sessions on both worktrees embed nothing and rank alike.
+    let mut answers = Vec::new();
+    for root in [&repo.main, &repo.linked] {
+        let mut reopened = data_layer_process(storage.path());
+        configure_data_layer(&mut reopened, root, storage.path(), &server);
+        wait_data_layer_filled(&mut reopened);
+        let answer = data_layer_search(&mut reopened, "reopened-query");
+        assert_eq!(answer["complete"], true, "{answer}");
+        answers.push(ranked(root, &answer));
+    }
+    assert!(!answers[0].is_empty());
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(
+        server.texts() - chunks,
+        1,
+        "reopened sessions must reuse stored vectors"
+    );
+}
+
 /// The model fingerprint of the root's served semantic view, if any.
 fn served_model(ctx: &AppContext) -> Option<String> {
     ctx.checkout_semantic_runtime().map(|runtime| {

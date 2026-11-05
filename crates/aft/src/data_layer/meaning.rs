@@ -37,6 +37,11 @@ pub(crate) const STARTING_STAGE: &str = "loading_embedding_model";
 /// serve yet.
 pub(crate) const FILLING_STAGE: &str = "filling";
 
+/// The stage a meaning plane reports while its fill waits for another fill
+/// of the same repository, in this process or another, to publish what it
+/// is embedding; it then embeds only what that one did not.
+pub(crate) const WAITING_STAGE: &str = "waiting_for_another_fill";
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
