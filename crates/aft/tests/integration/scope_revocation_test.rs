@@ -506,6 +506,16 @@ async fn describe(stream: &mut tokio::net::TcpStream) -> Frame {
 }
 
 async fn describe_phase(stream: &mut tokio::net::TcpStream, phase: &str) -> Frame {
+    describe_scope_phase(stream, phase, "run-scope").await
+}
+
+/// Read AFT's next frame, which must be a scope.describe for the scope named
+/// `scope_ref` under [`stamp`]'s owner.
+async fn describe_scope_phase(
+    stream: &mut tokio::net::TcpStream,
+    phase: &str,
+    scope_ref: &str,
+) -> Frame {
     let request = read_frame_timeout(stream, phase).await;
     assert_eq!(
         request.header.ty,
@@ -519,8 +529,8 @@ async fn describe_phase(stream: &mut tokio::net::TcpStream, phase: &str) -> Fram
     let body: subc_protocol::session::ModuleControlRequestFromModule =
         serde_json::from_slice(&request.body).unwrap();
     assert!(
-        matches!(body, subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {owner, scope_ref}
-        if owner == stamp().owner && scope_ref == "run-scope")
+        matches!(body, subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {owner, scope_ref: described}
+        if owner == stamp().owner && described == scope_ref)
     );
     request
 }
@@ -1567,9 +1577,13 @@ fn codemode_call_needing_an_ask_is_refused_permission_ask_unavailable() {
     );
 }
 
+/// A codemode program's background task belongs to the head the program ran
+/// for. The program usually returns right after starting it, and its run
+/// route then closes: the task keeps running in the head's session. Only the
+/// head's own confirmed scope end stops it.
 #[cfg(unix)]
 #[test]
-fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
+fn codemode_background_task_outlives_its_run_and_ends_with_its_head() {
     run_subc_bridge_test_with_dispatch(
         "codemode-background-run-end",
         Duration::from_secs(30),
@@ -1577,9 +1591,7 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
             use subc_protocol::scope::ScopeStatus;
             let mut daemon = open_scope_daemon_session(input).await;
             bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
-            // Two routes of one run: closing one is a transient close.
             bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
-            bind_run(&mut daemon.stream, &daemon.root2, 3, stamp()).await;
             let pid_path = daemon.root1.join("background.pid");
             let command = format!(
                 "(trap '' TERM; sleep 30) & echo $! > '{}'; wait",
@@ -1637,29 +1649,28 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
                 "{}",
                 reply_text(&status)
             );
-            // A transient close without a definitive describe keeps it running.
+            // The program returns and its run route closes. The task is the
+            // head's, so nothing of the run is left for AFT to stop: it asks
+            // no scope.describe about the run, and the task keeps running.
             send_route_goodbye(&mut daemon.stream, 2, 200).await;
-            let request = describe_phase(&mut daemon.stream, "transient close describe").await;
-            answer(
+            no_extra_frames_until_pong(
                 &mut daemon.stream,
-                &request,
-                ScopeStatus::Live,
-                true,
-                Some(1),
+                9100,
+                "closed run keeps the head's task",
             )
             .await;
-            no_extra_frames_until_pong(&mut daemon.stream, 9100, "live run keeps its task").await;
             assert!(
                 alive(pid),
-                "a transient close must not kill the program's task"
+                "the run's end must not kill the head's background task"
             );
             let snapshot = registry
                 .status(&task, "head-session", None, None, 0)
                 .unwrap();
             assert_eq!(snapshot.info.status, BgTaskStatus::Running);
-            // The run's end, confirmed by describe, kills it.
-            send_route_goodbye(&mut daemon.stream, 3, 201).await;
-            let request = describe_phase(&mut daemon.stream, "run end describe").await;
+            // The head's own end, confirmed by describe, kills it.
+            send_route_goodbye(&mut daemon.stream, 1, 201).await;
+            let request =
+                describe_scope_phase(&mut daemon.stream, "head end describe", "head-scope").await;
             answer(
                 &mut daemon.stream,
                 &request,
@@ -1669,7 +1680,13 @@ fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
             )
             .await;
             wait_dead(pid).await;
-            assert_run_kill_settled(&pid_path, "head-session").await;
+            assert_scope_kill_settled_as(
+                &pid_path,
+                "head-session",
+                "scope_revoked",
+                "killed (scope revoked)",
+            )
+            .await;
             send_connection_goodbye(&mut daemon.stream).await;
         },
         |_, _, _| {},
