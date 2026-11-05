@@ -10098,6 +10098,12 @@ mod views_import_tests;
 mod tests {
     #[path = "disk_reserve_tests.rs"]
     mod disk_reserve_tests;
+
+    /// How long a test waits for background work it started (a
+    /// materialization starting or publishing) before failing. The wait ends
+    /// as soon as the work does; a loaded Windows runner needed more than 10 s.
+    const POSITIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     #[test]
     fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
         use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};
@@ -15581,7 +15587,7 @@ mod tests {
         };
         let worker = spawn_read();
         let bound = crate::views::contracts::CALLGRAPH_QUERY_WAIT;
-        let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+        let entered = entered_rx.recv_timeout(POSITIVE_WAIT);
         // A reader queued behind the first read gets the same total budget,
         // not another full wait after the first read releases the query lock.
         let concurrent = spawn_read();
@@ -15680,7 +15686,7 @@ mod tests {
             }
         }
 
-        published_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        published_rx.recv_timeout(POSITIVE_WAIT).unwrap();
         let started = Instant::now();
         let next = ctx.with_ready_callgraph_for_test(|| {
             crate::commands::callers::handle_callers(&callers_request, &ctx)
@@ -15837,7 +15843,7 @@ mod tests {
                 ))
                 .unwrap();
         });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        entered_rx.recv_timeout(POSITIVE_WAIT).unwrap();
         let reserved_during_build =
             crate::blob_store::v3::LedgerReader::open_existing(&storage, &family)
                 .unwrap()
@@ -16959,7 +16965,7 @@ mod tests {
                 Response::success("delayed-semantic-refresh", json!({ "worker_exited": true }))
             }),
         );
-        if let Err(error) = entered_rx.recv_timeout(Duration::from_secs(10)) {
+        if let Err(error) = entered_rx.recv_timeout(POSITIVE_WAIT) {
             let events = observed_rx.recv_timeout(Duration::from_secs(10));
             panic!("real refresh did not reach embedding: {error}; events={events:?}");
         }
