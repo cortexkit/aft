@@ -50,6 +50,7 @@ impl Held {
 }
 
 struct Sample {
+    started: Instant,
     admission: Duration,
     egress_queue: Duration,
 }
@@ -317,6 +318,7 @@ impl Fixture {
             "the reply settled and kept its body"
         );
         Sample {
+            started,
             admission,
             egress_queue: queued.expect("the reply kept its write trace"),
         }
@@ -515,6 +517,18 @@ async fn keyed_read_egress_queue_load_harness() {
                 &format!("keyed {label} admission"),
                 samples.iter().map(|sample| sample.admission).collect()
             )
+        );
+    }
+    // Edits are few, so list each one with when it started.
+    for (index, edit) in edits.iter().enumerate() {
+        eprintln!(
+            "keyed edit {index} started at {:.0}ms: admission {:.2}ms, egress_queue {:.2}ms",
+            edit.started
+                .saturating_duration_since(started)
+                .as_secs_f64()
+                * 1_000.0,
+            edit.admission.as_secs_f64() * 1_000.0,
+            edit.egress_queue.as_secs_f64() * 1_000.0,
         );
     }
     eprintln!(
