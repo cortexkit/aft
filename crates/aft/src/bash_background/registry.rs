@@ -4254,6 +4254,11 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn observed_erased_watch_reference(&self, task_id: &str) -> bool {
+        if let Some(identity) = super::TaskIdentity::current() {
+            if !self.task_identity_allows_current(&identity.session, task_id) {
+                return false;
+            }
+        }
         // A task this registry still runs is not erased whatever its row
         // state: its output is still captured and its watches still scan, so
         // reporting it as a terminal storage failure would be false.
@@ -9257,6 +9262,9 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: &Path,
     ) -> Option<String> {
+        if !self.task_identity_allows_current(session_id, task_id) {
+            return None;
+        }
         validate_task_id(task_id).ok()?;
         let pool = self.inner.db_pool.read().ok()?.clone()?;
         let conn = pool.lock().ok()?;
@@ -10732,6 +10740,9 @@ impl BgTaskRegistry {
         let mut lines = Vec::new();
         for task_id in task_ids {
             let Some(task) = self.task_for_session(&task_id, session_id) else {
+                if self.task(&task_id).is_some() {
+                    self.index_cancelled_call_here(session_id, &task_id);
+                }
                 continue;
             };
             let mut db = DeferredDbWrites::new(self, &task);
