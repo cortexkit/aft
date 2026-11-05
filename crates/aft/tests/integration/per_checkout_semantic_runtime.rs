@@ -959,8 +959,21 @@ fn data_layer_two_process_single_flight(commit_main: bool, commit_linked: bool) 
         let mut reopened = data_layer_process(storage.path());
         configure_data_layer(&mut reopened, root, storage.path(), &server);
         wait_data_layer_filled(&mut reopened);
-        let answer = data_layer_search(&mut reopened, "reopened-query");
-        assert_eq!(answer["complete"], true, "{answer}");
+        // A reply can still name watcher changes the process has not applied
+        // yet (the `watcher_pending` gap), which also makes it incomplete;
+        // ask again until it is complete.
+        let deadline = Instant::now() + DEADLINE;
+        let answer = loop {
+            let answer = data_layer_search(&mut reopened, "reopened-query");
+            if answer["complete"] == true {
+                break answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a reopened session never answered completely: {answer}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
         answers.push(ranked(root, &answer));
     }
     assert!(!answers[0].is_empty());
