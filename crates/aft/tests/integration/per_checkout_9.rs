@@ -1669,13 +1669,24 @@ fn slow_discovery_never_delays_the_bind() {
     assert_eq!(session.children().len(), 20);
     let after = grep(&ctx, "anything");
     assert!(!gap_kinds(&after).contains(&"parent_discovering".to_string()));
-    assert_eq!(
-        gap_kinds(&after)
+    // Each child is named as loading only until its own checkout publishes,
+    // then answered, so every child is eventually searched.
+    let answered_by = Instant::now() + DEADLINE;
+    loop {
+        let reply = grep(&ctx, "anything");
+        let unavailable = gap_kinds(&reply)
             .iter()
             .filter(|kind| *kind == "parent_child_unavailable")
-            .count(),
-        20
-    );
+            .count();
+        if unavailable == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < answered_by,
+            "{unavailable} children never answered: {reply:#}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Pi uses this stdin/stdout loop, not a daemon actor. Opening the view's
