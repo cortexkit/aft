@@ -9897,8 +9897,9 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     expect_route_bind_ack(&mut stream, 796).await;
     send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
     send_bg_events_subscribe(&mut stream, FOREIGN_BG_CHANNEL, FOREIGN_BG_CORR).await;
-    // Subscription seeds are unrelated to the task. Wait until both empty
-    // subscriptions settle before testing which caller the pattern wakes.
+    // Health requests can overtake subscriptions on the control channel. Wait
+    // for both subscriptions to install and their initial seeds to settle before
+    // testing which caller the pattern wakes.
     loop {
         send_control_request(&mut stream, 798, ModuleControlRequest::HealthCheck {}).await;
         let report = loop {
@@ -9932,9 +9933,15 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         if report
             .metrics
             .as_ref()
-            .and_then(|metrics| metrics.pointer("/runtime/bg_wake_pending"))
+            .and_then(|metrics| metrics.pointer("/runtime/bg_subscriptions"))
             .and_then(Value::as_u64)
-            == Some(0)
+            == Some(2)
+            && report
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.pointer("/runtime/bg_wake_pending"))
+                .and_then(Value::as_u64)
+                == Some(0)
         {
             break;
         }
