@@ -85,7 +85,7 @@ impl DeadCodeSources {
             return None;
         }
         let started = Instant::now();
-        match view.dead_code_snapshot() {
+        match view.dead_code_snapshot_shared() {
             Ok(snapshot) => {
                 crate::slog_info!(
                     "perf tier2_callgraph_snapshot: source=data_layer files={} exports={} edges={} entry_points={} ms={}",
@@ -100,7 +100,7 @@ impl DeadCodeSources {
                     snapshot.entry_points.len(),
                     started.elapsed().as_millis()
                 );
-                Some(Arc::new(snapshot))
+                Some(snapshot)
             }
             Err(error) => {
                 crate::slog_warn!(

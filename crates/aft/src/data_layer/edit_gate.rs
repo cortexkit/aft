@@ -636,9 +636,15 @@ pub fn run_reuse(
             edits.push(value);
         }
     }
-    // The checkout at the end of each commit, resolved cold.
+    // The checkout at the end of each commit, resolved cold. Each
+    // resolution is kept as its fragment bytes, as the store keeps it, and
+    // identical fragments are kept once, so the gate's memory does not grow
+    // with every commit's decoded resolution.
     let mut checkouts = Vec::new();
     let mut cold_ms = Vec::new();
+    // For each (record key, path): its distinct fragments, and which
+    // commits resolved to each.
+    let mut distinct = BTreeMap::<(String, String), Vec<(Vec<u8>, BTreeSet<usize>)>>::new();
     for (index, edit) in edits.iter().enumerate() {
         let path = edit["path"].as_str().ok_or("edit without path")?;
         if edit["kind"] == "delete" {
@@ -651,33 +657,62 @@ pub fn run_reuse(
             .get(index + 1)
             .is_none_or(|next| next["commit"] != edit["commit"]);
         if last_of_commit {
+            let commit = checkouts.len();
             let inputs = files.inputs();
             let started = Instant::now();
             let cold = resolve_checkout(&inputs, threads).map_err(|error| error.to_string())?;
             cold_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-            checkouts.push((inputs, cold));
+            for (path, file) in &cold {
+                let key = inputs.parses[path].0.clone();
+                let bytes = super::fragment::encode(file);
+                let variants = distinct.entry((key, path.clone())).or_default();
+                match variants.iter_mut().find(|(known, _)| *known == bytes) {
+                    Some((_, sources)) => {
+                        sources.insert(commit);
+                    }
+                    None => variants.push((bytes, BTreeSet::from([commit]))),
+                }
+            }
+            checkouts.push(inputs);
         }
     }
-    let distinct = super::reuse::distinct_resolutions(&checkouts);
+    let decode = |key: &str, path: &str, bytes: &[u8]| {
+        super::fragment::decode(key, path, bytes)
+            .map_err(|error| format!("{path}: fragment does not decode: {error:?}"))
+    };
     let mut failures = 0;
-    for (commit, (inputs, cold)) in checkouts.iter().enumerate() {
-        // Only resolutions some other commit made.
-        let pool = distinct
+    for (commit, inputs) in checkouts.iter().enumerate() {
+        // Only resolutions some other commit made, decoded for this commit
+        // alone.
+        let mut owned = Vec::<((String, String), Vec<FileResolution>)>::new();
+        let mut cold = BTreeMap::new();
+        for ((key, path), variants) in &distinct {
+            let mut others = Vec::new();
+            for (bytes, sources) in variants {
+                if sources.contains(&commit) {
+                    cold.insert(path.clone(), decode(key, path, bytes)?);
+                }
+                if sources.iter().any(|source| *source != commit) {
+                    others.push(decode(key, path, bytes)?);
+                }
+            }
+            if !others.is_empty() {
+                owned.push(((key.clone(), path.clone()), others));
+            }
+        }
+        let pool = owned
             .iter()
-            .map(|(file, variants)| {
+            .map(|((key, path), variants)| {
                 (
-                    *file,
-                    variants
-                        .iter()
-                        .filter(|(_, sources)| sources.iter().any(|source| *source != commit))
-                        .map(|(resolution, _)| *resolution)
-                        .collect::<Vec<_>>(),
+                    (key.as_str(), path.as_str()),
+                    variants.iter().collect::<Vec<_>>(),
                 )
             })
-            .filter(|(_, variants)| !variants.is_empty())
             .collect();
         let (reused, stats) = super::reuse::resolve_reusing(inputs, &pool, threads)
             .map_err(|error| error.to_string())?;
+        drop(pool);
+        drop(owned);
         let mut record = ReuseRecord {
             commit,
             cold_ms: cold_ms[commit],
@@ -686,7 +721,7 @@ pub fn run_reuse(
             differing_recordings: 0,
             examples: Vec::new(),
         };
-        let (answers, recordings) = compare(&reused, cold, &mut record.examples);
+        let (answers, recordings) = compare(&reused, &cold, &mut record.examples);
         record.differing_files = answers;
         record.differing_recordings = recordings;
         if answers > 0 || recordings > 0 {

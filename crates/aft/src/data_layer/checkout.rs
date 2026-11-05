@@ -175,6 +175,37 @@ struct Refreshed {
     replaced: BTreeMap<String, (String, Arc<ParseBlob>, Arc<FileResolution>)>,
     /// Files the publication has that the checkout no longer parses.
     removed: BTreeSet<String>,
+    /// The dead-code snapshot of this call graph, built on first use.
+    dead_code: DeadCodeMemo,
+}
+
+/// A dead-code snapshot built once for one call graph and shared by every
+/// request that asks for it while that graph is served. Building it reads
+/// every stored record and fragment, so concurrent first requests wait for
+/// one build rather than each starting their own. A copy starts empty: a
+/// memo belongs to the call graph it was built for.
+#[derive(Default)]
+struct DeadCodeMemo(Mutex<Option<Arc<crate::inspect::job::CallgraphSnapshot>>>);
+
+impl Clone for DeadCodeMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl DeadCodeMemo {
+    fn get_or_build(
+        &self,
+        build: impl FnOnce() -> Result<crate::inspect::job::CallgraphSnapshot, DataError>,
+    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+        let mut slot = self.0.lock().expect("no panics while holding it");
+        if let Some(snapshot) = slot.as_ref() {
+            return Ok(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(build()?);
+        *slot = Some(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
 }
 
 /// How long a build waits for another process to release the store's
@@ -862,17 +893,22 @@ impl Checkout {
             }
             stats = Some(update);
         }
-        let overlay = engine.overlay.clone();
-        let refreshed = engine.refreshed.clone();
+        // A refresh that applied nothing keeps the served graph, and with it
+        // any dead-code snapshot already built for it.
+        let served = stats
+            .is_some()
+            .then(|| (engine.overlay.clone(), engine.refreshed.clone()));
         let mut live = self.write_live();
         if live
             .published
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &published))
         {
-            let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
-            live.graph = Some(graph);
-            live.refreshed = Some(Arc::new(refreshed));
+            if let Some((overlay, refreshed)) = served {
+                let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
+                live.graph = Some(graph);
+                live.refreshed = Some(Arc::new(refreshed));
+            }
             let resolved = live
                 .changes
                 .iter()
@@ -914,6 +950,7 @@ impl Checkout {
                 state: published.state.clone(),
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
+                dead_code: DeadCodeMemo::default(),
             },
         })
     }
@@ -966,6 +1003,9 @@ struct Published {
     /// Paths in a parsed language with no stored resolution: their
     /// extraction failed.
     unparsed: BTreeSet<Vec<u8>>,
+    /// The dead-code snapshot of the published call graph, built on first
+    /// use.
+    dead_code: DeadCodeMemo,
     /// Holds the lease that keeps this generation's files on disk while any
     /// view reads them.
     _snapshot: Snapshot,
@@ -1059,6 +1099,7 @@ impl Published {
             membership,
             graph: Arc::new(graph),
             unparsed,
+            dead_code: DeadCodeMemo::default(),
             _snapshot: snapshot,
         })
     }
@@ -1214,6 +1255,29 @@ impl CheckoutView {
     ///
     /// When a record or fragment cannot be read.
     pub(crate) fn dead_code_snapshot(
+        &self,
+    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+        self.dead_code_snapshot_shared()
+            .map(|snapshot| crate::inspect::job::CallgraphSnapshot::clone(&snapshot))
+    }
+
+    /// [`Self::dead_code_snapshot`], built once per call graph: every view
+    /// of the same publication and refresh shares it.
+    ///
+    /// # Errors
+    ///
+    /// When a record or fragment cannot be read.
+    pub(crate) fn dead_code_snapshot_shared(
+        &self,
+    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+        let memo = match &self.refreshed {
+            Some(refreshed) => &refreshed.dead_code,
+            None => &self.published.dead_code,
+        };
+        memo.get_or_build(|| self.build_dead_code_snapshot())
+    }
+
+    fn build_dead_code_snapshot(
         &self,
     ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
         let (mut parses, mut resolved) = self
