@@ -8352,6 +8352,63 @@ mod tests {
     }
 
     #[test]
+    fn switched_off_callgraph_reports_off_not_building_in_a_contended_read() {
+        crate::data_layer::runtime::force_on_for_test();
+        let executor = Executor::new();
+        let (_dir, root) = test_root("health-callgraph-switched-off");
+        std::fs::write(root.as_path().join("lib.rs"), "pub fn lib() {}\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().to_path_buf());
+        config.indexes.callgraph = false;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        // Bound with the text plane alone: the call graph is off because the
+        // configuration switches it off, not because nothing bound the root.
+        let checkout = ctx.data_checkout().expect("the data layer binds the root");
+        assert!(!checkout.checkout().planes().callgraph);
+        assert!(executor.register_actor(root.clone(), ctx));
+
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &app);
+        let metrics = DispatchPathMetrics::new();
+        let mut reads = 0;
+        let report = health_report_after_scheduler_contention(
+            "switched_off_callgraph_reports_off_not_building_in_a_contended_read",
+            || {
+                reads += 1;
+                let read_report =
+                    || build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+                if reads <= 3 {
+                    health_report_while_scheduler_locked(&executor, read_report)
+                } else {
+                    read_report()
+                }
+            },
+        );
+        // The scheduler thread itself may also hold the lock on a later read, so
+        // more retries are valid; three forced collisions need at least four.
+        assert!(reads >= 4, "the test must retry the three contended reads");
+
+        assert_ne!(
+            report.status,
+            HealthStatus::Degraded,
+            "a switched-off call graph is not a degradation: {report:?}"
+        );
+        // build_health_report reads one rollup Arc for both the verdict and
+        // the roots detail, so they describe the same moment.
+        let metrics = report.metrics.expect("health metrics");
+        assert_eq!(
+            metrics["roots"][0]["callgraph_store"],
+            json!({"status": "off"}),
+            "a switched-off call graph reports off, never building: {metrics:#}"
+        );
+    }
+
+    #[test]
     fn overdue_bind_refusal_blames_the_oldest_reader_only_while_the_bind_is_queued() {
         let reader = |request_id: &str, command: &str, started_age_ms: u64| {
             crate::executor::BindBlockerReaderSnapshot {
