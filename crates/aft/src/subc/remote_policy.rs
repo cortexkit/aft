@@ -219,6 +219,7 @@ fn catalog_inner(
             ctx.config().revision_reads,
             worker_wait_max_ms,
             confined(ctx, identity)?,
+            tool_provider::HeadSettings::from_config(&ctx.config()),
         );
     }
     let mut routing_policy = if preset == "worker"
@@ -356,20 +357,26 @@ fn catalog_inner(
     } else {
         confined(ctx, identity)?
     };
-    let render = if is_confined {
-        tool_provider::catalog_for_confined_request
-    } else {
-        tool_provider::catalog_for_request
-    };
-    let answer = render(
+    let (answer, registration) = tool_provider::catalog_for_route(
         request,
         catalog_preset,
         &identity.disabled_tools,
         powershell,
-        runon.is_ok(),
-        ctx.config().revision_reads,
+        (runon.is_ok(), ctx.config().revision_reads),
         worker_wait_max_ms,
+        is_confined,
+        tool_provider::HeadSettings::from_config(&ctx.config()),
     )?;
+    // A runner head's `read` and `edit` follow the edit mode its catalog was
+    // rendered for, so the session's hashline binding is installed with it.
+    if let Some(registration) = registration {
+        tool_provider::register_runner_head_edit_mode(
+            ctx,
+            &identity.project_root,
+            &identity.session,
+            registration,
+        );
+    }
     // Digest-only replies have no tools array. For those, use the renderer's
     // tool selection and its confinement filter to describe the full catalog.
     let bash_in_catalog = answer

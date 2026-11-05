@@ -303,18 +303,24 @@ impl DatabaseWaits {
             return Err(decoded);
         }
         if identity.role == tool_provider::RouteRole::ToolProviderV1 {
-            let Ok(call) = serde_json::from_value::<
+            let Ok(mut call) = serde_json::from_value::<
                 cortexkit_role_tool_provider::call::ToolCallRequest,
             >(body.clone()) else {
                 return Err(decoded);
             };
-            if tool_provider::admit(
+            tool_provider::route_head_call_name(&mut call, identity.scope.is_some());
+            if tool_provider::admit_for_session(
                 &call,
                 identity.scope.is_some(),
                 &identity.disabled_tools,
                 crate::bash_background::powershell_available(),
                 &identity.session,
                 !matches!(identity.trust, BindTrust::Untrusted),
+                tool_provider::runner_head_hashline(
+                    &ctx,
+                    &identity.project_root,
+                    &identity.session,
+                ),
             )
             .is_err()
             {
