@@ -199,6 +199,10 @@ struct Live {
     unparsed: Arc<BTreeSet<Vec<u8>>>,
     /// Changed contents' trigrams by path, which text queries see at once.
     text: Arc<TextOverlay>,
+    /// The publication's text members with `text` set aside, built by the
+    /// first trigram lookup and shared by every view until `text` or the
+    /// publication changes (each replaces `text`, which resets it).
+    text_members: Arc<std::sync::OnceLock<aft_store::text::TextMembers>>,
     /// Paths changed since the publication whose call graph is not
     /// resolved yet.
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
@@ -256,6 +260,47 @@ struct Refreshed {
     removed: BTreeSet<String>,
     /// The dead-code snapshot of this call graph, built on first use.
     dead_code: DeadCodeMemo,
+}
+
+/// Each published path's [`PathText`] once read, by position: a lexical query
+/// scores thousands of candidates, and every read otherwise goes through the
+/// block cache. A publication never changes, so an entry never goes stale.
+struct PathTextMemo(Box<[std::sync::atomic::AtomicU32]>);
+
+impl PathTextMemo {
+    /// Not read yet.
+    const UNKNOWN: u32 = u32::MAX;
+    const UNINDEXED: u32 = u32::MAX - 1;
+    const EXCLUDED: u32 = u32::MAX - 2;
+
+    fn new(paths: usize) -> Self {
+        Self(
+            (0..paths)
+                .map(|_| std::sync::atomic::AtomicU32::new(Self::UNKNOWN))
+                .collect(),
+        )
+    }
+
+    fn get(&self, index: usize) -> Option<PathText> {
+        match self.0[index].load(std::sync::atomic::Ordering::Relaxed) {
+            Self::UNKNOWN => None,
+            Self::UNINDEXED => Some(PathText::Unindexed),
+            Self::EXCLUDED => Some(PathText::Excluded),
+            distinct => Some(PathText::Indexed { distinct }),
+        }
+    }
+
+    /// Records `text`, unless it is a distinct count too large to tell from
+    /// the markers, which is then read again each time.
+    fn set(&self, index: usize, text: PathText) {
+        let code = match text {
+            PathText::Indexed { distinct } if distinct < Self::EXCLUDED => distinct,
+            PathText::Indexed { .. } => return,
+            PathText::Unindexed => Self::UNINDEXED,
+            PathText::Excluded => Self::EXCLUDED,
+        };
+        self.0[index].store(code, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A dead-code snapshot built once for one call graph and shared by every
@@ -443,6 +488,7 @@ impl Checkout {
             live.early.clear();
             live.state = None;
             live.text = Arc::new(TextOverlay::default());
+            live.text_members = Arc::default();
             live.callgraph_pending = Arc::new(BTreeSet::new());
             live.graph = None;
             live.refreshed = None;
@@ -491,7 +537,7 @@ impl Checkout {
             published,
             planes: self.planes,
             text: Arc::clone(&live.text),
-            text_members: Arc::default(),
+            text_members: Arc::clone(&live.text_members),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
             graph,
             refreshed: live.refreshed.clone(),
@@ -801,6 +847,7 @@ impl Checkout {
             );
         }
         live.text = Arc::new(text);
+        live.text_members = Arc::default();
         live.callgraph_pending = Arc::new(pending);
         live.unparsed = Arc::new(unparsed);
         live.state = Some(Arc::new(state));
@@ -1189,6 +1236,7 @@ impl Checkout {
             let mut text = (*live.text).clone();
             text.retain(|path| kept.contains(path));
             live.text = Arc::new(text);
+            live.text_members = Arc::default();
             live.callgraph_pending = Arc::new(
                 live.callgraph_pending
                     .iter()
@@ -2026,6 +2074,10 @@ struct Published {
     /// The dead-code snapshot of the published call graph, built on first
     /// use.
     dead_code: DeadCodeMemo,
+    /// Each published path's text standing as the lexical score reads it,
+    /// by position, read from its segment on first use (see
+    /// [`CheckoutView::published_path_text`]).
+    path_texts: PathTextMemo,
     /// Holds the lease that keeps this generation's files on disk while any
     /// view reads them.
     _snapshot: Snapshot,
@@ -2136,6 +2188,7 @@ impl Published {
             ));
         }
         let graph = StoredSlices::open_files(segments.clone(), &files).map_err(DataError::Store)?;
+        let path_texts = PathTextMemo::new(state.paths().len());
         Ok(Self {
             root,
             identity,
@@ -2147,6 +2200,7 @@ impl Published {
             graph_built,
             unparsed,
             dead_code: DeadCodeMemo::default(),
+            path_texts,
             _snapshot: snapshot,
         })
     }
@@ -2343,9 +2397,15 @@ impl CheckoutView {
     ///
     /// When a segment cannot be read.
     pub fn published_path_text(&self, index: usize) -> Result<PathText, DataError> {
+        let memo = &self.published.path_texts;
+        if let Some(text) = memo.get(index) {
+            return Ok(text);
+        }
         let texts = self.published.texts()?;
-        aft_store::text::published_path_text(&self.published.membership, &texts, index)
-            .map_err(DataError::store)
+        let text = aft_store::text::published_path_text(&self.published.membership, &texts, index)
+            .map_err(DataError::store)?;
+        memo.set(index, text);
+        Ok(text)
     }
 
     /// The publication's indexed paths not in this view's changes, grouped
