@@ -251,9 +251,68 @@ pub fn paths_with_trigram(
 /// many trigrams over the same state and overlay.
 #[derive(Debug)]
 pub struct TextMembers {
-    /// Per segment: its members as (ordinal, path index), sorted, and their
-    /// distinct ordinals ascending.
-    segments: Vec<(Vec<(u32, usize)>, Vec<u32>)>,
+    segments: Vec<SegmentMembers>,
+}
+
+/// One segment's members among a checkout's paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SegmentMembers {
+    /// (ordinal, path index), sorted. Paths with the same content share an
+    /// ordinal.
+    members: Vec<(u32, usize)>,
+    /// The distinct ordinals of `members`, ascending.
+    ordinals: Vec<u32>,
+    /// By ordinal, the position in `members` of its first member, or
+    /// [`SegmentMembers::NONE`]: a posting maps to its paths without a search.
+    first: Vec<u32>,
+}
+
+impl SegmentMembers {
+    const NONE: u32 = u32::MAX;
+
+    fn new(mut members: Vec<(u32, usize)>) -> Self {
+        members.sort_unstable();
+        let mut ordinals = members
+            .iter()
+            .map(|(ordinal, _)| *ordinal)
+            .collect::<Vec<_>>();
+        ordinals.dedup();
+        let len = ordinals.last().map_or(0, |last| *last as usize + 1);
+        let mut first = vec![Self::NONE; len];
+        for (position, (ordinal, _)) in members.iter().enumerate().rev() {
+            first[*ordinal as usize] = position as u32;
+        }
+        Self {
+            members,
+            ordinals,
+            first,
+        }
+    }
+
+    /// Whether this checkout holds most of the ordinal range its members
+    /// span, so walking a trigram's whole posting list costs no more than
+    /// walking the members.
+    fn dense(&self) -> bool {
+        self.ordinals.len() * 4 >= self.first.len()
+    }
+
+    /// The path indexes holding `ordinal`.
+    fn paths(&self, ordinal: u32) -> impl Iterator<Item = usize> + '_ {
+        let start = self
+            .first
+            .get(ordinal as usize)
+            .copied()
+            .unwrap_or(Self::NONE);
+        let members = if start == Self::NONE {
+            &[][..]
+        } else {
+            &self.members[start as usize..]
+        };
+        members
+            .iter()
+            .take_while(move |(held, _)| *held == ordinal)
+            .map(|(_, index)| *index)
+    }
 }
 
 impl TextMembers {
@@ -275,18 +334,7 @@ impl TextMembers {
                 members[segment as usize].push((ordinal, index));
             }
         }
-        let segments = members
-            .into_iter()
-            .map(|mut members| {
-                members.sort_unstable();
-                let mut ordinals = members
-                    .iter()
-                    .map(|(ordinal, _)| *ordinal)
-                    .collect::<Vec<_>>();
-                ordinals.dedup();
-                (members, ordinals)
-            })
-            .collect();
+        let segments = members.into_iter().map(SegmentMembers::new).collect();
         Self { segments }
     }
 }
@@ -312,6 +360,7 @@ pub fn paths_with_trigram_among(
         .chain(holders.changed)
         .collect::<Vec<_>>();
     found.sort_unstable();
+    found.dedup();
     Ok(found)
 }
 
@@ -322,7 +371,7 @@ pub fn paths_with_trigram_among(
 /// the changed ones, so no path is in both.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrigramHolders {
-    /// Positions in the state's path list, ascending (so in byte order).
+    /// Positions in the state's path list, in no particular order.
     pub published: Vec<usize>,
     /// The overlay's paths, in byte order.
     pub changed: Vec<Vec<u8>>,
@@ -355,24 +404,23 @@ pub fn trigram_holders_among(
     trigram: u32,
 ) -> Result<TrigramHolders, SegmentError> {
     let mut published = Vec::new();
-    for (segment, (members, ordinals)) in members.segments.iter().enumerate() {
-        if members.is_empty() {
+    for (segment, members) in members.segments.iter().enumerate() {
+        if members.members.is_empty() {
             continue;
         }
-        let hits = segments[segment].ordinals(trigram, 0, ordinals)?;
-        let mut hits = hits.into_iter().peekable();
-        for &(ordinal, index) in members {
-            while hits.peek().is_some_and(|hit| *hit < ordinal) {
-                hits.next();
-            }
-            if hits.peek() == Some(&ordinal) {
-                published.push(index);
-            }
+        // Where this checkout holds most of the segment, one pass over the
+        // trigram's postings maps each to its paths. Where it holds a few
+        // (a segment the family's other checkouts mostly fill), the postings
+        // are skipped to its members instead.
+        let hits = if members.dense() {
+            segments[segment].all_ordinals(trigram)?
+        } else {
+            segments[segment].ordinals(trigram, 0, &members.ordinals)?
+        };
+        for ordinal in hits {
+            published.extend(members.paths(ordinal));
         }
     }
-    // Members are grouped by segment, so positions from several segments
-    // interleave.
-    published.sort_unstable();
     let changed = overlay
         .entries
         .iter()

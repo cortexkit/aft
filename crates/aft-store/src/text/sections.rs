@@ -373,6 +373,24 @@ impl<'s> TextSegment<'s> {
         Ok(found)
     }
 
+    /// Every ordinal whose content holds `trigram`, ascending: the whole
+    /// posting list, for a caller that holds most of the segment's contents.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails or a posting block is malformed.
+    pub fn all_ordinals(&self, trigram: u32) -> Result<Vec<u32>, SegmentError> {
+        let Some(list) = self.lookup.get(u64::from(trigram))? else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::with_capacity(list.count as usize);
+        let mut cursor = PostingCursor::new(self.segment, self.postings, posting_layout(), list);
+        while let Some(block) = cursor.next_block()? {
+            found.extend_from_slice(&block.ordinals);
+        }
+        Ok(found)
+    }
+
     fn malformed(&self, reason: &'static str) -> SegmentError {
         SegmentError::new(self.segment.path(), ErrorKind::Malformed(reason))
     }
