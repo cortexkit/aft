@@ -29,7 +29,7 @@ use aft_store::text::{
     TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
-use super::callgraph::{resolve_checkout, CheckoutInputs};
+use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use super::graph_store::{write_sections, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
@@ -143,6 +143,19 @@ struct Live {
     /// The call graph with the files resolved since the publication laid
     /// over it; `None` until the first refresh.
     graph: Option<Arc<dyn SliceSource + Send + Sync>>,
+    /// What the last refresh resolved, for readers that need whole
+    /// resolutions rather than slices; `None` until a refresh.
+    refreshed: Option<Arc<Refreshed>>,
+}
+
+/// The files resolved again since a publication, with the paths they were
+/// resolved over.
+struct Refreshed {
+    state: CheckoutState,
+    /// Each re-resolved file's record key, parse and resolution.
+    replaced: BTreeMap<String, (String, Arc<ParseBlob>, FileResolution)>,
+    /// Files the publication has that the checkout no longer parses.
+    removed: BTreeSet<String>,
 }
 
 /// One changed path, as an edit or the watcher reports it.
@@ -235,6 +248,7 @@ impl Checkout {
             text: Arc::clone(&live.text),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
             graph,
+            refreshed: live.refreshed.clone(),
             sequence: live.sequence,
         })
     }
@@ -447,6 +461,7 @@ impl Checkout {
         // The new publication's graph replaces the old one and whatever was
         // laid over it; the next refresh starts from it.
         live.graph = None;
+        live.refreshed = None;
         let mut text = (*live.text).clone();
         text.retain(|path| kept.contains(path));
         live.text = Arc::new(text);
@@ -513,6 +528,11 @@ impl Checkout {
             stats = Some(update);
         }
         let mut overlay = OverlaySlices::new(Arc::clone(&published.graph));
+        let mut refreshed = Refreshed {
+            state: engine.live.inputs.state.clone(),
+            replaced: BTreeMap::new(),
+            removed: BTreeSet::new(),
+        };
         for file in &engine.dirty {
             match (
                 engine.live.resolved.get(file),
@@ -520,8 +540,15 @@ impl Checkout {
             ) {
                 (Some(resolution), Some((key, parse))) => {
                     overlay.replace(FileSlice::build(file, key, parse, resolution));
+                    refreshed.replaced.insert(
+                        file.clone(),
+                        (key.clone(), Arc::clone(parse), resolution.clone()),
+                    );
                 }
-                _ => overlay.remove(file),
+                _ => {
+                    overlay.remove(file);
+                    refreshed.removed.insert(file.clone());
+                }
             }
         }
         let mut live = self.write_live();
@@ -532,6 +559,7 @@ impl Checkout {
         {
             let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
             live.graph = Some(graph);
+            live.refreshed = Some(Arc::new(refreshed));
             let resolved = live
                 .changed_at
                 .iter()
@@ -648,6 +676,8 @@ pub struct CheckoutView {
     text: Arc<TextOverlay>,
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
     graph: Arc<dyn SliceSource + Send + Sync>,
+    /// What the call graph resolved since the publication.
+    refreshed: Option<Arc<Refreshed>>,
     /// The checkout's change count when the view was taken.
     sequence: u64,
 }
@@ -843,13 +873,29 @@ impl CheckoutView {
     pub(crate) fn dead_code_snapshot(
         &self,
     ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
-        let (parses, resolved) = self
+        let (mut parses, mut resolved) = self
             .published
             .graph
             .resolutions()
             .map_err(DataError::Store)?;
+        // The call graph as callgraph() answers it: what was resolved since
+        // the publication replaces what the publication stored.
+        let state = match &self.refreshed {
+            Some(refreshed) => {
+                for file in &refreshed.removed {
+                    parses.remove(file);
+                    resolved.remove(file);
+                }
+                for (file, (key, parse, resolution)) in &refreshed.replaced {
+                    parses.insert(file.clone(), (key.clone(), Arc::clone(parse)));
+                    resolved.insert(file.clone(), resolution.clone());
+                }
+                refreshed.state.clone()
+            }
+            None => self.published.state.clone(),
+        };
         let inputs = CheckoutInputs {
-            state: self.published.state.clone(),
+            state,
             parses,
             configs: HashMap::new(),
         };
@@ -1202,6 +1248,11 @@ mod tests {
         }]);
         assert_ne!(checkout.view().unwrap().text_generation(), generation);
 
+        // The dead-code snapshot follows the refreshed graph: `callee` is
+        // still called (from src/extra.rs), and the snapshot equals a cold
+        // build's.
+        let mut refreshed_snapshot = checkout.view().unwrap().dead_code_snapshot().unwrap();
+
         // The answers equal a cold build of the same files.
         let cold_store = tempfile::tempdir().unwrap();
         let cold = Checkout::bind(
@@ -1215,6 +1266,18 @@ mod tests {
         assert_eq!(
             callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
             after
+        );
+        let mut cold_snapshot = cold.view().unwrap().dead_code_snapshot().unwrap();
+        refreshed_snapshot.generated_at = None;
+        cold_snapshot.generated_at = None;
+        assert_eq!(
+            format!("{refreshed_snapshot:?}"),
+            format!("{cold_snapshot:?}"),
+            "the refreshed dead-code snapshot equals a cold build's"
+        );
+        assert!(
+            format!("{refreshed_snapshot:?}").contains("src/extra.rs"),
+            "the new caller is in the snapshot: {refreshed_snapshot:?}"
         );
     }
 
