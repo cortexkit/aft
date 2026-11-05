@@ -114,7 +114,7 @@ enum Parsed {
 /// The checkout as text files, with each file's extraction kept so an edit
 /// extracts only the file it changes.
 #[derive(Default)]
-struct Files {
+pub(super) struct Files {
     entries: BTreeMap<String, (ContentKey, String, Option<Parsed>)>,
     records: HashMap<RecordKey, Option<Parsed>>,
     /// Every parsed record, by the key its parse carries.
@@ -122,7 +122,7 @@ struct Files {
 }
 
 impl Files {
-    fn set(&mut self, path: &str, text: &str) -> Result<(), String> {
+    pub(super) fn set(&mut self, path: &str, text: &str) -> Result<(), String> {
         let bytes = text.as_bytes();
         let content = ContentKey::of(bytes);
         let language = language_for(path, bytes).unwrap_or_default();
@@ -160,7 +160,11 @@ impl Files {
         Ok(())
     }
 
-    fn inputs(&self) -> CheckoutInputs {
+    pub(super) fn remove(&mut self, path: &str) {
+        self.entries.remove(path);
+    }
+
+    pub(super) fn inputs(&self) -> CheckoutInputs {
         let records = self
             .entries
             .iter()
