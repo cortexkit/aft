@@ -106,6 +106,21 @@ pub(crate) fn write_sections(
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut content = ContentSectionsBuilder::new();
+    // Configuration files' records too, so a reader of the segment can give
+    // the resolver the same configuration bytes the build read.
+    for record in inputs.state.paths() {
+        if record.language != "config" {
+            continue;
+        }
+        let key = RecordKey::new(
+            record.content,
+            &record.language,
+            super::content::EXTRACTOR_VERSION,
+        );
+        if let Some((record_key, stored)) = records.get(&key.digest().to_string()) {
+            content.add(*record_key, stored);
+        }
+    }
     let mut graph = GraphSectionsBuilder::new();
     let mut keys = BTreeMap::new();
     for (file, resolution) in resolved {
@@ -300,6 +315,49 @@ impl StoredSlices {
             &parse,
             &resolution,
         ))
+    }
+
+    /// The configuration bytes of every path of `state` the resolver reads
+    /// as configuration, from their stored records. A configuration file
+    /// whose record no segment holds is left out, as a missing file is.
+    ///
+    /// # Errors
+    ///
+    /// When a record cannot be read.
+    pub(crate) fn configs(
+        &self,
+        state: &aft_store::checkout::CheckoutState,
+    ) -> Result<HashMap<Vec<u8>, Arc<[u8]>>, String> {
+        let contents = self
+            .segments
+            .iter()
+            .map(|segment| ContentSegment::open(segment))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let mut configs = HashMap::new();
+        for record in state.paths() {
+            if record.language != "config" {
+                continue;
+            }
+            let key = RecordKey::new(
+                record.content,
+                &record.language,
+                super::content::EXTRACTOR_VERSION,
+            );
+            let Some((index, ordinal)) = find_newest(&contents, |content| content.find(key))?
+            else {
+                continue;
+            };
+            let stored = contents[index as usize]
+                .as_ref()
+                .expect("found in it")
+                .record(ordinal)
+                .map_err(|error| error.to_string())?;
+            if let aft_store::content::RecordBody::Config { source } = stored.data {
+                configs.insert(record.path.clone(), Arc::from(source));
+            }
+        }
+        Ok(configs)
     }
 
     /// Every file's parse and resolution, decoded from its stored record

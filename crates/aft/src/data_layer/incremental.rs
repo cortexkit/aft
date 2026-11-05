@@ -61,6 +61,9 @@ pub struct UpdateStats {
     pub dispatch_ms: f64,
     pub sites_ms: f64,
     pub total_ms: f64,
+    /// Files whose stored resolution changed: rebound, resolved, traced or
+    /// re-sited again, or removed.
+    pub touched: BTreeSet<String>,
 }
 
 /// Which files recorded each input key, for one kind of recording: the
@@ -286,6 +289,44 @@ impl LiveCheckout {
                 file.site_dependencies = dependencies;
             }
             Ok::<_, ManifestJoinError>((surfaces, prebound, resolved, calls))
+        })?;
+        let mut reverse = ReverseInputs::default();
+        for (path, binding) in &prebound {
+            reverse.note_prebound(path, binding);
+        }
+        for (path, file) in &resolved {
+            reverse.note_resolution(path, file);
+        }
+        Ok(Self {
+            inputs,
+            surfaces,
+            prebound,
+            resolved,
+            calls,
+            reverse,
+            pool,
+        })
+    }
+
+    /// A checkout's resolution from what a publication stored: every file's
+    /// resolution as `resolved` holds it. Binds every file again for the
+    /// surfaces and pass-1 bindings later updates compare against, without
+    /// resolving anything.
+    ///
+    /// # Errors
+    ///
+    /// When binding fails on a file.
+    pub(crate) fn from_resolved(
+        inputs: CheckoutInputs,
+        resolved: BTreeMap<String, FileResolution>,
+        threads: usize,
+    ) -> Result<Self, ManifestJoinError> {
+        let pool = Arc::new(super::callgraph::pool(threads)?);
+        let (surfaces, prebound, calls) = pool.install(|| {
+            let paths = inputs.parses.keys().collect::<Vec<_>>();
+            let (surfaces, prebound) = bind_all(&inputs, &paths)?;
+            let calls = MethodCallInputs::build(&inputs, &resolved);
+            Ok::<_, ManifestJoinError>((Arc::new(surfaces), prebound, calls))
         })?;
         let mut reverse = ReverseInputs::default();
         for (path, binding) in &prebound {
@@ -637,6 +678,13 @@ impl LiveCheckout {
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
+        stats.touched = rebind
+            .into_iter()
+            .chain(resolve)
+            .chain(recompute)
+            .chain(sites)
+            .chain(removed)
+            .collect();
         Ok(stats)
     }
 }

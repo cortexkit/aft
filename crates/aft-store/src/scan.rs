@@ -34,6 +34,10 @@ pub struct ScanPolicy {
     pub ignore_files: Vec<String>,
     /// File names that are never members, such as `.DS_Store`.
     pub skip_names: Vec<String>,
+    /// Directory names whose contents are never members, whether or not an
+    /// ignore file names them: dependency, build and environment folders.
+    /// The checkout's root itself is never skipped.
+    pub skip_dirs: Vec<String>,
 }
 
 impl Default for ScanPolicy {
@@ -44,6 +48,19 @@ impl Default for ScanPolicy {
             skip_names: [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"]
                 .map(String::from)
                 .to_vec(),
+            // The folders AFT's project walk has always left out.
+            skip_dirs: [
+                "node_modules",
+                "target",
+                "venv",
+                ".venv",
+                "__pycache__",
+                ".tox",
+                "dist",
+                "build",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 }
@@ -127,6 +144,7 @@ pub fn scan(
         builder.add_custom_ignore_filename(name);
     }
     let skip_names = policy.skip_names.clone();
+    let skip_dirs = policy.skip_dirs.clone();
     let nested_root = root.to_path_buf();
     builder.filter_entry(move |entry| {
         let name = entry.file_name();
@@ -137,6 +155,12 @@ pub fn scan(
             return false;
         }
         let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        if is_dir
+            && entry.depth() > 0
+            && skip_dirs.iter().any(|skip| OsStr::new(skip) == name)
+        {
+            return false;
+        }
         !(is_dir
             && entry.depth() > 0
             && entry.path() != nested_root
@@ -605,6 +629,14 @@ mod tests {
         // Another repository nested inside it stays a member.
         write("vendor/lib/.git/HEAD", b"ref: refs/heads/main\n");
         write("vendor/lib/lib.rs", b"pub fn lib() {}\n");
+        // Dependency and build folders are never members, ignored or not;
+        // a file merely named like one is.
+        write("web/node_modules/pkg/index.js", b"no");
+        write("crates/x/target/debug/out.rs", b"no");
+        write("app/dist/bundle.js", b"no");
+        write("tool/build/gen.rs", b"no");
+        write("py/.venv/lib.py", b"no");
+        write("docs/build", b"a file named build\n");
         #[cfg(unix)]
         std::os::unix::fs::symlink("src/a.rs", root.join("link.rs")).unwrap();
 
@@ -628,13 +660,14 @@ mod tests {
             ".gitignore",
             "big.txt",
             "blob.bin",
+            "docs/build",
             "src/.hidden.rs",
             "src/a.rs",
             "src/b.rs",
             "vendor/lib/lib.rs",
         ];
         if cfg!(unix) {
-            expected.insert(4, "link.rs");
+            expected.insert(5, "link.rs");
         }
         assert_eq!(paths(&first.state), expected);
         assert_eq!(get(&first.state, "big.txt").kind, PathKind::Oversize);
@@ -644,9 +677,9 @@ mod tests {
             get(&first.state, "src/b.rs").content
         );
         // Every read file is handed over with its path; the oversize file is
-        // never read.
-        assert_eq!(sink.calls.load(Ordering::Relaxed), 7);
-        assert_eq!(first.counters.read, 7);
+        // never read. `docs/build` is the one added member.
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 8);
+        assert_eq!(first.counters.read, 8);
         assert_eq!(
             sink.read.lock().unwrap()[&b"blob.bin"[..]].1,
             ContentKind::Binary
@@ -659,7 +692,7 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(second.counters.read, 1, "{:?}", second.counters);
-            assert_eq!(second.counters.reused, 7);
+            assert_eq!(second.counters.reused, 8);
         }
         assert_ne!(
             get(&second.state, "src/a.rs").content,
@@ -670,7 +703,7 @@ mod tests {
         // read again; reused records keep their old evidence.
         let third = scan(root, &policy, Some(&second.state), &sink).unwrap();
         #[cfg(unix)]
-        assert_eq!((third.counters.reused, third.counters.read), (7, 1));
+        assert_eq!((third.counters.reused, third.counters.read), (8, 1));
         let contents = |state: &CheckoutState| {
             state
                 .paths()

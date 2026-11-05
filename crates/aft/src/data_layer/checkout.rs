@@ -32,7 +32,10 @@ use aft_store::text::{
 use super::callgraph::{resolve_checkout, CheckoutInputs};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use super::graph_store::{write_sections, StoredSlices};
-use super::query::SliceReader;
+use super::incremental::{LiveCheckout, UpdateStats};
+use super::overlay::OverlaySlices;
+use super::query::{SliceReader, SliceSource};
+use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 /// Why the data layer could not do what was asked.
@@ -101,6 +104,21 @@ pub struct Checkout {
     checkout: CheckoutId,
     /// The last published generation, and the changes made since.
     live: RwLock<Live>,
+    /// The call graph's incremental state between publications, built from
+    /// the publication on the first refresh.
+    engine: Mutex<Option<GraphEngine>>,
+}
+
+/// A checkout's call graph kept up to date between publications.
+struct GraphEngine {
+    /// The publication the engine started from; a newer one replaces it.
+    published: Arc<Published>,
+    live: LiveCheckout,
+    /// Each changed path's bytes as the engine last applied them; `None`
+    /// for a removed path.
+    applied: BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    /// Files whose resolution changed since the publication.
+    dirty: BTreeSet<String>,
 }
 
 /// A checkout's current data: its last publication and the changes made
@@ -119,6 +137,12 @@ struct Live {
     /// latest change, so a build knows which changes its scan covered.
     sequence: u64,
     changed_at: BTreeMap<Vec<u8>, u64>,
+    /// Each changed path's latest bytes, `None` once removed, for the call
+    /// graph to resolve again.
+    changed_bytes: BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    /// The call graph with the files resolved since the publication laid
+    /// over it; `None` until the first refresh.
+    graph: Option<Arc<dyn SliceSource + Send + Sync>>,
 }
 
 /// One changed path, as an edit or the watcher reports it.
@@ -176,6 +200,7 @@ impl Checkout {
             family,
             checkout,
             live: RwLock::new(Live::default()),
+            engine: Mutex::new(None),
         };
         let snapshot = handle.family.snapshot().map_err(DataError::store)?;
         if let Some(published) = handle.open_published(&snapshot)? {
@@ -200,10 +225,17 @@ impl Checkout {
     #[must_use]
     pub fn view(&self) -> Option<CheckoutView> {
         let live = self.live.read().expect("no panics while holding it");
+        let published = Arc::clone(live.published.as_ref()?);
+        let graph = live.graph.clone().unwrap_or_else(|| {
+            let graph: Arc<dyn SliceSource + Send + Sync> = published.graph.clone();
+            graph
+        });
         Some(CheckoutView {
-            published: Arc::clone(live.published.as_ref()?),
+            published,
             text: Arc::clone(&live.text),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
+            graph,
+            sequence: live.sequence,
         })
     }
 
@@ -266,6 +298,13 @@ impl Checkout {
             pending.insert(path.clone());
             live.changed_at.insert(path.clone(), sequence);
             text.set(path, entry);
+        }
+        for change in changes {
+            let bytes = match change {
+                PathChange::Written { bytes, .. } => Some(Arc::clone(bytes)),
+                PathChange::Removed { .. } => None,
+            };
+            live.changed_bytes.insert(change.path().to_vec(), bytes);
         }
         live.text = Arc::new(text);
         live.callgraph_pending = Arc::new(pending);
@@ -404,6 +443,10 @@ impl Checkout {
         live.published = Some(Arc::new(published));
         live.changed_at.retain(|_, sequence| *sequence > covered);
         let kept = live.changed_at.keys().cloned().collect::<BTreeSet<_>>();
+        live.changed_bytes.retain(|path, _| kept.contains(path));
+        // The new publication's graph replaces the old one and whatever was
+        // laid over it; the next refresh starts from it.
+        live.graph = None;
         let mut text = (*live.text).clone();
         text.retain(|path| kept.contains(path));
         live.text = Arc::new(text);
@@ -415,6 +458,118 @@ impl Checkout {
                 .collect(),
         );
         Ok(report)
+    }
+
+    /// Resolves the call graph again for the paths changed since the
+    /// publication, and lays the files whose resolution changed over the
+    /// published graph. Returns `None` when nothing needed it.
+    ///
+    /// # Errors
+    ///
+    /// When a stored record or fragment cannot be read, or resolution
+    /// fails. The pending paths stay pending then.
+    pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        let (published, changes, covered) = {
+            let live = self.live.read().expect("no panics while holding it");
+            let Some(published) = live.published.clone() else {
+                return Ok(None);
+            };
+            (published, live.changed_bytes.clone(), live.sequence)
+        };
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        let mut slot = self.engine.lock().expect("no panics while holding it");
+        if slot
+            .as_ref()
+            .is_some_and(|engine| !Arc::ptr_eq(&engine.published, &published))
+        {
+            *slot = None;
+        }
+        if slot.is_none() {
+            *slot = Some(self.start_engine(&published)?);
+        }
+        let engine = slot.as_mut().expect("started");
+        let changed = changes
+            .iter()
+            .filter(|(path, bytes)| engine.applied.get(*path) != Some(*bytes))
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut stats = None;
+        if !changed.is_empty() {
+            let next = next_inputs(&published.state, &engine.live.inputs, &changes, &changed);
+            let changed_names = changed
+                .iter()
+                .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
+                .collect::<BTreeSet<_>>();
+            let update = engine
+                .live
+                .update(next, &changed_names)
+                .map_err(|error| DataError::Resolve(error.to_string()))?;
+            engine.dirty.extend(update.touched.iter().cloned());
+            for path in &changed {
+                engine.applied.insert(path.clone(), changes[path].clone());
+            }
+            stats = Some(update);
+        }
+        let mut overlay = OverlaySlices::new(Arc::clone(&published.graph));
+        for file in &engine.dirty {
+            match (
+                engine.live.resolved.get(file),
+                engine.live.inputs.parses.get(file),
+            ) {
+                (Some(resolution), Some((key, parse))) => {
+                    overlay.replace(FileSlice::build(file, key, parse, resolution));
+                }
+                _ => overlay.remove(file),
+            }
+        }
+        let mut live = self.write_live();
+        if live
+            .published
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &published))
+        {
+            let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
+            live.graph = Some(graph);
+            let resolved = live
+                .changed_at
+                .iter()
+                .filter(|(_, sequence)| **sequence <= covered)
+                .map(|(path, _)| path.clone())
+                .collect::<BTreeSet<_>>();
+            live.callgraph_pending = Arc::new(
+                live.callgraph_pending
+                    .iter()
+                    .filter(|path| !resolved.contains(*path))
+                    .cloned()
+                    .collect(),
+            );
+        }
+        Ok(stats)
+    }
+
+    /// The incremental state for `published`: every stored resolution, and
+    /// the parses and configuration the publication was built from.
+    fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
+        let (parses, resolved) = published.graph.resolutions().map_err(DataError::Store)?;
+        let configs = published
+            .graph
+            .configs(&published.state)
+            .map_err(DataError::Store)?;
+        let inputs = CheckoutInputs {
+            state: published.state.clone(),
+            parses,
+            configs,
+        };
+        let live = LiveCheckout::from_resolved(inputs, resolved, self.layer.threads)
+            .map_err(|error| DataError::Resolve(error.to_string()))?;
+        Ok(GraphEngine {
+            published: Arc::clone(published),
+            live,
+            applied: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+        })
     }
 
     /// This checkout's publication in `snapshot`, or `None` when the
@@ -438,7 +593,12 @@ impl Checkout {
                     .map_err(DataError::store)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Published::open(self.root.clone(), state, segments).map(Some)
+        let identity = format!(
+            "{}:{}",
+            snapshot.generation(),
+            Digest128::of(&state.encode())
+        );
+        Published::open(self.root.clone(), identity, state, segments).map(Some)
     }
 }
 
@@ -451,6 +611,8 @@ fn elapsed_ms(started: Instant) -> f64 {
 /// readable for as long as anything holds it.
 struct Published {
     root: PathBuf,
+    /// The family generation it was read from and its state's digest.
+    identity: String,
     state: CheckoutState,
     segments: Vec<Arc<Segment>>,
     membership: TextMembership,
@@ -485,11 +647,15 @@ pub struct CheckoutView {
     published: Arc<Published>,
     text: Arc<TextOverlay>,
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
+    graph: Arc<dyn SliceSource + Send + Sync>,
+    /// The checkout's change count when the view was taken.
+    sequence: u64,
 }
 
 impl Published {
     fn open(
         root: PathBuf,
+        identity: String,
         state: CheckoutState,
         segments: Vec<Arc<Segment>>,
     ) -> Result<Self, DataError> {
@@ -521,6 +687,7 @@ impl Published {
         let graph = StoredSlices::open_files(segments.clone(), &files).map_err(DataError::Store)?;
         Ok(Self {
             root,
+            identity,
             state,
             segments,
             membership,
@@ -550,6 +717,15 @@ impl CheckoutView {
     #[must_use]
     pub fn state(&self) -> &CheckoutState {
         &self.published.state
+    }
+
+    /// Names what text answers this view gives: it differs between two
+    /// views whenever any text answer can, that is a new publication or any
+    /// recorded change (a second edit of one path included). A call-graph
+    /// refresh alone keeps it. For keying caches of text answers.
+    #[must_use]
+    pub fn text_generation(&self) -> String {
+        format!("{}:{}", self.published.identity, self.sequence)
     }
 
     /// The paths changed since the publication, which queries answer from
@@ -679,13 +855,14 @@ impl CheckoutView {
         Ok(super::dead_code::snapshot(&self.published.root, &rows))
     }
 
-    /// The call graph of the publication, as the call-graph commands read
-    /// it. Files in [`changed_paths`](Self::changed_paths) answer as they
-    /// were published until they are resolved again; the status says so.
+    /// The call graph as the call-graph commands read it: the publication,
+    /// with the files resolved since laid over it. A file in
+    /// [`changed_paths`](Self::changed_paths) answers as it was last
+    /// resolved until it is resolved again; the status says so.
     #[must_use]
-    pub(crate) fn callgraph(&self) -> SliceReader<Arc<StoredSlices>> {
+    pub(crate) fn callgraph(&self) -> SliceReader<Arc<dyn SliceSource + Send + Sync>> {
         SliceReader::new(
-            Arc::clone(&self.published.graph),
+            Arc::clone(&self.graph),
             self.published.root.clone(),
             self.published.root.display().to_string(),
         )
@@ -697,6 +874,89 @@ impl CheckoutView {
     #[must_use]
     pub fn callgraph_failures(&self) -> Vec<String> {
         self.published.graph.failures()
+    }
+}
+
+/// The resolver's inputs after `changed` paths of `changes` (each path's
+/// bytes since the publication, `None` once removed): the published state
+/// with every change applied, and `previous`'s parses and configuration with
+/// the changed paths extracted again.
+fn next_inputs(
+    published: &CheckoutState,
+    previous: &CheckoutInputs,
+    changes: &BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    changed: &BTreeSet<Vec<u8>>,
+) -> CheckoutInputs {
+    let mut records = published
+        .paths()
+        .iter()
+        .filter(|record| !changes.contains_key(&record.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for (path, bytes) in changes {
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let language = std::str::from_utf8(path)
+            .ok()
+            .and_then(|text| language_for(text, bytes))
+            .unwrap_or_default();
+        records.push(PathRecord {
+            path: path.clone(),
+            mode: 0o100_644,
+            kind: if bytes.contains(&0) {
+                PathKind::Binary
+            } else {
+                PathKind::Text
+            },
+            content: ContentKey::of(bytes),
+            link: Vec::new(),
+            stat: aft_store::checkout::StatEvidence::default(),
+            language,
+        });
+    }
+    let state = CheckoutState::new(published.git.clone(), published.conversion, records)
+        .expect("paths are unique: published paths without the changed ones, plus the changes");
+    let mut parses = previous.parses.clone();
+    let mut configs = previous.configs.clone();
+    for path in changed {
+        let Ok(name) = std::str::from_utf8(path) else {
+            continue;
+        };
+        parses.remove(name);
+        configs.remove(path);
+        let Some(Some(bytes)) = changes.get(path) else {
+            continue;
+        };
+        let Some(record) = state.get(path) else {
+            continue;
+        };
+        if record.language.is_empty() || record.kind != PathKind::Text {
+            continue;
+        }
+        let Ok(extracted) = extract(bytes, &record.language) else {
+            // As in a build: a file the extractor fails on is not parsed.
+            continue;
+        };
+        match &extracted.data {
+            RecordBody::Config { source } => {
+                configs.insert(path.clone(), Arc::from(source.as_slice()));
+            }
+            RecordBody::Parsed { .. } => {
+                if let Ok(CallgraphBlob::Parse(parse)) = blob_from_record(&extracted) {
+                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                    parses.insert(
+                        name.to_string(),
+                        (key.digest().to_string(), Arc::new(parse)),
+                    );
+                }
+            }
+        }
+    }
+    CheckoutInputs {
+        state,
+        parses,
+        configs,
     }
 }
 
@@ -870,6 +1130,83 @@ mod tests {
             true,
         );
         format!("{callers:?}")
+    }
+
+    #[test]
+    fn an_edit_updates_the_call_graph_without_a_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod extra;\npub fn caller() { util::callee(); }\n",
+        );
+        write(root.path(), "src/util.rs", "pub fn callee() {}\n");
+        write(root.path(), "src/extra.rs", "pub fn other() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let family = FamilyId::from_digest(Digest128::of(b"demo"));
+        let checkout = Checkout::bind(layer, store.path(), family, root.path()).unwrap();
+        checkout.build().unwrap();
+        let before = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(!before.contains("src/extra.rs"), "{before}");
+
+        // A new caller of `callee` in another file, and the old caller
+        // removed: the call graph must show both after a refresh, with no
+        // rebuild.
+        let extra = "use crate::util;\npub fn other() { util::callee(); }\n";
+        let lib = "mod util;\nmod extra;\npub fn caller() {}\n";
+        write(root.path(), "src/extra.rs", extra);
+        write(root.path(), "src/lib.rs", lib);
+        checkout.record_changes(&[
+            PathChange::Written {
+                path: b"src/extra.rs".to_vec(),
+                bytes: Arc::from(extra.as_bytes()),
+            },
+            PathChange::Written {
+                path: b"src/lib.rs".to_vec(),
+                bytes: Arc::from(lib.as_bytes()),
+            },
+        ]);
+        assert!(matches!(
+            checkout.status().callgraph,
+            PlaneStatus::Building { .. }
+        ));
+        let stats = checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("two files changed");
+        assert!(stats.resolved >= 2, "{stats:?}");
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let after = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(after.contains("src/extra.rs"), "{after}");
+        assert!(!after.contains("src/lib.rs"), "{after}");
+
+        // Nothing changed since: a second refresh does nothing, and the text
+        // generation only moves with a recorded change.
+        let generation = checkout.view().unwrap().text_generation();
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(checkout.view().unwrap().text_generation(), generation);
+        checkout.record_changes(&[PathChange::Written {
+            path: b"src/extra.rs".to_vec(),
+            bytes: Arc::from(extra.as_bytes()),
+        }]);
+        assert_ne!(checkout.view().unwrap().text_generation(), generation);
+
+        // The answers equal a cold build of the same files.
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            cold_store.path(),
+            family,
+            root.path(),
+        )
+        .unwrap();
+        cold.build().unwrap();
+        assert_eq!(
+            callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
+            after
+        );
     }
 
     #[test]
