@@ -1776,6 +1776,194 @@ mod tests {
     fn task_notices_isolate_harnesses_and_reconnect() {
         assert_task_notice_isolation("reserved:thalamus-harness", "opencode2");
     }
+
+    #[tokio::test]
+    async fn codemode_background_task_records_head_identity_and_completes_to_head() {
+        use crate::bash_background::{persistence, TaskIdentity};
+        use subc_protocol::call_mode::CallMode;
+
+        let (_root_dir, root) = test_root("codemode-background-owner");
+        let storage = tempfile::tempdir().unwrap();
+        let storage_root = storage.path().join("opencode");
+        let mut head = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let mut run = caller_route(&root, "reserved:prefrontal-core", "runner");
+        for (route, session) in [(&mut head, "head-session"), (&mut run, "run-session")] {
+            let data = Arc::get_mut(&mut route.0).unwrap();
+            data.session = session.into();
+            if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal
+            {
+                *session_id = session.into();
+            }
+        }
+        Arc::get_mut(&mut head.0).unwrap().scope = Some(
+            serde_json::from_value(json!({
+                "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+                "ref":"head-a", "scope_epoch":3, "kind":"head", "owner_authorized":true,
+                "attributes":{"agent_id":"agent-a"},
+            }))
+            .unwrap(),
+        );
+        let run_data = Arc::get_mut(&mut run.0).unwrap();
+        run_data.call_mode = CallMode::Codemode;
+        run_data.held_reply = true;
+        run_data.tool_result_body = true;
+        run_data.scope = Some(serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+            "ref":"run-scope", "scope_epoch":1, "kind":"ephemeral", "owner_authorized":true,
+            "attributes":{"agent_id":"agent-a","run_id":"run-1"},
+            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head-a","scope_epoch":3},
+            "parent_state":"linked",
+        })).unwrap());
+        let routes = HashMap::from([
+            (route_key(1, 1), head.clone()),
+            (route_key(9, 1), run.clone()),
+        ]);
+        let body = json!({"name":"bash","preset":"head","arguments":{
+            "command":"echo codemode-head-complete", "background":true,
+        }});
+        let effective = match codemode::admit(&routes, route_key(9, 1), Some(&body), |_| {
+            Some(Ok(codemode::EffectiveSavedPolicy::default()))
+        }) {
+            codemode::Admission::Owner(identity) => identity,
+            codemode::Admission::Refused(error) => {
+                panic!("code-mode call refused: {} {:?}", error.code, error.detail)
+            }
+            _ => panic!("code-mode call must resolve its owner"),
+        };
+        let expected = TaskIdentity {
+            principal: Some("reserved:thalamus-harness".into()),
+            harness: "opencode".into(),
+            session: "head-session".into(),
+        };
+        assert_eq!(head.task_identity(), expected);
+        assert_ne!(run.task_identity(), expected);
+        assert_eq!(effective.spawn_principal, head.spawn_principal);
+
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        let sender: ProgressSender = Arc::new(Box::new(move |frame| {
+            let _ = notice_tx.send(frame);
+        }) as Box<dyn Fn(PushFrame) + Send + Sync>);
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(storage.path().into());
+            config.experimental_bash_background = true;
+        });
+        ctx.set_progress_sender(Some(sender));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (done_tx, mut done_rx) = mpsc::channel(4);
+        let (touch_tx, _touch_rx) = mpsc::channel(4);
+        {
+            let _identity =
+                secret_consent::SecretIdentityGuard::install_optional(Some(effective.clone()));
+            bash::submit_deferred_bash(
+                false,
+                &executor,
+                &done_tx,
+                &touch_tx,
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash::handle(&request, ctx),
+                root.clone(),
+                root.as_path().into(),
+                effective.session.clone(),
+                "codemode-background".into(),
+                route_key(9, 1),
+                1,
+                control_flags(),
+                PROTOCOL_VERSION,
+                json!({"command":"echo codemode-head-complete","background":true,"compressed":false,"timeout":5000}),
+                crate::subc_format::FormatContext::default(),
+                bash::BashWaitCancel {
+                    keepalive: None,
+                    speech_seed: None,
+                    run_scope: None,
+                    scope: effective.scope.clone(),
+                    late_results: true,
+                    ledger_carrier: Some("reserved:prefrontal-core".into()),
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                BindTrust::FirstParty,
+                effective.spawn_principal.clone(),
+                None,
+                Some("codemode-background".into()),
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                true,
+                remote_policy::RemoteSource::None,
+                Instant::now() + Duration::from_secs(10),
+            );
+        }
+        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"]
+            .as_str()
+            .expect("background task id")
+            .to_string();
+        let completion = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), notice_rx.recv())
+                .await
+                .unwrap()
+                .expect("background completion");
+            if matches!(&frame, PushFrame::BashCompleted(frame) if frame.task_id == task_id) {
+                break frame;
+            }
+        };
+        let task = persistence::resolve_task_layout(
+            &persistence::session_tasks_dir(&storage_root, "head-session"),
+            &task_id,
+        )
+        .unwrap();
+        let metadata = persistence::read_task_at(&task).unwrap();
+        assert_eq!(metadata.launching_identity, Some(expected));
+        assert_eq!(metadata.session_id, "head-session");
+        assert_eq!(metadata.scope, run.scope);
+        assert_eq!(
+            metadata.call_key.unwrap().requester,
+            "reserved:prefrontal-core"
+        );
+
+        let root_channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(1, 1), route_key(9, 1)]),
+        )]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        let result = fan_out_reliable_push_frame(
+            &writer_tx,
+            &DispatchPathMetrics::new(),
+            &routes,
+            &root_channels,
+            &HashMap::new(),
+            &mut RetryBuffer::new(),
+            &mut HashMap::new(),
+            &root,
+            &completion,
+            None,
+        );
+        assert_eq!(result.matched_channels, 1);
+        assert_eq!(result.sent_frames, 1);
+        let delivered = writer_rx.try_recv().expect("head receives completion");
+        assert_eq!((delivered.header.channel, delivered.header.epoch), (1, 1));
+        assert_eq!(
+            push_frame_task_id(&delivered).as_deref(),
+            Some(task_id.as_str())
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "run route must not receive the head's completion"
+        );
+        ctx.bash_background().shutdown();
+    }
     use crate::protocol::{ConfigureWarningsFrame, StatusChangedFrame};
 
     #[cfg(unix)]

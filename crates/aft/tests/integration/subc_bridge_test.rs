@@ -9903,8 +9903,14 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         send_control_request(&mut stream, 798, ModuleControlRequest::HealthCheck {}).await;
         let report = loop {
             let frame = read_any_frame_timeout(&mut stream, "pattern subscription seeds").await;
-            if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR)
-                || is_expected_bg_event_stream_data(&frame, FOREIGN_BG_CHANNEL, FOREIGN_BG_CORR)
+            if (frame.header.channel == BG_CHANNEL
+                && is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR))
+                || (frame.header.channel == FOREIGN_BG_CHANNEL
+                    && is_expected_bg_event_stream_data(
+                        &frame,
+                        FOREIGN_BG_CHANNEL,
+                        FOREIGN_BG_CORR,
+                    ))
             {
                 continue;
             }
@@ -10031,7 +10037,8 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         let report = loop {
             let frame = read_any_frame_timeout(&mut stream, "pattern rearm health").await;
             assert!(
-                !is_expected_bg_event_stream_data(&frame, FOREIGN_BG_CHANNEL, FOREIGN_BG_CORR),
+                frame.header.ty != FrameType::StreamData
+                    || frame.header.channel != FOREIGN_BG_CHANNEL,
                 "pattern nudge reached a different caller on the same session"
             );
             if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR) {

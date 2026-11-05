@@ -652,20 +652,24 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
-    daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
-        .await;
-    daemon.bind(2, 1, "direct", None, false).await;
     if cfg!(windows) {
+        daemon
+            .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+            .await;
         daemon
             .assert_windows_strict_refusal(1, gated_shell(&root, Some("drained")))
             .await;
         return;
     }
+    // Broca's runner is admitted for shell observation in production. The
+    // synthetic reserved:owner principal is not, even for its own task.
+    daemon
+        .bind(1, 1, "broca", Some(stamp("broca", 1)), false)
+        .await;
+    daemon.bind(2, 1, "direct", None, false).await;
     let keyed = daemon
         .start(1, 1, gated_shell(&root, Some("drained")))
         .await;
-    daemon.allow(1).await;
     let plain = daemon.start(2, 1, gated_shell(&root, None)).await;
     running_task(&mut daemon, 1, keyed).await;
     running_task(&mut daemon, 2, plain).await;
@@ -691,7 +695,7 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
         assert_eq!(
             record["launching_identity"],
             json!({
-                "principal": if index == 0 { "reserved:owner" } else { "direct" },
+                "principal": if index == 0 { "reserved:broca" } else { "direct" },
                 "harness": "runner", "session": format!("session-{}", index + 1),
             }),
             "{record}"
@@ -707,11 +711,11 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &[]).await;
     daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "broca", Some(stamp("broca", 1)), false)
         .await;
     daemon.bind(2, 1, "direct", None, false).await;
     daemon
-        .bind(3, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(3, 1, "broca", Some(stamp("broca", 1)), false)
         .await;
     for (index, task) in tasks.iter().enumerate() {
         daemon

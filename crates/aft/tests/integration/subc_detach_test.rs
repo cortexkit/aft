@@ -397,7 +397,7 @@ fn subc_foreign_harness_cannot_observe_or_recover_task() {
         let text = frame_body(&refused_watch);
         assert!(
             tool_result_is_error(&refused_watch)
-                && text.contains(&format!("background task not found: {task_id}"))
+                && text.contains("task_not_found")
                 && !text.contains(stdout)
                 && !text.contains(stderr),
             "{text}"
