@@ -47,6 +47,8 @@ pub enum DataError {
     Scan(String),
     /// The call graph could not be resolved.
     Resolve(String),
+    /// Another process kept the repository's store busy past the wait.
+    Busy(String),
 }
 
 impl std::fmt::Display for DataError {
@@ -55,6 +57,7 @@ impl std::fmt::Display for DataError {
             Self::Store(error) => write!(f, "data store: {error}"),
             Self::Scan(error) => write!(f, "checkout scan: {error}"),
             Self::Resolve(error) => write!(f, "call-graph resolution: {error}"),
+            Self::Busy(error) => write!(f, "data store busy: {error}"),
         }
     }
 }
@@ -128,6 +131,10 @@ struct GraphEngine {
 #[derive(Default)]
 struct Live {
     published: Option<Arc<Published>>,
+    /// Paths in a parsed language that the call graph does not cover,
+    /// because extracting them failed: the publication's, with recorded
+    /// changes applied.
+    unparsed: Arc<BTreeSet<Vec<u8>>>,
     /// Changed contents' trigrams by path, which text queries see at once.
     text: Arc<TextOverlay>,
     /// Paths changed since the publication whose call graph is not
@@ -165,6 +172,10 @@ struct Refreshed {
     removed: BTreeSet<String>,
 }
 
+/// How long a build waits for another process to release the store's
+/// writer before it gives up and reports the store busy.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One path changed since the publication.
 #[derive(Clone)]
 struct Change {
@@ -201,6 +212,9 @@ pub struct BuildReport {
     pub segment_bytes: u64,
     /// Segments no checkout needs any more, left out of the new generation.
     pub retired_segments: usize,
+    /// Another process published this checkout while the build ran, so
+    /// nothing was published; the checkout serves that publication.
+    pub superseded: bool,
     /// Files the reclamation after publishing removed, or why it could not
     /// run (the publication stands either way).
     pub reclaimed_files: usize,
@@ -234,27 +248,50 @@ impl Checkout {
             engine: Mutex::new(None),
             recording: Mutex::new(()),
         };
-        let snapshot = handle.family.snapshot().map_err(DataError::store)?;
-        if let Some(published) = handle.open_published(snapshot)? {
-            let published = Arc::new(published);
-            // Files may have changed while no process watched them. Before
-            // the first view is served, compare the checkout with what was
-            // published: the scan reads only files whose stat no longer
-            // proves their recorded content, and every difference is
-            // recorded as a change.
-            let sink = ChangeSink::default();
-            let scanned = scan(
-                &handle.root,
-                &handle.layer.policy,
-                Some(&published.state),
-                &sink,
-            )
-            .map_err(|error| DataError::Scan(error.to_string()))?;
-            let changed = changed_members(&published.state, &scanned.state);
-            handle.write_live().published = Some(Arc::clone(&published));
-            handle.apply_scan(&published.state, scanned.state, &changed, sink.finish());
-        }
+        handle.adopt_newest()?;
         Ok(handle)
+    }
+
+    /// Serves the newest publication of this checkout, if any. Files may
+    /// have changed while no process watched them (or since another process
+    /// scanned), so before the view is served the checkout is compared with
+    /// what was published: the scan reads only files whose stat no longer
+    /// proves their recorded content, and every difference is recorded as a
+    /// change.
+    fn adopt_newest(&self) -> Result<(), DataError> {
+        // A recording waits, so none lands between the scan and the swap.
+        let _order = self.recording.lock().expect("no panics while holding it");
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let Some(published) = self.open_published(snapshot)? else {
+            return Ok(());
+        };
+        let published = Arc::new(published);
+        let sink = ChangeSink::default();
+        let scanned = scan(
+            &self.root,
+            &self.layer.policy,
+            Some(&published.state),
+            &sink,
+        )
+        .map_err(|error| DataError::Scan(error.to_string()))?;
+        let changed = changed_members(&published.state, &scanned.state);
+        {
+            // The scan compared the files on disk with this publication, so
+            // changes recorded against an earlier one are replaced by what it
+            // found.
+            let mut live = self.write_live();
+            live.unparsed = Arc::new(published.unparsed.clone());
+            live.published = Some(Arc::clone(&published));
+            live.changes.clear();
+            live.early.clear();
+            live.state = None;
+            live.text = Arc::new(TextOverlay::default());
+            live.callgraph_pending = Arc::new(BTreeSet::new());
+            live.graph = None;
+            live.refreshed = None;
+        }
+        self.apply_scan(&published.state, scanned.state, &changed, sink.finish());
+        Ok(())
     }
 
     /// The checkout's root folder.
@@ -285,6 +322,7 @@ impl Checkout {
             graph,
             refreshed: live.refreshed.clone(),
             sequence: live.sequence,
+            unparsed: Arc::clone(&live.unparsed),
         })
     }
 
@@ -292,15 +330,18 @@ impl Checkout {
     /// what they could not cover.
     #[must_use]
     pub fn status(&self) -> CheckoutStatus {
-        if let Some(view) = self.view() {
-            return view.status();
-        }
-        let plane = if self
+        let building = self
             .live
             .read()
             .expect("no panics while holding it")
-            .building
-        {
+            .building;
+        if let Some(view) = self.view() {
+            return CheckoutStatus {
+                building,
+                ..view.status()
+            };
+        }
+        let plane = if building {
             PlaneStatus::Building {
                 done: 0,
                 total: None,
@@ -311,6 +352,8 @@ impl Checkout {
         CheckoutStatus {
             text: plane,
             callgraph: plane,
+            building,
+            unparsed: 0,
         }
     }
 
@@ -413,8 +456,16 @@ impl Checkout {
         let sequence = live.sequence;
         let mut text = (*live.text).clone();
         let mut pending = (*live.callgraph_pending).clone();
+        let mut unparsed = (*live.unparsed).clone();
         for (path, entry, record, content) in entries {
             pending.insert(path.clone());
+            let failed =
+                matches!(content, Extracted::Nothing) && record.as_ref().is_some_and(is_unparsed);
+            if failed {
+                unparsed.insert(path.clone());
+            } else {
+                unparsed.remove(&path);
+            }
             text.set(path.clone(), entry);
             live.changes.insert(
                 path,
@@ -427,6 +478,7 @@ impl Checkout {
         }
         live.text = Arc::new(text);
         live.callgraph_pending = Arc::new(pending);
+        live.unparsed = Arc::new(unparsed);
         live.state = Some(Arc::new(state));
     }
 
@@ -452,6 +504,16 @@ impl Checkout {
             .read()
             .expect("no panics while holding it")
             .sequence;
+        // What this checkout's published state was when the scan started:
+        // if another process publishes a newer one before this build does,
+        // this build's scan may be the older one.
+        let started_from = self
+            .family
+            .snapshot()
+            .map_err(DataError::store)?
+            .manifest()
+            .checkout(self.checkout)
+            .cloned();
         let mut report = BuildReport::default();
         let started = Instant::now();
         let sink = BuildSink::default();
@@ -504,12 +566,29 @@ impl Checkout {
         report.resolve_ms = elapsed_ms(started);
 
         let started = Instant::now();
+        let deadline = Instant::now() + WRITER_WAIT;
         let mut session = loop {
             if let Some(session) = self.family.try_write().map_err(DataError::store)? {
                 break session;
             }
+            if Instant::now() >= deadline {
+                return Err(DataError::Busy(format!(
+                    "another process held the store's writer for over {} s",
+                    WRITER_WAIT.as_secs()
+                )));
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        if session.base().checkout(self.checkout) != started_from.as_ref() {
+            // Another process published this checkout after the scan began.
+            // Its state may be newer than this scan, so this build stands
+            // down: it serves that publication and records what differs from
+            // the files now on disk, as a bind does.
+            drop(session);
+            report.superseded = true;
+            self.adopt_newest()?;
+            return Ok(report);
+        }
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected
             .text
@@ -587,6 +666,17 @@ impl Checkout {
             } else {
                 Some(Arc::new(with_changes(&published.state, &live.changes)))
             };
+            let mut unparsed = published.unparsed.clone();
+            for (path, change) in &live.changes {
+                let failed = matches!(change.extracted, Extracted::Nothing)
+                    && change.record.as_ref().is_some_and(is_unparsed);
+                if failed {
+                    unparsed.insert(path.clone());
+                } else {
+                    unparsed.remove(path);
+                }
+            }
+            live.unparsed = Arc::new(unparsed);
             live.published = Some(Arc::new(published));
             // The new publication's graph replaces the old one and whatever
             // was laid over it; the next refresh starts from it.
@@ -861,6 +951,9 @@ struct Published {
     segments: Vec<Arc<Segment>>,
     membership: TextMembership,
     graph: Arc<StoredSlices>,
+    /// Paths in a parsed language with no stored resolution: their
+    /// extraction failed.
+    unparsed: BTreeSet<Vec<u8>>,
     /// Holds the lease that keeps this generation's files on disk while any
     /// view reads them.
     _snapshot: Snapshot,
@@ -884,6 +977,12 @@ pub enum PlaneStatus {
 pub struct CheckoutStatus {
     pub text: PlaneStatus,
     pub callgraph: PlaneStatus,
+    /// A build is running. Answers still come from the current view, which
+    /// covers every change recorded so far.
+    pub building: bool,
+    /// Files in a parsed language that the call graph does not cover,
+    /// because extracting them failed. The plane can be ready with some.
+    pub unparsed: usize,
 }
 
 /// A checkout's data as queries see it at one moment: the last publication
@@ -899,6 +998,7 @@ pub struct CheckoutView {
     refreshed: Option<Arc<Refreshed>>,
     /// The checkout's change count when the view was taken.
     sequence: u64,
+    unparsed: Arc<BTreeSet<Vec<u8>>>,
 }
 
 impl Published {
@@ -920,8 +1020,12 @@ impl Published {
         // Each parsed path's record key follows from its content and
         // language; its fragment is the one the state names.
         let mut files = Vec::new();
+        let mut unparsed = BTreeSet::new();
         for (index, record) in state.paths().iter().enumerate() {
             let Some(fragment) = state.fragment(index) else {
+                if is_unparsed(record) {
+                    unparsed.insert(record.path.clone());
+                }
                 continue;
             };
             let Ok(path) = std::str::from_utf8(&record.path) else {
@@ -942,6 +1046,7 @@ impl Published {
             segments,
             membership,
             graph: Arc::new(graph),
+            unparsed,
             _snapshot: snapshot,
         })
     }
@@ -1006,7 +1111,12 @@ impl CheckoutView {
                 total: Some(pending),
             },
         };
-        CheckoutStatus { text, callgraph }
+        CheckoutStatus {
+            text,
+            callgraph,
+            building: false,
+            unparsed: self.unparsed.len(),
+        }
     }
 
     /// The paths in `scope` that may match `query`, in byte order, with the
@@ -1214,6 +1324,13 @@ fn changed_members(before: &CheckoutState, after: &CheckoutState) -> Vec<Vec<u8>
         }
     }
     changed.into_iter().collect()
+}
+
+/// Whether `record` is a text file in a parsed language that has no
+/// resolution: given that it has none, its extraction failed. Resolver
+/// configuration files are read raw and never resolved.
+fn is_unparsed(record: &PathRecord) -> bool {
+    record.kind == PathKind::Text && !record.language.is_empty() && record.language != "config"
 }
 
 /// The language a changed file is parsed as, and what the call graph reads
@@ -1561,6 +1678,55 @@ mod tests {
             .filter_map(Result::ok)
             .count();
         assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_build_stands_down_when_another_process_published_first() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Arc::new(
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap(),
+        );
+        // Another process holds the writer while this build scans.
+        let family_store = Family::open(store.path(), family()).unwrap();
+        let mut other = family_store.try_write().unwrap().unwrap();
+        let building = std::thread::spawn({
+            let checkout = Arc::clone(&checkout);
+            move || checkout.build()
+        });
+        let started = Instant::now();
+        while !checkout.status().building {
+            assert!(started.elapsed().as_secs() < 30, "the build never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Let the build take its starting snapshot and reach the writer.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // The other process publishes this checkout first.
+        let state = scan(root.path(), &layer.policy, None, &ChangeSink::default())
+            .unwrap()
+            .state;
+        let written = other
+            .write_checkout_state(checkout.checkout, &state)
+            .unwrap();
+        other
+            .publish(&Publication {
+                states: vec![written],
+                ..Publication::default()
+            })
+            .unwrap();
+        drop(other);
+
+        let report = building.join().unwrap().unwrap();
+        assert!(report.superseded, "{report:?}");
+        // The checkout serves the other process's publication, and nothing
+        // of its own was published over it.
+        let snapshot = family_store.snapshot().unwrap();
+        assert!(snapshot.manifest().segments().is_empty());
+        let view = checkout.view().unwrap();
+        assert_eq!(view.state().paths().len(), state.paths().len());
+        assert!(!checkout.status().building);
     }
 
     #[test]
