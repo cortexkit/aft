@@ -27,6 +27,7 @@ pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
 pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
     let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     name == b"package.json"
+        || name == b"pnpm-workspace.yaml"
         || name == b"Cargo.toml"
         || name == b"go.mod"
         || name == b".gitignore"

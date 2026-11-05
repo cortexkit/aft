@@ -462,9 +462,12 @@ pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
 pub(crate) fn zoom_callgraph_field(ctx: &AppContext) -> Option<Option<Value>> {
     let report = report(ctx)?;
     let plane = &report.callgraph;
+    // `callgraph_off` tells the agent the call graph is switched off in
+    // config. A root that is merely not bound yet is off in status, but its
+    // call graph is unavailable, not switched off.
     let code = match plane.status {
         READY => return Some(None),
-        OFF => "callgraph_off",
+        OFF if plane.reason != Some(reason::NOT_BOUND) => "callgraph_off",
         BUILDING => "callgraph_building",
         _ => "callgraph_unavailable",
     };
@@ -952,7 +955,7 @@ mod tests {
         assert_eq!(health.data_store.unwrap().reason, Some(reason::NOT_BOUND));
         assert_eq!(
             zoom(&ctx, &lib)["callgraph"],
-            json!({"status": "unavailable", "code": "callgraph_off",
+            json!({"status": "unavailable", "code": "callgraph_unavailable",
                 "index": {"status": "off", "reason": "not_bound"}})
         );
         assert!(
