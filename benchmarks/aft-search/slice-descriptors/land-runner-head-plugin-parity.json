@@ -1,8 +1,13 @@
 {
-  "fixtures": [
-    "harness-goldens"
-  ],
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
   "kind": "harness",
-  "slice_class": "non_ranking",
-  "targeted_mechanism": "none"
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs"
+  ],
+  "slices": [
+    "runner-head-plugin-parity"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/commands/semantic_search/external_exact.rs, and only its test module: a ToolCallContext literal gains the new head_catalog_key field (None). No search code changes; ranked rows must remain byte-identical to the committed reference."
 }
