@@ -3358,7 +3358,7 @@ fn prewarm_symbol_cache_from_view(
     report
 }
 
-fn walk_semantic_project_files_bounded(
+pub(crate) fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {

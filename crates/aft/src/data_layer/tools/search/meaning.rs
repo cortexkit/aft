@@ -263,3 +263,601 @@ impl MeaningIndex<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::config::{SemanticBackend, SemanticBackendConfig};
+    use crate::protocol::RawRequest;
+
+    const DIMENSIONS: usize = 8;
+
+    /// Every text's vector follows from its digest.
+    fn vector_of(text: &str) -> Vec<f32> {
+        let hash = blake3::hash(text.as_bytes());
+        (0..DIMENSIONS)
+            .map(|i| (f32::from(hash.as_bytes()[i]) - 127.5) / 50.0)
+            .collect()
+    }
+
+    /// Holds every embedding request whose input names `marker` until
+    /// [`Gate::open`] is called.
+    struct Gate {
+        marker: &'static str,
+        open: Mutex<bool>,
+        opened: Condvar,
+        held: AtomicUsize,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        fn wait_if_held(&self, texts: &[String]) {
+            if !texts.iter().any(|text| text.contains(self.marker)) {
+                return;
+            }
+            self.held.fetch_add(1, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+    }
+
+    /// A loopback OpenAI-compatible embedding server answering every text
+    /// with [`vector_of`], holding requests that name `marker` until the
+    /// returned gate opens. Returns its base URL.
+    fn serve(marker: &'static str) -> (String, Arc<Gate>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate {
+            marker,
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+            held: AtomicUsize::new(0),
+        });
+        let served = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let gate = Arc::clone(&served);
+                std::thread::spawn(move || {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let (header_end, length) = loop {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(end) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (end + 4, length);
+                        }
+                    };
+                    while buffer.len() < header_end + length {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                    }
+                    let request: Value =
+                        serde_json::from_slice(&buffer[header_end..header_end + length])
+                            .unwrap_or(Value::Null);
+                    let texts: Vec<String> = match &request["input"] {
+                        Value::String(text) => vec![text.clone()],
+                        Value::Array(items) => items
+                            .iter()
+                            .map(|item| item.as_str().unwrap_or_default().to_string())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    gate.wait_if_held(&texts);
+                    let data: Vec<Value> = texts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, text)| json!({"index": index, "embedding": vector_of(text)}))
+                        .collect();
+                    let body = json!({"object": "list", "data": data}).to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes());
+                });
+            }
+        });
+        (format!("http://{address}/v1"), gate)
+    }
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(found) = check() {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn search(ctx: &AppContext, id: &str, query: &str) -> Value {
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": id,
+            "command": "semantic_search",
+            "query": query,
+            "top_k": 5,
+        }))
+        .unwrap();
+        serde_json::to_value(crate::commands::semantic_search::handle_semantic_search(
+            &request, ctx,
+        ))
+        .unwrap()
+    }
+
+    /// While a fill is under way the plane serves what is filled and every
+    /// surface says the answer is partial; it reports ready only once every
+    /// file is filled, and the filled answer is cached under another
+    /// generation than the partial one.
+    #[test]
+    fn a_fill_under_way_is_reported_partial_and_ready_only_once_every_file_is_filled() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // More files than one fill round takes, the last of them held back
+        // by the embedder, so the first round lands and the second waits.
+        for index in 0..300 {
+            write(
+                &root,
+                &format!("src/f{index:03}.rs"),
+                &format!("/// Counts the widgets of batch {index}.\npub fn widget_count_{index}(items: &[u32]) -> usize {{\n    items.len() + {index}\n}}\n"),
+            );
+        }
+        write(
+            &root,
+            "src/zz_last.rs",
+            "/// The last file.\npub fn omega_marker() -> u32 {\n    7\n}\n",
+        );
+        let (base_url, gate) = serve("omega_marker");
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            indexes: crate::config::IndexesConfig {
+                trigram: true,
+                semantic: true,
+                callgraph: false,
+            },
+            semantic: SemanticBackendConfig {
+                backend: SemanticBackend::OpenAiCompatible,
+                model: "test-hashed".to_string(),
+                base_url: Some(base_url),
+                timeout_ms: 120_000,
+                query_timeout_ms: 30_000,
+                ..SemanticBackendConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::semantic_admission::note_opened("data-layer-meaning-test", &root);
+        let checkout = ctx.data_checkout().unwrap();
+        wait_for("the text build", || checkout.view());
+
+        // Asking starts the fill; its first round lands, the second waits.
+        let partial = wait_for("the first fill round", || {
+            DataSemantic::current(&ctx).and_then(|data| data.serving().cloned())
+        });
+        assert!(!partial.complete());
+        assert_eq!(partial.coverage().files, 301);
+        assert_eq!(
+            partial.coverage().pending.len(),
+            45,
+            "{:?}",
+            partial.coverage()
+        );
+        wait_for("the held request", || {
+            (gate.held.load(Ordering::SeqCst) > 0).then_some(())
+        });
+
+        let status = ctx.build_status_snapshot();
+        assert_eq!(status["semantic_index"]["status"], "building", "{status}");
+        assert_eq!(status["semantic_index"]["files_pending"], 45, "{status}");
+
+        let reply = search(&ctx, "meaning-partial", "count the widgets of a batch");
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(reply["status"], "partial", "{reply}");
+        assert_eq!(reply["complete"], false, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        assert!(
+            text.contains("semantic: 45 file(s) not yet embedded"),
+            "{text}"
+        );
+        assert!(text.contains("semantic: partial"), "{text}");
+        assert!(!reply["results"].as_array().unwrap().is_empty(), "{reply}");
+        let partial_generation = reply["structuredContent"]["plan"]["snapshot_generation"].clone();
+
+        gate.open();
+        wait_for("the fill to finish", || {
+            DataSemantic::current(&ctx)
+                .and_then(|data| data.serving().cloned())
+                .filter(|meaning| meaning.complete())
+        });
+        let status = ctx.build_status_snapshot();
+        assert_eq!(status["semantic_index"]["status"], "ready", "{status}");
+        assert_eq!(status["semantic_index"]["files_embedded"], 301, "{status}");
+
+        let reply = search(&ctx, "meaning-ready", "count the widgets of a batch");
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(reply["status"], "ready", "{reply}");
+        assert_eq!(reply["complete"], true, "{reply}");
+        let text = reply["text"].as_str().unwrap();
+        assert!(!text.contains("not yet embedded"), "{text}");
+        assert_ne!(
+            reply["structuredContent"]["plan"]["snapshot_generation"], partial_generation,
+            "a fill that lands changes the generation cached lists are keyed by"
+        );
+    }
+
+    /// A deterministic stand-in for an embedding model: each word of the
+    /// text (identifiers split at case changes, digits and underscores,
+    /// lowercased) adds a signed unit to one of 384 dimensions chosen by its
+    /// digest. Texts sharing words point the same way, so a search ranks as
+    /// a weak model would, and both sources get exactly the same vectors.
+    fn hashed_embedding(text: &str) -> Vec<f32> {
+        const LENGTH: usize = 384;
+        let mut vector = vec![0.0f32; LENGTH];
+        let mut word = String::new();
+        let mut flush = |word: &mut String| {
+            if word.is_empty() {
+                return;
+            }
+            let digest = blake3::hash(word.as_bytes());
+            let bytes = digest.as_bytes();
+            let slot = usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) % LENGTH;
+            vector[slot] += if bytes[2] & 1 == 0 { 1.0 } else { -1.0 };
+            word.clear();
+        };
+        let mut previous_lower = false;
+        for character in text.chars() {
+            if !character.is_alphanumeric() {
+                flush(&mut word);
+                previous_lower = false;
+                continue;
+            }
+            if character.is_uppercase() && previous_lower {
+                flush(&mut word);
+            }
+            previous_lower = character.is_lowercase() || character.is_ascii_digit();
+            word.extend(character.to_lowercase());
+        }
+        flush(&mut word);
+        vector
+    }
+
+    /// A result row's fields, with its scores' bits.
+    fn row(result: &SemanticResult) -> String {
+        format!(
+            "{} {} {:?} {:?} {}-{} {} {:08x} {:08x} {} {} {:?}",
+            result.file.display(),
+            result.name,
+            result.qualified_name,
+            result.kind,
+            result.start_line,
+            result.end_line,
+            result.exported,
+            result.score.to_bits(),
+            result.rank_score.to_bits(),
+            result.cap_protected,
+            result.source,
+            result.snippet,
+        )
+    }
+
+    /// What one comparison found over the query list, recorded as it goes
+    /// so no answer is kept past its comparison.
+    #[derive(Default)]
+    struct Tally {
+        queries: usize,
+        differing: usize,
+        today: Duration,
+        data: Duration,
+        examples: Vec<Value>,
+    }
+
+    impl Tally {
+        fn record(
+            &mut self,
+            query: &str,
+            today: (Vec<String>, Duration),
+            data: (Vec<String>, Duration),
+        ) {
+            self.queries += 1;
+            self.today += today.1;
+            self.data += data.1;
+            if today.0 == data.0 {
+                return;
+            }
+            self.differing += 1;
+            if self.examples.len() >= 25 {
+                return;
+            }
+            let parted = today.0.iter().zip(&data.0).position(|(a, b)| a != b);
+            let clip =
+                |line: Option<&String>| line.map(|line| line.chars().take(400).collect::<String>());
+            self.examples.push(json!({
+                "query": query,
+                "today_rows": today.0.len(),
+                "data_rows": data.0.len(),
+                "first_parting_row": parted,
+                "today_at_parting": parted.and_then(|index| clip(today.0.get(index))),
+                "data_at_parting": parted.and_then(|index| clip(data.0.get(index))),
+            }));
+        }
+
+        fn summary(&self) -> Value {
+            let per_call =
+                |total: Duration| total.as_secs_f64() * 1000.0 / self.queries.max(1) as f64;
+            json!({
+                "queries": self.queries,
+                "differing": self.differing,
+                "today_ms_per_call": per_call(self.today),
+                "data_ms_per_call": per_call(self.data),
+                "examples": self.examples,
+            })
+        }
+    }
+
+    fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+        let started = Instant::now();
+        let value = work();
+        (value, started.elapsed())
+    }
+
+    /// Asks today's semantic index and the data layer's meaning plane, built
+    /// from the same checkout with the same embedder, the semantic lane's
+    /// question for each distinct query of a real query list, and writes
+    /// what differs and what each costs. The gate for wiring aft_search's
+    /// semantic lane onto the data layer runs it on aft's own checkout:
+    ///
+    /// `AFT_MEANING_PARITY_ROOT=<checkout> AFT_MEANING_PARITY_QUERIES=<one
+    /// query per line> AFT_MEANING_PARITY_OUT=<report.json> cargo test -p
+    /// agent-file-tools --lib -- --ignored meaning_lane_matches`
+    ///
+    /// Today's index is built from the files configure's semantic walk
+    /// finds, as configure builds it; the plane from the data layer's scan
+    /// of the same tree. `AFT_MEANING_PARITY_THREADS` spreads the queries
+    /// over threads (per-call costs then include the contention).
+    #[test]
+    #[ignore = "reads the checkout and query list named by AFT_MEANING_PARITY_*"]
+    fn meaning_lane_matches_todays_index_on_real_queries() {
+        use crate::data_layer::checkout::{Checkout, DataLayer};
+        use crate::data_layer::vectors::{FillBudget, Producer, VectorPlane};
+        use crate::semantic_index::SemanticIndexFingerprint;
+
+        let variable = |name: &str| std::env::var(name).ok();
+        let root = std::fs::canonicalize(variable("AFT_MEANING_PARITY_ROOT").unwrap()).unwrap();
+        let queries =
+            std::fs::read_to_string(variable("AFT_MEANING_PARITY_QUERIES").unwrap()).unwrap();
+        let out = std::path::PathBuf::from(variable("AFT_MEANING_PARITY_OUT").unwrap());
+        let threads = variable("AFT_MEANING_PARITY_THREADS")
+            .and_then(|threads| threads.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let config = SemanticBackendConfig::default();
+        let fingerprint = SemanticIndexFingerprint::for_config_dimension(&config, 384);
+        let caps = fingerprint.embed_text_caps;
+        let mut embed = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|text| hashed_embedding(text)).collect())
+        };
+
+        // Today's index, from configure's semantic walk.
+        let (today, today_ms) = timed(|| {
+            let files = crate::commands::configure::walk_semantic_project_files_bounded(
+                &root,
+                config.max_files,
+            )
+            .unwrap();
+            let index =
+                SemanticIndex::build_with_caps(&root, &files, &mut embed, 64, caps).unwrap();
+            (files, index)
+        });
+        let (today_files, today) = today;
+
+        // The data layer's plane over a fresh store.
+        let store = tempfile::tempdir().unwrap();
+        let family = aft_store::ids::FamilyId::from_digest(aft_store::ids::Digest128::of(
+            b"meaning lane parity",
+        ));
+        let ((checkout, plane, fill), data_ms) = timed(|| {
+            let checkout = Arc::new(
+                Checkout::bind(
+                    Arc::new(DataLayer::new(256 << 20, threads.max(2))),
+                    store.path(),
+                    family,
+                    &root,
+                )
+                .unwrap(),
+            );
+            checkout.build().unwrap();
+            let plane = VectorPlane::new(
+                Arc::clone(&checkout),
+                Producer::from_fingerprint(&fingerprint),
+                config.max_files,
+            );
+            let fill = plane
+                .fill(
+                    &mut embed,
+                    FillBudget {
+                        max_batch: 64,
+                        files_per_round: 256,
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            (checkout, plane, fill)
+        });
+        let view = checkout.view().unwrap();
+        plane.refresh().unwrap();
+        let meaning = DataMeaning {
+            snapshot: plane.snapshot(&view).unwrap(),
+            failure: None,
+        };
+        let coverage = meaning.coverage().clone();
+        let today_set: std::collections::BTreeSet<_> = today_files.iter().cloned().collect();
+        let data_set: std::collections::BTreeSet<_> = view
+            .current_state()
+            .paths()
+            .iter()
+            .filter(|record| {
+                record.kind != aft_store::checkout::PathKind::Symlink
+                    && crate::semantic_index::is_semantic_indexed_extension(Path::new(
+                        &String::from_utf8_lossy(&record.path).to_string(),
+                    ))
+            })
+            .map(|record| root.join(String::from_utf8_lossy(&record.path).to_string()))
+            .collect();
+        eprintln!(
+            "today: {} files, {} chunks in {:.0} ms; data layer: {} files, {} chunks embedded in {:.0} ms",
+            today_files.len(),
+            today.len(),
+            today_ms.as_secs_f64() * 1000.0,
+            coverage.files,
+            coverage.chunks_embedded,
+            data_ms.as_secs_f64() * 1000.0,
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        let queries = queries
+            .lines()
+            .map(str::trim)
+            .filter(|query| !query.is_empty() && seen.insert(query.to_string()))
+            .collect::<Vec<_>>();
+        let lane_k = crate::commands::semantic_search::SEMANTIC_ENUMERATION_LIMIT + 1;
+        let next = AtomicUsize::new(0);
+        let tallies = Mutex::new(std::collections::BTreeMap::<&'static str, Tally>::new());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let today_index = MeaningIndex::Snapshot(&today);
+                    let data_index = MeaningIndex::Data(&meaning);
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(query) = queries.get(index) else {
+                            break;
+                        };
+                        let vector = hashed_embedding(query);
+                        let mut found = Vec::new();
+                        for (name, include_tests, k) in [
+                            ("lane", false, lane_k),
+                            ("lane_include_tests", true, lane_k),
+                            ("recall_audit_full_ranking", false, usize::MAX),
+                        ] {
+                            let include = |file: &Path| {
+                                crate::commands::semantic_search::path_allowed_by_include_tests(
+                                    file,
+                                    &root,
+                                    include_tests,
+                                )
+                            };
+                            let ask = |source: MeaningIndex<'_>| {
+                                timed(|| {
+                                    source
+                                        .search_filtered(&vector, k, &include)
+                                        .unwrap()
+                                        .iter()
+                                        .map(row)
+                                        .collect::<Vec<_>>()
+                                })
+                            };
+                            found.push((name, ask(today_index), ask(data_index)));
+                        }
+                        let mut tallies = tallies.lock().unwrap();
+                        for (name, today, data) in found {
+                            tallies.entry(name).or_default().record(query, today, data);
+                        }
+                        let finished = tallies.get("lane").map_or(0, |tally| tally.queries);
+                        if finished % 500 == 0 {
+                            eprintln!(
+                                "{finished} queries in {:.0} s",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let tallies = tallies.into_inner().unwrap();
+        let only = |left: &std::collections::BTreeSet<std::path::PathBuf>,
+                    right: &std::collections::BTreeSet<std::path::PathBuf>| {
+            left.difference(right)
+                .take(25)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut report = json!({
+            "root": root,
+            "distinct_queries": queries.len(),
+            "threads": threads,
+            "today_files": today_files.len(),
+            "today_chunks": today.len(),
+            "today_build_ms": today_ms.as_secs_f64() * 1000.0,
+            "data_build_and_fill_ms": data_ms.as_secs_f64() * 1000.0,
+            "data_coverage": coverage,
+            "data_fill": fill,
+            "files_only_today": only(&today_set, &data_set),
+            "files_only_today_count": today_set.difference(&data_set).count(),
+            "files_only_data": only(&data_set, &today_set),
+            "files_only_data_count": data_set.difference(&today_set).count(),
+        });
+        for (name, tally) in &tallies {
+            report[*name] = tally.summary();
+            println!(
+                "{name}: {} of {} differ; today {:.3} ms, data layer {:.3} ms per call",
+                tally.differing,
+                tally.queries,
+                tally.today.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
+                tally.data.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
+            );
+        }
+        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let failing = tallies
+            .iter()
+            .filter(|(_, tally)| tally.differing > 0)
+            .map(|(name, tally)| format!("{name}: {} of {}", tally.differing, tally.queries))
+            .collect::<Vec<_>>();
+        assert!(
+            failing.is_empty(),
+            "semantic lane answers differ: {failing:?}"
+        );
+    }
+}
