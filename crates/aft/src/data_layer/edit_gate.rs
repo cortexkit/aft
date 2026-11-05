@@ -721,6 +721,17 @@ pub fn run_reuse(
             differing_recordings: 0,
             examples: Vec::new(),
         };
+        // The cold side was decoded from fragment bytes, and a fragment does
+        // not keep what is computed on load (the bound surface), so the
+        // reused side goes through the same encoding before comparing.
+        let reused = reused
+            .into_iter()
+            .map(|(path, file)| {
+                let key = &inputs.parses[&path].0;
+                let bytes = super::fragment::encode(&file);
+                decode(key, &path, &bytes).map(|file| (path, file))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let (answers, recordings) = compare(&reused, &cold, &mut record.examples);
         record.differing_files = answers;
         record.differing_recordings = recordings;
