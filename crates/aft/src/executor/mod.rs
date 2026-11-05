@@ -95,8 +95,9 @@ pub enum Lane {
     /// roots always ran beside any configure. Jobs run one at a time per actor
     /// in submission order, so one root's ledger writes land in the order they
     /// were queued; a scope end therefore settles every admission queued on
-    /// its root before it. Unlike ProviderMetadata, an unbind does not cancel
-    /// them: a settlement records a call that already ran.
+    /// its root before it. Queued ProviderMetadata jobs are cancelled when the
+    /// root's last route unbinds; these are not, because a settlement records
+    /// a call that already ran.
     CallLedger,
 }
 
