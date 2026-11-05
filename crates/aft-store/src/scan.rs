@@ -287,7 +287,12 @@ fn walk_records(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .require_git(false)
+        // Inside a repository, Git's rules stop at its root, as Git's do: an
+        // ignore file in a folder above it (a checkout placed inside another,
+        // or a home folder under version control) changes nothing. Outside
+        // one, `.gitignore` files still apply, from the root and above, as
+        // the project walk and the watcher's filter apply them.
+        .require_git(inside_work_tree(root))
         .follow_links(false)
         .same_file_system(true);
     for name in &policy.ignore_files {
@@ -655,6 +660,13 @@ fn is_sqlite_file(name: &OsStr) -> bool {
 
 /// The common Git directory of the repository `root` is in, when `root` is
 /// a Git checkout root.
+/// Whether `path` or a folder above it holds `.git` (a folder, or the file a
+/// linked worktree has) or `.jj`.
+fn inside_work_tree(path: &Path) -> bool {
+    path.ancestors()
+        .any(|dir| dir.join(".git").symlink_metadata().is_ok() || dir.join(".jj").is_dir())
+}
+
 fn git_common_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_dir() {
@@ -868,9 +880,36 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_inside_another_ignores_the_outer_rules() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join(".gitignore"), b"vendor/\n*.log\n").unwrap();
+        let root = outer.path().join("nested");
+        let write = |path: &str, bytes: &[u8]| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write("vendor/lib.rs", b"fn lib() {}\n");
+        write("run.log", b"log\n");
+        // Not a repository: the outer `.gitignore` applies, as it does to the
+        // project walk.
+        let plain = scan(&root, &ScanPolicy::default(), None, &Collect::default()).unwrap();
+        assert!(plain.state.get(b"vendor/lib.rs").is_none());
+        // A linked worktree's `.git` file makes it a repository, whose rules
+        // stop at its root.
+        write(".git", b"gitdir: /nowhere\n");
+        let checkout = scan(&root, &ScanPolicy::default(), None, &Collect::default()).unwrap();
+        assert!(checkout.state.get(b"vendor/lib.rs").is_some());
+        assert!(checkout.state.get(b"run.log").is_some());
+    }
+
+    #[test]
     fn admits_what_the_rules_admit_and_reuses_unchanged_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        // A repository, so folders above the temporary root cannot change
+        // what it admits.
+        std::fs::create_dir(root.join(".git")).unwrap();
         let write = |path: &str, bytes: &[u8]| {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
