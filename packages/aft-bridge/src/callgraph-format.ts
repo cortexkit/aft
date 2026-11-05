@@ -193,9 +193,7 @@ function rootTag(record: Record<string, unknown>): string | undefined {
   const label = kind ? ROOT_LABELS[kind] : undefined;
   if (!kind || !label) return undefined;
   const attribute = asString(record.attribute);
-  return kind === "attribute" && attribute
-    ? `[root: attribute ${attribute}]`
-    : `[root: ${label}]`;
+  return kind === "attribute" && attribute ? `[root: attribute ${attribute}]` : `[root: ${label}]`;
 }
 
 function renderTracePath(
