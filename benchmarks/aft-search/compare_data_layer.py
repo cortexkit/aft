@@ -18,13 +18,18 @@ same binary too.
 Every process first answers the same warm-up request, which no row repeats;
 the data-layer process serves from the view only after its first build has
 published, so it then waits until the build's log line appears. Every
-process then waits for the file watcher to go quiet before the replay. Each request then logs one line per ranking that
-read the view, and every row records how many it saw, so a reply that came
-from the legacy index anyway is visible rather than a silent pass.
+process then waits for the file watcher to go quiet before the replay.
+
+The ranking logs one line each time its lanes read the data layer's view.
+Each replayed row records how many such lines its request added to that
+process's log (`view_reads`), so a data-layer reply that the legacy index
+answered anyway is reported rather than passing silently.
 
 Families:
-  concept   the concept-recall fixtures (`fixtures.json`) on the pinned
-            evidence tree, semantic lane served by the fixture vector pack;
+  concept   the concept-recall fixtures (`fixtures.json`) on the evidence
+            tree `provision_evidence.py` materializes (AFT at the commit
+            `EVIDENCE_SHA` in `search_quality_lib.py` pins), semantic lane
+            served by the fixture vector pack;
   exact     the exact-recall fixtures on the provisioned corpus repositories,
             semantic search off, as `run_exact_recall.py` sends them;
   checkout  one query per line of `--queries` on `--root`, semantic search off.
