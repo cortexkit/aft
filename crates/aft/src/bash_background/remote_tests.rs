@@ -12614,6 +12614,106 @@ fn runon_write_return_paths_exempt_only_the_resolved_requested_file() {
     assert!(runon_write_refusal("echo new > ../other.rs", &request).is_some());
 }
 
+#[test]
+fn runon_write_formatter_workdir_accepts_one_returned_file() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "source\n").unwrap();
+    hermetic_git(root, &["add", "src/a.rs"]);
+    for command in [
+        "cargo fmt",
+        "cargo fmt --all",
+        "prettier --write .",
+        "gofmt -w .",
+        "ruff format",
+        "black .",
+    ] {
+        request.return_paths.clear();
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+        request.return_paths = vec!["./src/a.rs".into()];
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+    }
+    request.cwd = root.join("src").to_string_lossy().into_owned();
+    request.return_paths = vec!["./a.rs".into()];
+    assert!(runon_write_refusal("cargo fmt --all", &request).is_none());
+}
+
+#[test]
+fn runon_write_formatter_folder_requires_a_returned_descendant() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    for path in ["src/a.ts", "docs/a.md", "src-extra/a.ts"] {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), "source\n").unwrap();
+    }
+    hermetic_git(root, &["add", "src/a.ts", "docs/a.md", "src-extra/a.ts"]);
+    for command in [
+        "cd src && cargo fmt",
+        "cd src && cargo fmt --all",
+        "rustfmt --edition 2021 src/",
+        "prettier --write src/",
+        "gofmt -w src/",
+        "cd src && ruff format",
+        "black src/",
+        "biome format --write src/",
+        "biome check --write src/",
+    ] {
+        request.return_paths.clear();
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+        request.return_paths = vec!["./src/a.ts".into()];
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+        for outside in ["docs/a.md", "src-extra/a.ts"] {
+            request.return_paths = vec![outside.into()];
+            assert!(
+                runon_write_refusal(command, &request).is_some(),
+                "{command}, return_paths: {outside}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runon_write_formatter_files_and_other_edits_keep_exact_return_paths() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("src")).unwrap();
+    for path in ["src/a.ts", "src/b.ts"] {
+        fs::write(root.join(path), "source\n").unwrap();
+    }
+    hermetic_git(root, &["add", "src/a.ts", "src/b.ts"]);
+    request.return_paths = vec!["src/a.ts".into()];
+    assert!(runon_write_refusal("prettier --write src/a.ts", &request).is_none());
+    assert!(runon_write_refusal("echo new > src/a.ts", &request).is_none());
+    for command in [
+        "prettier --write src/a.ts src/b.ts",
+        "prettier --write src/ && echo new > src/b.ts",
+        "prettier --write src/ && sed -i 's/a/b/' src/b.ts",
+        "prettier --write src/ && rm -rf src",
+        "rm -rf src && prettier --write src/",
+        "prettier --write src/ > src",
+    ] {
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+    }
+    request.return_paths.push("src/b.ts".into());
+    assert!(runon_write_refusal("prettier --write src/a.ts src/b.ts", &request).is_none());
+}
+
 #[tokio::test]
 async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
