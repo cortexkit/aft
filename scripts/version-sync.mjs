@@ -249,6 +249,12 @@ const secretRulesPath = join(root, "crates", "secret-rules", "Cargo.toml");
 results.push(updateCargoToml(secretRulesPath, version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "secret-rules", version, dryRun));
 
+// 13: Cargo.toml — aft-store (leaf crate holding the on-disk index formats,
+// published before the main crate for the same reason as aft-tokenizer).
+const storePath = join(root, "crates", "aft-store", "Cargo.toml");
+results.push(updateCargoToml(storePath, version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-store", version, dryRun));
+
 // Report
 let updateCount = 0;
 for (const { path, changes } of results) {

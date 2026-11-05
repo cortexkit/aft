@@ -265,7 +265,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         publish = next(step["run"] for step in steps if step.get("name") == "Rehearse crates.io publishing")
         self.assertEqual(
             publish,
-            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p agent-file-tools",
+            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p agent-file-tools",
         )
         self.assertNotIn("--no-verify", publish)
         names = [step.get("name") for step in steps]
@@ -335,7 +335,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
             target = Path(temporary)
             directory = target / "package"
             directory.mkdir()
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
             files = [directory / f"{package['name']}-{package['version']}.crate" for package in packages]
             for file in files:
                 file.write_bytes(b"crate")
@@ -358,7 +358,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             target = Path(temporary)
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 copies = []
@@ -382,7 +382,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                     exec(script, {})
                 for archive in target.rglob("*.crate"):
                     archive.unlink()
-                with self.assertRaisesRegex(AssertionError, "missing packaged crates:.*aft-secret-rules.*aft-tokenizer.*agent-file-tools"):
+                with self.assertRaisesRegex(AssertionError, "missing packaged crates:.*aft-secret-rules.*aft-store.*aft-tokenizer.*agent-file-tools"):
                     exec(script, {})
 
     def test_tag_canceller_catches_first_failure_and_timeouts_without_waiting_for_other_builds(self):

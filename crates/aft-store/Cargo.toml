@@ -5,9 +5,6 @@ edition = "2024"
 description = "On-disk index formats for Agent File Tools"
 license = "MIT"
 rust-version.workspace = true
-# Nothing depends on this crate yet, so it is not published. It must be
-# published alongside agent-file-tools once that crate depends on it.
-publish = false
 
 [dependencies]
 blake3 = "1"
