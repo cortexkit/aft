@@ -68,14 +68,14 @@ pub enum DataError {
 impl std::fmt::Display for DataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Store(error) => write!(f, "data store: {error}"),
-            Self::Scan(error) => write!(f, "checkout scan: {error}"),
-            Self::Resolve(error) => write!(f, "call-graph resolution: {error}"),
-            Self::Busy(error) => write!(f, "data store busy: {error}"),
-            Self::Damaged(error) => write!(f, "data store damaged: {error}"),
+            Self::Store(error) => write!(f, "AFT's index store could not be read: {error}"),
+            Self::Scan(error) => write!(f, "AFT could not scan this checkout: {error}"),
+            Self::Resolve(error) => write!(f, "AFT could not build this checkout's call graph: {error}"),
+            Self::Busy(_) => f.write_str("Another AFT process is writing this repository's index; try again shortly."),
+            Self::Damaged(error) => write!(f, "AFT found damaged index data and rebuilds it from the files: {error}"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::DiskFloor(message) => f.write_str(message),
-            Self::Identity(error) => write!(f, "repository identity: {error}"),
+            Self::Identity(_) => f.write_str("AFT could not tell which repository this folder belongs to; it tries again shortly."),
         }
     }
 }
@@ -3782,7 +3782,7 @@ pub fn other() { callee(); }
 
         // 1 GiB free on a 1 TiB disk: below the 32 GiB floor.
         let low = crate::disk_floor::set_free_space_for_test(store.path(), 1 << 30, 1 << 40);
-        let paused = "View storage is paused: 1.0 GiB is free on this disk and AFT keeps \
+        let paused = "Index storage is paused: 1.0 GiB is free on this disk and AFT keeps \
                       32.0 GiB free. Unused view data is being cleaned up; retry later.";
         let error = checkout.build().unwrap_err();
         assert!(matches!(error, DataError::DiskFloor(_)), "{error}");

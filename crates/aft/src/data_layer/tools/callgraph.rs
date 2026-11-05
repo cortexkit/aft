@@ -56,7 +56,7 @@ pub(crate) fn access(ctx: &AppContext) -> Access {
         Fresh::Ready(view) => Access::Ready(view.callgraph(), view),
         Fresh::Building => Access::Building,
         Fresh::Failed(reason) => Access::Failed(CallGraphStoreError::Unavailable(format!(
-            "the data layer's call graph is unavailable: {reason}"
+            "the call graph is unavailable: {reason}"
         ))),
     }
 }
@@ -74,7 +74,7 @@ pub(crate) fn read_failure(view: &CheckoutView) -> Option<CallGraphStoreError> {
     let failures = view.callgraph_failures();
     (!failures.is_empty()).then(|| {
         CallGraphStoreError::Unavailable(format!(
-            "the data layer could not read part of the call graph: {}",
+            "AFT could not read part of the call graph: {}",
             failures.join("; ")
         ))
     })

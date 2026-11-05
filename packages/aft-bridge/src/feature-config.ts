@@ -220,7 +220,7 @@ function removedBlockKeyErrors(
     paths.push(...DATA_LAYER_RETIRED_PATHS);
   return paths
     .filter((path) => hasPath(value, path))
-    .map((path) => `removed_config_key:${path}; run aft doctor --fix`);
+    .map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
 }
 
 /** Retired config paths and their replacement. */

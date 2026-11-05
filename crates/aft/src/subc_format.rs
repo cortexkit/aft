@@ -4543,7 +4543,12 @@ fn format_status(data: &Value) -> String {
         let semantic_disk = format_optional_memory_bytes(disk.get("semantic_disk_bytes"));
         let data_store = disk
             .get("data_store_bytes")
-            .map(|bytes| format!("data store {}, ", format_optional_memory_bytes(Some(bytes))))
+            .map(|bytes| {
+                format!(
+                    "index store {}, ",
+                    format_optional_memory_bytes(Some(bytes))
+                )
+            })
             .unwrap_or_default();
         lines.push(format!(
             "storage: {storage} ({data_store}trigram {trigram}, semantic {semantic_disk})"
@@ -4901,7 +4906,7 @@ mod status_memory_tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("storage: /s (data store 2.0 KiB, trigram 0 B, semantic 0 B)"),
+            rendered.contains("storage: /s (index store 2.0 KiB, trigram 0 B, semantic 0 B)"),
             "{rendered}"
         );
         assert!(
@@ -4927,7 +4932,7 @@ mod status_memory_tests {
     #[test]
     fn status_text_without_the_data_layer_keeps_its_lines() {
         // Today's payload: no `callgraph_store`, a search index reason from a
-        // refusal, and no data store on disk.
+        // refusal, and no index store on disk.
         let data = json!({
             "features": {"callgraph_store": true},
             "search_index": {"status": "unavailable", "reason": "refused"},
@@ -4952,7 +4957,7 @@ mod status_memory_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("data layer"), "{rendered}");
-        assert!(!rendered.contains("data store"), "{rendered}");
+        assert!(!rendered.contains("index store"), "{rendered}");
     }
 }
 

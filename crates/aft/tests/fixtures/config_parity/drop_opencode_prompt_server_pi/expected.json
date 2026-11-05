@@ -1,5 +1,5 @@
 {
   "rejected": [
-    "removed_config_key:opencode.server_url; run aft doctor --fix"
+    "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix"
   ]
 }

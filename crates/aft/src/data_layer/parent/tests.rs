@@ -461,7 +461,7 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
             .data_children()
             .insert_for_test(session.root(), &root.join(name), checkout);
     }
-    let failure = "checkout scan: the fixture's build failed".to_string();
+    let failure = "AFT could not scan this checkout: the fixture's build failed".to_string();
 
     crate::data_layer::runtime::force_on_for_test();
     let named = vec![

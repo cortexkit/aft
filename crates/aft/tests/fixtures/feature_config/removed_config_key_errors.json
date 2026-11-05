@@ -9,8 +9,8 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run aft doctor --fix",
-        "removed_config_key:opencode.server_password_env; run aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:opencode.server_password_env; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -26,8 +26,8 @@
         }
       },
       "errors": [
-        "removed_config_key:harnesses.opencode.opencode.server_url; run aft doctor --fix",
-        "removed_config_key:harnesses.opencode.opencode.server_password_env; run aft doctor --fix"
+        "removed_config_key:harnesses.opencode.opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.opencode.opencode.server_password_env; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -75,7 +75,7 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -105,13 +105,13 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run aft doctor --fix",
-        "removed_config_key:views.callgraph_copies; run aft doctor --fix",
-        "removed_config_key:views.enabled; run aft doctor --fix",
-        "removed_config_key:views.idle_checkout_hours; run aft doctor --fix",
-        "removed_config_key:worktree.ram_overlay; run aft doctor --fix",
-        "removed_config_key:harnesses.pi.views.enabled; run aft doctor --fix",
-        "removed_config_key:harnesses.pi.worktree.ram_overlay; run aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -141,13 +141,13 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run aft doctor --fix",
-        "removed_config_key:views.callgraph_copies; run aft doctor --fix",
-        "removed_config_key:views.enabled; run aft doctor --fix",
-        "removed_config_key:views.idle_checkout_hours; run aft doctor --fix",
-        "removed_config_key:worktree.ram_overlay; run aft doctor --fix",
-        "removed_config_key:harnesses.pi.views.enabled; run aft doctor --fix",
-        "removed_config_key:harnesses.pi.worktree.ram_overlay; run aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {

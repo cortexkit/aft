@@ -2348,7 +2348,7 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
         CallGraphStoreError::Unavailable(message) => Response::error(
             req_id,
             "callgraph_unavailable",
-            format!("{operation}: persisted callgraph store unavailable: {message}"),
+            format!("{operation}: callgraph store unavailable: {message}"),
         ),
         CallGraphStoreError::StaleFiles(files) => Response::error(
             req_id,

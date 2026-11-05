@@ -4058,7 +4058,7 @@ fn with_data_store_failures(
     (
         HealthStatus::Degraded,
         Some(format!(
-            "{failed_roots} root(s) could not build or refresh their data store; see roots[].data_store"
+            "{failed_roots} root(s) could not build or refresh their index store; see roots[].data_store"
         )),
     )
 }
@@ -5048,7 +5048,7 @@ mod tests {
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
-            Some("1 root(s) could not build or refresh their data store; see roots[].data_store")
+            Some("1 root(s) could not build or refresh their index store; see roots[].data_store")
         );
         // A fleet already degraded for another reason keeps that reason.
         let (status, detail) = with_data_store_failures(root_health_rollup_state(2, 0, 0, None), 1);

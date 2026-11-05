@@ -442,10 +442,10 @@ describe("data-layer keys", () => {
       expect(removedConfigKeyErrors(base, [0, 64]), path).toEqual([]);
       expect(removedConfigKeyErrors(harness, [0, 64]), path).toEqual([]);
       expect(removedConfigKeyErrors(base, [0, 65])).toEqual([
-        `removed_config_key:${path}; run aft doctor --fix`,
+        `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`,
       ]);
       expect(removedConfigKeyErrors(harness, [0, 65])).toEqual([
-        `removed_config_key:harnesses.pi.${path}; run aft doctor --fix`,
+        `removed_config_key:harnesses.pi.${path}; run npx @cortexkit/aft doctor --fix`,
       ]);
       expect(removedConfigKeyErrors(base, [1, 0])).toHaveLength(1);
     }

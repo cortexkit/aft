@@ -187,7 +187,9 @@ fn removed_block_key_errors(map: &Map<String, Value>, release: (u64, u64)) -> Ve
     if release >= DATA_LAYER_KEYS_REFUSED_FROM {
         for path in DATA_LAYER_RETIRED_PATHS {
             if has_path(map, path) {
-                errors.push(format!("removed_config_key:{path}; run aft doctor --fix"));
+                errors.push(format!(
+                    "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+                ));
             }
         }
     }
@@ -201,7 +203,9 @@ fn removed_opencode_key_errors(map: &Map<String, Value>) -> Vec<String> {
     let mut errors = Vec::new();
     for (path, _) in REMOVED_OPENCODE_PATHS {
         if opencode.contains_key(path.strip_prefix("opencode.").unwrap()) {
-            errors.push(format!("removed_config_key:{path}; run aft doctor --fix"));
+            errors.push(format!(
+                "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+            ));
         }
     }
     errors
@@ -1940,12 +1944,14 @@ mod tests {
             }
             assert_eq!(
                 removed_config_key_errors_at(base.as_object().unwrap(), (0, 65)),
-                vec![format!("removed_config_key:{path}; run aft doctor --fix")]
+                vec![format!(
+                    "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+                )]
             );
             assert_eq!(
                 removed_config_key_errors_at(harness.as_object().unwrap(), (0, 65)),
                 vec![format!(
-                    "removed_config_key:harnesses.pi.{path}; run aft doctor --fix"
+                    "removed_config_key:harnesses.pi.{path}; run npx @cortexkit/aft doctor --fix"
                 )]
             );
             assert_eq!(

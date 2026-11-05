@@ -5,7 +5,7 @@ use serde::Serialize;
 pub(crate) const CODE: &str = "device_free_space_floor";
 
 /// Approved by Ufuk: agent-facing wording for a measured disk-reserve refusal.
-pub(crate) const APPROVED_MESSAGE: &str = "View storage is paused: {free} is free on this disk and AFT keeps {floor} free. Unused view data is being cleaned up; retry later.";
+pub(crate) const APPROVED_MESSAGE: &str = "Index storage is paused: {free} is free on this disk and AFT keeps {floor} free. Unused view data is being cleaned up; retry later.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskReserveCondition {
@@ -59,7 +59,7 @@ fn size(bytes: u64) -> String {
 }
 
 pub(crate) fn is_message(message: &str) -> bool {
-    message.starts_with("View storage is paused: ")
+    message.starts_with("Index storage is paused: ")
         && message.ends_with("Unused view data is being cleaned up; retry later.")
 }
 
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn disk_reserve_approved_sentence_is_pinned_byte_for_byte() {
-        assert_eq!(APPROVED_MESSAGE, "View storage is paused: {free} is free on this disk and AFT keeps {floor} free. Unused view data is being cleaned up; retry later.");
+        assert_eq!(APPROVED_MESSAGE, "Index storage is paused: {free} is free on this disk and AFT keeps {floor} free. Unused view data is being cleaned up; retry later.");
         let storage = tempfile::tempdir().unwrap();
         let _space = crate::disk_floor::set_free_space_for_test(
             storage.path(),
@@ -79,7 +79,7 @@ mod tests {
         crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
             .unwrap_err();
         let condition = DiskReserveCondition::observed(storage.path(), CODE).unwrap();
-        assert_eq!(condition.message, "View storage is paused: 21.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused view data is being cleaned up; retry later.");
+        assert_eq!(condition.message, "Index storage is paused: 21.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused view data is being cleaned up; retry later.");
         assert_eq!(condition.free_bytes, 22_548_578_304);
         assert_eq!(condition.floor_bytes, 34_359_738_368);
     }
