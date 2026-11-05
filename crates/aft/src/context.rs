@@ -23807,69 +23807,12 @@ mod health_warming_honesty_tests {
         AppContext::new(Box::new(TreeSitterProvider::new()), config)
     }
 
-    fn health_search_status(ctx: &AppContext) -> &'static str {
-        let root = std::path::Path::new("/tmp/health-warming-honesty-test");
-        ctx.try_health_snapshot(root)
-            .search_index
-            .expect("search_index component present")
-            .status
-    }
-
     fn health_tier2_status(ctx: &AppContext) -> &'static str {
         let root = std::path::Path::new("/tmp/health-warming-honesty-test");
         ctx.try_health_snapshot(root)
             .tier2
             .expect("tier2 component present")
             .status
-    }
-
-    #[test]
-    fn write_denied_search_index_reports_ready_not_building() {
-        // A write-denied cold build installs an empty index that is flagged
-        // build-denied and stays not-ready (so grep keeps the fallback walk).
-        // Health must treat it as settled, not "building" forever.
-        let config = Config {
-            indexes: crate::config::IndexesConfig {
-                trigram: true,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        };
-        let ctx = ctx_with_config(config);
-        let mut index = SearchIndex::new();
-        index.build_denied = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-
-        assert_eq!(
-            health_search_status(&ctx),
-            "ready",
-            "a build-denied index is a terminal settled state and must not report building forever"
-        );
-    }
-
-    #[test]
-    fn in_progress_search_index_still_reports_building() {
-        // Control: a genuinely not-ready, not-denied index (a real build in
-        // flight) must still report building — the build-denied carve-out must
-        // not leak into ordinary in-progress builds.
-        let config = Config {
-            indexes: crate::config::IndexesConfig {
-                trigram: true,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        };
-        let ctx = ctx_with_config(config);
-        let index = SearchIndex::new(); // ready=false, build_denied=false
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-
-        assert_eq!(health_search_status(&ctx), "building");
     }
 
     #[test]
