@@ -178,7 +178,12 @@ fn saved_scope_grants_direct_broca_and_runner_hosts_keep_grants() {
     let (dir, ctx, head, worker) = fixture();
     let outside = dir.path().join("outside.txt");
     std::fs::write(&outside, "saved authority").unwrap();
-    for principal in ["direct", "reserved:broca", "reserved:thalamus-harness"] {
+    for principal in [
+        "direct",
+        "reserved:broca",
+        "reserved:thalamus-harness",
+        "reserved:thalamus-pi",
+    ] {
         for route in [&head, &worker] {
             assert_saved_scope_grants(&ctx, &with_carrier(route, principal), &outside, None);
         }

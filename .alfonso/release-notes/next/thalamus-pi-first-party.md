@@ -1,0 +1,1 @@
+- Pi sessions hosted by CortexKit's Pi runner can run shell commands, with the same trust as the OpenCode runner's sessions.
