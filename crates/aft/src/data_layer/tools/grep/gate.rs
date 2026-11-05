@@ -7,8 +7,9 @@
 //! through the real tool handlers twice: once with the data layer ignored,
 //! as a process without it answers, and once reading it. It compares what
 //! the agent is shown (the reply text, the metadata the plugins show, and
-//! the subc rendering, or the error) and reports every difference, then
-//! makes a few edits, records them in both, and replays both corpora again.
+//! the text `subc_format::format_response` renders from the reply, or the
+//! error) and reports every difference, then makes a few edits, records
+//! them in both, and replays both corpora again.
 //!
 //! The grep corpus is real: each distinct pattern of
 //! `aft-store/examples/data/grep-patterns-14d.jsonl.gz` with its path
@@ -308,7 +309,7 @@ fn replay(
         let example = *seen <= EXAMPLES_PER_CLASS;
         // Repeat an unexplained difference, and the first few of each
         // class, twice: one that does not repeat comes from timing (a time
-        // budget), not from where the files came from.
+        // budget), not from reading the data layer instead of today's index.
         let stable = (example || !ACCEPTED.contains(&class)).then(|| {
             (0..2).all(|_| {
                 visible(case.tool, &call(ctx, case, true).0) == shown_today
