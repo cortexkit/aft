@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::callgraph::{CheckoutInputs, FileResolution};
 use crate::callgraph_store::join::{BlobRef, BlobRefKind, ParseBlob, ResolutionStatus};
-use crate::callgraph_store::PROVENANCE_TREESITTER;
+use crate::callgraph_store::{MACRO_BODY_CALL_REF_KIND, PROVENANCE_TREESITTER};
 
 /// One symbol.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -242,6 +242,7 @@ pub(crate) fn assemble(
             .and_then(|(path, symbol)| lookup.get(path)?.get(symbol))
             .cloned();
         let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
+        let macro_body = macro_body_call(row.kind, reference);
         let edge_ends = (
             caller_node.clone(),
             target_path.clone(),
@@ -268,6 +269,7 @@ pub(crate) fn assemble(
                     "value_ref"
                 }
                 BlobRefKind::CallbackRef => "callback_ref",
+                _ if macro_body => MACRO_BODY_CALL_REF_KIND,
                 _ => "call",
             };
             rows.edge_sequence
@@ -293,12 +295,20 @@ pub(crate) fn assemble(
                 ref_id,
                 caller_node,
                 caller_file: caller_path.to_string(),
-                kind: ref_kind(row.kind),
+                kind: if macro_body {
+                    MACRO_BODY_CALL_REF_KIND
+                } else {
+                    ref_kind(row.kind)
+                },
                 short_name: reference.short_name.clone(),
                 full_ref: reference.full_ref.clone(),
                 module_path: reference.module_path.clone(),
                 import_kind: reference.import_kind.clone(),
-                local_name: reference.local_name.clone(),
+                local_name: if macro_body {
+                    reference.caller_symbol.clone()
+                } else {
+                    reference.local_name.clone()
+                },
                 requested_name: reference.requested_name.clone(),
                 namespace_alias: reference.namespace_alias.clone(),
                 wildcard: reference.wildcard,
@@ -421,6 +431,21 @@ pub(crate) fn references_by_key(parse: &ParseBlob) -> HashMap<u32, &BlobRef> {
         .into_iter()
         .zip(&parse.refs)
         .collect()
+}
+
+/// Whether a reference of `kind` is a call written directly in a
+/// `macro_rules!` template, outside any item the template defines: its
+/// caller is the macro itself, named `name!`. The views database stored
+/// such a call as a `macro_body_call` reference that names the macro in
+/// `local_name`, with an edge of the same kind. Caller queries leave that
+/// edge out; the callers command lists the template and every invocation of
+/// the macro instead, by name.
+pub(crate) fn macro_body_call(kind: BlobRefKind, reference: &BlobRef) -> bool {
+    kind == BlobRefKind::Call
+        && reference
+            .caller_symbol
+            .as_deref()
+            .is_some_and(|caller| caller.ends_with('!'))
 }
 
 const fn ref_kind(kind: BlobRefKind) -> &'static str {

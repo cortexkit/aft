@@ -16,8 +16,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::callgraph::FileResolution;
-use super::graph_rows::references_by_key;
+use super::graph_rows::{macro_body_call, references_by_key};
 use crate::callgraph_store::join::{BlobRefKind, ParseBlob, ResolutionStatus};
+use crate::callgraph_store::MACRO_BODY_CALL_REF_KIND;
 
 /// One symbol.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +82,9 @@ pub(crate) struct SliceEdge {
     pub(crate) source_node: String,
     pub(crate) target_file: String,
     pub(crate) target_symbol: String,
-    /// `call` or `callback_ref`; for a construction, `construction`, which a
-    /// query reads as `call` when the target is a function or method and as
-    /// `value_ref` otherwise.
+    /// `call`, `callback_ref` or `macro_body_call`; for a construction,
+    /// `construction`, which a query reads as `call` when the target is a
+    /// function or method and as `value_ref` otherwise.
     pub(crate) kind: &'static str,
     pub(crate) line: u32,
     pub(crate) provenance: &'static str,
@@ -156,6 +157,7 @@ impl FileSlice {
                 continue;
             };
             let ref_id = format!("view:{path}:{}", row.ref_ordinal);
+            let macro_body = macro_body_call(row.kind, reference);
             let caller_node = reference
                 .caller_symbol
                 .as_ref()
@@ -186,6 +188,7 @@ impl FileSlice {
                         kind: match row.kind {
                             BlobRefKind::Construction => "construction",
                             BlobRefKind::CallbackRef => "callback_ref",
+                            _ if macro_body => MACRO_BODY_CALL_REF_KIND,
                             _ => "call",
                         },
                         line: reference.line,
@@ -200,12 +203,20 @@ impl FileSlice {
                     ref_id,
                     ordinal: row.ref_ordinal,
                     caller_node,
-                    kind: ref_kind(row.kind),
+                    kind: if macro_body {
+                        MACRO_BODY_CALL_REF_KIND
+                    } else {
+                        ref_kind(row.kind)
+                    },
                     short_name: reference.short_name.clone(),
                     full_ref: reference.full_ref.clone(),
                     module_path: reference.module_path.clone(),
                     import_kind: reference.import_kind.clone(),
-                    local_name: reference.local_name.clone(),
+                    local_name: if macro_body {
+                        reference.caller_symbol.clone()
+                    } else {
+                        reference.local_name.clone()
+                    },
                     requested_name: reference.requested_name.clone(),
                     namespace_alias: reference.namespace_alias.clone(),
                     wildcard: reference.wildcard,
