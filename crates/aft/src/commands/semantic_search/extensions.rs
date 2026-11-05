@@ -128,6 +128,9 @@ pub struct SemanticReadiness<'a> {
 pub struct TrigramReadiness {
     pub status: IndexStatus,
     pub snapshot: Option<Arc<SearchIndexSnapshot>>,
+    /// The data layer's view, when the lanes read it instead of `snapshot`
+    /// (see `crate::data_layer::tools::search`).
+    pub data_text: Option<Arc<crate::data_layer::tools::search::DataText>>,
     pub evicted: bool,
     pub lock_contended: bool,
 }

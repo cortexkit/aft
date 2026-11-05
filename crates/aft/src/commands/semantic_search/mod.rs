@@ -407,6 +407,7 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
+                    data_text: None,
                 },
                 symbol: SymbolReadiness {
                     status: SymbolIndexStatus::Disabled,
@@ -425,6 +426,7 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                     snapshot: Some(Arc::new(index.snapshot())),
                     evicted: false,
                     lock_contended: false,
+                    data_text: None,
                 }
             }
             ReadOnlyArtifact::Degraded(_) | ReadOnlyArtifact::Absent => TrigramReadiness {
@@ -432,12 +434,14 @@ impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
                 snapshot: None,
                 evicted: false,
                 lock_contended: false,
+                data_text: None,
             },
             ReadOnlyArtifact::Cancelled => TrigramReadiness {
                 status: IndexStatus::Building,
                 snapshot: None,
                 evicted: false,
                 lock_contended: false,
+                data_text: None,
             },
         };
         let semantic =
@@ -619,7 +623,16 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             },
         };
 
-        let trigram = if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
+        let data_text = crate::data_layer::tools::search::DataText::ready(self.ctx);
+        let trigram = if let Some(text) = data_text {
+            TrigramReadiness {
+                status: IndexStatus::Ready,
+                snapshot: None,
+                data_text: Some(Arc::new(text)),
+                evicted: false,
+                lock_contended: false,
+            }
+        } else if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
             match snapshot {
                 Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
                     TrigramReadiness {
@@ -627,6 +640,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: Some(Arc::new(snapshot)),
                         evicted: false,
                         lock_contended: false,
+                        data_text: None,
                     }
                 }
                 Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
@@ -635,6 +649,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: None,
                         evicted: false,
                         lock_contended: false,
+                        data_text: None,
                     }
                 }
                 Err(_) => TrigramReadiness {
@@ -642,6 +657,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
+                    data_text: None,
                 },
             }
         } else {
@@ -652,6 +668,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                         snapshot: index.as_ref().map(SearchIndex::snapshot).map(Arc::new),
                         evicted: false,
                         lock_contended: false,
+                        data_text: None,
                     }
                 }
                 Some(index) if index.is_some() => TrigramReadiness {
@@ -659,6 +676,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: false,
+                    data_text: None,
                 },
                 Some(_) => {
                     let receiver = try_read_with_budget(
@@ -671,18 +689,21 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                             snapshot: None,
                             evicted: false,
                             lock_contended: false,
+                            data_text: None,
                         },
                         Some(_) => TrigramReadiness {
                             status: IndexStatus::Fallback,
                             snapshot: None,
                             evicted: false,
                             lock_contended: false,
+                            data_text: None,
                         },
                         None => TrigramReadiness {
                             status: IndexStatus::Building,
                             snapshot: None,
                             evicted: false,
                             lock_contended: true,
+                            data_text: None,
                         },
                     }
                 }
@@ -691,6 +712,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                     snapshot: None,
                     evicted: false,
                     lock_contended: true,
+                    data_text: None,
                 },
             }
         };
@@ -725,7 +747,9 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        if self.ctx.lexical_views_enabled() {
+        if self.ctx.lexical_views_enabled()
+            || crate::data_layer::tools::search::DataText::ready(self.ctx).is_some()
+        {
             return extensions::ReadinessWait::Completed;
         }
         // A writer-held pointer cannot be advanced by the loader drain below;
@@ -3737,7 +3761,11 @@ fn path_is_hidden_test_file(path: &Path, project_root: &Path) -> bool {
     is_test_support_file(rel.as_ref()) || is_test_file(rel.as_ref())
 }
 
-fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
+pub(crate) fn path_allowed_by_include_tests(
+    path: &Path,
+    project_root: &Path,
+    include_tests: bool,
+) -> bool {
     include_tests || !path_is_hidden_test_file(path, project_root)
 }
 
@@ -4500,7 +4528,7 @@ fn file_stamp(path: &Path) -> memo::FileStamp {
 /// literal.
 fn literal_presence(
     ctx: &AppContext,
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     project_root: &Path,
     generation: &GenerationToken,
     phrase: &str,
@@ -4514,12 +4542,12 @@ fn literal_presence(
     );
     let store = ctx.search_exact_memo();
     if let Some(entry) = store.literal_presence(&key) {
-        if literal_presence_still_holds(&entry, snapshot, phrase, project_root)? {
+        if literal_presence_still_holds(&entry, index, phrase, project_root)? {
             return Ok(entry.presence);
         }
     }
     let entry = settle_literal_presence(
-        snapshot,
+        index,
         project_root,
         phrase,
         &normalized,
@@ -4535,7 +4563,7 @@ fn literal_presence(
 /// possible holders (a file that gained the literal would join them).
 fn literal_presence_still_holds(
     entry: &memo::LiteralPresenceEntry,
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     phrase: &str,
     project_root: &Path,
 ) -> std::io::Result<bool> {
@@ -4550,7 +4578,7 @@ fn literal_presence_still_holds(
         memo::LiteralPresence::Present => unchanged,
         memo::LiteralPresence::Absent => {
             unchanged
-                && snapshot
+                && index
                     .files_possibly_holding_phrase(phrase, project_root)?
                     .as_ref()
                     == Some(&entry.candidates)
@@ -4612,7 +4640,7 @@ impl PresenceReads {
 /// holder. Running out of reads or time, or meeting an unreadable file,
 /// settles nothing: that is never an absence.
 fn settle_literal_presence(
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     project_root: &Path,
     phrase: &str,
     normalized: &str,
@@ -4635,7 +4663,7 @@ fn settle_literal_presence(
     }
     #[cfg(test)]
     LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
-    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root)? else {
+    let Some(candidates) = index.files_possibly_holding_phrase(phrase, project_root)? else {
         return Ok(reads.entry(Undetermined, Vec::new()));
     };
     for path in &candidates {
@@ -5228,17 +5256,25 @@ fn run_engine_ranking(
 ) -> Result<EngineRanking, String> {
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, BLOCK_DEPTHS};
     use confidence::{Confidence, ConfidenceEngine};
+    use crate::data_layer::tools::search::TextIndex;
     use lexical_lane::CanonicalLexicalLane;
     use provenance::ObservedProvenance;
     use scoring::ScoringPolicy;
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
+    // With the data layer running and its view's text plane ready, the
+    // lexical and exact lanes read that view; otherwise they read the legacy
+    // index, or the borrowed one of an external root.
+    let data_text = borrowed_index
+        .is_none()
+        .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
+        .flatten();
     // Semantic readiness can admit a request before the borrowed search index
     // finishes loading. Wait up to the first-search budget before exact
     // verification falls back to filesystem search, without holding the search
     // index's read lock.
-    if borrowed_index.is_none() && plan_needs_exact_index(plan) {
+    if borrowed_index.is_none() && data_text.is_none() && plan_needs_exact_index(plan) {
         use extensions::ReadinessSource as _;
         if (RuntimeReadinessSource { ctx }).bounded_first_search_wait()
             == extensions::ReadinessWait::Cancelled
@@ -5246,15 +5282,17 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let lexical_view = if borrowed_index.is_none() {
+    let lexical_view = if borrowed_index.is_none() && data_text.is_none() {
         ctx.lexical_view_snapshot("aft_search")
             .transpose()
             .map_err(crate::context::view_load_failure_message)?
     } else {
         None
     };
-    let context_index = (borrowed_index.is_none() && lexical_view.is_none())
-        .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
+    let context_index =
+        (borrowed_index.is_none() && data_text.is_none() && lexical_view.is_none()).then(|| {
+            try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+        });
     let view_snapshot =
         lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
     let empty_index = SearchIndex::new();
@@ -5267,9 +5305,14 @@ fn run_engine_ranking(
                 .and_then(|guard| guard.as_ref())
         })
         .unwrap_or(&empty_index);
-    let generation = view_snapshot
+    let generation = data_text
         .as_ref()
-        .map(|snapshot| GenerationToken::new_with_str(&snapshot.content_generation()))
+        .map(|text| GenerationToken::new_with_str(&text.generation()))
+        .or_else(|| {
+            view_snapshot
+                .as_ref()
+                .map(|snapshot| GenerationToken::new_with_str(&snapshot.content_generation()))
+        })
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
             GenerationToken::new_with_str(&format!(
@@ -5278,8 +5321,12 @@ fn run_engine_ranking(
                 ctx.semantic_index_rx_generation()
             ))
         });
-    let index_ready = view_snapshot.is_some() || index.is_ready();
+    let index_ready = data_text.is_some() || view_snapshot.is_some() || index.is_ready();
     let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
+    let text_index = match &data_text {
+        Some(text) => TextIndex::Data(text),
+        None => TextIndex::Snapshot(&snapshot),
+    };
     let lexical_cost = telemetry::CostPhase::start("lexical");
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
@@ -5296,8 +5343,8 @@ fn run_engine_ranking(
     let mut index_disclosures = split
         .map(|split| split.patterns.index_read_gaps.clone())
         .unwrap_or_default();
-    let lexical = match CanonicalLexicalLane::from_snapshot(
-        &snapshot,
+    let lexical = match CanonicalLexicalLane::from_text_index(
+        text_index,
         &query_trigrams,
         Some(&candidate_filter),
         lexical_lane::LEXICAL_ENUMERATION_LIMIT,
@@ -5368,8 +5415,8 @@ fn run_engine_ranking(
     let mut exact_candidates =
         if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
             let outcome = exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
-                .search_scoped_snapshot(
-                    index_ready.then_some(&snapshot),
+                .search_scoped_index(
+                    index_ready.then_some(text_index),
                     project_root,
                     generation.clone(),
                     exact_input,
@@ -5436,8 +5483,8 @@ fn run_engine_ranking(
             for (fact_input, exact_form) in fact_inputs {
                 // Only phrase evidence is kept from these passes.
                 let outcome = lane
-                    .search_scoped_snapshot(
-                        index_ready.then_some(&snapshot),
+                    .search_scoped_index(
+                        index_ready.then_some(text_index),
                         project_root,
                         generation.clone(),
                         &fact_input,
@@ -5514,7 +5561,7 @@ fn run_engine_ranking(
             // that only a test uses still exists, and the ordinary ranking says
             // more about it than a not-found answer would.
             identifiers.iter().all(|identifier| {
-                snapshot
+                text_index
                     .whole_corpus_exact_pass(identifier, project_root, None)
                     .map(|matches| matches.is_empty())
                     .unwrap_or_else(|error| {
@@ -5555,7 +5602,7 @@ fn run_engine_ranking(
         .filter(|phrase| {
             match literal_presence(
                 ctx,
-                &snapshot,
+                text_index,
                 project_root,
                 &generation,
                 phrase,
@@ -5746,13 +5793,12 @@ fn run_engine_ranking(
                 .into_iter()
                 .map(|definition| definition.path.clone())
                 .filter(|path| {
-                    let lexical_score = snapshot
+                    let lexical_score = text_index
                         .lexical_rank_at_depth(
                             &query_trigrams,
                             Some(&|candidate: &Path| candidate == path.as_path()),
                             1,
                         )
-                        .map(|result| result.files)
                         .unwrap_or_else(|error| {
                             index_disclosures.push(error.to_string());
                             Vec::new()
@@ -5792,9 +5838,19 @@ fn run_engine_ranking(
                 candidates: exact_candidates.clone(),
             }),
             SearchLaneKind::Anchored => {
-                let (candidates, examined, excluded) = match anchored_lane::AnchoredLane::new()
-                    .execute_with_admission_report(&index, project_root, query, include_tests)
-                {
+                let anchored = anchored_lane::AnchoredLane::new();
+                let executed = match &data_text {
+                    Some(text) => {
+                        anchored.execute_on_data_view(text, project_root, query, include_tests)
+                    }
+                    None => anchored.execute_with_admission_report(
+                        &index,
+                        project_root,
+                        query,
+                        include_tests,
+                    ),
+                };
+                let (candidates, examined, excluded) = match executed {
                     Ok(result) => result,
                     Err(error) => {
                         index_disclosures.push(error.to_string());
@@ -6108,7 +6164,7 @@ fn run_engine_ranking(
         recall_audit::engine_audit(recall_audit::EngineAuditInput {
             project_root,
             plan,
-            snapshot: &snapshot,
+            index: text_index,
             query_trigrams: &query_trigrams,
             candidate_filter: &candidate_filter,
             lexical_order: lexical_candidates
@@ -7907,6 +7963,9 @@ fn search_index_ready_with_budget(
     ctx: &AppContext,
     wait_budget: Duration,
 ) -> Result<bool, SearchIndexWaitError> {
+    if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
+        return Ok(true);
+    }
     if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
         return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
     }

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::comparator::{score_free_r3_cmp, CandidateResult, SymbolOffsetRange};
 use super::evidence_descriptor::EvidenceDescriptor;
 use super::plan_table::SearchLaneKind;
+use crate::data_layer::tools::search::TextIndex;
 use crate::search_index::SearchIndexSnapshot;
 
 /// Keep the initial emitted batch at 50 candidates; deeper tiers reveal more.
@@ -172,9 +173,42 @@ impl CanonicalLexicalLane {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         initial_batch_size: usize,
+        build_candidate: impl FnMut(PathBuf, f32) -> LexicalCandidate,
+    ) -> Result<Self, LexicalLaneError> {
+        Self::from_text_index_with(
+            TextIndex::Snapshot(snapshot),
+            query_trigrams,
+            candidate_filter,
+            initial_batch_size,
+            build_candidate,
+        )
+    }
+
+    /// [`Self::from_snapshot`] over either text index source.
+    pub(crate) fn from_text_index(
+        index: TextIndex<'_>,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        initial_batch_size: usize,
+    ) -> Result<Self, LexicalLaneError> {
+        Self::from_text_index_with(
+            index,
+            query_trigrams,
+            candidate_filter,
+            initial_batch_size,
+            LexicalCandidate::file,
+        )
+    }
+
+    fn from_text_index_with(
+        index: TextIndex<'_>,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        initial_batch_size: usize,
         mut build_candidate: impl FnMut(PathBuf, f32) -> LexicalCandidate,
     ) -> Result<Self, LexicalLaneError> {
-        let scored = score_complete_selected_pool(snapshot, query_trigrams, candidate_filter)
+        let scored = index
+            .lexical_selected_pool(query_trigrams, candidate_filter)
             .map_err(|error| LexicalLaneError::PostingRead(error.to_string()))?;
         let candidates = scored
             .into_iter()
@@ -262,6 +296,7 @@ pub fn depth_tier(depth: usize) -> Option<usize> {
 
 /// Score the union of the three rarest nonempty query-trigram postings,
 /// materializing each query posting only once.
+#[cfg(test)]
 fn score_complete_selected_pool(
     snapshot: &SearchIndexSnapshot,
     query_trigrams: &[u32],

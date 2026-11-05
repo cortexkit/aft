@@ -13,6 +13,7 @@ use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
+use crate::data_layer::tools::search::TextIndex;
 use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
@@ -273,7 +274,25 @@ impl ExactLane {
         include_tests: bool,
         scope: &ExactEvidenceScope,
     ) -> VerifiedExactSet {
-        let matches = match snapshot.whole_corpus_exact_pass_scoped(
+        self.execute_ready_mode_index(
+            TextIndex::Snapshot(snapshot),
+            project_root,
+            query,
+            include_tests,
+            scope,
+        )
+    }
+
+    /// [`Self::execute_ready_mode_scoped`] over either text index source.
+    pub(crate) fn execute_ready_mode_index(
+        &self,
+        index: TextIndex<'_>,
+        project_root: &Path,
+        query: &str,
+        include_tests: bool,
+        scope: &ExactEvidenceScope,
+    ) -> VerifiedExactSet {
+        let matches = match index.whole_corpus_exact_pass_scoped(
             query,
             project_root,
             Some(&|path| super::path_allowed_by_include_tests(path, project_root, include_tests)),
@@ -550,7 +569,34 @@ impl ExactLane {
         fallback_options: Option<&FallbackExactOptions>,
         scope: &ExactEvidenceScope,
     ) -> Result<ServeOutcome, MemoError> {
-        let is_ready = snapshot.is_some();
+        self.search_scoped_index(
+            snapshot.map(TextIndex::Snapshot),
+            project_root,
+            snapshot_generation,
+            query,
+            include_tests,
+            offset,
+            top_k,
+            fallback_options,
+            scope,
+        )
+    }
+
+    /// [`Self::search_scoped_snapshot`] over either text index source: ready
+    /// mode when `index` is given, the bounded fallback walk otherwise.
+    pub(crate) fn search_scoped_index(
+        &self,
+        index: Option<TextIndex<'_>>,
+        project_root: &Path,
+        snapshot_generation: GenerationToken,
+        query: &str,
+        include_tests: bool,
+        offset: usize,
+        top_k: usize,
+        fallback_options: Option<&FallbackExactOptions>,
+        scope: &ExactEvidenceScope,
+    ) -> Result<ServeOutcome, MemoError> {
+        let is_ready = index.is_some();
         // Index loading can finish without changing snapshot_generation. Give
         // fallback results a separate memo key so they cannot be reused once
         // the full index is ready.
@@ -566,9 +612,9 @@ impl ExactLane {
         let fallback_opts = fallback_options.unwrap_or(&default_opts);
 
         self.memo.get_or_verify(&key, offset, top_k, || {
-            if is_ready {
-                Ok(self.execute_ready_mode_scoped(
-                    snapshot.unwrap(),
+            if let Some(index) = index {
+                Ok(self.execute_ready_mode_index(
+                    index,
                     project_root,
                     query,
                     include_tests,

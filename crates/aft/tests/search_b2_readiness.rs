@@ -133,6 +133,7 @@ fn trigram(status: IndexStatus) -> TrigramReadiness {
         snapshot,
         evicted: false,
         lock_contended: false,
+        data_text: None,
     }
 }
 
