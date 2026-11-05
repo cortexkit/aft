@@ -302,18 +302,61 @@ fn aft_callgraph_matches_the_shared_fixtures() {
     }
 }
 
+/// A context over `files` for zoom's call-graph field, with the data layer on
+/// for the calling thread and a family store of its own, and the root's
+/// checkout in the named scenario. Returns the project and storage folders
+/// with it, to keep them for the call.
+/// - `off`: every index configured off, so the checkout is never bound;
+/// - `unavailable`: the call graph enabled, and nothing has bound the root
+///   yet, so nothing is built;
+/// - `building` and `partially_ready`: the caller holds the checkout's slot
+///   as a bind in progress does (`AppContext::hold_data_checkout_slot_for_test`).
+///   The call graph is building in both; zoom does not read the text plane
+///   that is ready in the second.
+fn data_layer_scenario(
+    name: &str,
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+    crate::data_layer::runtime::force_on_for_test();
+    let root = tempfile::tempdir().expect("project root");
+    let storage = tempfile::tempdir().expect("storage");
+    for (rel, content) in files {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+    let project_root = std::fs::canonicalize(root.path()).unwrap();
+    let mut config = crate::config::Config {
+        project_root: Some(project_root.clone()),
+        storage_dir: Some(storage.path().to_path_buf()),
+        ..crate::config::Config::default()
+    };
+    if name == "off" {
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
+    }
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    ctx.set_canonical_cache_root(project_root);
+    (root, storage, ctx)
+}
+
 #[test]
 fn aft_zoom_callgraph_matches_the_shared_fixtures() {
     for name in SCENARIOS {
         let expected = expected("aft_zoom.callgraph", name);
-        let scenario = scenario(name, &[EXAMPLE_FUNCTION]);
-        let file = scenario.root().join("src/example.ts");
+        let (root, _storage, ctx) = data_layer_scenario(name, &[EXAMPLE_FUNCTION]);
+        let file = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("src/example.ts");
+        let _binding = matches!(name, "building" | "partially_ready")
+            .then(|| ctx.hold_data_checkout_slot_for_test());
         let response = crate::commands::zoom::handle_zoom(
             &request(
                 "zoom",
                 json!({ "file": file, "symbol": "example", "callgraph": true }),
             ),
-            &scenario.ctx,
+            &ctx,
         );
         let actual = response_json(&response);
         assert_eq!(
