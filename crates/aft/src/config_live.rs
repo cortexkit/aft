@@ -959,6 +959,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("inspect.duplicates.expected_mirrors", inspect.duplicates);
     // Idle, worktree, backup.
     live!("idle.root_ttl_minutes", idle.root_ttl_minutes);
+    live!("idle.checkout_hours", idle.checkout_hours);
     live!("lsp.idle_minutes", lsp_idle_minutes);
     live!("worktree.ram_overlay", worktree.ram_overlay);
     later!("backup.enabled", backup.enabled);
@@ -1175,6 +1176,7 @@ fn classification_is_exhaustive(config: &Config) {
     } = github;
     let crate::config::IdleConfig {
         root_ttl_minutes: _,
+        checkout_hours: _,
     } = idle;
 }
 

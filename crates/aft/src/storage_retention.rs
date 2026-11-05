@@ -6337,7 +6337,7 @@ fn v3_mark_checkout_idle_evicting(
     let hours = match read_json::<u32>(&checkout_idle_policy_path(paths, root)) {
         Ok(hours) => hours.max(1),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            crate::config::DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS
+            crate::config::DEFAULT_IDLE_CHECKOUT_HOURS
         }
         Err(error) => return Ok(Some(V3IdleStep::Unknown(error.to_string()))),
     };
@@ -15097,7 +15097,7 @@ mod v3_collector_tests {
     }
 
     #[test]
-    fn views_idle_checkout_hours_one_evicts_all_members_but_not_the_shared_base() {
+    fn idle_checkout_hours_one_evicts_all_members_but_not_the_shared_base() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let root = bound_root(temp.path(), &storage, "main");
@@ -15172,7 +15172,7 @@ mod v3_collector_tests {
             ..Default::default()
         };
         config.views.enabled = true;
-        config.views.idle_checkout_hours = 1;
+        config.idle.checkout_hours = 1;
         config.indexes.semantic = false;
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),

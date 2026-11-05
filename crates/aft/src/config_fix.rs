@@ -5,13 +5,17 @@
 //! `hoist_builtin_tools`, top-level `enabled`, `search_index`,
 //! `semantic_search`, `callgraph_store`, `github.enabled`, the GitHub enable
 //! aliases `gh_read`/`gh_shim.enabled`, the prefixed `aft_*` host names,
-//! `idle.lsp_ttl_minutes` and the two removed inspect keys) in memory and never
-//! refuses them. This module rewrites a config file so that it states the same
-//! intent with canonical keys, and splices the changes into the original text
-//! so comments, formatting and unrelated keys survive. `doctor --fix` runs it
-//! for the user and project files on request; [`auto_migrate_user_config`]
-//! runs it for the user file whenever AFT loads that file. A project file is
-//! shared through its repository and is never rewritten automatically.
+//! `idle.lsp_ttl_minutes`, the two removed inspect keys and
+//! `views.idle_checkout_hours`) in memory and never refuses them before the
+//! release that retires them. This module rewrites a config file so that it
+//! states the same intent with canonical keys, and splices the changes into
+//! the original text so comments, formatting and unrelated keys survive.
+//! `doctor --fix` runs it for the user and project files on request, and also
+//! deletes the removed data-layer keys (`views.enabled`,
+//! `views.callgraph_copies`, `worktree.ram_overlay`);
+//! [`auto_migrate_user_config`] runs it for the user file whenever AFT loads
+//! that file, but leaves the removed data-layer keys in place. A project file
+//! is shared through its repository and is never rewritten automatically.
 //!
 //! Every block is repaired: the base object and each embedded
 //! `harnesses.<id>` object. A project file only ever gains disables for
@@ -141,6 +145,16 @@ fn repair_github_aliases(
     Ok(())
 }
 
+/// Whether a rewrite also deletes the removed data-layer keys
+/// ([`feature_config::REMOVED_DATA_LAYER_PATHS`]). `doctor --fix` deletes
+/// them; the automatic rewrite of the user file keeps them, because until the
+/// code that reads them is deleted their values still take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovedKeys {
+    Delete,
+    Keep,
+}
+
 /// Rewrite one block's retired keys to the canonical values ordinary loading
 /// derives from them ([`feature_config::translate_document`]).
 fn migrate_block(
@@ -149,6 +163,7 @@ fn migrate_block(
     raw: &Map<String, Value>,
     translated: &Map<String, Value>,
     tier: FixTier,
+    removed_keys: RemovedKeys,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let label = block_label(prefix);
@@ -250,11 +265,34 @@ fn migrate_block(
         }
     }
 
+    if let Some(value) = raw
+        .get("views")
+        .and_then(|views| views.get("idle_checkout_hours"))
+    {
+        if raw
+            .get("idle")
+            .and_then(|idle| idle.get("checkout_hours"))
+            .is_none()
+        {
+            let hours = feature_config::retired_idle_checkout_hours(value);
+            doc.set(
+                &path_of(prefix, &["idle", "checkout_hours"]),
+                &Value::from(hours),
+            )?;
+        }
+    }
+
+    let removed_paths: &[&str] = match removed_keys {
+        RemovedKeys::Delete => &feature_config::REMOVED_DATA_LAYER_PATHS,
+        RemovedKeys::Keep => &[],
+    };
     for (path, _) in RETIRED_PATHS
         .into_iter()
         .chain(feature_config::REMOVED_INSPECT_LSP_PATHS)
         .chain(feature_config::REMOVED_NO_EFFECT_PATHS)
         .chain(feature_config::REMOVED_OPENCODE_PATHS)
+        .chain([feature_config::RETIRED_IDLE_CHECKOUT_HOURS])
+        .chain(removed_paths.iter().map(|path| (*path, "")))
     {
         if path == "experimental.bash"
             && translated
@@ -283,9 +321,19 @@ fn migrate_block(
     Ok(())
 }
 
-/// Migrate one config file's text. `changed` is false (and `text` identical)
-/// when the file needs no migration.
+/// Migrate one config file's text the way `doctor --fix` does: retired keys
+/// become their current equivalents and the removed data-layer keys are
+/// deleted. `changed` is false (and `text` identical) when the file needs no
+/// migration.
 pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, String> {
+    migrate_config_text_with(text, tier, RemovedKeys::Delete)
+}
+
+fn migrate_config_text_with(
+    text: &str,
+    tier: FixTier,
+    removed_keys: RemovedKeys,
+) -> Result<Migration, String> {
     let mut doc = JsoncDocument::parse(text)?;
     let mut notes = Vec::new();
 
@@ -332,6 +380,7 @@ pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, Strin
             raw_block,
             translated_block,
             tier,
+            removed_keys,
             &mut notes,
         )?;
     }
@@ -671,7 +720,7 @@ fn auto_migrate_user_config_with_reader(
         Err(error) => return not_migrated(format!("could not read it: {error}"), &translation),
     };
     let translation = retired_key_translation(&text)?;
-    let migration = match migrate_config_text(&text, FixTier::User) {
+    let migration = match migrate_config_text_with(&text, FixTier::User, RemovedKeys::Keep) {
         Ok(migration) if migration.changed => migration,
         Ok(_) => return None,
         Err(error) => return not_migrated(error, &translation),

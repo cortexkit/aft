@@ -9163,7 +9163,7 @@ impl AppContext {
                 &self.storage_paths(),
                 &family,
                 &root,
-                config.views.idle_checkout_hours,
+                config.idle.checkout_hours,
                 crate::pins::now_ms(),
             ) {
                 crate::slog_warn!("views checkout activity: {error}");
@@ -9185,7 +9185,7 @@ impl AppContext {
             .then(|| {
                 self.last_request_at
                     .try_lock()
-                    .map(|stamp| (*stamp, config.views.idle_checkout_hours))
+                    .map(|stamp| (*stamp, config.idle.checkout_hours))
             })
             .flatten()
     }

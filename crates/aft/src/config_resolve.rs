@@ -552,11 +552,12 @@ impl RawInspectDuplicates {
 #[serde(default)]
 pub struct RawIdle {
     pub root_ttl_minutes: Option<Value>,
+    pub checkout_hours: Option<Value>,
 }
 
 impl RawIdle {
     fn is_empty(&self) -> bool {
-        self.root_ttl_minutes.is_none()
+        self.root_ttl_minutes.is_none() && self.checkout_hours.is_none()
     }
 }
 
@@ -574,12 +575,15 @@ pub struct RawSubc {
     pub client_reaper: Option<bool>,
 }
 
+/// The removed `views` keys. A config file that sets them gets a removal
+/// notice, but until the views code is deleted their values still reach
+/// [`crate::config::ViewsConfig`]. `views.idle_checkout_hours` never arrives
+/// here: translation moves it to `idle.checkout_hours` first.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawViews {
     pub enabled: Option<bool>,
     pub callgraph_copies: Option<Value>,
-    pub idle_checkout_hours: Option<Value>,
 }
 
 /// Each tier sets only the views keys it names; a project that sets
@@ -594,9 +598,6 @@ fn merge_views(base: Option<RawViews>, over: Option<RawViews>) -> Option<RawView
     }
     if over.callgraph_copies.is_some() {
         views.callgraph_copies = over.callgraph_copies;
-    }
-    if over.idle_checkout_hours.is_some() {
-        views.idle_checkout_hours = over.idle_checkout_hours;
     }
     Some(views)
 }
@@ -783,7 +784,7 @@ pub fn resolve_config_for_harness(
             }
         };
         let (raw, translation) = outcome;
-        if translation.legacy_input {
+        if translation.legacy_input || !translation.removed_keys.is_empty() {
             log_retired_keys_once(tier, &translation);
         }
         for warning in translation.warnings {
@@ -1096,20 +1097,37 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
-/// Log, once per config file and set of retired keys in this process, that a
-/// tier's retired keys were translated in memory. Reloads and repeated binds
-/// of the same root therefore do not repeat it. The host plugin delivers the
-/// user-facing notice; the user file's automatic rewrite reports its own.
+/// Log, once per config file and set of retired and removed keys in this
+/// process, that a tier's retired keys were translated in memory and which
+/// removed keys it still sets. Reloads and repeated binds of the same root
+/// therefore do not repeat it. The host plugin delivers the user-facing
+/// notice; the user file's automatic rewrite reports its own.
 fn log_retired_keys_once(tier: &ConfigTier, translation: &feature_config::DocumentTranslation) {
-    let keys = translation.retired_keys.join(", ");
+    let keys = translation
+        .retired_keys
+        .iter()
+        .chain(&translation.removed_keys)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     if !first_superseded_note(&tier.source, "retired_keys", &keys) {
         return;
     }
     let notice = if tier.tier == "user" {
-        format!(
-            "{} uses retired keys ({keys}); AFT applied their current equivalents in memory",
-            tier.source
-        )
+        let mut parts = Vec::new();
+        if translation.legacy_input {
+            parts.push(format!(
+                "{} uses retired keys ({}); AFT applied their current equivalents in memory",
+                tier.source,
+                translation.retired_keys.join(", ")
+            ));
+        }
+        parts.push(feature_config::removed_keys_notice(
+            &tier.source,
+            translation,
+        ));
+        parts.retain(|part| !part.is_empty());
+        parts.join(". ")
     } else {
         feature_config::project_retired_keys_notice(&tier.source, translation)
     };
@@ -2331,6 +2349,9 @@ fn merge_idle_config(base: Option<RawIdle>, override_idle: Option<RawIdle>) -> O
     if override_idle.root_ttl_minutes.is_some() {
         idle.root_ttl_minutes = override_idle.root_ttl_minutes;
     }
+    if override_idle.checkout_hours.is_some() {
+        idle.checkout_hours = override_idle.checkout_hours;
+    }
     (!idle.is_empty()).then_some(idle)
 }
 
@@ -2764,14 +2785,6 @@ fn apply_resolved_config(
             crate::config::MAX_VIEWS_CALLGRAPH_COPIES,
             warnings,
         );
-        config.views.idle_checkout_hours = resolve_clamped_views_setting(
-            views.idle_checkout_hours.as_ref(),
-            "views.idle_checkout_hours",
-            crate::config::DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS,
-            1,
-            crate::config::MAX_VIEWS_IDLE_CHECKOUT_HOURS,
-            warnings,
-        );
     }
     if let Some(value) = raw.callgraph_chunk_size {
         config.callgraph_chunk_size = value;
@@ -2955,9 +2968,20 @@ fn resolve_idle_config(raw: Option<&RawIdle>, warnings: &mut Vec<ConfigWarning>)
         MAX_IDLE_ROOT_TTL_MINUTES,
         warnings,
     );
+    idle.checkout_hours = resolve_clamped_minutes(
+        raw.checkout_hours.as_ref(),
+        "idle.checkout_hours",
+        crate::config::DEFAULT_IDLE_CHECKOUT_HOURS,
+        crate::config::MIN_IDLE_CHECKOUT_HOURS,
+        crate::config::MAX_IDLE_CHECKOUT_HOURS,
+        warnings,
+    );
     idle
 }
 
+/// An integer setting clamped to `min..=max`, with a warning when it is out
+/// of range or not an integer. Used for the idle windows; the unit (minutes or
+/// hours) is the caller's.
 fn resolve_clamped_minutes(
     raw: Option<&Value>,
     key: &'static str,
@@ -5336,41 +5360,113 @@ mod tests {
         assert!(at_max.warnings.is_empty());
     }
 
+    /// `views.callgraph_copies` and `views.enabled` are removed keys: a file
+    /// that sets them gets a notice, but until the views code is deleted
+    /// their values still reach `ViewsConfig`, merged per key.
     #[test]
-    fn views_copy_settings_default_clamp_and_merge_per_key() {
+    fn removed_views_settings_still_apply_and_merge_per_key_until_cutover() {
         let default = resolve_config(&[tier("user", r#"{}"#)]);
         assert_eq!(default.config.views.callgraph_copies, 4);
-        assert_eq!(default.config.views.idle_checkout_hours, 168);
+        assert!(!default.config.views.enabled);
 
-        // A project that only turns views on keeps the user's copy settings.
+        // A project that only turns views on keeps the user's copy setting.
+        let merged = resolve_config(&[
+            tier("user", r#"{"views":{"callgraph_copies":0}}"#),
+            tier("project", r#"{"views":{"enabled":true}}"#),
+        ]);
+        assert!(merged.errors.is_empty(), "{:?}", merged.errors);
+        assert!(merged.config.views.enabled);
+        assert_eq!(merged.config.views.callgraph_copies, 0);
+        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+
+        let clamped = resolve_config(&[tier("user", r#"{"views":{"callgraph_copies":1000}}"#)]);
+        assert_eq!(clamped.config.views.callgraph_copies, 256);
+        assert!(
+            clamped
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "clamped_views_setting"
+                    && warning.key == "views.callgraph_copies"),
+            "{:?}",
+            clamped.warnings
+        );
+    }
+
+    /// `idle.checkout_hours` replaces `views.idle_checkout_hours` with the
+    /// same default (168) and range (1..=8760), and merges per key beside
+    /// `idle.root_ttl_minutes`.
+    #[test]
+    fn idle_checkout_hours_defaults_clamps_and_merges_per_key() {
+        let default = resolve_config(&[tier("user", r#"{}"#)]);
+        assert_eq!(default.config.idle.checkout_hours, 168);
+
         let merged = resolve_config(&[
             tier(
                 "user",
-                r#"{"views":{"callgraph_copies":0,"idle_checkout_hours":2}}"#,
+                r#"{"idle":{"checkout_hours":2,"root_ttl_minutes":20}}"#,
             ),
-            tier("project", r#"{"views":{"enabled":true}}"#),
+            tier("project", r#"{"idle":{"root_ttl_minutes":15}}"#),
         ]);
-        assert!(merged.config.views.enabled);
-        assert_eq!(merged.config.views.callgraph_copies, 0);
-        assert_eq!(merged.config.views.idle_checkout_hours, 2);
-        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+        assert_eq!(merged.config.idle.checkout_hours, 2);
+        assert_eq!(merged.config.idle.root_ttl_minutes, 15);
+        let project = resolve_config(&[
+            tier("user", r#"{"idle":{"checkout_hours":2}}"#),
+            tier("project", r#"{"idle":{"checkout_hours":48}}"#),
+        ]);
+        assert_eq!(project.config.idle.checkout_hours, 48);
 
-        let clamped = resolve_config(&[tier(
-            "user",
-            r#"{"views":{"idle_checkout_hours":0,"callgraph_copies":1000}}"#,
-        )]);
-        assert_eq!(clamped.config.views.idle_checkout_hours, 1);
-        assert_eq!(clamped.config.views.callgraph_copies, 256);
-        for key in ["views.idle_checkout_hours", "views.callgraph_copies"] {
+        for (doc, want) in [
+            (r#"{"idle":{"checkout_hours":0}}"#, 1),
+            (r#"{"idle":{"checkout_hours":9000}}"#, 8760),
+        ] {
+            let clamped = resolve_config(&[tier("user", doc)]);
+            assert_eq!(clamped.config.idle.checkout_hours, want, "{doc}");
             assert!(
                 clamped
                     .warnings
                     .iter()
-                    .any(|warning| warning.code == "clamped_views_setting" && warning.key == key),
-                "{key}: {:?}",
+                    .any(|warning| warning.code == "clamped_idle_ttl"
+                        && warning.key == "idle.checkout_hours"),
+                "{doc}: {:?}",
                 clamped.warnings
             );
         }
+        let fractional = resolve_config(&[tier("user", r#"{"idle":{"checkout_hours":1.5}}"#)]);
+        assert_eq!(fractional.config.idle.checkout_hours, 168);
+        assert!(fractional
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "invalid_idle_ttl"
+                && warning.key == "idle.checkout_hours"));
+    }
+
+    /// A retired `views.idle_checkout_hours` is translated to
+    /// `idle.checkout_hours` (clamped to its range) at both tiers, and loses
+    /// to an explicit `idle.checkout_hours` in the same file.
+    #[test]
+    fn retired_views_idle_checkout_hours_becomes_idle_checkout_hours() {
+        let user = resolve_config(&[tier("user", r#"{"views":{"idle_checkout_hours":2}}"#)]);
+        assert!(user.errors.is_empty(), "{:?}", user.errors);
+        assert_eq!(user.config.idle.checkout_hours, 2);
+
+        let project = resolve_config(&[
+            tier("user", r#"{"idle":{"checkout_hours":2}}"#),
+            tier(
+                "project",
+                r#"{"views":{"idle_checkout_hours":72,"enabled":true}}"#,
+            ),
+        ]);
+        assert_eq!(project.config.idle.checkout_hours, 72);
+        assert!(project.config.views.enabled);
+
+        let clamped = resolve_config(&[tier("user", r#"{"views":{"idle_checkout_hours":0}}"#)]);
+        assert_eq!(clamped.config.idle.checkout_hours, 1);
+
+        let canonical = resolve_config(&[tier(
+            "user",
+            r#"{"views":{"idle_checkout_hours":2},"idle":{"checkout_hours":5}}"#,
+        )]);
+        assert_eq!(canonical.config.idle.checkout_hours, 5);
     }
 
     #[test]

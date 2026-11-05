@@ -47,6 +47,123 @@
         }
       },
       "errors": []
+    },
+    {
+      "name": "data-layer keys before the refusing release",
+      "release": "0.64.9",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys from the refusing release",
+      "release": "0.65.0",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run aft doctor --fix",
+        "removed_config_key:views.enabled; run aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys in a later major release",
+      "release": "1.0.0",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run aft doctor --fix",
+        "removed_config_key:views.enabled; run aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys inside an unrelated block are not settings",
+      "release": "0.65.0",
+      "doc": {
+        "bash": {
+          "views": {
+            "enabled": true
+          }
+        },
+        "idle": {
+          "checkout_hours": 5
+        }
+      },
+      "errors": []
     }
   ]
 }
