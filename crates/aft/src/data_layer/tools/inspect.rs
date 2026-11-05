@@ -106,3 +106,89 @@ impl DeadCodeSources {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use aft_store::ids::{Digest128, FamilyId};
+
+    use crate::data_layer::checkout::{Checkout, DataLayer};
+    use crate::inspect::job::CallgraphSnapshot;
+
+    /// Each snapshot part as one line per item, so two snapshots compare as
+    /// sets of items.
+    fn parts(snapshot: &CallgraphSnapshot) -> [(&'static str, Vec<String>); 6] {
+        fn lines<T: std::fmt::Debug>(items: impl IntoIterator<Item = T>) -> Vec<String> {
+            items.into_iter().map(|item| format!("{item:?}")).collect()
+        }
+        [
+            ("files", lines(&snapshot.files)),
+            ("exported_symbols", lines(&snapshot.exported_symbols)),
+            ("outbound_calls", lines(&snapshot.outbound_calls)),
+            ("entry_points", lines(&snapshot.entry_points)),
+            (
+                "entry_point_symbols",
+                lines(snapshot.entry_point_symbols.iter().flat_map(|(file, symbols)| {
+                    symbols.iter().map(move |symbol| (file, symbol))
+                })),
+            ),
+            ("go_initializers", lines(&snapshot.go_initializers)),
+        ]
+    }
+
+    /// A diagnostic for the inspect gate, not a check: on the checkout named
+    /// by `AFT_INSPECT_GATE_ROOT`, builds today's call-graph database and the
+    /// data layer's checkout, and prints each dead-code snapshot part that
+    /// differs between the database's projection and the data layer's
+    /// snapshot, with the items found on one side only. Run it with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "a diagnostic run on a named checkout"]
+    fn print_how_dead_code_snapshots_differ_on_a_checkout() {
+        let Some(root) = std::env::var_os("AFT_INSPECT_GATE_ROOT") else {
+            return;
+        };
+        let root = crate::inspect::job::canonicalize_normalized(std::path::Path::new(&root));
+        let storage = tempfile::tempdir().expect("storage");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let store =
+            crate::callgraph_store::CallGraphStore::open(storage.path().join("callgraph"), root.clone())
+                .expect("open today's database");
+        store.cold_build(&files).expect("build today's database");
+        let today = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
+            .expect("project today's snapshot");
+        let threads = std::thread::available_parallelism().map_or(4, usize::from);
+        let checkout = Checkout::bind(
+            Arc::new(DataLayer::new(256 << 20, threads)),
+            &storage.path().join("data"),
+            FamilyId::from_digest(Digest128::of(b"inspect gate")),
+            &root,
+        )
+        .expect("bind the checkout");
+        checkout.build().expect("build the checkout");
+        let ours = checkout
+            .view()
+            .expect("published")
+            .dead_code_snapshot()
+            .expect("the data layer's snapshot");
+        for ((name, theirs), (_, mine)) in parts(&today).into_iter().zip(parts(&ours)) {
+            let theirs = theirs.iter().collect::<BTreeSet<_>>();
+            let mine = mine.iter().collect::<BTreeSet<_>>();
+            let only_today = theirs.difference(&mine).collect::<Vec<_>>();
+            let only_ours = mine.difference(&theirs).collect::<Vec<_>>();
+            println!(
+                "{name}: {} items only today, {} only in the data layer",
+                only_today.len(),
+                only_ours.len()
+            );
+            for line in only_today.iter().take(12) {
+                println!("  today:      {line}");
+            }
+            for line in only_ours.iter().take(12) {
+                println!("  data layer: {line}");
+            }
+        }
+    }
+}
