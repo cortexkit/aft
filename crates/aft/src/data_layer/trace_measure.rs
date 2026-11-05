@@ -313,7 +313,7 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
     };
 
     // Every function and method, once per file and scoped name, in path
-    // order; then an even spread of `sample` of them.
+    // order.
     let mut symbols = Vec::new();
     for (path, (_, parse)) in inputs.parses.iter() {
         let mut names = parse
@@ -326,12 +326,10 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
         names.dedup();
         symbols.extend(names.into_iter().map(|name| (path.clone(), name)));
     }
+    // An even spread of `sample` of them: every `step`-th one.
     let step = (symbols.len() / sample.max(1)).max(1);
-    let chosen = symbols
-        .iter()
-        .step_by(step)
-        .take(sample)
-        .cloned()
+    let chosen = (0..symbols.len().div_ceil(step).min(sample))
+        .map(|index| symbols[index * step].clone())
         .collect::<Vec<_>>();
 
     use crate::commands::callgraph_store_adapter as adapter;

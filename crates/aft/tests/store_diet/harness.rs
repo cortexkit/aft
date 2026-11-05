@@ -134,6 +134,10 @@ fn fixture_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Each command's reply on the fixture. `impact` and `trace_to` are left
+/// out: they label roots from entry facts only the data layer's call graph
+/// records, so their replies over today's database and views no longer
+/// describe what those stores held.
 fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
     let file = root.join("main.ts");
     let target = root.join("helpers.ts");
@@ -141,8 +145,6 @@ fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
     json!({
         "callers": adapter::callers_result(store, &target, "validate", 4, true).unwrap(),
         "call_tree": adapter::call_tree_result(store, &file, "main", 4, true).unwrap(),
-        "impact": adapter::impact_result(store, &target, "validate", 4, true).unwrap(),
-        "trace_to": adapter::trace_to_result(store, &target, "validate", 4, true).unwrap(),
         "trace_to_symbol": adapter::trace_to_symbol_result(store, &file, "main", "validate", Some(&target), 4, true).unwrap(),
         "trace_data": adapter::trace_data_result(store, &root.join("data_flow.ts"), "transformData", "rawInput", 4, cache).unwrap(),
     })
@@ -543,6 +545,8 @@ fn answer<T: serde::Serialize>(result: std::result::Result<T, impl std::fmt::Dis
     }
 }
 
+/// Replies to sampled queries. Like [`replies`], it leaves `impact` and
+/// `trace_to` out.
 fn seeded_replies(store: &CallGraphStore, reader: &impl CallGraphRead, root: &Path) -> Value {
     let symbols = sample_queries(store);
     if symbols.is_empty() {
@@ -555,7 +559,6 @@ fn seeded_replies(store: &CallGraphStore, reader: &impl CallGraphRead, root: &Pa
             "file": file, "symbol": symbol,
             "callers": answer(adapter::callers_result(reader, &path, symbol, 4, true)),
             "call_tree": answer(adapter::call_tree_result(reader, &path, symbol, 4, true)),
-            "impact": answer(adapter::impact_result(reader, &path, symbol, 4, true)),
         }));
     }
     let count = symbols.len() as u128;
@@ -569,7 +572,6 @@ fn seeded_replies(store: &CallGraphStore, reader: &impl CallGraphRead, root: &Pa
         let path = root.join(file);
         results.push(json!({
             "file": file, "symbol": symbol, "to_file": to_file, "to_symbol": to_symbol,
-            "trace_to": answer(adapter::trace_to_result(reader, &path, symbol, 4, true)),
             "trace_to_symbol": answer(adapter::trace_to_symbol_result(reader, &path, symbol, to_symbol, Some(&root.join(to_file)), 4, true)),
         }));
     }
