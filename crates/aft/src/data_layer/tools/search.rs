@@ -994,7 +994,7 @@ mod tests {
                 (format!("{by_files:06x?}"), zero),
                 (format!("{by_frequency:06x?}"), zero),
             );
-            let as_set = |picks: &[u32]| picks.iter().collect::<BTreeSet<_>>();
+            let as_set = |picks: &[u32]| picks.iter().copied().collect::<BTreeSet<u32>>();
             picks_as_sets.record(
                 query,
                 (format!("{:06x?}", as_set(&by_files)), zero),
