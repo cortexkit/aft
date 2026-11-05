@@ -3048,6 +3048,8 @@ mod tests {
         assert!(merged.truncated);
     }
 
+    /// 100 directories of 100 files, each file holding one `needle`, and a
+    /// context for it with no index of any kind, so grep walks the folder.
     fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -3062,7 +3064,6 @@ mod tests {
                 .unwrap();
             }
         }
-        let index = crate::search_index::SearchIndex::build_with_limit(&root, 1024 * 1024);
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
@@ -3070,19 +3071,54 @@ mod tests {
                 ..crate::config::Config::default()
             },
         );
-        *ctx.search_index().write().unwrap() = Some(index);
         (dir, ctx)
+    }
+
+    /// A context for the fixture at `root` whose checkout is bound in the
+    /// data layer and has published its text index, so grep takes its
+    /// candidates from the data layer's view. The call graph is switched off:
+    /// grep never reads it, and building it for 10,000 files is slow.
+    fn grep_io_data_layer_context(root: &Path, storage: &Path) -> AppContext {
+        crate::data_layer::runtime::force_on_for_test();
+        let mut config = crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        config.indexes.callgraph = false;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(600);
+        while crate::data_layer::tools::grep::ready_view(&ctx).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the data layer never published the fixture's text index"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        ctx
+    }
+
+    /// The grep measurement on a data-layer context, checking that the data
+    /// layer answered: a walk of the fixture reports `Fallback`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn measured_data_layer_grep(ctx: &AppContext) -> (Duration, usize, usize) {
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
+        let (measurement, index_status) = measured_grep_with_status(ctx, budget);
+        assert_eq!(index_status, "Ready", "the data layer did not answer");
+        measurement
     }
 
     fn measured_grep(ctx: &AppContext) -> (Duration, usize, usize) {
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
-        measured_grep_with_budget(ctx, budget)
+        measured_grep_with_status(ctx, budget).0
     }
 
-    fn measured_grep_with_budget(
+    /// The measurement and the reply's `index_status`.
+    fn measured_grep_with_status(
         ctx: &AppContext,
         budget: crate::bounded_io::Budget,
-    ) -> (Duration, usize, usize) {
+    ) -> ((Duration, usize, usize), serde_json::Value) {
         let request = crate::protocol::RawRequest {
             id: "grep-io-measurement".into(),
             command: "grep".into(),
@@ -3102,22 +3138,26 @@ mod tests {
         );
         assert_eq!(response.data["total_matches"], 10_000);
         let (spawns, round_trips) = budget.measurements();
-        (elapsed, spawns, round_trips)
+        (
+            (elapsed, spawns, round_trips),
+            response.data["index_status"].clone(),
+        )
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ten_thousand_file_grep_uses_directory_probes_not_per_file_helpers() {
         let (_fixture, ctx) = grep_io_fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let indexed = grep_io_data_layer_context(&project_root(&ctx), storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+        let (_, spawns, round_trips) = pool.install(|| measured_data_layer_grep(&indexed));
         assert!(spawns > 0, "cold first-access probes must be counted");
         assert!(spawns <= 132 && round_trips <= 132, "100 directories plus fixed root work, not 10000 files: spawns={spawns} round_trips={round_trips}");
-        *ctx.search_index().write().unwrap() = None;
         let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
         assert!(spawns > 0);
         assert!(spawns <= 132 && round_trips <= 132, "the fallback walk must reuse its bounded helper: spawns={spawns} round_trips={round_trips}");
@@ -3143,7 +3183,6 @@ mod tests {
     #[test]
     fn ten_thousand_file_grep_sorts_matches_without_per_directory_respawns() {
         let (_fixture, ctx) = grep_io_fixture();
-        *ctx.search_index().write().unwrap() = None;
         let (_, spawns, round_trips) =
             std::thread::scope(|scope| scope.spawn(|| measured_grep(&ctx)).join().unwrap());
         assert!(spawns > 0);
@@ -3161,17 +3200,16 @@ mod tests {
         const ROOT_ACCESS_CAP: Duration = Duration::from_secs(12);
         const QUEUE_HOLD: Duration = Duration::from_secs(8);
         const RUNNING_HOLD: Duration = Duration::from_secs(6);
-        let (_fixture, ctx) = grep_io_fixture();
-        let root = project_root(&ctx);
+        let (_fixture, walked) = grep_io_fixture();
+        let root = project_root(&walked);
+        let storage = tempfile::tempdir().unwrap();
+        let data_layer = grep_io_data_layer_context(&root, storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        for indexed in [true, false] {
-            if !indexed {
-                *ctx.search_index().write().unwrap() = None;
-            }
+        for (indexed, ctx) in [(true, &data_layer), (false, &walked)] {
             let queued = crate::bounded_io::stall_helper(&root);
             let running = crate::bounded_io::stall_running_helper(&root);
             let budget = crate::bounded_io::Budget::after(Duration::from_secs(60))
@@ -3182,7 +3220,7 @@ mod tests {
                 let pool = &pool;
                 let ctx = &ctx;
                 let caller = scope.spawn(move || {
-                    let result = pool.install(|| measured_grep_with_budget(ctx, budget));
+                    let result = pool.install(|| measured_grep_with_status(ctx, budget));
                     let _ = done_tx.send(());
                     result
                 });
@@ -3198,7 +3236,10 @@ mod tests {
                 let started = running.reached.recv_timeout(Duration::from_secs(30));
                 let before_release = done_rx.recv_timeout(RUNNING_HOLD);
                 drop(running);
-                let (_, spawns, round_trips) = caller.join().unwrap();
+                let ((_, spawns, round_trips), index_status) = caller.join().unwrap();
+                if indexed {
+                    assert_eq!(index_status, "Ready", "the data layer did not answer");
+                }
                 assert_eq!(cold_measurements.1, 1);
                 assert!(before_start.is_err());
                 started.expect("the fixture-root metadata helper must start");
@@ -3217,19 +3258,18 @@ mod tests {
     #[test]
     #[ignore = "manual five-run 10000-file grep wall-time and helper-count measurement"]
     fn grep_io_10k_measurement() {
-        let (_fixture, ctx) = grep_io_fixture();
+        let (_fixture, walked) = grep_io_fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let data_layer = grep_io_data_layer_context(&project_root(&walked), storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        for indexed in [true, false] {
-            if !indexed {
-                *ctx.search_index().write().unwrap() = None;
-            }
+        for (indexed, ctx) in [(true, &data_layer), (false, &walked)] {
             let mut samples = Vec::new();
             for run in 0..5 {
-                let (elapsed, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+                let (elapsed, spawns, round_trips) = pool.install(|| measured_grep(ctx));
                 println!("grep_io_10k mode={} run={} elapsed_ms={:.3} thread_spawns={} helper_round_trips={}",
                     if indexed { "indexed" } else { "fallback" }, run + 1, elapsed.as_secs_f64() * 1000.0, spawns, round_trips);
                 samples.push(elapsed);
