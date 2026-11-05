@@ -1230,7 +1230,7 @@ pub(super) fn drain_reliable_push_turn(
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
     first: Option<PushEnvelope>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -1540,6 +1540,188 @@ pub(super) fn process_lossy_push_envelope_batch(
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    fn caller_route(root: &ProjectRootId, principal: &str, harness: &str) -> RouteIdentity {
+        let mut route =
+            route_identity_with_harness(root, "moved-session", BindTrust::FirstParty, harness);
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        if let AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness: bound_harness,
+            ..
+        } = &mut data.spawn_principal
+        {
+            *principal_id = Some(principal.to_string());
+            *bound_harness = harness.to_string();
+        }
+        route
+    }
+
+    fn assert_task_notice_isolation(other_principal: &str, other_harness: &str) {
+        let (_dir, root) = test_root("task-notice-caller-root");
+        let owner = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let other = caller_route(&root, other_principal, other_harness);
+        let owner_channel = route_key(1, 1);
+        let other_channel = route_key(2, 1);
+        let routes = HashMap::from([
+            (owner_channel, owner.clone()),
+            (other_channel, other.clone()),
+        ]);
+        let root_channels =
+            HashMap::from([(root.clone(), HashSet::from([owner_channel, other_channel]))]);
+        let subscriptions = HashMap::from([
+            (
+                (root.clone(), owner.task_identity()),
+                HashSet::from([owner_channel]),
+            ),
+            (
+                (root.clone(), other.task_identity()),
+                HashSet::from([other_channel]),
+            ),
+        ]);
+        let metrics = DispatchPathMetrics::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(16);
+        let mut retry = RetryBuffer::new();
+        let mut buffered = HashMap::new();
+        let mut completed = CompletedTaskIds::default();
+        let mut pending = BgWakePending::new();
+        let mut epochs = HashMap::new();
+        let mut completion = completion_frame_with_session("owned-task", "moved-session");
+        if let PushFrame::BashCompleted(frame) = &mut completion {
+            frame.launching_identity = Some(owner.task_identity());
+        }
+        let mut pattern = BashPatternMatchFrame::new(
+            "owned-task",
+            "moved-session",
+            "watch",
+            "ready",
+            1,
+            "ready",
+            true,
+        );
+        pattern.launching_identity = Some(owner.task_identity());
+        for frame in [completion.clone(), PushFrame::BashPatternMatch(pattern)] {
+            process_reliable_push_and_arm_bg_wake(
+                &writer_tx,
+                &metrics,
+                &routes,
+                &root_channels,
+                &HashMap::new(),
+                &mut retry,
+                &mut buffered,
+                &mut completed,
+                &subscriptions,
+                &mut pending,
+                &mut epochs,
+                root.clone(),
+                frame,
+                None,
+            );
+            assert_eq!(writer_rx.try_recv().unwrap().header.channel, 1);
+            assert!(writer_rx.try_recv().is_err());
+            assert_eq!(
+                pending.keys().copied().collect::<HashSet<_>>(),
+                HashSet::from([owner_channel])
+            );
+        }
+        let bg_subs = HashMap::from([
+            (
+                owner_channel,
+                BgSub {
+                    corr: 11,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: "moved-session".into(),
+                },
+            ),
+            (
+                other_channel,
+                BgSub {
+                    corr: 22,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: "moved-session".into(),
+                },
+            ),
+        ]);
+        emit_bg_event_wakes(&writer_tx, &metrics, &bg_subs, &mut pending);
+        let nudge = writer_rx.try_recv().unwrap();
+        assert_eq!((nudge.header.channel, nudge.header.corr), (1, 11));
+        assert!(writer_rx.try_recv().is_err());
+
+        let mut long = BashLongRunningFrame::new("owned-task", "moved-session", "sleep", 100);
+        long.launching_identity = Some(owner.task_identity());
+        let result = fan_out_lossy_push_frame(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &root,
+            &PushFrame::BashLongRunning(long),
+        );
+        assert_eq!(result.sent_frames, 1);
+        assert_eq!(writer_rx.try_recv().unwrap().header.channel, 1);
+        assert!(writer_rx.try_recv().is_err());
+
+        // The owner disconnects while the other consumer stays bound. Retain the
+        // notice by its launch identity, not the last route using the session id.
+        let detached_routes = HashMap::from([(other_channel, other.clone())]);
+        let detached_channels = HashMap::from([(root.clone(), HashSet::from([other_channel]))]);
+        fan_out_reliable_push_frame(
+            &writer_tx,
+            &metrics,
+            &detached_routes,
+            &detached_channels,
+            &HashMap::new(),
+            &mut retry,
+            &mut buffered,
+            &root,
+            &completion,
+            None,
+        );
+        assert!(writer_rx.try_recv().is_err());
+        assert_eq!(
+            replay_buffered_push_frames(
+                &writer_tx,
+                &metrics,
+                other_channel,
+                &mut buffered,
+                &ReplayKey::from_identity(&other),
+                BindTrust::FirstParty,
+                None
+            ),
+            0
+        );
+        let reconnect = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        assert_eq!(
+            replay_buffered_push_frames(
+                &writer_tx,
+                &metrics,
+                route_key(3, 9),
+                &mut buffered,
+                &ReplayKey::from_identity(&reconnect),
+                BindTrust::FirstParty,
+                None
+            ),
+            1
+        );
+        let replay = writer_rx.try_recv().unwrap();
+        assert_eq!((replay.header.channel, replay.header.epoch), (3, 9));
+        assert!(writer_rx.try_recv().is_err());
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn task_notices_isolate_principals_and_reconnect() {
+        assert_task_notice_isolation("direct", "opencode");
+    }
+
+    #[test]
+    fn task_notices_isolate_harnesses_and_reconnect() {
+        assert_task_notice_isolation("reserved:thalamus-harness", "opencode2");
+    }
     use crate::protocol::{ConfigureWarningsFrame, StatusChangedFrame};
 
     #[cfg(unix)]
@@ -3212,7 +3394,7 @@ mod tests {
     #[test]
     fn arm_bg_wake_bumps_epoch_even_when_channel_is_already_pending() {
         let (_root_dir, root) = test_root("subc-bg-wake-epoch-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(7, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3303,7 +3485,10 @@ mod tests {
     fn duplicate_session_subscriptions_emit_each_route_correlation() {
         let (_root_dir, root) = test_root("subc-bg-duplicate-session-root");
         let session = "shared-session".to_string();
-        let key = (root.clone(), session.clone());
+        let key = (
+            root.clone(),
+            route_identity(&root, &session).task_identity(),
+        );
         let route_a = route_key(17, 1);
         let route_b = route_key(23, 4);
         let metrics = DispatchPathMetrics::new();
@@ -3319,6 +3504,7 @@ mod tests {
             &mut bg_wake_epoch,
             root.clone(),
             session.clone(),
+            None,
         );
         assert_eq!(bg_wake_pending.len(), 2);
         assert!(bg_wake_pending.contains_key(&route_a));
@@ -3370,7 +3556,7 @@ mod tests {
     #[test]
     fn stale_maintenance_epoch_does_not_clear_newer_bg_wake() {
         let (_root_dir, root) = test_root("subc-bg-wake-stale-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(8, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3412,7 +3598,7 @@ mod tests {
     #[test]
     fn matching_maintenance_epoch_clears_genuinely_stale_bg_wake() {
         let (_root_dir, root) = test_root("subc-bg-wake-clear-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(9, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3457,6 +3643,7 @@ mod tests {
             &mut bg_wake_epoch,
             root.clone(),
             "session-without-subscription".to_string(),
+            None,
         );
 
         assert_eq!(metrics.bg_arm_misses_60s_total(), 1);

@@ -17351,7 +17351,10 @@ mod tests {
             },
         )]);
         let mut bg_sub_by_session = HashMap::from([(
-            (root.clone(), "deleted-route".to_string()),
+            (
+                root.clone(),
+                route_identity(&root, "deleted-route").task_identity(),
+            ),
             HashSet::from([route]),
         )]);
         let mut bg_wake_pending =
@@ -19023,7 +19026,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), ctx));
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        let session = "idle-session".to_string();
+        let session = route_identity(&root, "idle-session").task_identity();
         let channel = route_key(17, 1);
         let metrics = DispatchPathMetrics::new();
         let bg_sub_by_session =
