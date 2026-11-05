@@ -2294,6 +2294,13 @@ pub(super) fn submit_deferred_bash(
     let request_id_for_spawn = request_id.clone();
     let session_for_spawn = session_id.clone();
     let project_root_for_spawn = project_root.clone();
+    // A runner head's rewritten `cat`/`head`/`tail` mints hashline tags like
+    // its `read`, so it installs the binding its catalog's recorded edit mode
+    // calls for (see `run_tool_call::resolve_head_edit_mode`). A worker's
+    // bash call never reads a head catalog's mode.
+    let head_catalog_key = super::secret_consent::current_identity()
+        .filter(|identity| !worker_session && identity.session == session_id)
+        .and_then(|identity| super::tool_provider::head_catalog_key(&identity));
     let format_context_for_spawn = format_context.clone();
     // A call that returns its result ends in exactly one of three places: the
     // spawn job answers it at once (a rewritten command, an error, or a
@@ -2372,6 +2379,14 @@ pub(super) fn submit_deferred_bash(
                             &session_for_spawn,
                             edit_slot_survives,
                             false,
+                        );
+                    }
+                    if let Some(key) = &head_catalog_key {
+                        crate::run_tool_call::resolve_head_edit_mode(
+                            ctx,
+                            &project_root_for_spawn,
+                            &session_for_spawn,
+                            key,
                         );
                     }
 

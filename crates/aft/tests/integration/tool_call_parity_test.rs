@@ -526,6 +526,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
                         request_id: "forced-pair".into(),
                         project_root: root.clone(),
                         standard_edit_grammar: true,
+                        head_catalog_key: None,
                         session_id: None,
                         diagnostics_on_edit: false,
                         preview: false,

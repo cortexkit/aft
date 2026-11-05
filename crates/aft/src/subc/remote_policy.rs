@@ -79,6 +79,20 @@ fn catalog_needs_policy_database(body: &Value, identity: &RouteIdentity) -> bool
             })
 }
 
+/// A runner head's catalog (a `head` request naming its model) records its
+/// edit mode in aft.db, so while that database opens its fetch waits rather
+/// than be served before the mode can be recorded. A database that failed to
+/// open does not refuse it: nothing is recorded or read then, and the catalog
+/// and the head's calls both use the standard edit grammar.
+pub(super) fn catalog_records_edit_mode(body: &Value, identity: &RouteIdentity) -> bool {
+    body.get("preset").and_then(Value::as_str).unwrap_or("head") == "head"
+        && body
+            .get("params")
+            .and_then(|params| params.get("model"))
+            .is_some()
+        && tool_provider::head_catalog_key(identity).is_some()
+}
+
 pub(super) fn catalog(
     body: Value,
     identity: &RouteIdentity,
@@ -87,7 +101,9 @@ pub(super) fn catalog(
     // The transport already gave this open a bounded asynchronous wait. Do not
     // re-enter the open or silently skip a required preset/policy persistence.
     let needs_database = catalog_needs_database(&body, identity);
-    if needs_database && ctx.database_runtime_initializing() {
+    if (needs_database || catalog_records_edit_mode(&body, identity))
+        && ctx.database_runtime_initializing()
+    {
         return Err(if awaits_policy_store(ctx, identity) {
             policy_unavailable()
         } else {
@@ -357,6 +373,13 @@ fn catalog_inner(
     } else {
         confined(ctx, identity)?
     };
+    let mut head_settings = tool_provider::HeadSettings::from_config(&ctx.config());
+    // A runner head's hashline catalog is served only where its edit mode can
+    // be recorded, because its later calls are decoded by that record (see
+    // `tool_provider::record_runner_head_edit_mode`).
+    if tool_provider::head_catalog_key(identity).is_none() || ctx.db().is_none() {
+        head_settings.hashline = false;
+    }
     let (answer, registration) = tool_provider::catalog_for_route(
         request,
         catalog_preset,
@@ -365,17 +388,10 @@ fn catalog_inner(
         (runon.is_ok(), ctx.config().revision_reads),
         worker_wait_max_ms,
         is_confined,
-        tool_provider::HeadSettings::from_config(&ctx.config()),
+        head_settings,
     )?;
-    // A runner head's `read` and `edit` follow the edit mode its catalog was
-    // rendered for, so the session's hashline binding is installed with it.
     if let Some(registration) = registration {
-        tool_provider::register_runner_head_edit_mode(
-            ctx,
-            &identity.project_root,
-            &identity.session,
-            registration,
-        );
+        tool_provider::record_runner_head_edit_mode(ctx, identity, registration)?;
     }
     // Digest-only replies have no tools array. For those, use the renderer's
     // tool selection and its confinement filter to describe the full catalog.

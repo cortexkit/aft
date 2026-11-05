@@ -2019,6 +2019,7 @@ fn run(
         edit_slot_survives: None,
         report_registration_downgrade: false,
         standard_edit_grammar: true,
+        head_catalog_key: None,
         disabled_tools: Some(Arc::new(Vec::new())),
         worker_session: true,
         host_tool_names: None,

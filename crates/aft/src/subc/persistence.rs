@@ -289,7 +289,8 @@ impl DatabaseWaits {
             };
             let catalog_wait = operation == "tool.catalog"
                 && ctx.database_runtime_initializing()
-                && remote_policy::catalog_needs_database(catalog_body, identity);
+                && (remote_policy::catalog_needs_database(catalog_body, identity)
+                    || remote_policy::catalog_records_edit_mode(catalog_body, identity));
             let grants_wait =
                 operation.starts_with("grants.") && ctx.database_runtime_initializing();
             if catalog_wait
@@ -316,11 +317,7 @@ impl DatabaseWaits {
                 crate::bash_background::powershell_available(),
                 &identity.session,
                 !matches!(identity.trust, BindTrust::Untrusted),
-                tool_provider::runner_head_hashline(
-                    &ctx,
-                    &identity.project_root,
-                    &identity.session,
-                ),
+                tool_provider::head_catalog_key(identity).is_some(),
             )
             .is_err()
             {
@@ -344,6 +341,21 @@ impl DatabaseWaits {
         {
             return Err(decoded);
         }
+        // A runner head's `read` mints hashline tags only once the edit mode
+        // its catalog recorded in aft.db has been read, so while that database
+        // opens it waits like the edits that need the database anyway.
+        let edit_mode_wait = name == "read"
+            && identity.role == tool_provider::RouteRole::ToolProviderV1
+            && ctx.database_runtime_initializing()
+            && tool_provider::head_catalog_key(identity).is_some()
+            && matches!(
+                tool_provider::resolve_caller_role(
+                    body.get("preset").and_then(Value::as_str),
+                    identity.scope.is_some(),
+                    false,
+                ),
+                Ok(tool_provider::CallerRole::Head)
+            );
         if ctx.claim_database_runtime_retry(name) {
             let generation = ctx.configure_generation();
             let response = executor.submit_maintenance_async(
@@ -371,12 +383,19 @@ impl DatabaseWaits {
                 }
             });
         }
-        if !ctx.database_runtime_pending(name) && !confine_wait {
+        if !ctx.database_runtime_pending(name) && !confine_wait && !edit_mode_wait {
             return Err(decoded);
         }
         let name = name.to_string();
         let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
-        self.wait(decoded, route, &ctx, name, deadline_ms, confine_wait)
+        self.wait(
+            decoded,
+            route,
+            &ctx,
+            name,
+            deadline_ms,
+            confine_wait || edit_mode_wait,
+        )
     }
 
     /// Read a scoped worker route's saved confinement on a blocking thread

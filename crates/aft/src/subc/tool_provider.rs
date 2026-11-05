@@ -1,7 +1,7 @@
 //! The v1 catalog and admission boundary, separate from plugin tool forwarding.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -914,7 +914,7 @@ pub(super) fn catalog_for_confined_request(
 /// Render a project route's catalog under that project's `head` settings,
 /// confined to the project root when `confined`. For a runner head the reply
 /// also carries the hashline registration its edit and read tools need (see
-/// [`register_runner_head_edit_mode`]); any other catalog carries `None`.
+/// [`record_runner_head_edit_mode`]); any other catalog carries `None`.
 pub(super) fn catalog_for_route(
     request: CatalogRequest,
     preset: CatalogPreset,
@@ -1628,8 +1628,9 @@ pub(super) fn admit_call_mode(
     Err(error)
 }
 
-/// [`admit_for_session`] for a session whose `edit` takes the standard
-/// find-and-replace and symbol arguments rather than a hashline patch.
+/// [`admit_for_session`] for a route whose catalog can only have served the
+/// standard `edit`, which takes find-and-replace and symbol arguments rather
+/// than a hashline patch.
 #[cfg(test)]
 pub(super) fn admit(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -1650,9 +1651,10 @@ pub(super) fn admit(
     )
 }
 
-/// Admit a v1 `tool.call` and resolve the role it runs under. `hashline_edit`
-/// says whether the session's `edit` takes hashline patches (see
-/// [`runner_head_hashline`]); a call to it is then checked against that arm.
+/// Admit a v1 `tool.call` and resolve the role it runs under. `hashline_route`
+/// says whether the route's head catalog may have served the hashline `edit`
+/// (it has a [`head_catalog_key`]); a head's `edit` call is then checked
+/// against the arm its arguments take (see [`admit_arguments_for`]).
 pub(super) fn admit_for_session(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
     scoped_route: bool,
@@ -1660,7 +1662,7 @@ pub(super) fn admit_for_session(
     powershell_available: bool,
     session: &str,
     trusted: bool,
-    hashline_edit: bool,
+    hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     check_call(call)?;
     let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
@@ -1671,7 +1673,7 @@ pub(super) fn admit_for_session(
         session,
         trusted,
         role,
-        hashline_edit,
+        hashline_route,
     )?;
     Ok(role)
 }
@@ -1701,7 +1703,7 @@ pub(super) fn admit_on_route(
     trusted: bool,
     root: &Path,
     channel: u16,
-    hashline_edit: bool,
+    hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     admit_on_route_at(
         call,
@@ -1713,7 +1715,7 @@ pub(super) fn admit_on_route(
         root,
         channel,
         Instant::now(),
-        hashline_edit,
+        hashline_route,
     )
 }
 
@@ -1727,7 +1729,7 @@ fn admit_on_route_at(
     root: &Path,
     channel: u16,
     now: Instant,
-    hashline_edit: bool,
+    hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     let result = admit_for_session(
         call,
@@ -1736,7 +1738,7 @@ fn admit_on_route_at(
         powershell_available,
         session,
         trusted,
-        hashline_edit,
+        hashline_route,
     );
     if scoped_route
         && call.preset.is_none()
@@ -2453,9 +2455,7 @@ impl LedgerEdge {
                 crate::bash_background::powershell_available(),
                 &identity.session,
                 admission_trusted(&identity, &call),
-                executor.actor_context(&identity.root).is_some_and(|ctx| {
-                    runner_head_hashline(&ctx, &identity.project_root, &identity.session)
-                }),
+                head_catalog_key(&identity).is_some(),
             )
             .and_then(|_| super::rich_ui::admission::reject_non_carrier(&call.arguments))
         };
@@ -3714,7 +3714,7 @@ fn admit_as(
     session: &str,
     trusted: bool,
     role: CallerRole,
-    hashline_edit: bool,
+    hashline_route: bool,
 ) -> Result<(), ErrorBody> {
     admit_role_name(
         &call.name,
@@ -3724,7 +3724,7 @@ fn admit_as(
         trusted,
         role,
     )?;
-    admit_arguments_for(call, role, true, hashline_edit)
+    admit_arguments_for(call, role, true, hashline_route)
 }
 
 /// Role admission is separate from served-argument validation because carrier
@@ -3780,16 +3780,24 @@ pub(super) fn admit_arguments(
     admit_arguments_for(call, role, check_pin, false)
 }
 
-/// [`admit_arguments`] for a session whose `edit` takes hashline patches when
-/// `hashline_edit`: such a call is checked against the hashline arm, the only
-/// edit schema that session was offered.
+/// [`admit_arguments`] for a route whose head catalog may have served the
+/// hashline `edit` when `hashline_route`. Which arm it served is recorded in
+/// aft.db (see [`record_runner_head_edit_mode`]), which admission runs too
+/// early to read, so a head's `edit` call is checked against the arm it
+/// takes: the hashline arm for a call pinned to that arm, or an unpinned call
+/// with a `patch`, and the standard arm otherwise. The call is decoded with
+/// the recorded grammar when it runs (see `run_tool_call::prepare_tool_call`),
+/// which refuses the other arm.
 fn admit_arguments_for(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
     role: CallerRole,
     check_pin: bool,
-    hashline_edit: bool,
+    hashline_route: bool,
 ) -> Result<(), ErrorBody> {
-    let hashline_edit = hashline_edit && call.name == "edit";
+    let hashline_edit = hashline_route
+        && role == CallerRole::Head
+        && call.name == "edit"
+        && takes_hashline_arm(call);
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
     let served = if hashline_edit {
@@ -3912,6 +3920,19 @@ fn admit_arguments_for(
         ));
     }
     Ok(())
+}
+
+/// Whether an `edit` call takes the hashline arm: its schema pin names that
+/// arm's digest, or it carries no readable pin and passes a `patch`.
+fn takes_hashline_arm(call: &cortexkit_role_tool_provider::call::ToolCallRequest) -> bool {
+    match call
+        .schema_pin
+        .as_deref()
+        .and_then(|pin| SchemaPin::parse(pin).ok())
+    {
+        Some(pin) => pin.schema_digest == RUNNER_HEAD_TOOLS.hashline_edit.catalog.schema_digest,
+        None => call.arguments.get("patch").is_some(),
+    }
 }
 
 /// The role a tool call runs under. It decides everything the core words or
@@ -4039,86 +4060,78 @@ pub(super) fn route_head_call_name(
     call.name = catalog_name.into();
 }
 
-/// The sessions whose hashline binding their runner head's catalog installed,
-/// by binding root and session. A plugin session registers its own binding
-/// through `configure` and keeps the standard v1 edit grammar on any v1 route
-/// it opens; only these sessions take hashline patches over v1.
-static RUNNER_HEAD_HASHLINE: LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// The root a session's hashline binding is registered under, as the tool-call
-/// path registers and captures it.
-fn hashline_binding_root(ctx: &crate::context::AppContext, project_root: &Path) -> PathBuf {
-    ctx.canonical_cache_root_opt()
-        .unwrap_or_else(|| project_root.to_path_buf())
+/// The key a runner head's catalog records its edit mode under: the bind
+/// identity, scope and preset key of the other per-preset catalog params (see
+/// `remote_policy::session_preset_key`), with the `head` preset. A call from a
+/// route with a run owner (a codemode program's call) is made with that
+/// owner's catalog, so it uses the owner route's key. `None` for a route that
+/// can hold no record: one that is not a v1 route, or has no scope or no
+/// authenticated principal.
+pub(super) fn head_catalog_key(
+    identity: &super::RouteIdentity,
+) -> Option<crate::db::rich_ui::PresetKey> {
+    let identity = identity
+        .run_owner
+        .as_ref()
+        .map_or(identity, |owner| &owner.owner_route);
+    if identity.role != RouteRole::ToolProviderV1 {
+        return None;
+    }
+    super::remote_policy::session_preset_key(identity, CatalogPreset::Head.name())
 }
 
-/// Install the edit mode a runner head's catalog was rendered for, so its
-/// `read` mints the tags its hashline `edit` addresses. A runner head whose
-/// catalog is no longer hashline (a model without `edit`, a disabled `read`, a
-/// changed setting) has the binding it installed earlier turned off; a
-/// session whose binding came from elsewhere is left as it is.
-pub(super) fn register_runner_head_edit_mode(
+/// Record the edit mode a runner head's catalog was rendered for under the
+/// route's [`head_catalog_key`], and install the session's hashline binding to
+/// match, so its `read` mints the tags its hashline `edit` addresses.
+///
+/// The head keeps this catalog across AFT restarts, route closes and rebinds,
+/// so the record in aft.db, not this process, is what its later calls are
+/// decoded by (see `run_tool_call::resolve_head_edit_mode`). A catalog that is
+/// no longer hashline (a model without `edit`, a disabled `read`, a changed
+/// setting) turns off the binding an earlier hashline catalog installed; a
+/// binding that came from elsewhere is left as it is. An error means the
+/// record could not be written, and the catalog must not be acknowledged.
+pub(super) fn record_runner_head_edit_mode(
     ctx: &crate::context::AppContext,
-    project_root: &Path,
-    session: &str,
+    identity: &super::RouteIdentity,
     registration: RegistrationRequest,
-) {
-    let key = (
-        hashline_binding_root(ctx, project_root),
-        session.to_string(),
-    );
-    let install = {
-        let mut sessions = RUNNER_HEAD_HASHLINE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if registration.effective() {
-            sessions.insert(key.clone());
-            true
-        } else {
-            sessions.remove(&key)
-        }
+) -> Result<(), ErrorBody> {
+    let hashline = registration.effective();
+    // Without a key or a database there is nothing to record, and
+    // `remote_policy::catalog_inner` renders such a catalog without the
+    // hashline arm, so it matches the standard grammar its calls get.
+    let (Some(key), Some(db)) = (head_catalog_key(identity), ctx.db()) else {
+        return Ok(());
+    };
+    let unavailable = || {
+        ErrorBody::new(
+            "database_unavailable",
+            "catalog edit mode persistence unavailable",
+        )
+    };
+    let prior = {
+        let conn = db.lock().map_err(|_| unavailable())?;
+        let prior =
+            crate::db::catalog_edit_modes::lookup(&conn, &key).map_err(|_| unavailable())?;
+        crate::db::catalog_edit_modes::record(
+            &conn,
+            &key,
+            hashline,
+            crate::bash_background::persistence::unix_millis() as i64,
+        )
+        .map_err(|_| unavailable())?;
+        prior
     };
     // Registering can wait for the session's in-flight edits to finish, so it
-    // runs outside the lock every session's calls consult.
-    if install {
-        ctx.hashline_bindings()
-            .register(&key.0, key.1, registration);
+    // runs after the database lock is released.
+    if hashline || prior == Some(true) {
+        ctx.hashline_bindings().register(
+            crate::run_tool_call::hashline_binding_root(ctx, &identity.project_root),
+            identity.session.clone(),
+            registration,
+        );
     }
-}
-
-/// Whether `session`'s `edit` takes hashline patches over v1: its runner head's
-/// catalog installed an effective hashline binding that is still in place.
-pub(super) fn runner_head_hashline(
-    ctx: &crate::context::AppContext,
-    project_root: &Path,
-    session: &str,
-) -> bool {
-    let root = hashline_binding_root(ctx, project_root);
-    RUNNER_HEAD_HASHLINE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(&(root.clone(), session.to_string()))
-        && ctx
-            .hashline_bindings()
-            .peek(&root, session)
-            .is_some_and(|binding| binding.effective())
-}
-
-/// Forget a session's runner-head edit mode once its binding is torn down.
-pub(super) fn forget_runner_head_edit_mode(
-    ctx: &crate::context::AppContext,
-    project_root: &Path,
-    session: &str,
-) {
-    let key = (
-        hashline_binding_root(ctx, project_root),
-        session.to_string(),
-    );
-    RUNNER_HEAD_HASHLINE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&key);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7969,6 +7982,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: Some(Arc::default()),
                     worker_session: false,
                     host_tool_names: None,
@@ -8012,10 +8026,11 @@ pub(in crate::subc) mod route_tests {
         }
     }
 
-    /// A v1 route for `root` bound under a head scope, as a runner opens one
-    /// for a head session.
+    /// A v1 route for `root` bound under a head scope, as Broca opens one for a
+    /// runner head: with the runner's authenticated principal, so the head's
+    /// catalog can record its edit mode under the route's key.
     fn head_route(root: &ProjectRootId, session: &str) -> RouteIdentity {
-        let scope = serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap();
+        let scope = serde_json::from_value(json!({"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head-scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap();
         RouteIdentity(Arc::new(RouteIdentityData {
             output_scope: Default::default(),
             root: root.clone(),
@@ -8024,7 +8039,15 @@ pub(in crate::subc) mod route_tests {
             session: session.into(),
             role: RouteRole::ToolProviderV1,
             trust: BindTrust::FirstParty,
-            spawn_principal: AuthenticatedPrincipal::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: "runner".into(),
+                session_id: session.into(),
+                principal_id: Some("reserved:broca".into()),
+            },
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
@@ -8107,6 +8130,7 @@ pub(in crate::subc) mod route_tests {
             edit_slot_survives: None,
             report_registration_downgrade: false,
             standard_edit_grammar: true,
+            head_catalog_key: None,
             disabled_tools: Some(Arc::default()),
             worker_session: false,
             host_tool_names: None,
@@ -8202,70 +8226,96 @@ pub(in crate::subc) mod route_tests {
         }
     }
 
-    /// A runner head's catalog in hashline edit mode installs the session's
-    /// binding, so its `edit` takes a hashline patch; a later catalog for a
-    /// model without `edit` turns it off again.
-    #[tokio::test]
-    async fn a_hashline_runner_head_catalog_routes_patch_edits() {
-        let _guard = EXCHANGE_LOCK.lock().await;
-        let (_dir, root) = test_support::test_root("runner-head-hashline");
-        let ctx = test_support::test_ctx();
-        ctx.update_config(|config| config.hashline_enabled = true);
-        let session = "hashline-head";
-        let identity = head_route(&root, session);
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let fetch = |model: &str| json!({"op": "tool.catalog", "preset": "head", "params": {"model": {"provider": "example", "model": model}}});
-        let patch = json!({"op": "tool.call", "preset": "head", "name": "edit", "arguments": {"patch": "[a.rs#ABCD]\nREM"}});
-        let refused = |reply: &WriterFrame| {
-            assert_eq!(reply.header.ty, FrameType::Error);
-            let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(errors::invalid_request_field(&error), Some("patch"));
-        };
-        let no_dispatch =
-            |_: RawRequest, _: &AppContext| -> Response { panic!("reached dispatch") };
-        // Before a runner-head catalog, the session's edit is the standard one.
-        refused(
-            &exchange_with_actor(
-                patch.clone(),
-                identity.clone(),
-                ctx.clone(),
-                &metrics,
-                no_dispatch,
-            )
-            .await,
-        );
-        let reply = exchange_with_actor(
-            fetch("claude-opus-5-5"),
-            identity.clone(),
-            ctx.clone(),
-            &metrics,
-            no_dispatch,
-        )
-        .await;
+    /// A context for `root` with hashline edit mode on and its aft.db in
+    /// `storage`. A second context made the same way stands for AFT after a
+    /// restart: it shares nothing with the first but the database file.
+    fn runner_head_ctx(root: &ProjectRootId, storage: &std::path::Path) -> Arc<AppContext> {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().into());
+        config.storage_dir = Some(storage.into());
+        config.hashline_enabled = true;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.join("aft.db")).unwrap(),
+        )));
+        ctx
+    }
+
+    /// Runs the native `read` and hashline edit a runner head's calls reach,
+    /// and records every dispatched command in `LAST_DISPATCH`; any other
+    /// command is answered without running.
+    fn read_and_edit(request: RawRequest, ctx: &AppContext) -> Response {
+        *LAST_DISPATCH.lock().unwrap() = Some(json!({"command": request.command}));
+        match request.command.as_str() {
+            "read" => crate::commands::read::handle_read(&request, ctx),
+            "hashline_edit" => crate::commands::hashline::handle_edit(&request, ctx),
+            _ => Response::success(request.id, json!({})),
+        }
+    }
+
+    fn runner_head_fetch(model: &str) -> Value {
+        json!({"op": "tool.catalog", "preset": "head", "params": {"model": {"provider": "example", "model": model}}})
+    }
+
+    /// The `edit` tool of a catalog reply.
+    fn served_edit(reply: &WriterFrame) -> Value {
         let answer: Value = serde_json::from_slice(&reply.body).unwrap();
-        let edit = answer["tools"]
+        answer["tools"]
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("{answer}"))
             .iter()
             .find(|tool| tool["name"] == "edit")
-            .unwrap()
-            .clone();
-        assert_eq!(
-            edit["input_schema"]["required"],
-            json!(["patch"]),
-            "{answer}"
-        );
-        assert!(runner_head_hashline(&ctx, root.as_path(), session));
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Read `a.rs` as the runner head on `identity`, and return the hashline
+    /// header (`[path#TAG]`) the read minted, or `None` for an untagged read.
+    async fn head_read_tag(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+    ) -> Option<String> {
         let reply = exchange_with_actor(
-            patch.clone(),
+            json!({"op": "tool.call", "preset": "head", "name": "read", "arguments": {"path": "a.rs"}}),
             identity.clone(),
             ctx.clone(),
-            &metrics,
-            |request, _| {
-                assert_eq!(request.command, "hashline_edit");
-                ACTIONS.fetch_add(1, Ordering::SeqCst);
-                Response::success(request.id, json!({}))
-            },
+            metrics,
+            read_and_edit,
+        )
+        .await;
+        let text = String::from_utf8_lossy(&reply.body).to_string();
+        assert_eq!(reply.header.ty, FrameType::Response, "{text}");
+        assert!(text.contains("one"), "{text}");
+        // Shown only when a test fails, to tell an untagged read from a
+        // header this helper could not find.
+        eprintln!("read reply: {text}");
+        let tag_at = text.find("a.rs#")?;
+        let start = text[..tag_at].rfind('[')?;
+        let end = tag_at + text[tag_at..].find(']')? + 1;
+        Some(text[start..end].to_string())
+    }
+
+    /// Send a hashline patch that replaces line 1 of `a.rs` under `header`
+    /// (`[path#TAG]`), and return the file's content afterwards.
+    async fn head_patch(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        root: &ProjectRootId,
+        header: &str,
+    ) -> String {
+        LAST_DISPATCH.lock().unwrap().take();
+        let patch = format!("{header}\nPUT 1:\n+changed\n");
+        let reply = exchange_with_actor(
+            json!({"op": "tool.call", "preset": "head", "name": "edit", "arguments": {"patch": patch}}),
+            identity.clone(),
+            ctx.clone(),
+            metrics,
+            read_and_edit,
         )
         .await;
         assert_eq!(
@@ -8274,22 +8324,163 @@ pub(in crate::subc) mod route_tests {
             "{}",
             String::from_utf8_lossy(&reply.body)
         );
-        // A GPT model is served no `edit`, so the binding is turned off.
+        std::fs::read_to_string(root.as_path().join("a.rs")).unwrap()
+    }
+
+    /// After a hashline catalog, AFT restarts: a fresh context on the same
+    /// aft.db, with no binding and no catalog refetch. The head's `read` still
+    /// mints a tag and its hashline patch still applies.
+    #[tokio::test]
+    async fn a_runner_heads_hashline_mode_survives_an_aft_restart() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-restart");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let identity = head_route(&root, "restarted-head");
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        {
+            let ctx = runner_head_ctx(&root, storage.path());
+            let reply = exchange_with_actor(
+                runner_head_fetch("claude-opus-5-5"),
+                identity.clone(),
+                ctx,
+                &metrics,
+                read_and_edit,
+            )
+            .await;
+            assert_eq!(
+                served_edit(&reply)["input_schema"]["required"],
+                json!(["patch"])
+            );
+        }
+        let ctx = runner_head_ctx(&root, storage.path());
+        assert!(ctx.hashline_bindings().is_empty());
+        let tag = head_read_tag(&identity, &ctx, &metrics)
+            .await
+            .expect("the first read after a restart mints a tag");
+        assert_eq!(
+            head_patch(&identity, &ctx, &metrics, &root, &tag).await,
+            "changed\ntwo\n"
+        );
+    }
+
+    /// Closing the session's last route tears its hashline binding down (see
+    /// `teardown_installed_route`); Broca reopens the route without fetching
+    /// the catalog again. The reopened route's `read` mints a tag again and
+    /// its hashline patch applies.
+    #[tokio::test]
+    async fn a_runner_heads_hashline_mode_survives_a_route_close_and_reopen() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-reopen");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let session = "reopened-head";
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let route = head_route(&root, session);
         exchange_with_actor(
-            fetch("gpt-5.5"),
-            identity.clone(),
+            runner_head_fetch("claude-opus-5-5"),
+            route.clone(),
             ctx.clone(),
             &metrics,
-            no_dispatch,
+            read_and_edit,
         )
         .await;
-        assert!(!runner_head_hashline(&ctx, root.as_path(), session));
+        assert!(head_read_tag(&route, &ctx, &metrics).await.is_some());
+        drop(route);
+        assert!(ctx.hashline_bindings().teardown(root.as_path(), session));
+        let reopened = head_route(&root, session);
+        let tag = head_read_tag(&reopened, &ctx, &metrics)
+            .await
+            .expect("the reopened route's read mints a tag");
+        assert_eq!(
+            head_patch(&reopened, &ctx, &metrics, &root, &tag).await,
+            "changed\ntwo\n"
+        );
+    }
+
+    /// A catalog fetched without the hashline arm after a hashline one (here,
+    /// for a GPT model, which is served no `edit`) records the standard mode:
+    /// the binding is turned off, `read` mints no tag, and a hashline patch is
+    /// refused, also after a restart.
+    #[tokio::test]
+    async fn a_catalog_without_hashline_after_a_hashline_one_turns_the_mode_off() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-mode-off");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let session = "switched-head";
+        let identity = head_route(&root, session);
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        for model in ["claude-opus-5-5", "gpt-5.5"] {
+            exchange_with_actor(
+                runner_head_fetch(model),
+                identity.clone(),
+                ctx.clone(),
+                &metrics,
+                read_and_edit,
+            )
+            .await;
+        }
         assert!(!ctx
             .hashline_bindings()
-            .peek(hashline_binding_root(&ctx, root.as_path()), session)
+            .peek(root.as_path(), session)
             .unwrap()
             .effective());
-        refused(&exchange_with_actor(patch, identity, ctx, &metrics, no_dispatch).await);
+        for ctx in [ctx, runner_head_ctx(&root, storage.path())] {
+            assert_eq!(head_read_tag(&identity, &ctx, &metrics).await, None);
+            assert_eq!(
+                head_patch(&identity, &ctx, &metrics, &root, "[a.rs#ABCD]").await,
+                "one\ntwo\n"
+            );
+            assert_eq!(
+                *LAST_DISPATCH.lock().unwrap(),
+                None,
+                "the patch reached dispatch"
+            );
+        }
+    }
+
+    /// A runner head whose catalog recorded no edit mode (one fetched before
+    /// modes were recorded, or never fetched) keeps the standard grammar:
+    /// `read` mints no tag, a hashline patch is refused before dispatch, and a
+    /// standard edit is dispatched as one.
+    #[tokio::test]
+    async fn a_runner_head_with_no_recorded_mode_uses_the_standard_grammar() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-no-record");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let identity = head_route(&root, "unrecorded-head");
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        assert_eq!(head_read_tag(&identity, &ctx, &metrics).await, None);
+        assert_eq!(
+            head_patch(&identity, &ctx, &metrics, &root, "[a.rs#ABCD]").await,
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            *LAST_DISPATCH.lock().unwrap(),
+            None,
+            "the patch reached dispatch"
+        );
+        let reply = exchange_with_actor(
+            json!({"op": "tool.call", "preset": "head", "name": "edit", "arguments": {"path": "a.rs", "edits": [{"oldString": "one", "newString": "uno"}]}}),
+            identity,
+            ctx.clone(),
+            &metrics,
+            read_and_edit,
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let dispatched = LAST_DISPATCH
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a standard edit is dispatched");
+        assert_ne!(dispatched["command"], "hashline_edit");
+        assert!(ctx.hashline_bindings().is_empty());
     }
 
     #[tokio::test]
@@ -8885,6 +9076,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: None,
                     worker_session: true,
                     host_tool_names: None,
@@ -9008,6 +9200,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: None,
                     worker_session: true,
                     host_tool_names: None,

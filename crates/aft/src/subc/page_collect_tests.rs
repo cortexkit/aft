@@ -673,6 +673,7 @@ async fn read_tool_allows_on(
             edit_slot_survives: None,
             report_registration_downgrade: false,
             standard_edit_grammar: true,
+            head_catalog_key: None,
             disabled_tools: None,
             worker_session: false,
             host_tool_names: None,

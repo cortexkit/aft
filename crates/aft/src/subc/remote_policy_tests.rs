@@ -52,6 +52,7 @@ fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Res
         edit_slot_survives: None,
         report_registration_downgrade: false,
         standard_edit_grammar: true,
+        head_catalog_key: None,
         disabled_tools: Some(route.disabled_tools.clone()),
         worker_session: true,
         host_tool_names: None,

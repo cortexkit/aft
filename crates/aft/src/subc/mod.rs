@@ -4200,13 +4200,12 @@ async fn teardown_installed_route(
             .any(|route| route.root == identity.root && route.session == identity.session);
         if !session_still_routed {
             if let Some(ctx) = executor.actor_context(&identity.root) {
+                // The binding goes with the session's last route, but the edit
+                // mode its runner head's catalog recorded stays in aft.db: the
+                // head keeps that catalog when the route is reopened, and its
+                // next call installs the binding again.
                 ctx.hashline_bindings()
                     .teardown(identity.root.as_path(), &identity.session);
-                tool_provider::forget_runner_head_edit_mode(
-                    &ctx,
-                    &identity.project_root,
-                    &identity.session,
-                );
                 let _ = ctx.release_backup_session_in_background(identity.session.clone());
             }
         }
@@ -11253,7 +11252,7 @@ async fn handle_tool_call_with_capabilities(
             tool_provider::admission_trusted(&identity, &call),
             &identity.project_root,
             frame.header.channel,
-            route_takes_hashline_edits(executor, &identity),
+            tool_provider::head_catalog_key(&identity).is_some(),
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -11898,8 +11897,10 @@ async fn handle_tool_call_with_capabilities(
         preview: call.preview,
         edit_slot_survives: call.edit_slot_survives,
         report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
-        standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1
-            && !route_takes_hashline_edits(executor, &identity),
+        standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
+        head_catalog_key: (role == tool_provider::CallerRole::Head)
+            .then(|| tool_provider::head_catalog_key(&identity))
+            .flatten(),
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
         worker_session: role.is_worker(),
         host_tool_names: format_context.host_tool_names.clone(),
@@ -12953,14 +12954,6 @@ async fn signal_fatal_teardown(
     }
     shutdown.notify_one();
 }
-/// Whether the route's session takes hashline patches in `edit` because its
-/// runner head's catalog said so (see `tool_provider::runner_head_hashline`).
-fn route_takes_hashline_edits(executor: &Executor, identity: &RouteIdentity) -> bool {
-    executor.actor_context(&identity.root).is_some_and(|ctx| {
-        tool_provider::runner_head_hashline(&ctx, &identity.project_root, &identity.session)
-    })
-}
-
 /// Check a tool call against the route's saved root confinement, before any
 /// catalog or call-mode admission, on every route kind. Policy-independent
 /// capability refusals run first and never need a database lookup.
