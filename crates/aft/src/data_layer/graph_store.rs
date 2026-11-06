@@ -231,6 +231,11 @@ pub(crate) struct SectionsWriter<'i> {
     graph: GraphSectionsBuilder,
     keys: BTreeMap<String, FragmentKey>,
     subjects: HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
+    /// The file a test's build stores damaged, read from [`DAMAGED_FRAGMENT`]
+    /// where the writer is made: a cold build adds fragments from the
+    /// resolver's threads, which do not see the test's thread-local.
+    #[cfg(test)]
+    damaged: Option<String>,
 }
 
 impl<'i> SectionsWriter<'i> {
@@ -268,6 +273,8 @@ impl<'i> SectionsWriter<'i> {
             graph: GraphSectionsBuilder::new(),
             keys: BTreeMap::new(),
             subjects: HashMap::new(),
+            #[cfg(test)]
+            damaged: DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().clone()),
         }
     }
 
@@ -302,7 +309,7 @@ impl<'i> SectionsWriter<'i> {
         // A test stores a fragment that does not decode, as a damaged one
         // reads back.
         #[cfg(test)]
-        let bytes = if DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().as_deref() == Some(file)) {
+        let bytes = if self.damaged.as_deref() == Some(file.as_str()) {
             vec![0xFF, 0x00]
         } else {
             bytes

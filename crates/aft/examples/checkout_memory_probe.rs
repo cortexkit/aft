@@ -238,10 +238,19 @@ fn main() {
         "{}",
         serde_json::json!({
             "label": "cold build parts",
-            "parts_mib": report
+            "scan_ms": report.scan_ms,
+            "resolve_ms": report.resolve_ms,
+            "write_ms": report.write_ms,
+            "publish_ms": report.publish_ms,
+            // `ms.<stage>` entries are stage times in milliseconds, the rest
+            // bytes shown in MiB.
+            "parts": report
                 .memory
                 .iter()
-                .map(|(part, bytes)| (part.clone(), serde_json::json!(bytes >> 20)))
+                .map(|(part, value)| {
+                    let shown = if part.starts_with("ms.") { *value } else { value >> 20 };
+                    (part.clone(), serde_json::json!(shown))
+                })
                 .collect::<serde_json::Map<_, _>>(),
         })
     );
