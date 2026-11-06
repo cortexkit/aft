@@ -35,9 +35,12 @@ pub(crate) const ROW_LEN: usize = 64;
 /// more than it uses.
 pub const BLOCK_LEN: usize = 64 * 1024;
 
-/// The largest segment a writer produces and a reader accepts. Small segments
-/// are merged in the background, so no segment needs to be larger.
-pub const MAX_SEGMENT_LEN: u64 = 256 * 1024 * 1024;
+/// The largest segment a writer produces and a reader accepts. A checkout's
+/// first build writes the whole checkout into one segment, so this has to hold
+/// the largest repository's build; it is a bound against a damaged length, not
+/// a format limit (offsets are 64-bit). 256 MiB was too small for a
+/// 9,000-file repository with vendored crates.
+pub const MAX_SEGMENT_LEN: u64 = 16 * 1024 * 1024 * 1024;
 
 /// More sections than any plane writes; a table claiming more is corrupt.
 pub(crate) const MAX_SECTIONS: u32 = 4096;
