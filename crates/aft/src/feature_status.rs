@@ -314,18 +314,6 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
     {
         return IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE);
     }
-    // A started views-on lane serves only from its checkout view. Until that
-    // view is loaded the lane is loading or failed, whatever the shared status
-    // was last set to.
-    match ctx.checkout_semantic().try_state() {
-        None | Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Loading)) => {
-            return IndexObservation::building();
-        }
-        Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Unavailable(reason))) => {
-            return IndexObservation::unavailable(semantic_failure_cause(ctx, &reason));
-        }
-        Some(_) => {}
-    }
     let resident = match ctx.semantic_index().try_read() {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),

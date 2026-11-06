@@ -324,7 +324,6 @@ struct PreparedPauseJob {
     cold: Option<ColdPauseCheckpoint>,
     reuse: Option<ReusePauseCheckpoint>,
     file_chunks: HashMap<FileCheckpointKey, (IndexedFileMetadata, Vec<SemanticChunk>)>,
-    view_chunks: HashMap<ViewCheckpointKey, Option<Vec<SemanticChunk>>>,
     view: Option<ViewPauseCheckpoint>,
     producer: Option<SemanticIndexFingerprint>,
 }
@@ -340,14 +339,6 @@ struct ColdCheckpointIdentity {
 struct FileCheckpointKey {
     root: PathBuf,
     file: PathBuf,
-    caps: EmbedTextCaps,
-}
-
-#[derive(PartialEq, Eq, Hash)]
-struct ViewCheckpointKey {
-    root: PathBuf,
-    file: PathBuf,
-    content: crate::blob_store::v2::ContentHash,
     caps: EmbedTextCaps,
 }
 
@@ -576,68 +567,6 @@ fn retain_reuse_files(
                 caps,
             },
             (metadata, chunks),
-        );
-    }
-}
-
-pub(crate) fn retain_view_pause_chunks(
-    root: &Path,
-    caps: EmbedTextCaps,
-    files: impl Iterator<Item = (PathBuf, crate::blob_store::v2::ContentHash)>,
-    error: &str,
-) {
-    let Some(job) = observe_lane_pause(error) else {
-        return;
-    };
-    let mut job = job.borrow_mut();
-    let Some(state) = &job.view else {
-        return;
-    };
-    let mut chunks = vec![Vec::new(); state.runs.len()];
-    for (file, chunk) in &state.pending {
-        checkpoint_work(0, 0, 1);
-        chunks[*file].push(chunk.clone());
-    }
-    for ((file, content), chunks) in files.zip(chunks) {
-        checkpoint_work(0, 1, 0);
-        job.view_chunks.insert(
-            ViewCheckpointKey {
-                root: root.to_path_buf(),
-                file,
-                content,
-                caps,
-            },
-            Some(chunks),
-        );
-    }
-}
-
-pub(crate) fn retain_unattempted_view_chunks(
-    root: &Path,
-    caps: EmbedTextCaps,
-    files: impl Iterator<
-        Item = (
-            PathBuf,
-            crate::blob_store::v2::ContentHash,
-            Vec<SemanticChunk>,
-        ),
-    >,
-    error: &str,
-) {
-    let Some(job) = observe_lane_pause(error) else {
-        return;
-    };
-    let mut job = job.borrow_mut();
-    for (file, content, chunks) in files {
-        checkpoint_work(0, 1, 0);
-        job.view_chunks.insert(
-            ViewCheckpointKey {
-                root: root.to_path_buf(),
-                file,
-                content,
-                caps,
-            },
-            Some(chunks),
         );
     }
 }
@@ -5673,71 +5602,6 @@ type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbeddin
 
 const SEMANTIC_BLOB_PAYLOAD_VERSION: u8 = 1;
 
-fn extend_reuse_map_from_semantic_blob(
-    reuse_map: &mut ChunkReuseMap,
-    file: &Path,
-    payload: &[u8],
-    expected_fingerprint: &str,
-    expected_dimension: usize,
-) -> Result<(), String> {
-    let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
-    let version = read_u8_stream(&mut reader, "missing semantic blob version")?;
-    if version != SEMANTIC_BLOB_PAYLOAD_VERSION {
-        return Err(format!("unsupported semantic blob version {version}"));
-    }
-    for (label, expected) in [
-        ("chunker", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
-        ("template", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
-        ("model", expected_fingerprint),
-    ] {
-        let actual = read_string_stream(&mut reader, Some(payload.len()))?;
-        if actual != expected {
-            return Err(format!("semantic blob {label} fingerprint mismatch"));
-        }
-    }
-    let entry_count = read_u32_stream(&mut reader)? as usize;
-    if entry_count > MAX_ENTRIES {
-        return Err(format!("too many semantic blob entries {entry_count}"));
-    }
-    let vector_bytes = expected_dimension
-        .checked_mul(F32_BYTES)
-        .ok_or_else(|| "semantic blob vector length overflow".to_string())?;
-    for _ in 0..entry_count {
-        let _name = read_string_stream(&mut reader, Some(payload.len()))?;
-        let _qualified_name = read_string_stream(&mut reader, Some(payload.len()))?;
-        let _kind = read_u8_stream(&mut reader, "missing semantic blob symbol kind")?;
-        let _start_line = read_u32_stream(&mut reader)?;
-        let _end_line = read_u32_stream(&mut reader)?;
-        let _exported = read_u8_stream(&mut reader, "missing semantic blob export flag")?;
-        let _snippet = read_string_stream(&mut reader, Some(payload.len()))?;
-        let embed_text = read_string_stream(&mut reader, Some(payload.len()))?;
-        let raw_vector = read_blob_bytes(&mut reader, payload.len())?;
-        if raw_vector.len() != vector_bytes {
-            return Err(format!(
-                "semantic blob vector has {} bytes, expected {vector_bytes}",
-                raw_vector.len()
-            ));
-        }
-        let vector = raw_vector
-            .chunks_exact(F32_BYTES)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
-            .collect::<Vec<_>>();
-        reuse_map
-            .entry(file.to_path_buf())
-            .or_default()
-            .entry(blake3::hash(embed_text.as_bytes()))
-            .or_default()
-            .push(ReusableEmbedding {
-                embed_text,
-                vector: vector.into(),
-            });
-    }
-    if reader.bytes_read() != payload.len() {
-        return Err("trailing bytes after semantic blob payload".to_string());
-    }
-    Ok(())
-}
-
 fn read_blob_bytes<R: Read>(
     reader: &mut CountingReader<R>,
     total_len: usize,
@@ -6833,47 +6697,6 @@ impl SemanticIndex {
         reuse_map
     }
 
-    fn extend_reuse_map_from_blob_store<R>(
-        &self,
-        project_root: &Path,
-        files: impl IntoIterator<Item = PathBuf>,
-        reuse_map: &mut ChunkReuseMap,
-        reuse_blob: &mut R,
-    ) where
-        R: FnMut(&Path) -> Option<Vec<u8>>,
-    {
-        let Some(fingerprint) = self.fingerprint().map(SemanticIndexFingerprint::as_string) else {
-            return;
-        };
-        let mut reused_files = 0usize;
-        for file in files {
-            let Some(payload) = reuse_blob(&file) else {
-                continue;
-            };
-            match extend_reuse_map_from_semantic_blob(
-                reuse_map,
-                &file,
-                &payload,
-                &fingerprint,
-                self.dimension,
-            ) {
-                Ok(()) => reused_files += 1,
-                Err(error) => slog_warn!(
-                    "semantic blob reuse rejected for {}: {}",
-                    file.display(),
-                    error
-                ),
-            }
-        }
-        if reused_files > 0 {
-            slog_info!(
-                "semantic refresh reused content-addressed vectors: root={} files={}",
-                project_root.display(),
-                reused_files
-            );
-        }
-    }
-
     fn reusable_vector_for_chunk(
         reuse_map: &ChunkReuseMap,
         chunk: &SemanticChunk,
@@ -7775,12 +7598,6 @@ impl SemanticIndex {
             .unwrap_or_default();
         let (chunks, fresh_metadata) =
             Self::collect_chunks(project_root, &to_embed, embed_text_caps);
-        self.extend_reuse_map_from_blob_store(
-            project_root,
-            fresh_metadata.keys().cloned(),
-            &mut reuse_map,
-            reuse_blob,
-        );
         let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let vanished = to_embed
             .iter()
@@ -8083,12 +7900,6 @@ impl SemanticIndex {
             }
             fresh_metadata.extend(new_metadata);
         }
-        self.extend_reuse_map_from_blob_store(
-            project_root,
-            fresh_metadata.keys().cloned(),
-            &mut reuse_map,
-            reuse_blob,
-        );
 
         let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
@@ -11788,17 +11599,6 @@ pub(crate) fn chunk_view_file(
     bytes: &[u8],
     embed_text_caps: EmbedTextCaps,
 ) -> Result<Option<Vec<SemanticChunk>>, String> {
-    if let Some(job) = prepared_pause_job() {
-        let key = ViewCheckpointKey {
-            root: project_root.to_path_buf(),
-            file: rel_path.to_path_buf(),
-            content: crate::blob_store::v2::ContentHash::of(bytes),
-            caps: embed_text_caps,
-        };
-        if let Some(chunks) = job.borrow_mut().view_chunks.remove(&key) {
-            return Ok(chunks);
-        }
-    }
     chunk_view_file_uncached(project_root, rel_path, bytes, embed_text_caps)
 }
 

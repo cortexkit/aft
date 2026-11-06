@@ -1,33 +1,17 @@
 //! Multi-repo parent folders.
 //!
-//! A views-on session opened in a folder that is not itself a git checkout
-//! but holds git repositories (its children) builds no index of its own. It
-//! serves grep, glob, `aft_search`, the call graph tools and inspect from the
-//! children's own published indexes, read-only:
-//!
-//! - **trigram:** the child's published v3 lexical view when its sessions run
-//!   with views on, answered as of that publication (the child's own session
-//!   is the only one that claims freshness, so the parent applies no file
-//!   changes on top). A child whose sessions run with views off publishes
-//!   only its persisted `cache.bin`, which the parent opens through the
-//!   borrowed read-only loader and keeps current in RAM from its watcher.
-//! - **semantic:** the child's published v3 semantic member
-//!   (`<scope>.semantic`), opened with read markers on the generation it
-//!   serves and the base it composes; answers are as of that publication.
-//! - **callgraph:** the child's published v3 call-graph view, protected by a
-//!   read marker on the generation it serves. Answers name the publication
-//!   they are as of (`as_of`).
+//! A session opened in a folder that is not itself a git checkout but holds
+//! git repositories (its children) builds no index of its own. It serves
+//! grep, glob, `aft_search`, the call graph tools and inspect from each
+//! child's own checkout in the index store (`data_layer::parent`), and from
+//! the project-wide inspect results the child's own sessions stored.
 //!
 //! Everything slow happens on the session's background worker: finding the
-//! children, loading each child plane once, following the children's later
-//! publications, and applying file changes. Changes reach the worker as
-//! paths from the parent's own file watcher, routed to the child that owns
-//! them, so only the changed files of that child are re-read; a slow
-//! full-reconcile backstop catches anything the watcher missed. A request
-//! never loads, builds, repairs or waits for a child index: a child still
-//! loading, or without a published index, is a named gap for that child, and
-//! files outside every child are a named gap too. Gaps use the existing
-//! `complete: false` and `gaps` response fields.
+//! children and opening the model that embeds queries for them. A request
+//! never waits for a child's first build: a child with nothing published yet
+//! is a named gap for that child, and files outside every child are a named
+//! gap too. Gaps use the existing `complete: false` and `gaps` response
+//! fields.
 //!
 //! The session registry is process-wide and keyed by the canonical parent
 //! root, so every context bound to the same parent folder shares one warm set
@@ -51,13 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::readonly_artifacts::BorrowedArtifactGeneration;
-use crate::search_index::SearchIndex;
 
-use super::contracts::ViewAccess;
 
-use super::semantic::SemanticPlane;
-use super::snapshot::{OpenGeneration, Snapshot};
 
 /// Most child repositories one parent folder serves. The operator's own
 /// projects folder holds 39 repositories, so the cap leaves room above that.
@@ -96,10 +75,6 @@ const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
 /// through watcher events instead.
 const DEFAULT_POINTER_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How often the worker compares each child's files with its trigram
-/// snapshot in full, to catch changes the watcher did not deliver. It walks
-/// and stats the child; nothing is re-read or copied when nothing changed.
-const DEFAULT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -467,9 +442,6 @@ pub fn activate(
 ) -> bool {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut registry = lock(registry());
-    let trigram_policy = crate::blob_store::v2::TrigramPolicy {
-        max_file_size: ctx.config().search_index_max_file_size,
-    };
     let Some(planes) = registry.prepared.remove(&root) else {
         if let Some(session) = registry.sessions.get(&root) {
             session.release(context_id(ctx));
@@ -482,7 +454,6 @@ pub fn activate(
         if !existing.stopped()
             && existing.planes == planes
             && existing.storage == storage
-            && existing.trigram_policy == trigram_policy
         {
             existing.hold(Holder::of(ctx));
             return true;
@@ -493,7 +464,6 @@ pub fn activate(
         planes,
         storage.to_path_buf(),
         semantic.clone(),
-        trigram_policy,
         Holder::of(ctx),
     );
     if let Some(previous) = registry.sessions.insert(root, session) {
@@ -618,9 +588,6 @@ fn record_child_failure(
             .insert(child_reserve_key(child, plane), reserve);
         return;
     }
-    if super::semantic_runtime::is_transient_reason(error) {
-        return;
-    }
     let cause = crate::context::view_load_cause(error);
     let error = format!("{child}: {error}");
     let now = Instant::now();
@@ -693,34 +660,7 @@ pub fn session_for(ctx: &crate::context::AppContext) -> Option<Arc<ParentSession
     session_for_root(config.project_root.as_deref()?)
 }
 
-/// Routes changed paths from a file watcher to the parent sessions whose
-/// children own them. The watcher thread calls this for every batch it
-/// dispatches; it only queues the paths and wakes the session worker.
-pub fn note_changed_paths(paths: &[PathBuf]) {
-    let sessions = {
-        let registry = lock(registry());
-        if registry.sessions.is_empty() {
-            return;
-        }
-        registry.sessions.values().cloned().collect::<Vec<_>>()
-    };
-    for session in sessions {
-        let mut woke = false;
-        for path in paths.iter().filter(|path| path.starts_with(session.root())) {
-            if let Some(child) = session.child_for(path) {
-                lock(&child.pending).insert(path.clone());
-                woke = true;
-            }
-        }
-        if woke {
-            session.wake();
-        }
-    }
-}
-
 static POINTER_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
-/// Always zero: the backstop default is changed per root, never globally.
-static BACKSTOP_DEFAULT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn interval(env: &str, overridden: &AtomicU64, default: Duration) -> Duration {
     if let Some(millis) = std::env::var(env)
@@ -749,30 +689,6 @@ fn store_override(target: &AtomicU64, interval: Duration) {
 #[doc(hidden)]
 pub fn set_default_refresh_interval(interval: Duration) {
     store_override(&POINTER_OVERRIDE_MS, interval);
-}
-
-/// Replaces the full-reconcile backstop interval for the session next started
-/// for `root`. Only tests use this.
-#[doc(hidden)]
-pub fn set_backstop_interval_for(root: &Path, interval: Duration) {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    lock(backstop_overrides()).insert(root, interval);
-}
-
-fn backstop_overrides() -> &'static Mutex<HashMap<PathBuf, Duration>> {
-    static OVERRIDES: OnceLock<Mutex<HashMap<PathBuf, Duration>>> = OnceLock::new();
-    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn backstop_interval(root: &Path) -> Duration {
-    if let Some(interval) = lock(backstop_overrides()).get(root) {
-        return *interval;
-    }
-    interval(
-        "AFT_PARENT_BACKSTOP_MS",
-        &BACKSTOP_DEFAULT_MS,
-        DEFAULT_BACKSTOP_INTERVAL,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -818,87 +734,19 @@ impl<T> Plane<T> {
     }
 }
 
-pub(crate) struct TrigramChild {
-    pub index: Arc<SearchIndex>,
-    source: TrigramSource,
-}
-
-/// Where a child's trigram snapshot came from.
-#[derive(Clone)]
-pub(crate) enum TrigramSource {
-    /// The persisted `cache.bin` of a child whose sessions run with views
-    /// off. The parent keeps it current from its own watcher and backstop.
-    Legacy(BorrowedArtifactGeneration),
-    /// The child's published v3 lexical view. Answers are as of the child's
-    /// publication ([`PublishedFrontier`]); only the child's own session
-    /// claims freshness, so the parent applies no file changes on top.
-    View(PublishedChild),
-}
-
-/// A v3 generation a child's own session published, as a foreign reader
-/// sees it: its name and the frontier its answers are as of.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PublishedChild {
-    pub generation: String,
-    pub frontier: Option<super::manifest_v2::PublishedFrontier>,
-}
-
-impl PublishedChild {
-    fn of(generation: &super::snapshot::ComposedGeneration) -> Self {
-        Self {
-            generation: generation.name().to_owned(),
-            frontier: generation.published().cloned(),
-        }
-    }
-
-    /// The `as_of` object a parent answer carries for this child.
-    pub(crate) fn as_of(&self, child: &Child) -> serde_json::Value {
-        let frontier = self.frontier.clone().unwrap_or_default();
-        serde_json::json!({
-            "child": child.display(),
-            "generation": self.generation,
-            "published_at_ms": frontier.published_at_ms,
-            "delta_cut_version": frontier.delta_cut_version,
-            "watcher_epoch": frontier.watcher_epoch,
-        })
-    }
-}
-
-pub(crate) struct SemanticChild {
-    pub access: ViewAccess,
-    pub generation: Arc<OpenGeneration>,
-    pub snapshot: Snapshot,
-}
-
-pub(crate) struct CallgraphChild {
-    pub store: Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
-    pub published: PublishedChild,
-}
-
 /// One child repository of a parent folder.
 pub struct Child {
     /// Canonical checkout root.
     pub root: PathBuf,
     /// Path relative to the parent folder, used as the answer's path prefix.
     pub relative: PathBuf,
-    family: OnceLock<String>,
     scope: String,
-    pub(crate) trigram: RwLock<Plane<TrigramChild>>,
-    pub(crate) semantic: RwLock<Plane<SemanticChild>>,
-    pub(crate) callgraph: RwLock<Plane<CallgraphChild>>,
     /// Read-only handle on the child's persisted inspect aggregates, holding
     /// a read marker on the inspect generation it reads.
     pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
     /// The search engine context that runs `aft_search` over this child's
     /// loaded indexes; see [`engine`].
     pub(crate) engine: Mutex<Option<engine::ChildEngine>>,
-    /// Changed paths the watcher reported and the worker has not applied.
-    pending: Mutex<BTreeSet<PathBuf>>,
-    /// Ignore files read for deciding whether a newly created file belongs
-    /// to the child, keyed by path with the mtime they were read at.
-    ignore_files: Mutex<worker::IgnoreCache>,
-    loads: AtomicUsize,
-    applied: AtomicUsize,
 }
 
 impl Child {
@@ -911,28 +759,10 @@ impl Child {
         Self {
             root,
             relative,
-            family: OnceLock::new(),
             scope,
-            trigram: RwLock::new(Plane::Loading),
-            semantic: RwLock::new(Plane::Loading),
-            callgraph: RwLock::new(Plane::Loading),
             inspect: RwLock::new(None),
             engine: Mutex::new(None),
-            pending: Mutex::new(BTreeSet::new()),
-            ignore_files: Mutex::new(worker::IgnoreCache::default()),
-            loads: AtomicUsize::new(0),
-            applied: AtomicUsize::new(0),
         }
-    }
-
-    /// The child's artifact family, the same key its own sessions use.
-    fn family(&self, storage: &Path) -> Result<&str, String> {
-        if self.family.get().is_none() {
-            let key = crate::search_index::artifact_cache_key_read_only(&self.root, storage)
-                .map_err(|error| error.to_string())?;
-            let _ = self.family.set(key);
-        }
-        Ok(self.family.get().expect("resolved child family"))
     }
 
     /// The child's path relative to the parent, slash-separated, for gaps.
@@ -940,58 +770,18 @@ impl Child {
         self.relative.to_string_lossy().replace('\\', "/")
     }
 
-    /// How many index artifacts the worker has loaded for this child. Queries
-    /// never add to it, and neither does applying file changes.
-    pub fn loads(&self) -> usize {
-        self.loads.load(Ordering::SeqCst)
-    }
-
-    /// How many changed paths the worker has applied to this child's trigram
-    /// snapshot, from watcher events and the backstop together.
-    pub fn applied_paths(&self) -> usize {
-        self.applied.load(Ordering::SeqCst)
-    }
-
-    pub fn trigram_ready(&self) -> bool {
-        read(&self.trigram).ready().is_some()
-    }
-
-    pub fn semantic_ready(&self) -> bool {
-        read(&self.semantic).ready().is_some()
-    }
-
-    pub fn callgraph_ready(&self) -> bool {
-        read(&self.callgraph).ready().is_some()
-    }
-
     /// True once this child's search engine serves its loaded indexes.
     pub fn engine_ready(&self) -> bool {
         lock(&self.engine).is_some()
     }
 
-    /// The callgraph generation this session holds a read marker on.
-    pub fn callgraph_generation(&self) -> Option<String> {
-        read(&self.callgraph)
-            .ready()
-            .map(|callgraph| callgraph.published.generation.clone())
-    }
-
-    /// The semantic generation this session holds a read marker on.
-    pub fn semantic_generation(&self) -> Option<String> {
-        read(&self.semantic)
-            .ready()
-            .map(|semantic| semantic.generation.name().to_owned())
-    }
 }
 
-/// The semantic model this session embeds queries with, and the shared
-/// semantic plane whose arena holds the children's vectors once per family.
+/// The semantic model this session embeds queries with.
 pub(crate) struct ParentSemantic {
     /// The model, lent to each child's search engine for the length of one
     /// query so the query is embedded once and no child starts its own model.
     pub model: Mutex<Option<crate::semantic_index::EmbeddingModel>>,
-    pub plane: Arc<SemanticPlane>,
-    pub producer_id: String,
     /// The model's identity, which names the vectors each child's checkout
     /// in the data layer reads (see `data_layer::parent::search_children`).
     pub fingerprint: crate::semantic_index::SemanticIndexFingerprint,
@@ -1003,11 +793,6 @@ pub struct ParentSession {
     pub(crate) planes: RequestedPlanes,
     storage: PathBuf,
     semantic_config: crate::config::SemanticBackendConfig,
-    /// The trigram policy of the children's v3 views: the producer their
-    /// lexical and call-graph members are published under.
-    trigram_policy: crate::blob_store::v2::TrigramPolicy,
-    /// Parent call-graph and lexical answers served from children's v3 views.
-    view_routes: [AtomicU64; 2],
     /// `None` until the worker's first full discovery walk finishes.
     discovery: RwLock<Option<Arc<Discovery>>>,
     children: RwLock<Vec<Arc<Child>>>,
@@ -1021,7 +806,6 @@ pub struct ParentSession {
     rounds: AtomicUsize,
     wake: (Mutex<bool>, Condvar),
     pointer_interval: Duration,
-    backstop_interval: Duration,
 }
 
 impl ParentSession {
@@ -1030,17 +814,13 @@ impl ParentSession {
         planes: RequestedPlanes,
         storage: PathBuf,
         semantic_config: crate::config::SemanticBackendConfig,
-        trigram_policy: crate::blob_store::v2::TrigramPolicy,
         holder: Holder,
     ) -> Arc<Self> {
-        let root_for_backstop = root.clone();
         let session = Arc::new(Self {
             root,
             planes,
             storage,
             semantic_config,
-            trigram_policy,
-            view_routes: Default::default(),
             discovery: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             semantic: RwLock::new(if planes.semantic {
@@ -1058,7 +838,6 @@ impl ParentSession {
                 &POINTER_OVERRIDE_MS,
                 DEFAULT_POINTER_INTERVAL,
             ),
-            backstop_interval: backstop_interval(&root_for_backstop),
         });
         let weak = Arc::downgrade(&session);
         let spawned = std::thread::Builder::new()
@@ -1093,14 +872,6 @@ impl ParentSession {
         message
     }
 
-    fn note_child_success(&self, child: &Child, plane: &str) {
-        if let Some(failures) = lock(&CHILD_LOAD_FAILURES).get_mut(&self.root) {
-            failures
-                .disk_reserve
-                .remove(&child_reserve_key(&child.display(), plane));
-        }
-    }
-
     /// The children found so far; empty until discovery finishes.
     pub fn children(&self) -> Vec<Arc<Child>> {
         read(&self.children).clone()
@@ -1109,16 +880,6 @@ impl ParentSession {
     /// The finished discovery, or `None` while the worker is still walking.
     pub fn discovery(&self) -> Option<Arc<Discovery>> {
         read(&self.discovery).clone()
-    }
-
-    /// Parent answers served from the children's v3 views, ordered as call
-    /// graph, then grep and glob.
-    pub fn view_route_counts(&self) -> [u64; 2] {
-        std::array::from_fn(|index| self.view_routes[index].load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn note_view_route(&self, index: usize) {
-        self.view_routes[index].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Completed worker rounds; the first one is the initial load.

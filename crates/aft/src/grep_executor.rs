@@ -862,90 +862,13 @@ fn execute_root_profiled(
 
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
-    let mut import_building = false;
-    let view_snapshot = (root.use_index && !ignored_target)
-        .then(|| ctx.lexical_view_snapshot("grep"))
-        .flatten();
-    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
-        match snapshot {
-            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => Some(snapshot),
-            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
-                import_building = true;
-                None
-            }
-            Err(error) => {
-                return (
-                    failed_index_grep(std::io::Error::other(
-                        crate::context::view_load_failure_message(error),
-                    )),
-                    GrepExecutionPhaseTimings::default(),
-                )
-            }
-        }
-    } else {
-        None
-    };
     let snapshot_acquire = snapshot_started.elapsed();
-    let mut index_lacks_scope = ignored_target;
-    if let Some(snapshot) = indexed_snapshot {
-        let scope_started = Instant::now();
-        let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
-        let scope_elapsed = scope_started.elapsed();
-        // A project-wide search always answers from the index, even when it
-        // holds no files (everything ignored, or an empty project): that is a
-        // real, complete answer, not a missing scope.
-        if indexed_scope_has_files || is_same_directory(&root.search_root, project_root) {
-            let (result, mut query_timings) = match snapshot
-                .search_grep_profiled_with_filters_and_query_in_order(
-                    pattern,
-                    query,
-                    filters,
-                    &root.search_root,
-                    max_results,
-                    params.path_exclusion,
-                    order,
-                ) {
-                Ok(result) => result,
-                Err(error) => {
-                    return (
-                        failed_index_grep(error),
-                        GrepExecutionPhaseTimings::default(),
-                    )
-                }
-            };
-            query_timings.post_filter += scope_elapsed;
-            return (
-                result,
-                GrepExecutionPhaseTimings {
-                    snapshot_acquire,
-                    query_decomposition: Duration::ZERO,
-                    query: query_timings,
-                    indexed_scope_has_files: Some(
-                        snapshot.has_file_in_scope_with_filters(&root.search_root, filters),
-                    ),
-                    walk_counts: None,
-                },
-            );
-        }
-        // The index holds no file under this explicitly named subdirectory. That is the case when the
-        // caller named a directory an ignore rule keeps out of the index (a
-        // gitignored `node_modules/pkg`, for example) or a symlinked directory
-        // the index walk never follows. Answering from the index would report
-        // zero matches for a directory that may be full of files, so walk it
-        // instead. This follows ripgrep: the walk never applies ignore rules to
-        // the named root itself, only to entries nested inside it. The walk
-        // keeps its usual file-count and time bounds.
-        index_lacks_scope = true;
-    }
+    let index_lacks_scope = ignored_target;
 
     // A walk that replaces a ready index reports `Fallback`, so the response
     // discloses that these results came from the filesystem, not the index.
     let index_status = if root.use_index && !index_lacks_scope {
-        if import_building {
-            IndexStatus::Building
-        } else {
-            current_index_status(ctx)
-        }
+        current_index_status(ctx)
     } else {
         IndexStatus::Fallback
     };
@@ -963,11 +886,6 @@ fn execute_root_profiled(
         ignored_target,
         order,
     );
-    if import_building {
-        result
-            .index_read_gaps
-            .push("legacy text and symbol import building".into());
-    }
     (
         result,
         GrepExecutionPhaseTimings {

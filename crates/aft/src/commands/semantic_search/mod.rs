@@ -125,7 +125,6 @@ use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
-use crate::readonly_artifacts::{ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
     GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
@@ -307,210 +306,8 @@ struct RuntimeReadinessSource<'a> {
     ctx: &'a AppContext,
 }
 
-#[derive(Clone)]
-struct ExternalBorrowedArtifacts {
-    search: ReadOnlyArtifact<Arc<SearchIndex>>,
-    semantic: ReadOnlyArtifact<Arc<SemanticIndex>>,
-    search_generation: GenerationToken,
-    /// On-disk file of the borrowed search index, when one exists; its
-    /// modification time says when the index was last saved.
-    search_artifact_path: Option<PathBuf>,
-}
 
-struct ExternalReadinessSource<'a> {
-    ctx: &'a AppContext,
-    root: &'a Path,
-    storage_dir: Option<&'a Path>,
-    loaded: OnceLock<ExternalBorrowedArtifacts>,
-}
 
-impl<'a> ExternalReadinessSource<'a> {
-    fn new(ctx: &'a AppContext, root: &'a Path, storage_dir: Option<&'a Path>) -> Self {
-        Self {
-            ctx,
-            root,
-            storage_dir,
-            loaded: OnceLock::new(),
-        }
-    }
-
-    fn load(&self) -> &ExternalBorrowedArtifacts {
-        self.loaded.get_or_init(|| {
-            let artifact = crate::readonly_artifacts::search_index_artifact_generation(
-                self.root,
-                self.storage_dir,
-            );
-            let generation = artifact
-                .as_ref()
-                .map(|artifact| format!("{:?}", artifact.generation))
-                .unwrap_or_else(|| "absent".to_string());
-            let mut search = self
-                .ctx
-                .open_borrowed_search_index(self.root, self.storage_dir);
-            let semantic = self
-                .ctx
-                .open_borrowed_semantic_index(self.root, self.storage_dir);
-            // The background search-index load may finish while semantic artifacts
-            // load. Recheck it until the first-search budget expires rather than
-            // treating an earlier degraded result as final for this request.
-            let deadline = Instant::now() + first_search_index_load_wait_budget();
-            while matches!(search, ReadOnlyArtifact::Degraded(_))
-                && Instant::now() < deadline
-                && !search_cancellation_requested()
-            {
-                search = self
-                    .ctx
-                    .open_borrowed_search_index(self.root, self.storage_dir);
-                if matches!(search, ReadOnlyArtifact::Degraded(_)) {
-                    std::thread::sleep(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
-                }
-            }
-            ExternalBorrowedArtifacts {
-                search,
-                semantic,
-                search_generation: GenerationToken::new_with_str(&format!(
-                    "borrowed:{}:{generation}",
-                    self.root.display()
-                )),
-                search_artifact_path: artifact.map(|artifact| artifact.path),
-            }
-        })
-    }
-
-    fn loaded(&self) -> Option<&ExternalBorrowedArtifacts> {
-        self.loaded.get()
-    }
-}
-
-impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
-    fn sample(&self) -> extensions::ReadinessObservation<'_> {
-        use extensions::{
-            ReadinessObservation, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus,
-            SymbolReadiness, TrigramReadiness,
-        };
-
-        let Some(artifacts) = self.loaded() else {
-            return ReadinessObservation {
-                semantic: SemanticReadiness {
-                    status: SemanticIndexStatus::Building {
-                        stage: "loading_artifacts".to_string(),
-                        files: None,
-                        entries_done: None,
-                        entries_total: None,
-                    },
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                trigram: TrigramReadiness {
-                    status: IndexStatus::Building,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                    data_view: false,
-                },
-                symbol: SymbolReadiness {
-                    status: SymbolIndexStatus::Disabled,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-            };
-        };
-
-        let trigram = match &artifacts.search {
-            ReadOnlyArtifact::Fresh(index)
-            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. }) => {
-                TrigramReadiness {
-                    status: IndexStatus::Ready,
-                    snapshot: Some(Arc::new(index.snapshot())),
-                    evicted: false,
-                    lock_contended: false,
-                    data_view: false,
-                }
-            }
-            ReadOnlyArtifact::Degraded(_) | ReadOnlyArtifact::Absent => TrigramReadiness {
-                status: IndexStatus::Fallback,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-                data_view: false,
-            },
-            ReadOnlyArtifact::Cancelled => TrigramReadiness {
-                status: IndexStatus::Building,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-                data_view: false,
-            },
-        };
-        let semantic =
-            match &artifacts.semantic {
-                ReadOnlyArtifact::Fresh(index)
-                | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale {
-                    index, ..
-                }) if semantic_fingerprint_matches_session(self.ctx, index) => SemanticReadiness {
-                    status: SemanticIndexStatus::ready(),
-                    snapshot: Some(SemanticSnapshot::from_borrowed(Arc::clone(index))),
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Cancelled => SemanticReadiness {
-                    status: SemanticIndexStatus::Building {
-                        stage: "loading_artifacts".to_string(),
-                        files: None,
-                        entries_done: None,
-                        entries_total: None,
-                    },
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Degraded(_) => SemanticReadiness {
-                    status: SemanticIndexStatus::Failed(
-                        "borrowed_semantic_index_load_budget".to_string(),
-                    ),
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => SemanticReadiness {
-                    status: SemanticIndexStatus::Failed("fingerprint_mismatch".to_string()),
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Absent => SemanticReadiness {
-                    status: SemanticIndexStatus::Disabled,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-            };
-
-        ReadinessObservation {
-            semantic,
-            trigram,
-            symbol: SymbolReadiness {
-                status: SymbolIndexStatus::Disabled,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-            },
-        }
-    }
-
-    fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        let artifacts = self.load();
-        if matches!(artifacts.search, ReadOnlyArtifact::Cancelled)
-            || matches!(artifacts.semantic, ReadOnlyArtifact::Cancelled)
-        {
-            extensions::ReadinessWait::Cancelled
-        } else {
-            extensions::ReadinessWait::Completed
-        }
-    }
-}
 
 impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     fn sample(&self) -> extensions::ReadinessObservation<'_> {
@@ -540,61 +337,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 ) {
                     Some(status) => {
                         let status = status.clone();
-                        // A views-on root reports the index its checkout view serves
-                        // for the installed snapshot. The fill worker builds it
-                        // before the lane is served and after every fill, so a sample
-                        // normally finds it built, possibly out of date (the search
-                        // itself rebuilds an out-of-date one). Between a publication
-                        // and the worker's rebuild there is none; `serving_index`
-                        // then builds it, because without a snapshot the semantic
-                        // lane would silently drop out of this search. If it cannot
-                        // be built, the lane is failed for this search with that
-                        // reason, never served from the legacy index, which a
-                        // views-on root does not build. A started lane whose view is
-                        // still loading, or failed to load, is sampled in that state
-                        // even when the shared status was rewritten to ready.
-                        // Views-off roots never have a checkout lane.
-                        use crate::views::semantic_runtime::CheckoutSemanticState;
-                        let lane = matches!(status, SemanticIndexStatus::Ready { .. })
-                            .then(|| self.ctx.checkout_semantic().state())
-                            .flatten();
-                        if let Some(lane) = lane {
-                            let unserved = |status| SemanticReadiness {
-                                status,
-                                snapshot: None,
-                                evicted: false,
-                                lock_contended: false,
-                            };
-                            match lane {
-                        CheckoutSemanticState::Ready(runtime) => match runtime.serving_index() {
-                            Ok(index) => SemanticReadiness {
-                                status,
-                                snapshot: Some(SemanticSnapshot::from_borrowed(index)),
-                                evicted: false,
-                                lock_contended: false,
-                            },
-                            Err(reason) => {
-                                // A built semantic view whose index cannot be
-                                // served is a view failure: count it in health.
-                                // Contention clears by itself and is not counted.
-                                if !crate::views::semantic_runtime::is_transient_reason(&reason) {
-                                    self.ctx.note_view_load_failure("semantic", &reason);
-                                }
-                                unserved(SemanticIndexStatus::Failed(reason))
-                            }
-                        },
-                        CheckoutSemanticState::Loading => unserved(SemanticIndexStatus::Building {
-                            stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE
-                                .to_string(),
-                            files: None,
-                            entries_done: None,
-                            entries_total: None,
-                        }),
-                        CheckoutSemanticState::Unavailable(reason) => {
-                            unserved(SemanticIndexStatus::Failed(reason))
-                        }
-                    }
-                        } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
+                        if matches!(status, SemanticIndexStatus::Ready { .. }) {
                             match try_read_with_budget(
                                 self.ctx.semantic_index(),
                                 INTERACTIVE_ARTIFACT_READ_BUDGET,
@@ -1014,25 +757,7 @@ fn handle_semantic_search_with_disk_fallback(
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
-    let import_building = if external_root.is_none() {
-        match ctx.lexical_view_snapshot("aft_search") {
-            Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
-                // Importing existing indexes is expected progress. Let the
-                // bounded file scan answer and disclose the unavailable indexes
-                // even when neither index has published a snapshot yet.
-                true
-            }
-            Some(Err(error)) => {
-                return crate::context::view_load_error_response(
-                    &req.id,
-                    crate::context::view_load_failure_message(error),
-                );
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
+    let import_building = false;
     let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
         return handle_pattern_request(
@@ -1086,13 +811,7 @@ fn handle_semantic_search_with_disk_fallback(
     });
     let runtime_source = RuntimeReadinessSource { ctx };
     let storage_dir = ctx.config().cache_storage_dir();
-    let external_source = external_root
-        .as_deref()
-        .map(|root| ExternalReadinessSource::new(ctx, root, storage_dir.as_deref()));
-    let readiness_source: &dyn extensions::ReadinessSource = external_source
-        .as_ref()
-        .map(|source| source as &dyn extensions::ReadinessSource)
-        .unwrap_or(&runtime_source);
+    let readiness_source: &dyn extensions::ReadinessSource = &runtime_source;
     let root = Root::new(
         external_root.as_deref().unwrap_or(&project_root),
         readiness_source,
@@ -1137,7 +856,7 @@ fn handle_semantic_search_with_disk_fallback(
         page_request,
         extensions,
         &plan,
-        external_source.as_ref(),
+        external_root.as_deref(),
         allow_disk_fallback,
     );
     if response.success {
@@ -1546,12 +1265,11 @@ fn split_semantic_results(
     let mass_refresh_pending = status.mass_refresh_pending();
     // With views enabled, the root's own checkout view serves the semantic
     // lane; it is `None` for every views-off root.
-    let checkout_semantic = ctx.checkout_semantic_runtime();
     let loaded = match semantic_index_loaded_with_budget(ctx) {
         Ok(loaded) => loaded,
         Err(()) => return SplitSemantic::from_gap(semantic_artifacts_busy_gap()),
     };
-    if !loaded && checkout_semantic.is_none() {
+    if !loaded {
         return SplitSemantic::from_gap(semantic_not_loaded_gap(ctx));
     }
     let query_vector = match embed_query(prose, ctx) {
@@ -1560,28 +1278,8 @@ fn split_semantic_results(
     };
     let fetch_limit = SEMANTIC_ENUMERATION_LIMIT.saturating_add(1);
     let ann_cost = telemetry::CostPhase::start("ann");
-    let mut checkout_gaps = None;
-    let mut results = if let Some(runtime) = checkout_semantic.as_ref() {
-        match runtime.search(&query_vector, fetch_limit, &|file| {
-            path_allowed_by_include_tests(file, project_root, include_tests)
-        }) {
-            Ok(answer) => {
-                if !answer.complete() {
-                    checkout_gaps = Some(CheckoutSemanticGaps::from(&answer));
-                }
-                answer.results
-            }
-            Err(error) => {
-                // The reply names the gap; health counts the failed view
-                // unless it is contention that clears by itself.
-                if !crate::views::semantic_runtime::is_transient_reason(&error) {
-                    ctx.note_view_load_failure("semantic", &error);
-                }
-                checkout_gaps = Some(CheckoutSemanticGaps::unavailable(error));
-                Vec::new()
-            }
-        }
-    } else {
+    let checkout_gaps: Option<CheckoutSemanticGaps> = None;
+    let mut results = {
         match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(index) => index
                 .as_ref()
@@ -1593,7 +1291,8 @@ fn split_semantic_results(
                 .unwrap_or_default(),
             None => return SplitSemantic::from_gap(semantic_artifacts_busy_gap()),
         }
-    };
+    
+                      };
     if ctx.shared_artifacts_read_only() {
         results.retain(|result| result.file.is_file());
     }
@@ -1612,9 +1311,7 @@ fn split_semantic_results(
         },
         gap: mass_refresh_pending.map(semantic_mass_refresh_disclosure),
         served: true,
-        // A checkout view's vectors are not scored per file here, so a view
-        // leaves admission to lexical relevance.
-        query_vector: checkout_semantic.is_none().then_some(query_vector),
+        query_vector: Some(query_vector),
         not_ready: None,
         checkout_gaps,
         data_meaning: None,
@@ -2096,7 +1793,7 @@ impl SearchLaneStatus {
                 if (Self::not_observed(&observation)
                     || observation.unavailable_reason.as_deref()
                         == Some(feature_cause::SEMANTIC_BUILD_FAILED))
-                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx) =>
+                    && false =>
             {
                 semantic_reload_started = true;
                 IndexObservation::building()
@@ -2478,7 +2175,7 @@ fn handle_semantic_search_inner(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
-    external_source: Option<&ExternalReadinessSource<'_>>,
+    external_root: Option<&Path>,
     allow_disk_fallback: bool,
 ) -> Response {
     if search_cancellation_requested() {
@@ -2513,16 +2210,16 @@ fn handle_semantic_search_inner(
     params.offset = page_request.offset();
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
-    if let Some(external_source) = external_source {
-        return handle_external_search(
+    // A repository outside the project with no checkout in the index store
+    // is answered by a bounded scan of its files, with a disclosure.
+    if let Some(external_root) = external_root {
+        return handle_external_unindexed_fallback(
             req,
             ctx,
-            params,
-            shape,
-            page_request,
-            extensions,
-            engine_plan,
-            external_source,
+            &params,
+            top_k,
+            &shape,
+            external_root,
         );
     }
     // An unsettled artifact identity keeps indexes off until the next bind;
@@ -2696,207 +2393,6 @@ fn handle_semantic_search_inner(
     }
 }
 
-fn handle_external_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: SemanticSearchParams,
-    shape: QueryShape,
-    page_request: paging::ValidatedPageRequest,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    readiness_source: &ExternalReadinessSource<'_>,
-) -> Response {
-    let top_k = page_request.top_k();
-    let external_root = readiness_source.root.to_path_buf();
-    let artifacts = readiness_source
-        .loaded()
-        .expect("external readiness always loads artifacts before execution");
-    let mut borrow_metadata = if ctx.daemonless_query_mode() {
-        standing_snapshot_metadata(&external_root, Some(&ctx.storage_dir()))
-    } else {
-        ExternalBorrowMetadata::default()
-    };
-    let mut warnings = Vec::new();
-    let search_index = match &artifacts.search {
-        ReadOnlyArtifact::Fresh(index) => Arc::clone(index),
-        ReadOnlyArtifact::Degraded(degradation) => {
-            if engine_plan.contains(SearchLaneKind::Semantic) {
-                borrow_metadata.degraded_reason = Some(degradation.reason);
-                warnings.push(
-                    "Borrowed trigram index loading stopped at the interactive budget; continuing with the semantic lane.".to_string(),
-                );
-                Arc::new(SearchIndex::new())
-            } else {
-                return handle_external_borrowed_degraded_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                    *degradation,
-                );
-            }
-        }
-        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-        ReadOnlyArtifact::Absent => {
-            if engine_plan.contains(SearchLaneKind::Semantic) {
-                warnings.push(
-                    "External trigram index is not available; continuing with the semantic lane."
-                        .to_string(),
-                );
-                Arc::new(SearchIndex::new())
-            } else {
-                return handle_external_unindexed_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                );
-            }
-        }
-        ReadOnlyArtifact::Stale(stale) => {
-            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-            crate::slog_warn!(
-                "{}",
-                borrowed_drift_log_message("search", &external_root, stale.drift_count)
-            );
-            Arc::clone(&stale.index)
-        }
-    };
-    if let ReadOnlyArtifact::Stale(stale) = &artifacts.semantic {
-        borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-        crate::slog_warn!(
-            "{}",
-            borrowed_drift_log_message("semantic", &external_root, stale.drift_count)
-        );
-    }
-    if borrow_metadata.standing_snapshot {
-        borrow_metadata.record_drift(search_index.borrowed_stat_mismatch_count(), false);
-    }
-
-    if borrow_metadata.stale_cli_snapshot() {
-        warnings.push(STALE_CLI_SNAPSHOT_WARNING.to_string());
-    }
-    let mode = choose_mode(
-        &params.query,
-        &shape,
-        engine_plan.readiness.lexical_index,
-        &mut warnings,
-    );
-    let ranked_mode = matches!(mode, SearchMode::Semantic | SearchMode::Hybrid);
-    let usable_semantic_index = match &artifacts.semantic {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index) =>
-        {
-            Some(Arc::clone(index))
-        }
-        _ => None,
-    };
-    // Only the ranked handler consults the semantic index, and only when the
-    // plan has a semantic lane.
-    let semantic_lane_answers = ranked_mode
-        && engine_plan.contains(SearchLaneKind::Semantic)
-        && usable_semantic_index.is_some();
-    // The grep and ranked (hybrid/semantic) handlers below can answer from
-    // this project's saved trigram or semantic index, which loading it never
-    // compared with the files now on disk.
-    let served_from_saved_index = matches!(
-        artifacts.search,
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
-    ) || usable_semantic_index.is_some();
-    let search_artifact_path = artifacts.search_artifact_path.clone();
-    let notice_root = external_root.clone();
-
-    // Bring the saved trigram index in line with the disk before it answers.
-    // An identifier in a ranked mode is answered by the exact sweep instead,
-    // which compares every file with the saved index itself.
-    let identifier_sweep =
-        ranked_mode && external_exact::IdentifierTerms::from_query(&params.query).is_some();
-    let mut search_generation = artifacts.search_generation.clone();
-    let mut disk_check = None;
-    let search_index = if matches!(
-        artifacts.search,
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
-    ) && !identifier_sweep
-    {
-        let (checked, age, generation) = external_pattern::checked_index(
-            ctx,
-            &external_root,
-            &search_index,
-            usable_semantic_index.as_ref(),
-            &artifacts.search_generation,
-        );
-        if search_cancellation_requested() {
-            return cancelled_search_response(req);
-        }
-        search_generation = generation;
-        disk_check = Some((checked.check, age));
-        checked.index
-    } else {
-        search_index
-    };
-
-    let mut response = match mode {
-        SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
-            req,
-            ctx,
-            &params.query,
-            page_request,
-            &shape,
-            mode,
-            warnings,
-            &external_root,
-            params.include_tests,
-            &search_index,
-            &borrow_metadata,
-            extensions,
-            engine_plan,
-            &search_generation,
-        ),
-        SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
-            req,
-            ctx,
-            params,
-            shape,
-            mode,
-            warnings,
-            external_root,
-            &search_index,
-            &artifacts.semantic,
-            &search_generation,
-            borrow_metadata,
-            page_request,
-            extensions,
-            engine_plan,
-            disk_check
-                .as_ref()
-                .is_none_or(|(check, _)| check.verified()),
-        ),
-    };
-    if let Some((check, age)) = &disk_check {
-        disclose_checked_saved_index(
-            &mut response,
-            &notice_root,
-            search_artifact_path.as_deref(),
-            check,
-            *age,
-            semantic_lane_answers,
-        );
-    } else if served_from_saved_index {
-        disclose_unverified_saved_index(
-            &mut response,
-            &notice_root,
-            search_artifact_path.as_deref(),
-            None,
-        );
-    }
-    response
-}
-
 /// Report on an external reply whose saved trigram index was compared with
 /// the files on disk first (see `external_disk_check`).
 ///
@@ -3062,27 +2558,7 @@ fn handle_external_unindexed_fallback(
     shape: &QueryShape,
     external_root: &Path,
 ) -> Response {
-    handle_external_bounded_lexical_fallback(req, ctx, params, top_k, shape, external_root, None)
-}
-
-fn handle_external_borrowed_degraded_fallback(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: &SemanticSearchParams,
-    top_k: usize,
-    shape: &QueryShape,
-    external_root: &Path,
-    degradation: ReadOnlyDegradation,
-) -> Response {
-    handle_external_bounded_lexical_fallback(
-        req,
-        ctx,
-        params,
-        top_k,
-        shape,
-        external_root,
-        Some(degradation),
-    )
+    handle_external_bounded_lexical_fallback(req, ctx, params, top_k, shape, external_root)
 }
 
 fn handle_external_bounded_lexical_fallback(
@@ -3092,7 +2568,6 @@ fn handle_external_bounded_lexical_fallback(
     top_k: usize,
     shape: &QueryShape,
     external_root: &Path,
-    degradation: Option<ReadOnlyDegradation>,
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
     let display_root = absolute_display_root(external_root);
@@ -3123,7 +2598,6 @@ fn handle_external_bounded_lexical_fallback(
             params,
             shape,
             external_root,
-            degradation,
             ExternalFallbackBody {
                 results: reply.results,
                 text: reply.text,
@@ -3199,7 +2673,7 @@ fn handle_external_bounded_lexical_fallback(
         .collect::<Vec<_>>();
     let more_available =
         result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
-    if degradation.is_none() {
+    {
         // No index exists, so nothing could rank this query; say so plainly,
         // with how much of the project the scan for its literal text covered.
         let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
@@ -3214,7 +2688,6 @@ fn handle_external_bounded_lexical_fallback(
             params,
             shape,
             external_root,
-            None,
             ExternalFallbackBody {
                 results: result_values,
                 text,
@@ -3240,7 +2713,6 @@ fn handle_external_bounded_lexical_fallback(
         params,
         shape,
         external_root,
-        degradation,
         ExternalFallbackBody {
             results: result_values,
             text,
@@ -3273,25 +2745,15 @@ fn external_fallback_response(
     params: &SemanticSearchParams,
     shape: &QueryShape,
     external_root: &Path,
-    degradation: Option<ReadOnlyDegradation>,
     body: ExternalFallbackBody,
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
-    let mut text = body.text;
-    if degradation.is_some() {
-        text.push_str("\n\n");
-        text.push_str(BORROWED_SEARCH_LOAD_FOOTER);
-    }
+    let text = body.text;
 
-    let mut warnings = Vec::new();
-    if degradation.is_some() {
-        warnings.push(BORROWED_SEARCH_LOAD_WARNING.to_string());
-    } else {
-        warnings.push(format!(
-            "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
-            external_root.display()
-        ));
-    }
+    let mut warnings = vec![format!(
+        "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
+        external_root.display()
+    )];
     if body.walk_truncated {
         warnings.push(
             "Lexical scan stopped early (file-count or time budget reached); results may be incomplete.".to_string(),
@@ -3305,12 +2767,6 @@ fn external_fallback_response(
     if let Some(envelope) = &body.envelope {
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
     }
-    if let Some(degradation) = degradation {
-        extras.insert(
-            "borrowed_index_degraded_reason".to_string(),
-            serde_json::json!(degradation.reason),
-        );
-    }
     if let Some(summary) = body.exact_sweep {
         extras.insert("exact_sweep".to_string(), summary);
     }
@@ -3320,13 +2776,9 @@ fn external_fallback_response(
             query: &params.query,
             interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
-            semantic_status: if degradation.is_some() {
-                "external_borrowed_degraded"
-            } else {
-                "external_unindexed"
-            },
+            semantic_status: "external_unindexed",
             status: "ready",
-            complete: degradation.is_none() && !body.walk_truncated,
+            complete: !body.walk_truncated,
             text,
             results: body.results,
             more_available: body.more_available,
@@ -3336,465 +2788,6 @@ fn external_fallback_response(
             extras,
         },
     )
-}
-
-fn handle_external_grep_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    query: &str,
-    page_request: paging::ValidatedPageRequest,
-    shape: &QueryShape,
-    mode: SearchMode,
-    mut warnings: Vec<String>,
-    external_root: &Path,
-    include_tests: bool,
-    search_index: &SearchIndex,
-    borrow_metadata: &ExternalBorrowMetadata,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    search_generation: &GenerationToken,
-) -> Response {
-    let top_k = page_request.top_k();
-    let auto_regex = mode == SearchMode::Regex;
-    let mut effective_mode = mode;
-    let compile_literal_fallback = || -> Result<_, Response> {
-        match pattern_compile::compile(
-            query,
-            CompileOpts {
-                literal: true,
-                ..CompileOpts::default()
-            },
-        ) {
-            CompileResult::Ok(compiled) => Ok(compiled),
-            CompileResult::InvalidPattern { message, .. } => Err(Response::error_with_data(
-                &req.id,
-                "invalid_pattern",
-                message,
-                external_response_extras(external_root, borrow_metadata),
-            )),
-            CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
-                &req.id,
-                "unsupported_pattern",
-                format!(
-                    "Pattern uses regex syntax not supported by AFT's engine: {feature}. Rewrite without {feature} or use grep for explicit regex control."
-                ),
-                external_response_extras(external_root, borrow_metadata),
-            )),
-        }
-    };
-
-    let compiled = match pattern_compile::compile(
-        query,
-        CompileOpts {
-            literal: mode == SearchMode::Literal,
-            ..CompileOpts::default()
-        },
-    ) {
-        CompileResult::Ok(compiled) => compiled,
-        CompileResult::InvalidPattern { message, .. } => {
-            if auto_regex {
-                warnings.push(auto_regex_literal_fallback_warning(
-                    short_regex_compile_reason(&message),
-                ));
-                effective_mode = SearchMode::Literal;
-                match compile_literal_fallback() {
-                    Ok(compiled) => compiled,
-                    Err(response) => return response,
-                }
-            } else {
-                return Response::error_with_data(
-                    &req.id,
-                    "invalid_pattern",
-                    message,
-                    external_response_extras(external_root, borrow_metadata),
-                );
-            }
-        }
-        CompileResult::UnsupportedSyntax { feature, .. } => {
-            if auto_regex {
-                warnings.push(auto_regex_literal_fallback_warning(format!(
-                    "{feature} is not supported"
-                )));
-                effective_mode = SearchMode::Literal;
-                match compile_literal_fallback() {
-                    Ok(compiled) => compiled,
-                    Err(response) => return response,
-                }
-            } else {
-                return Response::error_with_data(
-                    &req.id,
-                    "unsupported_pattern",
-                    format!(
-                        "Pattern uses regex syntax not supported by AFT's engine: {feature}. Rewrite without {feature} or use grep for explicit regex control."
-                    ),
-                    external_response_extras(external_root, borrow_metadata),
-                );
-            }
-        }
-    };
-
-    let literal = effective_mode == SearchMode::Literal;
-    let fetch_limit = page_request.offset().saturating_add(top_k);
-    let mut result = match search_index.snapshot().search_grep_bounded(
-        &compiled,
-        &[],
-        &[],
-        external_root,
-        fetch_limit,
-        grep_path_exclusion(include_tests),
-        grep_executor::MAX_FALLBACK_WALK_FILES,
-        grep_executor::FALLBACK_WALK_BUDGET,
-    ) {
-        Ok(result) => result,
-        Err(error) => return Response::error(&req.id, "internal_error", error.to_string()),
-    };
-    result
-        .matches
-        .retain(|grep_match| grep_match.file.is_file());
-
-    if result.matches.is_empty() {
-        let extras = external_response_extras(external_root, borrow_metadata)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        return stale_cli_snapshot_partial_response(
-            zero_result_escalation_response(
-                req,
-                ctx,
-                query,
-                shape,
-                effective_mode,
-                "external",
-                warnings,
-                include_tests,
-                external_root,
-                &absolute_display_root(external_root),
-                extras,
-                page_request,
-                extensions,
-                engine_plan,
-                Some((search_index, search_generation)),
-            ),
-            borrow_metadata.stale_cli_snapshot(),
-        );
-    }
-
-    let interval_end = page_request.offset().saturating_add(top_k);
-    let interval_has_more = result.total_matches > interval_end || result.truncated;
-    result.matches = result
-        .matches
-        .into_iter()
-        .skip(page_request.offset())
-        .take(top_k)
-        .collect();
-    let result_source = if literal { "literal" } else { "regex" };
-    let result_values = result
-        .matches
-        .iter()
-        .map(|grep_match| grep_match_to_json(grep_match, result_source))
-        .collect::<Vec<_>>();
-    let interpreted_as = interpreted_as_label(effective_mode);
-    let display_root = absolute_display_root(external_root);
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
-    let mut extras = external_response_extras(external_root, borrow_metadata)
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(envelope) =
-        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
-    {
-        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
-    }
-    search_response(
-        req,
-        SearchResponseParts {
-            query,
-            interpreted_as,
-            query_kind: query_kind_label(shape.kind),
-            semantic_status: "external",
-            status: "ready",
-            complete: !borrow_metadata.stale_cli_snapshot(),
-            text,
-            results: result_values,
-            more_available: interval_has_more,
-            engine_capped: result.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras,
-        },
-    )
-}
-
-fn handle_external_semantic_or_hybrid_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: SemanticSearchParams,
-    shape: QueryShape,
-    mode: SearchMode,
-    mut warnings: Vec<String>,
-    external_root: PathBuf,
-    search_index: &SearchIndex,
-    semantic_artifact: &ReadOnlyArtifact<Arc<SemanticIndex>>,
-    search_generation: &GenerationToken,
-    mut borrow_metadata: ExternalBorrowMetadata,
-    page_request: paging::ValidatedPageRequest,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    disk_checked_in_full: bool,
-) -> Response {
-    let mut semantic_status = "ready";
-    let semantic_index = match semantic_artifact {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index) =>
-        {
-            Some(index.as_ref())
-        }
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => {
-            semantic_status = "unavailable";
-            warnings.push(
-                "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
-            );
-            None
-        }
-        ReadOnlyArtifact::Degraded(degradation) => {
-            semantic_status = "building";
-            warnings.push(
-                "Borrowed semantic index loading stopped at the interactive budget; returning lexical-only results from the trigram index.".to_string(),
-            );
-            borrow_metadata.degraded_reason = Some(degradation.reason);
-            None
-        }
-        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-        ReadOnlyArtifact::Absent => {
-            semantic_status = "unavailable";
-            warnings.push(
-                "External semantic index is not available; returning lexical-only results from the trigram index.".to_string(),
-            );
-            None
-        }
-    };
-
-    // An identifier is answered by every line that contains it. The borrowed
-    // index can predate the files on disk, so it only rules out files whose
-    // size and modification time still match it; the lexical lanes would pad
-    // the page with files that merely share the identifier's sub-tokens.
-    if let Some(terms) = external_exact::IdentifierTerms::from_query(&params.query) {
-        let usable_index =
-            (search_index.is_ready() && search_index.file_count() > 0).then_some(search_index);
-        let outcome = external_exact::sweep(
-            &external_root,
-            &terms,
-            usable_index,
-            params.include_tests,
-            Instant::now() + external_exact::SWEEP_BUDGET,
-        );
-        if search_cancellation_requested() {
-            return cancelled_search_response(req);
-        }
-        let reply = external_exact::reply(
-            &outcome,
-            &terms,
-            &external_root,
-            &absolute_display_root(&external_root),
-            params.offset,
-            page_request.top_k(),
-        );
-        let mut extras = external_response_extras(&external_root, &borrow_metadata)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        if let Some(envelope) = &reply.envelope {
-            crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
-        }
-        extras.insert("exact_sweep".to_string(), reply.summary);
-        extras.insert(
-            "lexical_only_fallback".to_string(),
-            serde_json::json!(semantic_status != "ready"),
-        );
-        extras.insert(
-            "semantic_unavailable".to_string(),
-            serde_json::json!(semantic_status != "ready"),
-        );
-        return search_response(
-            req,
-            SearchResponseParts {
-                query: &params.query,
-                interpreted_as: if semantic_status == "ready" {
-                    interpreted_as_label(mode)
-                } else {
-                    "lexical"
-                },
-                query_kind: query_kind_label(shape.kind),
-                semantic_status,
-                status: "ready",
-                // The identifier plan has no semantic lane, so semantic
-                // availability does not make this answer partial.
-                complete: !borrow_metadata.stale_cli_snapshot() && outcome.fully_covered(),
-                text: reply.text,
-                results: reply.results,
-                more_available: reply.more_available,
-                engine_capped: false,
-                fully_degraded: false,
-                warnings,
-                extras,
-            },
-        );
-    }
-
-    let mut semantic_more_available = false;
-    let mut semantic_results = if engine_plan.contains(SearchLaneKind::Semantic) {
-        semantic_index
-            .map(|semantic_index| {
-                embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())).map(
-                    |query_vector| {
-                        let mut results = semantic_index.search_filtered(
-                            &query_vector,
-                            SEMANTIC_ENUMERATION_LIMIT.saturating_add(1),
-                            |file| {
-                                path_allowed_by_include_tests(
-                                    file,
-                                    &external_root,
-                                    params.include_tests,
-                                )
-                            },
-                        );
-                        results.retain(|result| result.file.is_file());
-                        semantic_more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
-                        if semantic_more_available {
-                            results.truncate(SEMANTIC_ENUMERATION_LIMIT);
-                        }
-                        rerank_semantic_candidates(&mut results, &shape, &params.query);
-                        results
-                    },
-                )
-            })
-            .transpose()
-            .unwrap_or_else(|error| {
-                semantic_status = "unavailable";
-                warnings.push(classify_embed_query_error(&error).detail);
-                None
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let mut ranked = match run_engine_ranking(
-        &req.id,
-        ctx,
-        &external_root,
-        &params.query,
-        public_query(req),
-        params.include_tests,
-        std::mem::take(&mut semantic_results),
-        page_request,
-        extensions,
-        engine_plan,
-        Some((search_index, search_generation)),
-        None,
-    ) {
-        Ok(ranked) => ranked,
-        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
-    };
-    ranked.results.retain(|result| result.file.is_file());
-    let more_available = ranked.more_available || semantic_more_available;
-    let snippets_incomplete =
-        enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
-    let display_root = absolute_display_root(&external_root);
-    let (mut text, rendered_results) = format_ranked_text_counted(
-        &ranked.results,
-        &display_root,
-        more_available,
-        snippets_incomplete,
-        Some(ctx),
-        // "No file contains" holds only when the saved index was compared
-        // with every file on disk. A check cut short by its budget leaves
-        // files whose current text the index may not hold; the reply then
-        // says how far the check got (see `disclose_checked_saved_index`)
-        // and makes no claim that the literal is absent.
-        ranked
-            .literal_absent
-            .as_deref()
-            .filter(|_| disk_checked_in_full),
-    );
-    if let Some(answer) = &ranked.not_found {
-        text = answer.render(&display_root);
-    }
-    if semantic_status != "ready" {
-        let disclosure = if semantic_status == "building" {
-            borrowed_semantic_loading_notice(ranked.exact_match_files)
-        } else {
-            "Semantic search is not available for the external root; lexical engine results follow."
-                .to_string()
-        };
-        text = format!("{disclosure}\n\n{text}");
-    }
-    if let Some(line) = ranked.confidence_line {
-        text.push_str("\n\n");
-        text.push_str(line);
-    }
-    let mut extras = external_response_extras(&external_root, &borrow_metadata)
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    crate::list_surfaces::search::attach_projected_search_envelope(
-        &mut extras,
-        &ranked.results_list_envelope,
-    );
-    extras.insert("structuredContent".to_string(), ranked.structured_content);
-    extras.insert(
-        "rendered_results".to_string(),
-        serde_json::json!(rendered_results),
-    );
-    extras.insert(
-        "lexical_only_fallback".to_string(),
-        serde_json::json!(semantic_status != "ready"),
-    );
-    extras.insert(
-        "semantic_unavailable".to_string(),
-        serde_json::json!(semantic_status != "ready"),
-    );
-    extras.insert(
-        "lexical_engine_capped".to_string(),
-        serde_json::json!(ranked.engine_capped),
-    );
-    disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
-    disclose_rerank_note(&ranked.rerank_note, &mut text);
-    disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
-    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
-    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
-
-    let mut response = search_response(
-        req,
-        SearchResponseParts {
-            query: &params.query,
-            interpreted_as: if semantic_status == "ready" {
-                interpreted_as_label(mode)
-            } else {
-                "lexical"
-            },
-            query_kind: query_kind_label(shape.kind),
-            semantic_status,
-            status: if semantic_status == "building" {
-                "building"
-            } else {
-                "ready"
-            },
-            complete: semantic_status == "ready" && !borrow_metadata.stale_cli_snapshot(),
-            text,
-            results: ranked.results.iter().map(result_to_json).collect(),
-            more_available,
-            engine_capped: ranked.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras,
-        },
-    );
-    if let (Some(data), Some(index)) = (response.data.as_object_mut(), semantic_index) {
-        disclose_skipped_semantic_rows(data, index);
-    }
-    response
 }
 
 fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
@@ -4437,15 +3430,6 @@ impl CheckoutSemanticGaps {
         }
     }
 
-    fn from(answer: &crate::views::semantic::SemanticQuery) -> Self {
-        Self {
-            pending: answer.pending.clone(),
-            failed: answer.failed.clone(),
-            unvouched: answer.unvouched,
-            unavailable: answer.unavailable.clone(),
-            fill_failure: None,
-        }
-    }
 
     /// What a data-layer meaning plane whose fill is under way does not
     /// cover yet: the files waiting for vectors. Files that cannot be cut
@@ -5420,15 +4404,7 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let lexical_view = if borrowed_index.is_none() && data_text.is_none() {
-        ctx.lexical_view_snapshot("aft_search")
-            .transpose()
-            .map_err(crate::context::view_load_failure_message)?
-    } else {
-        None
-    };
-    let view_snapshot =
-        lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
+    let view_snapshot: Option<crate::search_index::SearchIndexSnapshot> = None;
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
@@ -6853,7 +5829,6 @@ fn handle_semantic_or_hybrid_search(
 
     // With views enabled, the root's own checkout view serves the semantic
     // lane; it is `None` for every views-off root.
-    let checkout_semantic = ctx.checkout_semantic_runtime();
     // With the data layer on, its meaning plane serves the lane instead of
     // today's index: `Some(None)` when it cannot serve this request.
     let data_meaning = data_meaning_for(ctx, engine_plan);
@@ -6875,7 +5850,7 @@ fn handle_semantic_or_hybrid_search(
         },
     };
     let data_meaning = data_meaning.flatten();
-    if !semantic_loaded && checkout_semantic.is_none() {
+    if !semantic_loaded {
         let gap = semantic_not_loaded_gap(ctx);
         return semantic_unavailable_or_fallback_response(
             req,
@@ -6947,26 +5922,6 @@ fn handle_semantic_or_hybrid_search(
             });
         semantic_gaps = gaps;
         results
-    } else if let Some(runtime) = checkout_semantic.as_ref() {
-        match runtime.search(&query_vector, semantic_fetch_limit, &|file| {
-            path_allowed_by_include_tests(file, project_root, params.include_tests)
-        }) {
-            Ok(answer) => {
-                if !answer.complete() {
-                    semantic_gaps = Some(CheckoutSemanticGaps::from(&answer));
-                }
-                answer.results
-            }
-            Err(error) => {
-                // The reply names the gap; health counts the failed view
-                // unless it is contention that clears by itself.
-                if !crate::views::semantic_runtime::is_transient_reason(&error) {
-                    ctx.note_view_load_failure("semantic", &error);
-                }
-                semantic_gaps = Some(CheckoutSemanticGaps::unavailable(error));
-                Vec::new()
-            }
-        }
     } else {
         match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(semantic_index) => semantic_index
@@ -8797,7 +7752,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
             let retrying_read_only_snapshot =
                 !crate::semantic_index::is_onnx_runtime_unavailable(error)
                     && ctx.shared_artifacts_read_only()
-                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+                    && false;
             Some(if retrying_read_only_snapshot {
                 SemanticLaneGap {
                     semantic_status: "building",
@@ -8821,7 +7776,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
 /// The gap for a ready index that is not loaded in memory. Starts a reload
 /// when the index was evicted, and says so.
 fn semantic_not_loaded_gap(ctx: &AppContext) -> SemanticLaneGap {
-    let reloading = super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+    let reloading = false;
     SemanticLaneGap {
         semantic_status: "unavailable",
         status: "not_ready",

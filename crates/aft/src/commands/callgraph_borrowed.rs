@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::artifact_owner::ArtifactOwnerMode;
 use crate::cache_freshness;
 use crate::context::AppContext;
 use crate::inspect::job::is_test_file;

@@ -2981,9 +2981,6 @@ impl WatcherFilterThread {
         let paths = filtered.changed.into_iter().collect::<Vec<_>>();
         let content_only = paths.iter().all(|path| content_only_paths.contains(path));
         let path_count = paths.len();
-        // A parent folder session follows its child repositories through
-        // this watcher; it only queues the paths for its own worker.
-        crate::views::parent::note_changed_paths(&paths);
         let event = if content_only {
             WatcherDispatchEvent::ContentOnlyPaths(paths)
         } else {

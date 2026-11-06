@@ -951,7 +951,6 @@ fn finalize_prefix(
     acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
     // Dispatch attaches these before tool text is rendered. Direct protocol
     // callers also need them; attachment is idempotent for the pinned outcome.
-    attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
@@ -1315,28 +1314,6 @@ mod tests {
     }
 }
 
-/// Applies the request's pinned post-wait gaps without reading newer runtime state.
-pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
-    let Some(crate::views::contracts::WaitOutcome::TimedOut { unreflected, .. }) =
-        ctx.checkout_query_outcome()
-    else {
-        return;
-    };
-    if let Some(data) = response.data.as_object_mut() {
-        data.insert("complete".into(), Value::Bool(false));
-        let gaps = data
-            .entry("gaps")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(gaps) = gaps.as_array_mut() {
-            for path in unreflected {
-                let gap = serde_json::json!({"kind":"view_pending", "path":path, "reason":"callgraph changes not yet installed"});
-                if !gaps.contains(&gap) {
-                    gaps.push(gap);
-                }
-            }
-        }
-    }
-}
 
 pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or cached results may omit unapplied file changes. Retry after maintenance catches up; a missing result is not evidence of absence.";
 
@@ -1639,7 +1616,6 @@ mod checkout_transport_tests {
         let _ = ctx.callgraph_store_for_ops();
         assert!(ctx.checkout_query_outcome().is_none());
         let mut response = Response::success("legacy", serde_json::json!({"complete":true}));
-        super::attach_checkout_query_gaps(&mut response, &ctx);
         assert_eq!(response.data, serde_json::json!({"complete":true}));
     }
 

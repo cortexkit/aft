@@ -16,12 +16,8 @@ use crate::pattern_compile::CompiledPattern;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
-use super::{display_relative, read, Child, ParentSession, Plane, TrigramSource};
+use super::{display_relative, read, Child, ParentSession, Plane};
 
-/// Index of [`ParentSession::view_route_counts`] for call-graph answers.
-const CALLGRAPH_ROUTE: usize = 0;
-/// Index of [`ParentSession::view_route_counts`] for grep and glob answers.
-const LEXICAL_ROUTE: usize = 1;
 
 /// Commands a parent session answers itself from its children.
 const ROUTED_COMMANDS: &[&str] = &[
@@ -160,24 +156,17 @@ fn overlapping(session: &ParentSession, scope: &Path) -> Vec<Arc<Child>> {
         .collect()
 }
 
-/// One child's text index as grep and glob read it.
+/// One child's text index as grep and glob read it: the child's checkout in
+/// the index store, scoped to the part of the search root inside the child.
 enum ChildText {
-    /// The trigram snapshot the session's worker loaded, and whether it
-    /// projects the child's published v3 lexical view.
-    Snapshot {
-        snapshot: SearchIndexSnapshot,
-        from_view: bool,
-    },
-    /// The child's checkout in the data layer, scoped to the part of the
-    /// search root inside the child.
     Data(crate::data_layer::tools::grep::ViewScope),
 }
 
 impl ChildText {
     /// Whether the child holds any file under `search_root`.
     fn has_files(&self, search_root: &Path) -> bool {
+        let _ = search_root;
         match self {
-            Self::Snapshot { snapshot, .. } => snapshot.has_file_in_scope(search_root),
             Self::Data(scope) => scope.has_files(),
         }
     }
@@ -185,10 +174,8 @@ impl ChildText {
     /// Whether the child holds any file under `search_root` that passes
     /// `filters`, which match paths relative to the child's root.
     fn has_files_matching(&self, search_root: &Path, filters: &PathFilters) -> bool {
+        let _ = search_root;
         match self {
-            Self::Snapshot { snapshot, .. } => {
-                snapshot.has_file_in_scope_with_filters(search_root, filters)
-            }
             Self::Data(scope) => scope.has_files_matching(filters),
         }
     }
@@ -199,7 +186,6 @@ impl ChildText {
         pattern: &CompiledPattern,
     ) -> Result<Cow<'_, SearchIndexSnapshot>, String> {
         match self {
-            Self::Snapshot { snapshot, .. } => Ok(Cow::Borrowed(snapshot)),
             Self::Data(scope) => scope
                 .candidates(pattern)
                 .map(Cow::Owned)
@@ -210,46 +196,25 @@ impl ChildText {
     /// A snapshot listing the child's files, for glob.
     fn listing(&self) -> Cow<'_, SearchIndexSnapshot> {
         match self {
-            Self::Snapshot { snapshot, .. } => Cow::Borrowed(snapshot),
             Self::Data(scope) => Cow::Owned(scope.listing()),
         }
     }
 
-    fn from_view(&self) -> bool {
-        matches!(
-            self,
-            Self::Snapshot {
-                from_view: true,
-                ..
-            }
-        )
-    }
 }
 
-/// Each child overlapping `search_root`, with its text index or the reason
-/// it cannot answer: from the child's own checkout in the data layer when
-/// the process runs the data layer, otherwise as the session's worker
-/// loaded it.
+/// Each child overlapping `search_root`, with its text index (the child's
+/// own checkout in the index store) or the reason it cannot answer.
 fn child_texts(
     ctx: &AppContext,
     session: &ParentSession,
     search_root: &Path,
 ) -> Vec<(Arc<Child>, Result<ChildText, String>)> {
     let children = overlapping(session, search_root);
-    // A plane the user turned off is the worker's named gap either way.
+    // A plane the user turned off is a named gap for every child.
     if !session.planes.trigram {
         return children
             .into_iter()
-            .filter_map(|child| {
-                let text = match read(&child.trigram).clone() {
-                    Plane::Ready(trigram) => Ok(ChildText::Snapshot {
-                        snapshot: trigram.index.snapshot(),
-                        from_view: matches!(trigram.source, TrigramSource::View(_)),
-                    }),
-                    plane => Err(plane.gap_reason("trigram")?),
-                };
-                Some((child, text))
-            })
+            .map(|child| (child, Err("trigram: the trigram index is off".to_string())))
             .collect();
     }
     let roots = children
@@ -303,7 +268,6 @@ pub(crate) fn grep_fan_out(
     let mut gaps = Gaps::default();
     let mut phases = GrepExecutionPhaseTimings::default();
     let mut scope_has_files = false;
-    let mut from_views = false;
     for root in &scope.roots {
         let search_root = &root.search_root;
         if search_root.is_file() || !search_root.starts_with(session.root()) {
@@ -335,7 +299,6 @@ pub(crate) fn grep_fan_out(
                 }
             };
             if text.has_files(search_root) {
-                from_views |= text.from_view();
                 sources.push((child, text));
             }
         }
@@ -394,9 +357,6 @@ pub(crate) fn grep_fan_out(
         gaps.scope(&session, search_root);
     }
     phases.indexed_scope_has_files = Some(scope_has_files || !gaps.is_empty());
-    if from_views {
-        session.note_view_route(LEXICAL_ROUTE);
-    }
     let result = if results.is_empty() {
         GrepResult {
             index_sources_unavailable: false,
@@ -446,7 +406,6 @@ pub(crate) fn glob_fan_out(
         gaps: Vec::new(),
     };
     let mut gaps = Gaps::default();
-    let mut from_views = false;
     for search_root in search_roots {
         let search_root =
             std::fs::canonicalize(search_root).unwrap_or_else(|_| search_root.clone());
@@ -468,15 +427,11 @@ pub(crate) fn glob_fan_out(
             };
             let (files, scope_has_files, visited) =
                 text.listing().glob_profiled(pattern, &search_root, false);
-            from_views |= text.from_view();
             answer.scope_has_files |= scope_has_files;
             answer.entries_visited += visited;
             answer.files.extend(files);
         }
         gaps.scope(&session, &search_root);
-    }
-    if from_views {
-        session.note_view_route(LEXICAL_ROUTE);
     }
     answer.files.sort();
     answer.files.dedup();
@@ -643,44 +598,17 @@ fn callgraph(
         );
         return gap_response(req, operation, gaps);
     };
-    if session.planes.callgraph {
-        return data_layer_callgraph(req, ctx, session, operation, &child, &file, symbol);
-    }
-    let plane = read(&child.callgraph).clone();
-    let Plane::Ready(callgraph) = plane else {
-        if let Some(reason) = plane.gap_reason("call graph") {
-            gaps.child(&child, reason);
-        }
+    if !session.planes.callgraph {
+        gaps.child(&child, "call graph: the call graph is off".into());
         return gap_response(req, operation, gaps);
-    };
-    match run_operation(
-        req,
-        ctx,
-        session,
-        operation,
-        callgraph.store.as_ref(),
-        &child,
-        &file,
-        symbol,
-    ) {
-        Ok(mut value) => {
-            prefix_paths(&mut value, &child.relative);
-            // The child's own session is the only one that claims its graph
-            // is current; the parent answers as of the child's publication.
-            if let Some(object) = value.as_object_mut() {
-                object.insert("as_of".into(), callgraph.published.as_of(&child));
-            }
-            session.note_view_route(CALLGRAPH_ROUTE);
-            Response::success(&req.id, value)
-        }
-        Err(response) => response,
     }
+    data_layer_callgraph(req, ctx, session, operation, &child, &file, symbol)
 }
 
-/// [`callgraph`] answered from the child's own checkout in the data layer.
+/// [`callgraph`] answered from the child's own checkout in the index store.
 /// The parent keeps that checkout current itself and waits for its
 /// recorded edits as a single checkout's query does, so the answer is
-/// current and names no publication it is as of.
+/// current.
 fn data_layer_callgraph(
     req: &RawRequest,
     ctx: &AppContext,

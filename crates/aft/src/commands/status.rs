@@ -4,7 +4,6 @@ use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
-use crate::views::semantic_runtime::CoordinationState;
 
 // Operator-only copy: never use these lines as fill errors or agent reply reasons.
 
@@ -481,10 +480,9 @@ impl AppContext {
                 .push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
         }
         let degraded = !degraded_reasons.is_empty();
-        let artifact_owner = self
-            .artifact_owner_status()
-            .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
-            .unwrap_or(serde_json::Value::Null);
+        // Index artifacts have no per-checkout owner: every checkout of a
+        // repository writes the one index store.
+        let artifact_owner = serde_json::Value::Null;
 
         // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
         // Surfaced for the TUI sidebar so users see the same code-health view
@@ -641,8 +639,6 @@ impl AppContext {
             payload["children"] = serde_json::json!(lifecycle.children);
             payload["fds"] = serde_json::json!(lifecycle.fds);
             payload["storage_refusals"] = serde_json::json!(storage_refusals);
-            payload["storage_retention"] =
-                serde_json::json!(crate::storage_retention::snapshot(&self.cache_dir()));
             payload["git"] = crate::developer_tools::git_status_json();
             let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
                 crate::backup::backup_skipped_totals();

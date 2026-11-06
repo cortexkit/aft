@@ -768,7 +768,6 @@ pub fn run_tool_call(
                 dispatch(prepared.request, app_ctx)
             };
             response = crate::bounded_io::finish_response(response);
-            crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
             crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
             crate::response_finalize::attach_callgraph_pending_gaps(
                 &mut response,

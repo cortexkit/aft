@@ -17,7 +17,7 @@ use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
     AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticBuildProgress,
     SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
-    SemanticRefreshWorkerSlot, SubcLifecycleAdmission, ViewRuntimeSnapshot,
+    SemanticRefreshWorkerSlot, SubcLifecycleAdmission,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -949,14 +949,6 @@ fn semantic_build_retry_backoff(attempt: usize) -> Duration {
 /// download that takes several.
 const ONNX_RUNTIME_DOWNLOAD_POLL: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug)]
-struct SemanticViewBlobSource {
-    storage: PathBuf,
-    family: String,
-}
-
-impl From<ViewRuntimeSnapshot> for SemanticViewBlobSource {
-}
 
 
 #[cfg(test)]
@@ -3124,8 +3116,7 @@ fn handle_configure_inner(
         let session_already_bound =
             ctx.has_configure_session_binding(canonical_root, req.session());
         if configs_equal_including_runtime_only_fields(&previous_config, &next_config) {
-            let missing = missing_artifact_loads(ctx);
-            let repair_artifacts = missing.search || missing.semantic;
+            let repair_artifacts = false;
             if (!session_already_bound || repair_artifacts)
                 && !ctx.configure_maintenance_has_capacity()
             {
@@ -3155,7 +3146,6 @@ fn handle_configure_inner(
                         canonical_root.clone(),
                         req.session().to_string(),
                     );
-                let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
                 let storage_root =
                     crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
                 let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3182,8 +3172,6 @@ fn handle_configure_inner(
                     supersede_search_artifact_persistence: false,
                     supersede_callgraph_artifact_persistence: false,
                     supersede_semantic_artifact_persistence: false,
-                    search_artifact_load_start: starts.0,
-                    semantic_artifact_load_start: starts.1,
                 });
                 if enqueue_result.is_err() {
                     if first_session_bind {
@@ -3376,8 +3364,7 @@ fn handle_configure_inner(
         }
         let needs_session_maintenance =
             !ctx.has_configure_session_binding(&canonical_cache_root, req.session());
-        let missing = missing_artifact_loads(ctx);
-        let repair_artifacts = missing.search || missing.semantic;
+        let repair_artifacts = false;
         if (needs_session_maintenance || repair_artifacts)
             && !ctx.configure_maintenance_has_capacity()
         {
@@ -3409,7 +3396,6 @@ fn handle_configure_inner(
         debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
         if first_session_bind || repair_artifacts {
-            let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
             let storage_root =
                 crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
             let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3436,8 +3422,6 @@ fn handle_configure_inner(
                 supersede_search_artifact_persistence: false,
                 supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
-                search_artifact_load_start: starts.0,
-                semantic_artifact_load_start: starts.1,
             });
             if enqueue_result.is_err() {
                 if first_session_bind {
@@ -3589,20 +3573,6 @@ fn handle_configure_inner(
         next_config.indexes.callgraph = false;
     }
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
-    ctx.begin_configure_ack_step("format_preflight");
-    if let Some(project_key) = project_key.as_ref() {
-        // Read only the version headers of this project's shared artifacts
-        // before any loader, builder or owner claim touches them, so a format
-        // written by a newer build is refused by name from the start instead
-        // of being discovered halfway through a rebuild.
-        let preflight_started = Instant::now();
-        crate::persisted_format::preflight_project_artifacts(
-            &durable_root,
-            &storage_root,
-            project_key,
-        );
-        cache_key_profile.format_preflight = preflight_started.elapsed();
-    }
     drop(cache_key_profile);
     let project_key = project_key.unwrap_or_default();
     ctx.begin_configure_ack_phase("storage_capability_probe");
@@ -3867,7 +3837,6 @@ fn handle_configure_inner(
         crate::callgraph::clear_workspace_package_cache_under(root);
     }
 
-    let (search_artifact_load_start, semantic_artifact_load_start);
     if equivalent_warm_config {
         if semantic_build_in_progress {
             slog_info!(
@@ -3881,14 +3850,6 @@ fn handle_configure_inner(
                 configure_generation
             );
         }
-        let _ = adopt_resident_semantic_index_if_available(
-            ctx,
-            semantic_search,
-            &project_key,
-            &ctx.config().semantic,
-        );
-        (search_artifact_load_start, semantic_artifact_load_start) =
-            schedule_missing_artifact_loads(ctx, search_index, semantic_search);
     } else {
         // Semantic and callgraph workers keep their receiver and dedicated
         // build epoch when that lane's inputs are unchanged. Changed lane inputs
@@ -3971,9 +3932,6 @@ fn handle_configure_inner(
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     SemanticIndexStatus::Disabled;
-                // The views-on lane was started for the previous semantic
-                // settings; the scheduling below starts it again.
-                ctx.checkout_semantic().clear();
             }
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
@@ -3984,14 +3942,6 @@ fn handle_configure_inner(
             ctx.clear_pending_index_updates();
         }
 
-        let _ = adopt_resident_semantic_index_if_available(
-            ctx,
-            semantic_search,
-            &project_key,
-            &ctx.config().semantic,
-        );
-        (search_artifact_load_start, semantic_artifact_load_start) =
-            schedule_missing_artifact_loads(ctx, search_index, semantic_search);
 
         // Reconfigure can point AFT at a different root; reset that root's
         // entries before warming the callgraph store for it.
@@ -4040,8 +3990,6 @@ fn handle_configure_inner(
         supersede_search_artifact_persistence: !equivalent_warm_config,
         supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
         supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
-        search_artifact_load_start,
-        semantic_artifact_load_start,
     });
     if enqueue_result.is_err() {
         if first_session_bind {
@@ -4499,11 +4447,7 @@ enum ConfigureMaintenanceStage {
     BashRuntime,
     ProjectRuntime,
     Watcher,
-    ViewLoad,
-    StorageSweeps,
     ProcessFlags,
-    Callgraph,
-    SemanticRelease,
     Status,
 }
 
@@ -4516,11 +4460,7 @@ impl ConfigureMaintenanceStage {
             Self::BashRuntime => "bash_runtime",
             Self::ProjectRuntime => "project_runtime",
             Self::Watcher => "watcher",
-            Self::ViewLoad => "view_load",
-            Self::StorageSweeps => "storage_sweeps",
             Self::ProcessFlags => "process_flags",
-            Self::Callgraph => "callgraph",
-            Self::SemanticRelease => "semantic_release",
             Self::Status => "status",
         }
     }
@@ -4555,9 +4495,6 @@ impl ConfigureMaintenanceStage {
 struct ConfigureMaintenanceContinuation {
     job: ConfigureMaintenanceJob,
     stage: ConfigureMaintenanceStage,
-    callgraph_start_baseline: u64,
-    semantic_waits_for_callgraph_start: bool,
-    view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
     lexical_bind_retry_at: Option<Instant>,
     lexical_bind_retry_delay: Duration,
@@ -4570,9 +4507,6 @@ impl ConfigureMaintenanceContinuation {
         Self {
             job,
             stage: ConfigureMaintenanceStage::Admission,
-            callgraph_start_baseline: 0,
-            semantic_waits_for_callgraph_start: false,
-            view_load: None,
             replay_retry_at: None,
             lexical_bind_retry_at: None,
             lexical_bind_retry_delay: Duration::from_secs(1),
@@ -4892,10 +4826,7 @@ fn run_configure_maintenance_unit(
 ) -> ConfigureMaintenanceUnitResult {
     let stage = continuation.stage;
     ctx.note_configure_tail_stage(Some(stage.label()));
-    if !matches!(
-        stage,
-        ConfigureMaintenanceStage::DatabaseRuntime | ConfigureMaintenanceStage::StorageSweeps
-    ) {
+    if !matches!(stage, ConfigureMaintenanceStage::DatabaseRuntime) {
         wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
     }
     // Maintenance units run on whatever executor thread drains the tail, and
@@ -5002,11 +4933,7 @@ pub(crate) fn gate_configure_tail_stage_for_test(
 
 #[cfg(test)]
 fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaintenanceStage) {
-    wait_on_configure_tail_gate_for_test(
-        root,
-        stage.label(),
-        matches!(stage, ConfigureMaintenanceStage::StorageSweeps),
-    );
+    wait_on_configure_tail_gate_for_test(root, stage.label(), false);
 }
 
 /// Holds the caller while a test gate for `root` and `label` is installed:
@@ -5123,9 +5050,7 @@ fn run_configure_maintenance_unit_inner(
                 && !job.sync_bash_compress_flag
                 && !job.reset_filter_registry
                 && !job.clear_failed_spawns
-                && !job.warm_callgraph_store
-                && job.search_artifact_load_start.is_none()
-                && job.semantic_artifact_load_start.is_none();
+                && !job.warm_callgraph_store;
             if session_only {
                 if ctx
                     .database_runtime_refusal("configure-session-replay", "bash_drain_completions")
@@ -5160,9 +5085,6 @@ fn run_configure_maintenance_unit_inner(
                     }
                     if job.supersede_callgraph_artifact_persistence {
                         ctx.next_callgraph_persist_epoch();
-                    }
-                    if let Some(start) = &job.search_artifact_load_start {
-                        let _ = start.send(());
                     }
                 })
                 .is_none()
@@ -5286,30 +5208,6 @@ fn run_configure_maintenance_unit_inner(
             // The project watcher may or may not cover the project config file
             // now; start or stop the root's own config file watch to match.
             crate::config_live::sync_config_watches(ctx);
-            continuation.stage = ConfigureMaintenanceStage::ViewLoad;
-        }
-        ConfigureMaintenanceStage::ViewLoad => {
-            // The data layer serves every index, so today's checkout views are
-            // neither opened nor built; a parent folder's session reads its
-            // children's checkouts.
-            ctx.clear_view_runtime();
-            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
-        }
-        ConfigureMaintenanceStage::StorageSweeps => {
-            if ctx.cache_unavailable_reason().is_some() {
-                continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
-                return ConfigureMaintenanceUnitResult::Continue;
-            }
-            crate::storage_retention::schedule(
-                crate::root_cache::StoragePaths::new(
-                    job.storage_root.clone(),
-                    job.artifact_root.clone(),
-                ),
-                ctx.subc_lifecycle_admission(),
-                ctx.configure_generation_flag(),
-                job.generation,
-            );
-            spawn_configure_storage_sweeps(job, ctx.view_runtime_snapshot());
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
         ConfigureMaintenanceStage::ProcessFlags => {
@@ -5333,41 +5231,6 @@ fn run_configure_maintenance_unit_inner(
                 }
             }
 
-            continuation.callgraph_start_baseline = crate::logging::index_build_start_sequence(
-                crate::logging::IndexPlane::Callgraph,
-                &job.canonical_cache_root,
-            );
-            continuation.stage = ConfigureMaintenanceStage::Callgraph;
-        }
-        ConfigureMaintenanceStage::Callgraph => {
-            // The data layer builds the call graph with the root's checkout
-            // (`data_layer::runtime::root_bound`); today's store is not warmed.
-            continuation.stage = ConfigureMaintenanceStage::SemanticRelease;
-        }
-        ConfigureMaintenanceStage::SemanticRelease => {
-            if ctx
-                .run_if_subc_bound_generation(job.generation, || {
-                    if let Some(start) = &job.semantic_artifact_load_start {
-                        if continuation.semantic_waits_for_callgraph_start {
-                            crate::logging::signal_after_index_build_start(
-                                crate::logging::IndexPlane::Callgraph,
-                                &job.canonical_cache_root,
-                                continuation.callgraph_start_baseline,
-                                start.clone(),
-                            );
-                        } else {
-                            let _ = start.send(());
-                        }
-                    }
-                })
-                .is_none()
-            {
-                if ctx.subc_unbound_quiesced() {
-                    return ConfigureMaintenanceUnitResult::CancelAll;
-                }
-                forget_configure_job_binding(ctx, job);
-                return ConfigureMaintenanceUnitResult::Complete;
-            }
             continuation.stage = ConfigureMaintenanceStage::Status;
         }
         ConfigureMaintenanceStage::Status => {

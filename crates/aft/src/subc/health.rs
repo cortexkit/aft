@@ -1453,7 +1453,6 @@ impl DispatchPathMetrics {
                 "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
             },
             "deferred_bash_waits_in_flight": self.deferred_bash_waits_in_flight.load(Ordering::Relaxed),
-            "off_lane_jobs": crate::executor::view_publication::health_snapshot(),
             "budget_deferrals": {
                 "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),
@@ -1944,50 +1943,6 @@ fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn retention_report_totals(
-    reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
-) -> Value {
-    let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
-    let mut trash = crate::storage_retention::TrashReport {
-        at_ms: crate::clock::now_ms(),
-        ..Default::default()
-    };
-    for report in reports.values() {
-        let census = &report.trash;
-        trash.entries = trash.entries.saturating_add(census.entries);
-        trash.bytes_estimate = trash.bytes_estimate.saturating_add(census.bytes_estimate);
-        trash.removed_entries = trash.removed_entries.saturating_add(census.removed_entries);
-        trash.incomplete |= census.incomplete || census.at_ms == 0;
-        if let Some(age) = census.oldest_age_ms {
-            let age = age.saturating_add(trash.at_ms.saturating_sub(census.at_ms));
-            trash.oldest_age_ms = Some(trash.oldest_age_ms.unwrap_or(0).max(age));
-        }
-        for (reason, count) in &census.kept_by_reason {
-            let total = trash.kept_by_reason.entry(reason.clone()).or_default();
-            *total = total.saturating_add(*count);
-        }
-        for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
-            let (key, count) = match value {
-                Value::Number(number) if field != "at_ms" => {
-                    (field.clone(), number.as_u64().unwrap_or(0))
-                }
-                Value::Bool(value) => (format!("{field}_reports"), u64::from(*value)),
-                Value::Array(entries) if field == "errors" || field == "incomplete" => {
-                    (field.clone(), entries.len() as u64)
-                }
-                _ => continue,
-            };
-            let total = totals.get(&key).and_then(Value::as_u64).unwrap_or(0);
-            totals.insert(key, json!(total.saturating_add(count)));
-        }
-    }
-    // Detail reports can be omitted by the health payload budget; keep the
-    // trash backlog and counts of entries retained by reason in the aggregate
-    // that survives trimming.
-    totals.insert("trash".into(), serde_json::to_value(trash).unwrap());
-    Value::Object(totals)
-}
-
 fn ordinary_ready_health_root(root: &Value) -> bool {
     root["abbreviated"] != true
         && root["standing"] != true
@@ -2302,8 +2257,6 @@ impl HealthDiagnosticRollup {
                 "disk_sweeps": serde_json::to_value(crate::bash_background::persisted_gc_health())
                     .unwrap_or(Value::Null),
             },
-            "storage_retention": Value::Null,
-            "storage_retention_totals": Value::Null,
             "storage_retention_reports_omitted": Value::Null,
             "bash_db_schema_hints": Value::Null,
             "bash_task_refusals": Value::Null,
@@ -3572,17 +3525,6 @@ fn build_health_diagnostic_rollup_from_actors(
                     }),
             );
         }
-        if tick_paths
-            .cache_unavailable_reason(ctx.as_ref(), &config)
-            .is_none()
-        {
-            crate::storage_retention::schedule(
-                tick_paths.storage_paths(&config),
-                ctx.subc_lifecycle_admission(),
-                ctx.configure_generation_flag(),
-                ctx.configure_generation(),
-            );
-        }
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -3962,16 +3904,6 @@ fn build_health_diagnostic_rollup_from_actors(
         data_store_failed_roots,
     );
 
-    let storage_retention = lifecycle_contexts
-        .iter()
-        .filter_map(|ctx| {
-            let storage = tick_paths.cache_dir(&ctx.config());
-            crate::storage_retention::snapshot(&storage)
-                .map(|report| (storage.display().to_string(), report))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let storage_retention_totals = retention_report_totals(&storage_retention);
-    rollup_mark!(timer, "storage retention snapshots");
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
     // Every context normally shares one cache root, but each context may name
@@ -4017,8 +3949,6 @@ fn build_health_diagnostic_rollup_from_actors(
         },
         "memory": memory,
         "bash_task_retention": bash_retention,
-        "storage_retention": storage_retention,
-        "storage_retention_totals": storage_retention_totals,
         "storage_retention_reports_omitted": 0,
         "bash_db_schema_hints": bash_db_hint_metrics(),
         "bash_task_refusals": bash_task_refusals,
@@ -4149,7 +4079,6 @@ pub(super) fn build_health_report(
         dispatch_path_metrics,
         shared_app,
         crate::cold_build_limiter::progress::snapshot,
-        crate::gc::family::sweep_stats(),
     )
 }
 
@@ -4167,7 +4096,6 @@ fn build_health_report_with_snapshots(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
-    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
 ) -> HealthReport {
     let mut report = assemble_health_report(
         cache,
@@ -4176,7 +4104,6 @@ fn build_health_report_with_snapshots(
         dispatch_path_metrics,
         shared_app,
         indexing_snapshot,
-        sweep_snapshot,
     );
     if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
         budget_health_metrics(metrics);
@@ -4194,7 +4121,6 @@ fn assemble_health_report(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
-    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
 ) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
@@ -4320,19 +4246,6 @@ fn assemble_health_report(
         "views_work".to_string(),
         crate::io_accounting::work_snapshot(),
     );
-    metrics.insert(
-        "v2_family_sweeps".to_string(),
-        json!(sweep_snapshot.details),
-    );
-    metrics.insert(
-        "v2_family_sweep_details_evicted_total".into(),
-        json!(sweep_snapshot.evicted_total),
-    );
-    metrics.insert(
-        "v2_family_sweep_details_retired_total".into(),
-        json!(sweep_snapshot.retired_total),
-    );
-    metrics.insert("v2_family_sweeps_omitted".into(), json!(0));
     metrics.insert(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
@@ -10241,7 +10154,6 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         callgraph_repair_entries_60s: None,
         callgraph_commits_60s: None,
         callgraph_pages_or_bytes_written_60s: None,
-        views: None,
         view_load_failures: Default::default(),
         view_load_failure_last: None,
         view_storage_reserve: Default::default(),

@@ -1030,8 +1030,6 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::config_live::drain_config_reload(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
-        aft::runtime_drain::drain_semantic_index_events(runtime);
-        aft::runtime_drain::drain_semantic_refresh_events(runtime);
         aft::runtime_drain::drain_inspect_events(runtime);
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
@@ -1070,8 +1068,6 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::runtime_drain::drain_configure_warning_events(runtime);
     aft::config_live::drain_config_reload(runtime);
     aft::runtime_drain::drain_callgraph_store_events(runtime);
-    aft::runtime_drain::drain_semantic_index_events(runtime);
-    aft::runtime_drain::drain_semantic_refresh_events(runtime);
     aft::runtime_drain::drain_inspect_events(runtime);
     aft::runtime_drain::drain_watcher_events(runtime);
     aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
@@ -1517,15 +1513,11 @@ fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     // when it was admitted, so a live config reload switches over between
     // requests, never in the middle of one (path restriction, sandbox).
     let _config_pin = ctx.pin_config();
-    // A detached view publication commits only between standalone requests,
-    // never in the middle of one (uncontended in subc mode).
-    let _publication_gate = aft::executor::standalone_request_gate();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
     let (watcher_pending, callgraph_pending) =
         aft::response_finalize::query_pending(ctx, &req.command);
     let mut response = dispatch_command(req, ctx);
-    aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
     aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
     aft::response_finalize::attach_callgraph_pending_gaps(
         &mut response,
@@ -1643,7 +1635,6 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
             }
             response
         }
-        "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => {
@@ -2185,7 +2176,6 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
         if aft::executor::current_job_cancelled() {
             return Some(cancelled_semantic_search_response(&req.id));
         }
-        aft::runtime_drain::drain_semantic_index_events(ctx);
 
         match ctx
             .semantic_index_status()
@@ -3201,32 +3191,6 @@ mod deferred_semantic_search_tests {
             session_id: Some("standalone-search-test".to_string()),
             params,
         }
-    }
-
-    #[test]
-    fn view_token_management_dispatch_reaches_the_default_off_guard() {
-        let storage = tempfile::tempdir().unwrap();
-        let context = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_owned()),
-                ..Default::default()
-            },
-        );
-        let response = super::dispatch_command(
-            request(
-                "token",
-                "view_token",
-                serde_json::json!({
-                    "root": storage.path().join("future"), "expected_tree": "a".repeat(40),
-                }),
-            ),
-            &context,
-        );
-        let wire = serde_json::to_value(response).unwrap();
-        assert_eq!(wire["success"], false);
-        assert_eq!(wire["code"], "VIEW_TOKEN");
-        assert!(!storage.path().join("blobs").exists());
     }
 
     fn slow_search_request(id: &str) -> RawRequest {
@@ -4786,7 +4750,6 @@ mod watcher_filter_tests {
         };
         drop(tx);
 
-        aft::runtime_drain::drain_semantic_index_events(&ctx);
 
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(matches!(
@@ -4817,7 +4780,6 @@ mod watcher_filter_tests {
             .unwrap();
         drop(event_tx);
 
-        drain_semantic_refresh_events(&ctx);
 
         assert!(ctx.semantic_refresh_event_rx().lock().is_none());
         assert_eq!(
@@ -5267,7 +5229,6 @@ mod watcher_filter_tests {
                 })
                 .unwrap();
 
-            drain_semantic_refresh_events(&ctx);
 
             match request_rx
                 .recv_timeout(RECV_DISPATCH_TIMEOUT)
@@ -5309,7 +5270,6 @@ mod watcher_filter_tests {
                     })
                     .unwrap();
             }
-            drain_semantic_refresh_events(&ctx);
 
             assert!(semantic_refresh_circuit_is_open(&ctx));
             assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
@@ -5322,7 +5282,6 @@ mod watcher_filter_tests {
                     })
                     .unwrap();
             }
-            drain_semantic_refresh_events(&ctx);
 
             assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
             let expected_probe_paths = files[(BREAKER_TRIP_THRESHOLD - 1)..].to_vec();
@@ -5345,7 +5304,6 @@ mod watcher_filter_tests {
                 ctx.completion_drains_have_work(),
                 "a ready breaker probe must schedule completion draining without another event"
             );
-            drain_semantic_refresh_events(&ctx);
 
             let mut batches = Vec::new();
             for _ in 0..BREAKER_TRIP_THRESHOLD {
@@ -5376,12 +5334,10 @@ mod watcher_filter_tests {
                 })
                 .unwrap();
 
-            drain_semantic_refresh_events(&ctx);
 
             assert!(semantic_refresh_circuit_is_open(&ctx));
             assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
             std::thread::sleep(std::time::Duration::from_millis(20));
-            drain_semantic_refresh_events(&ctx);
 
             assert!(matches!(
                 request_rx.recv_timeout(std::time::Duration::from_secs(1)),
@@ -5440,7 +5396,6 @@ mod watcher_filter_tests {
                     })
                     .unwrap();
             }
-            drain_semantic_refresh_events(&ctx);
             assert!(semantic_refresh_circuit_is_open(&ctx));
 
             // The pre-breaker failures each schedule a retry on an independent
@@ -5467,7 +5422,6 @@ mod watcher_filter_tests {
                     completed_paths: vec![files[BREAKER_TRIP_THRESHOLD - 1].clone()],
                 })
                 .unwrap();
-            drain_semantic_refresh_events(&ctx);
 
             assert!(!semantic_refresh_circuit_is_open(&ctx));
             assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 0);
@@ -5479,7 +5433,6 @@ mod watcher_filter_tests {
                     error: transient_embedding_error(),
                 })
                 .unwrap();
-            drain_semantic_refresh_events(&ctx);
 
             assert!(!semantic_refresh_circuit_is_open(&ctx));
             assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 1);
@@ -5553,7 +5506,6 @@ mod watcher_filter_tests {
             })
             .unwrap();
 
-        drain_semantic_refresh_events(&ctx);
 
         let pending = ctx.take_pending_semantic_index_paths();
         assert_eq!(pending, vec![file]);

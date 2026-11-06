@@ -619,19 +619,7 @@ fn glob_root(
             }
         }
     }
-    let view_snapshot = (search_scope.use_index && !ignored_target)
-        .then(|| ctx.lexical_view_snapshot("glob"))
-        .flatten();
-    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
-        // A failed view load fails the call, like grep: answering from a
-        // fallback walk would hide the outage, and the legacy snapshot may
-        // describe another checkout.
-        snapshot
-            .map_err(crate::context::view_load_failure_message)?
-            .into_ready()
-    } else {
-        None
-    };
+    let indexed_snapshot: Option<std::sync::Arc<crate::search_index::SearchIndexSnapshot>> = None;
     let index_covers_root = indexed_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.has_file_in_scope(&search_scope.root));

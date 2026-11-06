@@ -1,7 +1,4 @@
 mod single_flight;
-pub use view_publication::{
-    install_standalone_scope, standalone_request_gate, StandaloneGate, StandaloneScope,
-};
 
 #[cfg(test)]
 mod tests;
@@ -1454,9 +1451,6 @@ impl Executor {
     /// Interactive tools other than inspect retain their normal completion path.
     pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
         let mut state = self.inner.state.lock();
-        if let Some(actor) = state.actors.get(root_id) {
-            view_publication::cancel_for_context(&actor.ctx);
-        }
         let mut cancelled = state
             .actors
             .get_mut(root_id)
@@ -2896,9 +2890,7 @@ impl ActorState {
     }
 
     fn is_idle(&self) -> bool {
-        self.actor_total_inflight == 0
-            && !self.has_queued_jobs()
-            && !view_publication::running_for_context(&self.ctx)
+        self.actor_total_inflight == 0 && !self.has_queued_jobs()
     }
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
@@ -4519,11 +4511,6 @@ fn detached_writer_backoff(attempts: u32) -> Duration {
 const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
 
 fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
-    let _actor_scope = view_publication::ActorScope::install(
-        Arc::clone(&run_job.ctx),
-        Arc::clone(&run_job.epoch),
-        Arc::clone(&run_job.detached_writers),
-    );
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
         queued: Arc::clone(&run_job.waiting_writers),

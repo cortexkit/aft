@@ -447,7 +447,10 @@ impl CallgraphReconcileJob {
                 let _ = release.recv_timeout(std::time::Duration::from_secs(30));
             }
         }
-        let report = match CallGraphStore::open_readonly(callgraph_dir, project_root.clone()) {
+        // Today's call-graph store is retired, so there is never a published
+        // store to compare with the disk.
+        let _ = (&callgraph_dir, max_examined);
+        let report = match Ok::<Option<crate::callgraph_store::ReadonlyCallGraphStore>, crate::callgraph_store::CallGraphStoreError>(None) {
             Ok(Some(store)) => store.reconcile_with_disk(max_examined),
             Ok(None) => {
                 let outcome = CallgraphReconcileOutcome {

@@ -11,7 +11,6 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
-pub mod blob_store;
 pub(crate) mod tool_views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12665,8 +12664,6 @@ fn submit_maintenance_job(
             MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
                 runtime_drain::drain_callgraph_store_events(ctx);
-                runtime_drain::drain_semantic_index_events(ctx);
-                runtime_drain::drain_semantic_refresh_events(ctx);
                 runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()

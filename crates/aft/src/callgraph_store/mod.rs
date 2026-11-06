@@ -714,48 +714,6 @@ mod write_amplification_tests {
             .expect("WAL setup waits for the writer instead of failing locked");
     }
 
-    #[test]
-    fn busy_readiness_probe_waits_within_its_deadline() {
-        let temp = tempdir().unwrap();
-        let generation = "locked-probe";
-        let path = temp.path().join(format!("derived-{generation}.sqlite"));
-        let writer = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
-        writer.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT); BEGIN EXCLUSIVE;").unwrap();
-        let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
-        BEFORE_READINESS_QUERY.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |timeout| timeout_tx.send(timeout).unwrap()));
-        });
-        let started = Instant::now();
-        let error = manifest_view_database_ready(
-            temp.path(),
-            generation,
-            started + Duration::from_millis(20),
-        )
-        .unwrap_err();
-        assert!(error.is_transient_lock_contention(), "{error}");
-        assert!(
-            timeout_rx
-                .try_recv()
-                .expect("probe must install its SQLite wait policy")
-                <= 20,
-            "SQLite must not wait beyond the probe's 20ms deadline"
-        );
-
-        // Release the writer only after the next probe has opened its reader
-        // and installed the deadline. The first probe above proves contention;
-        // this one proves that a cleared lock is not cached as an error.
-        BEFORE_READINESS_QUERY.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |_| {
-                writer.execute_batch("ROLLBACK").unwrap();
-            }));
-        });
-        assert!(!manifest_view_database_ready(
-            temp.path(),
-            generation,
-            Instant::now() + Duration::from_secs(2)
-        )
-        .unwrap());
-    }
 
     #[test]
     fn callgraph_reader_setup_does_not_read_locked_schema() {
@@ -4477,8 +4435,6 @@ pub struct CallGraphStore {
 #[derive(Debug)]
 pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
-    _view_pin: Option<Arc<crate::pins::QueryPin>>,
-    _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
     health_stale_census: Mutex<Option<CachedStalePathCensus>>,
 }
 
@@ -7034,88 +6990,6 @@ impl CallGraphStore {
         }
     }
 
-    pub fn open_readonly(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> Result<Option<ReadonlyCallGraphStore>> {
-        crate::private_storage::tighten_keyed_dir(&callgraph_dir, "callgraph");
-        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
-        // A generation written by a newer build is refused by name rather than
-        // reported as not built (which would send callers to a cold build) or
-        // served from an older legacy partition.
-        refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
-        {
-            let conn = open_readonly_connection(&sqlite_path)?;
-            if !readonly_readiness(database_ready(&conn))? {
-                return Ok(None);
-            }
-            configure_serving_reader(&conn)?;
-            let marker_label = generation.as_deref().unwrap_or("legacy");
-            let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
-            return Ok(Some(ReadonlyCallGraphStore::from_inner(
-                Self::from_connection(
-                    project_root,
-                    project_key,
-                    sqlite_path,
-                    callgraph_dir,
-                    false,
-                    generation,
-                    None,
-                    Some(read_marker),
-                    conn,
-                ),
-            )));
-        }
-
-        let Some(target) = freshest_legacy_fallback_target(&callgraph_dir, &project_key)? else {
-            return Ok(None);
-        };
-        crate::slog_warn!(
-            "root-keyed callgraph store is empty; serving read-only fallback from legacy {} partition {}",
-            target.partition.harness,
-            target.sqlite_path.display()
-        );
-        let conn = open_readonly_connection(&target.sqlite_path)?;
-        if !readonly_readiness(database_ready(&conn))? {
-            return Ok(None);
-        }
-        configure_serving_reader(&conn)?;
-        let marker_label =
-            legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
-        let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, &marker_label)?;
-        Ok(Some(ReadonlyCallGraphStore::from_inner(
-            Self::from_connection(
-                project_root,
-                project_key,
-                target.sqlite_path,
-                callgraph_dir,
-                true,
-                target.generation,
-                None,
-                Some(read_marker),
-                conn,
-            ),
-        )))
-    }
-
-    /// A drain makes at most three fail-fast probes before yielding. Continued
-    /// contention stays owned by the completion receiver for a later drain.
-    pub fn reopen_readonly(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> Result<Option<ReadonlyCallGraphStore>> {
-        for attempt in 0..3 {
-            let result = Self::open_readonly(callgraph_dir.clone(), project_root.clone());
-            if attempt == 2
-                || !matches!(&result, Err(error) if error.is_transient_lock_contention())
-            {
-                return result;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        unreachable!("bounded reopen probes return on the final attempt")
-    }
 
     /// Open the currently-published ready store with write access so moved-root
     /// metadata can be repaired before projection readers consume it. Unlike
@@ -7298,153 +7172,7 @@ impl CallGraphStore {
         Ok((store, stats))
     }
 
-    pub fn ensure_built_with_lease(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-        files: &[PathBuf],
-    ) -> Result<(Self, Option<ColdBuildStats>)> {
-        Self::ensure_built_with_lease_chunked(callgraph_dir, project_root, files, 0)
-    }
 
-    pub fn ensure_built_with_lease_chunked(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-        files: &[PathBuf],
-        chunk_size: usize,
-    ) -> Result<(Self, Option<ColdBuildStats>)> {
-        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
-        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
-        else {
-            return Err(CallGraphStoreError::Unavailable(
-                "callgraph ensure could not acquire writer capability".to_string(),
-            ));
-        };
-        refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        crate::private_storage::create_dir_all(&callgraph_dir)?;
-        cleanup_incomplete_migrations(&callgraph_dir, &project_key);
-        // Another process may have published a ready generation while we waited
-        // for the lock — open it instead of rebuilding. If that generation is
-        // from this same project at an older filesystem root, repair the root
-        // metadata in-place while still holding the build lease. If data rows
-        // contain absolute paths, publish a fresh generation under this lease
-        // rather than recursively reacquiring the same lock.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
-        {
-            let OpenedStore { store, root_repair } = Self::open_at_path(
-                project_root.clone(),
-                project_key.clone(),
-                sqlite_path,
-                generation,
-                true,
-                Some(Arc::clone(&writer_lease)),
-                None,
-            )?;
-            match root_repair {
-                OpenRootRepair::NeedsRebuild { .. } => {
-                    log_root_repair_rebuild(&root_repair);
-                    drop(store);
-                    let (stats, generation) = Self::cold_build_publish_locked(
-                        &callgraph_dir,
-                        &project_root,
-                        &project_key,
-                        files,
-                        chunk_size,
-                        Arc::clone(&writer_lease),
-                    )?;
-                    let store = Self::open_generation(
-                        &callgraph_dir,
-                        project_root,
-                        project_key,
-                        generation,
-                        writer_lease,
-                    )?;
-                    return Ok((store, Some(stats)));
-                }
-                OpenRootRepair::None | OpenRootRepair::ReRooted => {
-                    return Ok((store, None));
-                }
-            }
-        }
-        if let Some(store) = try_legacy_migration_or_fallback(
-            &callgraph_dir,
-            &project_root,
-            &project_key,
-            Arc::clone(&writer_lease),
-        )? {
-            return Ok((store, None));
-        }
-        let (stats, generation) = Self::cold_build_publish_locked(
-            &callgraph_dir,
-            &project_root,
-            &project_key,
-            files,
-            chunk_size,
-            Arc::clone(&writer_lease),
-        )?;
-        let store = Self::open_generation(
-            &callgraph_dir,
-            project_root,
-            project_key,
-            generation,
-            writer_lease,
-        )?;
-        Ok((store, Some(stats)))
-    }
-
-    /// Migrate a legacy harness-partition store without falling through to a
-    /// cold build. This is used after a query has already opened a read-only
-    /// fallback: the caller runs it on the same limited background lane as cold
-    /// builds while queries continue using that fallback. Public so crash/retry
-    /// tests can drive the migration synchronously on a thread where the
-    /// thread-local failure seams apply.
-    pub fn migrate_legacy_with_lease(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> Result<Option<Self>> {
-        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
-        let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
-        else {
-            return Ok(None);
-        };
-        refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        crate::private_storage::create_dir_all(&callgraph_dir)?;
-        cleanup_incomplete_migrations(&callgraph_dir, &project_key);
-
-        // Another writer may have completed the migration while this worker was
-        // waiting for the lease. Adopt its root-keyed generation rather than
-        // copying the legacy source a second time.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
-        {
-            let OpenedStore { store, root_repair } = Self::open_at_path(
-                project_root,
-                project_key,
-                sqlite_path,
-                generation,
-                true,
-                Some(writer_lease),
-                None,
-            )?;
-            return match root_repair {
-                OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
-                OpenRootRepair::NeedsRebuild { reason, .. } => {
-                    Err(CallGraphStoreError::Unavailable(format!(
-                        "root-keyed store discovered during legacy migration requires a cold rebuild: {reason}"
-                    )))
-                }
-            };
-        }
-
-        let store = try_legacy_migration_or_fallback(
-            &callgraph_dir,
-            &project_root,
-            &project_key,
-            writer_lease,
-        )?;
-        // A disk-floor or backup-budget failure returns a readable legacy store.
-        // Keep the already-resident fallback instead of sending this duplicate
-        // reader through the background-install channel.
-        Ok(store.filter(|store| !store.is_legacy_fallback()))
-    }
 
     /// Build a fresh DB and publish it as a new generation, then atomically flip
     /// the `<key>.current` pointer to it. NEVER replaces an open DB file, so it
@@ -8579,7 +8307,6 @@ impl CallGraphStore {
             crate::cold_build_limiter::progress::StartLog::Quiet,
         );
         crate::cold_build_limiter::progress::phase("checking", Some(changed_files.len()));
-        let _io = crate::views::io::Window::event("legacy_callgraph_refresh", &self.project_root);
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
@@ -10163,45 +9890,6 @@ impl ReadonlyCallGraphStore {
         (result, observed)
     }
 
-    /// Open only the selected derived database, without legacy fallback. The
-    /// caller must retain the pinned generation for the lifetime of this reader.
-    pub(crate) fn open_pinned_derived(
-        project_root: PathBuf,
-        family: String,
-        view_dir: PathBuf,
-        generation: &str,
-    ) -> Result<Self> {
-        ensure_manifest_producer_ready(&view_dir, generation)?;
-        let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
-            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
-        // A sealed donor never changes; open it without locks or a WAL.
-        let conn = if crate::db::sealed_database::is_sealed(&sqlite_path) {
-            open_sealed_connection(&sqlite_path)?
-        } else {
-            open_readonly_connection(&sqlite_path)?
-        };
-        ensure_database_ready(&conn)?;
-        configure_serving_reader(&conn)?;
-        let mut inner = CallGraphStore::from_connection(
-            project_root,
-            family,
-            sqlite_path,
-            view_dir,
-            false,
-            None,
-            None,
-            None,
-            conn,
-        );
-        inner.manifest_view = true;
-        inner.database_ready.store(true, AtomicOrdering::Release);
-        Ok(Self {
-            inner,
-            _view_pin: None,
-            _generation_pin: None,
-            health_stale_census: Mutex::new(None),
-        })
-    }
 
     /// Opens a materialized view database by its path, outside any view
     /// directory, so the data layer's gates can read the same graph through
@@ -10232,73 +9920,12 @@ impl ReadonlyCallGraphStore {
         inner.database_ready.store(true, AtomicOrdering::Release);
         Ok(Self {
             inner,
-            _view_pin: None,
-            _generation_pin: None,
             health_stale_census: Mutex::new(None),
         })
     }
 
-    pub(crate) fn open_manifest_view(
-        project_root: PathBuf,
-        family: String,
-        view_dir: PathBuf,
-        generation: &str,
-        pin: Option<Arc<crate::pins::QueryPin>>,
-    ) -> Result<Self> {
-        ensure_manifest_producer_ready(&view_dir, generation)?;
-        let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
-        let conn = open_readonly_connection(&sqlite_path)?;
-        ensure_database_ready(&conn)?;
-        configure_serving_reader(&conn)?;
-        let mut inner = CallGraphStore::from_connection(
-            project_root,
-            family,
-            sqlite_path,
-            view_dir,
-            false,
-            None,
-            None,
-            None,
-            conn,
-        );
-        inner.manifest_view = true;
-        inner.database_ready.store(true, AtomicOrdering::Release);
-        Ok(Self {
-            inner,
-            _view_pin: pin,
-            _generation_pin: None,
-            health_stale_census: Mutex::new(None),
-        })
-    }
 
-    pub(crate) fn retain_generation(
-        mut self,
-        generation: Arc<crate::views::snapshot::OpenGeneration>,
-    ) -> Self {
-        self._generation_pin = Some(generation);
-        self
-    }
 
-    pub fn dispatch_site_counts(
-        &self,
-    ) -> Result<Option<BTreeMap<String, crate::views::materialization::dispatch::SiteCounts>>> {
-        let connection = self
-            .inner
-            .conn
-            .lock()
-            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='view_dispatch_sites')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Ok(None);
-        }
-        Ok(Some(crate::views::materialization::dispatch::counts(
-            &connection,
-        )?))
-    }
 
     pub fn reader_kind(&self) -> &'static str {
         if self.inner.manifest_view {
@@ -10311,8 +9938,6 @@ impl ReadonlyCallGraphStore {
     fn from_inner(inner: CallGraphStore) -> Self {
         Self {
             inner,
-            _view_pin: None,
-            _generation_pin: None,
             health_stale_census: Mutex::new(None),
         }
     }
@@ -12442,115 +12067,6 @@ fn log_legacy_migration_completion(
     );
 }
 
-fn try_legacy_migration_or_fallback(
-    callgraph_dir: &Path,
-    project_root: &Path,
-    project_key: &str,
-    writer_lease: Arc<crate::root_cache::WriterLease>,
-) -> Result<Option<CallGraphStore>> {
-    let partitions = legacy_callgraph_partitions(callgraph_dir, project_key)?;
-    if partitions.is_empty() {
-        return Ok(None);
-    }
-
-    for partition in &partitions {
-        if let Some(source) = newest_superseded_legacy_generation(partition)? {
-            if !migration_disk_floor_allows(&source, callgraph_dir)? {
-                return open_legacy_fallback_store(
-                    callgraph_dir,
-                    project_root,
-                    project_key,
-                    &partitions,
-                );
-            }
-            match publish_generation_copy_migration(
-                callgraph_dir,
-                project_key,
-                &source,
-                Arc::clone(&writer_lease),
-            ) {
-                Ok(published) => {
-                    log_legacy_migration_completion(
-                        project_key,
-                        "generation_copy",
-                        source.source_bytes,
-                        published.migrated_bytes,
-                    );
-                    return CallGraphStore::open_generation(
-                        callgraph_dir,
-                        project_root.to_path_buf(),
-                        project_key.to_string(),
-                        published.generation,
-                        writer_lease,
-                    )
-                    .map(Some);
-                }
-                Err(error) => {
-                    crate::slog_warn!(
-                        "root-keyed callgraph generation-copy migration failed from {}: {}",
-                        source.sqlite_path.display(),
-                        error
-                    );
-                    return open_legacy_fallback_store(
-                        callgraph_dir,
-                        project_root,
-                        project_key,
-                        &partitions,
-                    );
-                }
-            }
-        }
-
-        if let Some(source) = current_legacy_generation(partition)? {
-            if !migration_disk_floor_allows(&source, callgraph_dir)? {
-                return open_legacy_fallback_store(
-                    callgraph_dir,
-                    project_root,
-                    project_key,
-                    &partitions,
-                );
-            }
-            match publish_backup_migration(
-                callgraph_dir,
-                project_key,
-                &source,
-                Arc::clone(&writer_lease),
-            ) {
-                Ok(published) => {
-                    log_legacy_migration_completion(
-                        project_key,
-                        "sqlite_backup",
-                        source.source_bytes,
-                        published.migrated_bytes,
-                    );
-                    return CallGraphStore::open_generation(
-                        callgraph_dir,
-                        project_root.to_path_buf(),
-                        project_key.to_string(),
-                        published.generation,
-                        writer_lease,
-                    )
-                    .map(Some);
-                }
-                Err(error) => {
-                    crate::slog_warn!(
-                        "root-keyed callgraph backup migration failed from {}: {}",
-                        source.sqlite_path.display(),
-                        error
-                    );
-                    return open_legacy_fallback_store(
-                        callgraph_dir,
-                        project_root,
-                        project_key,
-                        &partitions,
-                    );
-                }
-            }
-        }
-    }
-
-    open_legacy_fallback_store(callgraph_dir, project_root, project_key, &partitions)
-}
 
 fn open_legacy_fallback_store(
     callgraph_dir: &Path,
@@ -12586,74 +12102,8 @@ fn open_legacy_fallback_store(
     )))
 }
 
-fn migration_disk_floor_allows(
-    source: &LegacyCallgraphTarget,
-    callgraph_dir: &Path,
-) -> Result<bool> {
-    let available = migration_available_disk(callgraph_dir)?;
-    let decision = crate::legacy_partitions::evaluate_root_keyed_copy_disk_floor(
-        source.source_bytes,
-        available,
-    );
-    if decision.should_skip_copy() {
-        crate::slog_warn!(
-            "{}",
-            decision.warning_message(&source.sqlite_path, callgraph_dir)
-        );
-        return Ok(false);
-    }
-    Ok(true)
-}
 
-fn migration_available_disk(path: &Path) -> Result<u64> {
-    if let Some(bytes) = MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()) {
-        return Ok(bytes);
-    }
-    crate::legacy_partitions::available_disk_for(path).map_err(CallGraphStoreError::from)
-}
 
-fn legacy_callgraph_partitions(
-    callgraph_dir: &Path,
-    project_key: &str,
-) -> Result<Vec<LegacyCallgraphPartition>> {
-    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
-        return Ok(Vec::new());
-    };
-    let inventory = crate::legacy_partitions::inventory_legacy_partitions(&storage_root)?;
-    let mut partitions = inventory
-        .into_iter()
-        .filter(|entry| {
-            entry.kind == crate::legacy_partitions::LegacyPartitionKind::Callgraph
-                && entry.key == project_key
-        })
-        .map(|entry| {
-            let dir = if entry.path.is_dir() {
-                entry.path.clone()
-            } else {
-                entry
-                    .path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| entry.path.clone())
-            };
-            LegacyCallgraphPartition {
-                harness: entry.harness,
-                dir,
-                key: entry.key,
-                bytes: entry.bytes,
-                freshness: entry.callgraph_pointer_mtime,
-            }
-        })
-        .collect::<Vec<_>>();
-    partitions.sort_by(|left, right| {
-        right
-            .freshness
-            .cmp(&left.freshness)
-            .then_with(|| right.bytes.cmp(&left.bytes))
-            .then_with(|| left.harness.cmp(&right.harness))
-    });
-    Ok(partitions)
-}
 
 fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
     let domain_dir = callgraph_dir.parent()?;
@@ -12663,38 +12113,6 @@ fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
     domain_dir.parent().map(Path::to_path_buf)
 }
 
-pub(crate) fn all_legacy_partitions_migrated_for_keys(
-    callgraph_dir: &Path,
-    configured_keys: &BTreeSet<String>,
-) -> Result<bool> {
-    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
-        return Ok(false);
-    };
-    let legacy_keys = crate::legacy_partitions::inventory_legacy_partitions(&storage_root)?
-        .into_iter()
-        .filter(|entry| {
-            entry.kind == crate::legacy_partitions::LegacyPartitionKind::Callgraph
-                && configured_keys.contains(&entry.key)
-        })
-        .map(|entry| entry.key)
-        .collect::<BTreeSet<_>>();
-    if legacy_keys.is_empty() {
-        return Ok(false);
-    }
-
-    for key in legacy_keys {
-        let migrated_dir = storage_root.join("callgraph").join(&key);
-        let Some(generation) = read_pointer(&migrated_dir, &key) else {
-            return Ok(false);
-        };
-        if !migration_generation_requires_manifest(&generation)
-            || !migration_manifest_valid(&migrated_dir, &generation)
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
 
 fn newest_superseded_legacy_generation(
     partition: &LegacyCallgraphPartition,
@@ -12753,13 +12171,6 @@ fn current_legacy_generation(
     Ok(Some(target))
 }
 
-fn freshest_legacy_fallback_target(
-    callgraph_dir: &Path,
-    project_key: &str,
-) -> Result<Option<LegacyCallgraphTarget>> {
-    let partitions = legacy_callgraph_partitions(callgraph_dir, project_key)?;
-    first_ready_legacy_target(&partitions)
-}
 
 fn first_ready_legacy_target(
     partitions: &[LegacyCallgraphPartition],
@@ -13182,81 +12593,9 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
     format!("legacy-{}", &digest[..16])
 }
 
-/// Publication reuse must satisfy the same build-output check as a view reader.
-/// HEAD and manifest equality cannot make output from an older builder readable.
-pub(crate) fn manifest_view_database_ready(
-    view_dir: &Path,
-    generation: &str,
-    deadline: Instant,
-) -> Result<bool> {
-    if !manifest_producer_ready(view_dir, generation)? {
-        return Ok(false);
-    }
-    let path = manifest_view_database_path(view_dir, generation)?;
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    }
-    // Use the store's reader opener, not a raw descriptor on its live file set.
-    // Contention that outlasts this job's budget remains an unknown readiness
-    // result (the SQLite busy/locked error), never a definitive negative answer.
-    let conn = open_readonly_connection_before(&path, deadline)?;
-    conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
-    #[cfg(test)]
-    write_amplification_tests::before_readiness_query(&conn);
-    database_ready(&conn)
-}
 
-/// V2/V3 manifests carry extractor identities as well as database output
-/// versions. Publication and readers must agree on both before reusing a graph.
-fn manifest_producer_ready(view_dir: &Path, generation: &str) -> Result<bool> {
-    if crate::views::manifest_v2::GenerationName::parse(generation).is_none() {
-        return Ok(true);
-    }
-    let manifest = crate::views::ViewStore::existing_dir(view_dir.to_path_buf())
-        .ok_or_else(|| {
-            CallGraphStoreError::Unavailable("database is missing, stale, or mid-build".into())
-        })?
-        .load_manifest_v2(generation)
-        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-    let mut expected = manifest.header().producers.clone();
-    expected.callgraph = crate::callgraph_extractor::PRODUCER.into();
-    if manifest
-        .header()
-        .producers
-        .has_older_callgraph_than(&expected)
-    {
-        return Ok(false);
-    }
-    manifest
-        .ensure_producers(&expected)
-        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-    Ok(true)
-}
 
-fn ensure_manifest_producer_ready(view_dir: &Path, generation: &str) -> Result<()> {
-    if manifest_producer_ready(view_dir, generation)? {
-        Ok(())
-    } else {
-        Err(CallGraphStoreError::Unavailable(
-            "database is missing, stale, or mid-build".into(),
-        ))
-    }
-}
 
-fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
-    let generation_path = crate::views::resolve_derived_path(view_dir, generation)
-        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-    // Older publications used one checkout-wide database. Keep them readable
-    // until the first generation-owned publication replaces their handle.
-    Ok(if generation_path.is_file() {
-        generation_path
-    } else {
-        view_dir.join("derived.sqlite")
-    })
-}
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     open_readonly_connection_before(path, Instant::now())
@@ -13453,7 +12792,6 @@ fn checkpoint_wal_truncate(conn: &TrackedConnection) -> bool {
     }
 }
 
-pub(crate) use crate::views::materialization::materialize_manifest_view_database;
 
 pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -33622,80 +32960,6 @@ edition = "2021"
         (store, snapshot)
     }
 
-    pub(super) fn callgraph_fixture_view_store(
-        root: &Path,
-        inputs: &[PathBuf],
-    ) -> ReadonlyCallGraphStore {
-        use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let fixture_dir = root.join(format!(
-            "view-fixture-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&fixture_dir).unwrap();
-        let blobs_path = fixture_dir.join("view-blobs.sqlite");
-        let blobs = Connection::open(&blobs_path).unwrap();
-        blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
-        let mut entries = Vec::new();
-        for path in inputs {
-            let bytes = fs::read(path).unwrap();
-            let config = path
-                .file_name()
-                .is_some_and(|s| s == "go.mod" || s == "Cargo.toml");
-            let blob = if config {
-                join::CallgraphBlob::config(bytes, crate::callgraph_extractor::PRODUCER)
-            } else {
-                join::CallgraphBlob::extract(
-                    std::str::from_utf8(&bytes).unwrap(),
-                    lang_label(crate::parser::detect_language(path).unwrap()),
-                    crate::callgraph_extractor::PRODUCER,
-                )
-                .unwrap()
-            };
-            let payload = blob.to_bytes().unwrap();
-            let key = blake3::hash(&payload);
-            let digest = blake3::hash(&payload);
-            blobs
-                .execute(
-                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
-                    params![
-                        key.as_bytes().as_slice(),
-                        payload,
-                        digest.as_bytes().as_slice()
-                    ],
-                )
-                .unwrap();
-            entries.push((
-                RelPath::new(relative_path(root, path).into_bytes()).unwrap(),
-                ManifestEntry::Regular {
-                    mode: 0o100644,
-                    planes: RegularPlanes {
-                        semantic: None,
-                        callgraph: Some(key.to_hex().to_string()),
-                    },
-                    resolution_input: config,
-                },
-            ));
-        }
-        let manifest = Manifest::new(entries).unwrap();
-        let views = fixture_dir.join("views");
-        fs::create_dir_all(&views).unwrap();
-        let database = manifest_view_database_path(&views, "parity").unwrap();
-        crate::views::materialization::materialize_manifest_view_database(
-            &database,
-            &blobs_path,
-            &manifest,
-        )
-        .unwrap();
-        ReadonlyCallGraphStore::open_manifest_view(
-            root.to_path_buf(),
-            "parity".into(),
-            views,
-            "parity",
-            None,
-        )
-        .unwrap()
-    }
 
     fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
         let view = callgraph_fixture_view_store(root, inputs);
@@ -33876,39 +33140,6 @@ edition = "2021"
         }
     }
 
-    #[test]
-    fn callgraph_previous_producer_blobs_are_lookup_misses() {
-        use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey};
-        let dir = tempdir().unwrap();
-        let mut store =
-            BlobStore::open(dir.path(), "version-fixture", BlobPlane::Callgraph).unwrap();
-        let source = b"package main\nvar Boot = Register()\n";
-        for (old_version, current_version) in [
-            (
-                "callgraph-v5-manifest-root-reexport-resolution",
-                crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
-            ),
-            (
-                "ruled-callgraph-v6-manifest-root-reexport-resolution",
-                crate::callgraph_extractor::PRODUCER,
-            ),
-            (
-                "ruled-callgraph-v9-without-ast-index",
-                crate::callgraph_extractor::PRODUCER,
-            ),
-        ] {
-            let old = CallgraphKey::from_bytes(source, "go", old_version).full_key();
-            store
-                .put(&old, b"old parse output without vars or macro refs")
-                .unwrap();
-            assert!(store.get(&old).unwrap().is_some());
-            let current = CallgraphKey::from_bytes(source, "go", current_version).full_key();
-            assert!(
-                store.get(&current).unwrap().is_none(),
-                "old parse output reused by {current_version}"
-            );
-        }
-    }
 
     #[test]
     fn callgraph_non_go_exported_variable_retains_view_root_flag() {

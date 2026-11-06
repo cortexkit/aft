@@ -2593,27 +2593,7 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
-            if let Some(view) = ctx.view_runtime_snapshot().filter(|view| {
-                view.pending_inputs
-                    .values()
-                    .any(|input| input.plane == "checkout")
-            }) {
-                let mut response = callgraph_index_refusal(
-                    req_id,
-                    "callgraph_building",
-                    format!("{operation}: call graph is waiting for working-tree verification and view publication; retry shortly"),
-                    IndexObservation::building(),
-                );
-                response.data["progress"] = serde_json::json!({
-                    "phase": "working_tree_refresh",
-                    "pending_paths": view.pending_paths.len(),
-                    "waiting_on": [{"plane": "checkout", "reason": "working-tree verification and view publication"}],
-                });
-                return response;
-            }
-            {
-                building_response(req_id, operation)
-            }
+            building_response(req_id, operation)
         }
         CallgraphStoreAccess::Suspended(suspension) => {
             suspended_response(req_id, operation, suspension)
@@ -3270,7 +3250,6 @@ fn content_matches_store(
     Ok(
         stored == crate::cache_freshness::zero_hash().to_hex().as_str()
             || stored == current.to_hex().as_str()
-            || stored == view_blob_key(file, current).unwrap_or_default()
             || data_layer_record_keys(file, current).contains(&stored),
     )
 }
@@ -3304,24 +3283,6 @@ fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
         .collect()
 }
 
-/// A view-materialized graph records each file's call-graph blob key rather
-/// than its raw content hash. The key is derived from the content hash, the
-/// file's language and the extractor version, so the current bytes match
-/// exactly when they derive the stored key.
-fn view_blob_key(file: &str, current: blake3::Hash) -> Option<String> {
-    let language = if crate::callgraph_extractor::is_resolution_input(file.as_bytes()) {
-        "config".to_owned()
-    } else {
-        format!("{:?}", crate::parser::detect_language(Path::new(file))?).to_lowercase()
-    };
-    let key = crate::blob_store::CallgraphKey::from_source_digest(
-        *current.as_bytes(),
-        language,
-        crate::callgraph_extractor::PRODUCER,
-    )
-    .full_key();
-    Some(crate::blob_store::v2::FamilyKey::from(&key).to_hex())
-}
 
 fn file_matches_store(
     store: &impl CallGraphRead,

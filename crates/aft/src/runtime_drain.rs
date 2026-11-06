@@ -559,14 +559,10 @@ impl StandaloneConfigureMaintenance {
     }
 
     pub fn drain_prefix(&mut self, ctx: &Arc<AppContext>) -> bool {
-        // A view publication scheduled here detaches instead of running on the
-        // standalone request thread; see `install_standalone_scope`.
-        let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
         crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
     }
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
-        let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
         crate::commands::configure::drain_standalone_configure_unit(ctx, &mut self.inner)
     }
 }
@@ -717,7 +713,6 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
 /// the call-graph store's, then the semantic index's.
 pub fn drain_build_completions(ctx: &AppContext) {
     drain_callgraph_store_events(ctx);
-    drain_semantic_index_events(ctx);
 }
 
 /// Return true when any background build-completion receiver is currently set.
@@ -922,7 +917,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         // generation through its read-only pointer.
         drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            match CallGraphStore::reopen_readonly(ctx.callgraph_store_dir(), project_root) {
+            // Today's call-graph store is retired: no build publishes one.
+            let _ = project_root;
+            match Ok::<Option<crate::callgraph_store::ReadonlyCallGraphStore>, crate::callgraph_store::CallGraphStoreError>(None) {
                 Ok(Some(store)) => reopened = Some(Arc::new(store)),
                 Ok(None) => {
                     crate::slog_warn!(
@@ -1017,379 +1014,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 }
 
-/// Starts a background check of the disk limits of the repository family
-/// whose per-checkout view this root has loaded, when one is due (see
-/// `views::eviction`). It runs on its own thread so eviction and the family
-/// sweep never hold up a drain. With views on but no checkout loaded yet,
-/// it looks again shortly; with views off it is never due.
-pub fn drain_view_disk_limits(ctx: &AppContext) {
-    if !ctx.view_disk_limits_due() {
-        return;
-    }
-    match ctx.checkout_view_registry() {
-        Some(registry) => {
-            ctx.schedule_view_disk_limits(crate::views::eviction::ENFORCEMENT_INTERVAL);
-            crate::views::eviction::spawn_enforcement_if_due(registry);
-        }
-        None => ctx.schedule_view_disk_limits(VIEW_DISK_LIMITS_UNLOADED_RETRY),
-    }
-}
-
 /// How soon the drain looks again for a views-on root whose checkout view
 /// has not loaded yet.
 const VIEW_DISK_LIMITS_UNLOADED_RETRY: Duration = Duration::from_secs(30);
-
-pub fn drain_semantic_index_events(ctx: &AppContext) {
-    drain_view_disk_limits(ctx);
-    let (events, disconnected, receiver_generation, receiver_epoch) = {
-        let rx_ref = ctx.semantic_index_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-
-        let mut events = Vec::new();
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (
-            events,
-            disconnected,
-            ctx.semantic_index_rx_generation(),
-            ctx.semantic_index_rx_epoch(),
-        )
-    };
-
-    if events.is_empty() && !disconnected {
-        return;
-    }
-    let carries_finished_load = events
-        .iter()
-        .any(|event| matches!(event, SemanticIndexEvent::Ready(_)));
-    let recorded_bytes = carries_finished_load
-        .then(|| ctx.take_semantic_pending_install(receiver_epoch))
-        .flatten();
-    // A dequeued finished load that cannot be committed is dropped when this
-    // function returns; say so and why, so the memory it held is accounted for
-    // in the log rather than vanishing silently.
-    let log_discarded_load = || {
-        if carries_finished_load {
-            crate::context::log_discarded_finished_load(
-                "semantic index",
-                ctx.canonical_cache_root_opt().as_deref(),
-                recorded_bytes,
-                ctx.finished_load_discard_reason(
-                    receiver_generation,
-                    receiver_epoch,
-                    ctx.semantic_index_rx_epoch(),
-                ),
-            );
-        }
-    };
-
-    wait_on_artifact_drain_commit_gate_for_test(ctx);
-    let mut terminal = false;
-    let mut status_changed = false;
-    let mut replay_refresh_paths = Vec::new();
-    let mut replay_corpus_refresh = false;
-    let mut cold_seed_resumes = Vec::new();
-
-    for event in events {
-        match event {
-            SemanticIndexEvent::Progress {
-                stage,
-                files,
-                entries_done,
-                entries_total,
-            } => {
-                let committed = ctx
-                    .with_current_semantic_index_rx(
-                        receiver_generation,
-                        receiver_epoch,
-                        |_receiver| {
-                            // Progress describes the replacement, not the usability
-                            // of a generation that has already been published.
-                            if ctx
-                                .semantic_index()
-                                .read()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .is_some()
-                            {
-                                return true;
-                            }
-                            *ctx.semantic_index_status()
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                SemanticIndexStatus::Building {
-                                    stage,
-                                    files,
-                                    entries_done,
-                                    entries_total,
-                                };
-                            true
-                        },
-                    )
-                    .unwrap_or(false);
-                if !committed {
-                    log_discarded_load();
-                    return;
-                }
-                status_changed = true;
-            }
-            SemanticIndexEvent::ColdSeedGateCleared => {
-                let resume = ctx.with_current_semantic_index_rx(
-                    receiver_generation,
-                    receiver_epoch,
-                    |_receiver| ctx.take_semantic_cold_seed_resume(true),
-                );
-                let Some(resume) = resume else {
-                    log_discarded_load();
-                    return;
-                };
-                cold_seed_resumes.push(resume);
-            }
-            SemanticIndexEvent::Ready(mut index) => {
-                let borrowed_paths = if ctx.shared_artifacts_read_only() {
-                    crate::commands::configure::borrowed_semantic_refresh_paths(ctx, &index)
-                } else {
-                    Ok(Vec::new())
-                };
-                // Hide rows whose hashes differ in this checkout before the
-                // watcher filter runs: matching sizes and mtimes must not make
-                // that filter discard a content difference found at adoption.
-                if let Ok(paths) = &borrowed_paths {
-                    index.invalidate_files(paths);
-                }
-                let committed = ctx.with_current_semantic_index_rx(
-                    receiver_generation,
-                    receiver_epoch,
-                    |receiver| {
-                        mark_semantic_corpus_refresh_success(ctx);
-                        let mut refresh_paths = ctx
-                            .take_pending_semantic_index_paths()
-                            .into_iter()
-                            .filter(|path| watcher_path_is_semantic_source(path))
-                            .collect::<Vec<_>>();
-                        match borrowed_paths {
-                            Ok(paths) => refresh_paths.extend(paths),
-                            Err(error) => {
-                                *ctx.semantic_index()
-                                    .write()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                                *ctx.semantic_index_status()
-                                    .write()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    SemanticIndexStatus::Failed(error);
-                                *receiver = None;
-                                return (
-                                    ctx.take_semantic_cold_seed_resume(false),
-                                    Vec::new(),
-                                    false,
-                                );
-                            }
-                        }
-                        refresh_paths.sort();
-                        refresh_paths.dedup();
-                        // Events that arrived during the build only matter for
-                        // files whose content moved past what the build read.
-                        let refresh_paths =
-                            semantic_paths_with_changed_content(ctx, &index, refresh_paths);
-                        index.invalidate_files(&refresh_paths);
-                        let corpus_refresh = (ctx.take_pending_semantic_corpus_refresh()
-                            || index.summaries_need_repair())
-                            && !ctx.shared_artifacts_read_only();
-                        if let Some(root) = ctx.canonical_cache_root_opt() {
-                            let semantic_config = ctx.config().semantic.clone();
-                            let _ = index.adopt_frozen_base_for_root(&root, &semantic_config);
-                        }
-                        *ctx.semantic_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                        *ctx.semantic_index_status()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            SemanticIndexStatus::ready();
-                        *receiver = None;
-                        (
-                            ctx.take_semantic_cold_seed_resume(false),
-                            refresh_paths,
-                            corpus_refresh,
-                        )
-                    },
-                );
-                let Some((resume, refresh_paths, corpus_refresh)) = committed else {
-                    log_discarded_load();
-                    return;
-                };
-                cold_seed_resumes.push(resume);
-                replay_refresh_paths.extend(refresh_paths);
-                replay_corpus_refresh = corpus_refresh;
-                terminal = true;
-                status_changed = true;
-            }
-            SemanticIndexEvent::Failed(error) => {
-                let committed = ctx.with_current_semantic_index_rx(
-                    receiver_generation,
-                    receiver_epoch,
-                    |receiver| {
-                        let _ = ctx.take_pending_semantic_index_paths();
-                        let _ = ctx.take_pending_semantic_corpus_refresh();
-                        *ctx.semantic_index()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                        ctx.clear_semantic_refresh_worker();
-                        *ctx.semantic_index_status()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            SemanticIndexStatus::Failed(error);
-                        *receiver = None;
-                        ctx.take_semantic_cold_seed_resume(false)
-                    },
-                );
-                let Some(resume) = committed else {
-                    return;
-                };
-                cold_seed_resumes.push(resume);
-                terminal = true;
-                status_changed = true;
-            }
-        }
-    }
-
-    if terminal
-        && matches!(
-            &*ctx
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            SemanticIndexStatus::Ready { .. }
-        )
-    {
-        let _ = crate::commands::configure::ensure_ready_semantic_refresh_worker(ctx);
-    }
-
-    if disconnected && !terminal {
-        let committed =
-            ctx.with_current_semantic_index_rx(receiver_generation, receiver_epoch, |receiver| {
-                let _ = ctx.take_pending_semantic_index_paths();
-                let _ = ctx.take_pending_semantic_corpus_refresh();
-                *ctx.semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                ctx.clear_semantic_refresh_worker();
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Failed(
-                        "semantic index build worker disconnected before reporting completion"
-                            .to_string(),
-                    );
-                *receiver = None;
-                ctx.take_semantic_cold_seed_resume(false)
-            });
-        let Some(resume) = committed else {
-            return;
-        };
-        cold_seed_resumes.push(resume);
-        status_changed = true;
-    }
-
-    if terminal || disconnected {
-        ctx.set_semantic_build_progress(None);
-    }
-
-    for resume in cold_seed_resumes {
-        ctx.apply_semantic_cold_seed_resume(resume);
-    }
-
-    if replay_corpus_refresh {
-        let replayed = ctx.run_if_subc_bound_generation(receiver_generation, || {
-            if ctx.semantic_index_rx_epoch() != receiver_epoch
-                || ctx.canonical_cache_root_opt().is_none()
-            {
-                return false;
-            }
-            *ctx.semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                SemanticIndexStatus::Building {
-                    stage: "refreshing_corpus".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-            let sent = ctx
-                .semantic_refresh_sender()
-                .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
-            if !sent {
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Failed(
-                        "semantic corpus refresh worker unavailable".to_string(),
-                    );
-            }
-            true
-        });
-        if replayed != Some(true) {
-            return;
-        }
-        status_changed = true;
-    } else if !replay_refresh_paths.is_empty() {
-        let replayed = ctx.run_if_subc_bound_generation(receiver_generation, || {
-            if ctx.semantic_index_rx_epoch() != receiver_epoch {
-                return false;
-            }
-            {
-                let mut status = ctx
-                    .semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                    for path in &replay_refresh_paths {
-                        status.add_refreshing_file(path.clone());
-                    }
-                }
-            }
-            let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-                sender
-                    .send(SemanticRefreshRequest::Files {
-                        paths: replay_refresh_paths.clone(),
-                    })
-                    .is_ok()
-            });
-            if !sent {
-                crate::slog_warn!(
-                    "semantic refresh worker unavailable; dropping {} replayed file(s)",
-                    replay_refresh_paths.len()
-                );
-                let mut status = ctx
-                    .semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for path in &replay_refresh_paths {
-                    status.cancel_refreshing_file(path);
-                }
-            }
-            true
-        });
-        if replayed != Some(true) {
-            return;
-        }
-        status_changed = true;
-    }
-
-    if status_changed {
-        ctx.signal_status_changed();
-    }
-}
 
 pub const MAX_RETRY_ATTEMPTS: usize = 6;
 pub const BREAKER_TRIP_THRESHOLD: usize = 3;
@@ -1651,411 +1278,6 @@ pub fn schedule_semantic_refresh_retry(
         });
     });
     true
-}
-
-pub fn drain_semantic_refresh_events(ctx: &AppContext) {
-    let (events, disconnected, receiver_generation, receiver_epoch) = {
-        let rx_ref = ctx.semantic_refresh_event_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-
-        let mut events = Vec::new();
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (
-            events,
-            disconnected,
-            ctx.semantic_refresh_generation(),
-            ctx.semantic_refresh_epoch(),
-        )
-    };
-
-    if events.is_empty() && !disconnected {
-        maybe_fire_semantic_refresh_probe(ctx);
-        return;
-    }
-
-    wait_on_artifact_drain_commit_gate_for_test(ctx);
-    let committed = ctx.with_current_semantic_refresh_rx(
-        receiver_generation,
-        receiver_epoch,
-        || {
-        let had_events = !events.is_empty();
-        let mut status_changed = false;
-        let mut replay_refresh_paths = Vec::new();
-        let mut schedule_breaker_probe = false;
-        let mut view_refresh_completed = false;
-        for event in events {
-        match event {
-            SemanticRefreshEvent::Started { paths } => {
-                let mut status = ctx
-                    .semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                    for path in paths {
-                        status.start_refreshing_file(path);
-                    }
-                    status_changed = true;
-                }
-            }
-            SemanticRefreshEvent::CorpusStarted { files } => {
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::Building {
-                        stage: "refreshing_corpus".to_string(),
-                        files: Some(files),
-                        entries_done: None,
-                        entries_total: None,
-                    };
-                status_changed = true;
-            }
-            SemanticRefreshEvent::Completed {
-                mut added_entries,
-                mut refused_rows,
-                mut context_skipped,
-                mut updated_metadata,
-                mut completed_paths,
-            } => {
-                // A worker generation can finish an older batch after the
-                // watcher has invalidated a second edit. Do not resurrect that
-                // batch or clear its successor's pending path.
-                let files_with_rows = added_entries.iter().map(|entry| entry.file()).collect::<HashSet<_>>();
-                let stale = updated_metadata.iter().filter_map(|(path, record)| {
-                    // Oversized files deliberately produce no rows and no hash.
-                    // A matching size/mtime can acknowledge that empty result;
-                    // demanding a hash here would retry the skipped file forever.
-                    let current = if record.size > aft::cache_freshness::CONTENT_HASH_SIZE_CAP
-                        && !files_with_rows.contains(path.as_path())
-                    {
-                        std::fs::metadata(path).is_ok_and(|metadata|
-                            metadata.len() == record.size && metadata.modified().ok() == Some(record.mtime))
-                    } else {
-                        matches!(aft::cache_freshness::verify_file_strict(path, record),
-                            aft::cache_freshness::FreshnessVerdict::HotFresh |
-                            aft::cache_freshness::FreshnessVerdict::ContentFresh { .. })
-                    };
-                    (!current || watcher_path_is_ignored_by_current_matcher(ctx, path)).then(|| path.clone())
-                }).collect::<HashSet<_>>();
-                added_entries.retain(|entry| !stale.contains(entry.file()));
-                updated_metadata.retain(|(path, _)| !stale.contains(path));
-                completed_paths.retain(|path| !stale.contains(path));
-                refused_rows.retain(|path, _| completed_paths.contains(path));
-                context_skipped.retain(|path, _| completed_paths.contains(path));
-                // Rows are only installed together with the freshness record of
-                // their file. A row without one (a file deleted while its batch
-                // was in flight) would be unreachable by every later freshness
-                // check and stay in the index for good.
-                let with_metadata = updated_metadata.iter().map(|(path, _)| path.as_path()).collect::<HashSet<_>>();
-                added_entries.retain(|entry| with_metadata.contains(entry.file()));
-                replay_refresh_paths.extend(stale.into_iter().filter(|path| !watcher_path_is_ignored_by_current_matcher(ctx, path)));
-                if let Some(index) = ctx
-                    .semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_mut()
-                {
-                    index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
-                    index.apply_refused_rows_update(refused_rows);
-                    index.apply_context_skips_update(context_skipped);
-                }
-                mark_semantic_refresh_success(ctx, &completed_paths);
-                view_refresh_completed = true;
-                let mut status = ctx
-                    .semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                    for path in &completed_paths {
-                        status.complete_refreshing_file(path);
-                    }
-                    status_changed = true;
-                }
-            }
-            SemanticRefreshEvent::CorpusCompleted {
-                mut index,
-                changed,
-                added,
-                deleted,
-                total_processed,
-            } => {
-                let snapshot_changes = match crate::commands::configure::borrowed_semantic_refresh_paths(ctx, &index) {
-                    Ok(paths) => paths,
-                    Err(error) => {
-                        aft::slog_warn!("semantic corpus completion could not verify current files: {}", error);
-                        ctx.mark_pending_semantic_corpus_refresh();
-                        continue;
-                    }
-                };
-                index.invalidate_files(&snapshot_changes);
-                aft::runtime_drain::mark_semantic_corpus_refresh_success(ctx);
-                if changed > 0 || added > 0 || deleted > 0 {
-                    aft::slog_info!(
-                        "semantic corpus refresh completed: {} changed, {} new, {} deleted, {} total processed",
-                        changed,
-                        added,
-                        deleted,
-                        total_processed
-                    );
-                }
-                let mut pending_paths = ctx
-                    .take_pending_semantic_index_paths()
-                    .into_iter()
-                    .filter(|path| aft::runtime_drain::watcher_path_is_semantic_source(path))
-                    .collect::<Vec<_>>();
-                pending_paths.extend(snapshot_changes);
-                pending_paths.sort();
-                pending_paths.dedup();
-                let invalidated_paths = semantic_paths_with_changed_content(ctx, &index, pending_paths);
-                for path in &invalidated_paths {
-                    if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, path) {
-                        replay_refresh_paths.push(path.clone());
-                    }
-                }
-                index.invalidate_files(&invalidated_paths);
-                *ctx.semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-                *ctx.semantic_index_status()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    SemanticIndexStatus::ready();
-                view_refresh_completed = true;
-                status_changed = true;
-            }
-            SemanticRefreshEvent::Failed { paths, error } => {
-                if aft::semantic_index::embedding_failure_is_transient(&error) {
-                    if record_semantic_refresh_transient_failure(ctx, &error) {
-                        ctx.add_pending_semantic_index_paths(paths);
-                        schedule_breaker_probe = true;
-                    } else if !schedule_semantic_refresh_retry(ctx, paths.clone(), &error) {
-                        aft::slog_warn!(
-                            "semantic refresh worker unavailable; preserving {} transiently failed file(s) for retry",
-                            paths.len(),
-                        );
-                        ctx.add_pending_semantic_index_paths(paths);
-                    }
-                } else {
-                    aft::slog_warn!("semantic refresh failed: {}", error);
-                    reset_semantic_refresh_transient_failure_count(ctx);
-                    clear_semantic_refresh_retry_attempts(ctx, &paths);
-                    let mut status = ctx
-                        .semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                        for path in &paths {
-                            status.complete_refreshing_file(path);
-                        }
-                        status_changed = true;
-                    }
-                }
-            }
-            SemanticRefreshEvent::CorpusFailed { paths, error } => {
-                let summary_repair_pending = !ctx.shared_artifacts_read_only()
-                    && ctx
-                        .semantic_index()
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .is_some_and(|index| index.summaries_need_repair());
-                if summary_repair_pending {
-                    ctx.mark_pending_semantic_corpus_refresh();
-                }
-                // A transient backend blip during a corpus refresh must NOT
-                // destroy the working index — the prior index is still valid and
-                // serving. Keep it Ready and let the next watcher/ignore change
-                // re-trigger the refresh, rather than nuking everything to
-                // `Failed` over a connection hiccup (the same park-forever trap
-                // the initial build now rides out). A deferred summary repair
-                // also keeps the published cache and records a pending corpus
-                // refresh for retry: its saved vectors are still usable even
-                // if the backend rejects the replacement input. Other permanent
-                // refresh errors still drop the index and surface the failure.
-                if aft::semantic_index::embedding_failure_is_transient(&error)
-                    || summary_repair_pending
-                {
-                    let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
-                    let has_index = ctx
-                        .semantic_index()
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_some();
-                    // The corpus worker already paid for the project walk and
-                    // identified the exact changed/new/deleted file set. Retain
-                    // only those paths so the probe re-extracts them through the
-                    // file refresh lane instead of collecting the corpus again.
-                    ctx.add_pending_semantic_index_paths(paths);
-                    ctx.trip_semantic_refresh_circuit(BREAKER_TRIP_THRESHOLD, &clean);
-                    schedule_breaker_probe = true;
-                    if has_index {
-                        aft::slog_warn!(
-                            "semantic corpus refresh hit a transient backend error ({}); keeping the existing index",
-                            clean,
-                        );
-                        *ctx.semantic_index_status()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            SemanticIndexStatus::ready();
-                    } else {
-                        // No index to fall back on — surface the clean message.
-                        aft::slog_warn!("semantic corpus refresh failed: {}", clean);
-                        *ctx.semantic_index_status()
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            SemanticIndexStatus::Failed(clean);
-                    }
-                    status_changed = true;
-                } else {
-                    aft::slog_warn!("semantic corpus refresh failed: {}", error);
-                    let _ = ctx.take_pending_semantic_index_paths();
-                    *ctx.semantic_index()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                    *ctx.semantic_index_status()
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        SemanticIndexStatus::Failed(error);
-                    status_changed = true;
-                }
-            }
-            }
-        }
-
-        if disconnected {
-        let refreshing_paths = {
-            let status = ctx
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match &*status {
-                SemanticIndexStatus::Ready { refreshing, .. } => refreshing.clone(),
-                _ => Vec::new(),
-            }
-        };
-        if !refreshing_paths.is_empty() {
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in &refreshing_paths {
-                status.cancel_refreshing_file(path);
-            }
-        }
-        if !refreshing_paths.is_empty() || had_events {
-            status_changed = true;
-        }
-    }
-
-    if !replay_refresh_paths.is_empty() {
-        {
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
-                for path in &replay_refresh_paths {
-                    status.add_refreshing_file(path.clone());
-                }
-                status_changed = true;
-            }
-        }
-        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
-            sender
-                .send(SemanticRefreshRequest::Files {
-                    paths: replay_refresh_paths.clone(),
-                })
-                .is_ok()
-        });
-        if !sent {
-            aft::slog_warn!(
-                "semantic refresh worker unavailable; dropping {} replayed corpus file(s)",
-                replay_refresh_paths.len()
-            );
-            let mut status = ctx
-                .semantic_index_status()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in &replay_refresh_paths {
-                status.cancel_refreshing_file(path);
-            }
-            status_changed = true;
-        }
-        }
-
-        (status_changed, schedule_breaker_probe, view_refresh_completed)
-    },
-    );
-    let Some((mut status_changed, schedule_breaker_probe, view_refresh_completed)) = committed
-    else {
-        return;
-    };
-    if schedule_breaker_probe && semantic_refresh_circuit_is_open(ctx) {
-        ensure_semantic_refresh_probe_scheduled(ctx);
-    }
-    if disconnected {
-        if let Some(disconnected_build_epoch) =
-            ctx.clear_semantic_refresh_worker_if_current(receiver_generation, receiver_epoch)
-        {
-            wait_on_semantic_refresh_recovery_gate_for_test(ctx);
-            let _ = crate::commands::configure::restart_semantic_artifacts_after_refresh_disconnect(
-                ctx,
-                disconnected_build_epoch,
-            );
-            status_changed = true;
-        }
-    }
-
-    maybe_fire_semantic_refresh_probe(ctx);
-
-    if view_refresh_completed {
-        publish_semantic_ready_view(ctx);
-    }
-
-    if status_changed {
-        ctx.signal_status_changed();
-    }
-}
-
-fn publish_semantic_ready_view(ctx: &AppContext) {
-    let Some(paths) = semantic_ready_view_publication_paths(
-        ctx.view_runtime_snapshot()
-            .map(|snapshot| snapshot.pending_paths),
-    ) else {
-        return;
-    };
-    let Some(root) = ctx.canonical_cache_root_opt() else {
-        return;
-    };
-    match crate::executor::view_publication::schedule_with_reason(
-        ctx,
-        paths,
-        !ctx.shared_artifacts_read_only(),
-        crate::views::publication_reason::Reason {
-            events: crate::views::publication_reason::Reason::SEMANTIC,
-            ..Default::default()
-        },
-    ) {
-        Ok(()) => crate::slog_info!(
-            "content-addressed view publication scheduled after semantic refresh root={}",
-            root.display()
-        ),
-        Err(error) => crate::slog_warn!(
-            "content-addressed view publication after semantic refresh failed: {}",
-            error
-        ),
-    }
 }
 
 /// Source file extensions that the call graph supports.
@@ -3089,115 +2311,13 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     state.semantic_refresh_paths.clear();
 }
 
-/// Paths the view still owes a semantic plane, or `None` when a completed
-/// refresh has nothing to publish. An absent view runtime (views off, or the
-/// load failed) and an empty pending set both mean "do nothing": the current
-/// generation already covers HEAD, and re-deriving it would only mint a
-/// duplicate.
-fn semantic_ready_view_publication_paths(
-    pending: Option<BTreeSet<Vec<u8>>>,
-) -> Option<BTreeSet<Vec<u8>>> {
-    pending.filter(|paths| !paths.is_empty())
-}
-
 /// Start a linked worktree's on-demand call-graph build that a query asked
 /// for but could not start itself (it ran outside the standalone scope).
 /// Standalone mode has no root actor, so the build detaches under the same
 /// standalone scope configure maintenance uses. Cheap when nothing is owed.
 pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
-    if !ctx.lazy_callgraph_build_outstanding() {
-        return;
-    }
-    let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
-    ctx.schedule_lazy_callgraph_build();
-}
-
-pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
-    {
-        return;
-    }
-    let Some(root) = ctx.canonical_cache_root_opt() else {
-        return;
-    };
-    if ctx.retire_deleted_view_root() {
-        state.view_publication_due = None;
-        state.view_publication_paths.clear();
-        state.view_publication_full = false;
-        state.view_publication_reason = Default::default();
-        return;
-    }
-    {
-        state.view_publication_due = None;
-        state.view_publication_paths.clear();
-        state.view_publication_full = false;
-        state.view_publication_reason = Default::default();
-        return;
-    }
-    if let Some(due) = ctx
-        .view_publication_retry()
-        .lock()
-        .due()
-        .filter(|due| Instant::now() < *due)
-    {
-        state.view_publication_due = Some(due);
-        return;
-    }
-    let changed = if state.view_publication_full {
-        BTreeSet::new()
-    } else {
-        state
-            .view_publication_paths
-            .iter()
-            .map(|path| {
-                path.strip_prefix(&root).ok()
-                    .and_then(|path| aft::views::RelPath::from_os_path(path).ok())
-                    .map(|path| path.as_bytes().to_vec())
-            })
-            // Losing one spelling (including a differently cased root) loses
-            // evidence for the whole delta, not just for that one path.
-            .collect::<Option<BTreeSet<_>>>()
-            .unwrap_or_default()
-    };
-    match crate::executor::view_publication::schedule_with_reason(
-        ctx,
-        changed,
-        !ctx.shared_artifacts_read_only(),
-        state.view_publication_reason,
-    ) {
-        Ok(()) => {
-            aft::slog_info!(
-                "content-addressed view publication scheduled root={}",
-                root.display()
-            );
-            state.view_publication_paths.clear();
-            state.view_publication_full = false;
-            state.view_publication_reason = Default::default();
-            state.view_publication_due = None;
-        }
-        Err(error) => {
-            if ctx.retire_deleted_view_root() || true {
-                state.view_publication_due = None;
-                state.view_publication_paths.clear();
-                state.view_publication_full = false;
-                state.view_publication_reason = Default::default();
-                return;
-            }
-            // Inline publication records and logs the failure in the same retry
-            // state used by detached jobs. Preserve this drain's path union.
-            let retry_due = ctx.view_publication_retry().lock().due();
-            if retry_due.is_none() {
-                // Admission or thread-spawn failures happen before the shared
-                // publication loop can record them; keep their diagnostic.
-                aft::slog_warn!(
-                    "content-addressed view publication failed root={} error={}",
-                    root.display(),
-                    error
-                );
-            }
-            state.view_publication_due =
-                retry_due.or_else(|| Some(Instant::now() + Duration::from_secs(1)));
-        }
-    }
+    // Today's call-graph store is retired, so nothing is ever owed.
+    let _ = ctx;
 }
 
 fn rebuild_gitignore_for_drain(
@@ -3306,22 +2426,12 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                                 })
                                 .inspect(|_| accepted = true),
                         );
-                        if accepted {
-                            state.view_publication_reason.events |= if content_only {
-                                crate::views::publication_reason::Reason::CONTENT
-                            } else {
-                                crate::views::publication_reason::Reason::PATHS
-                            };
-                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
                     // The individual changed paths are lost, so the data
                     // layer compares every file with its checkout's state.
                     ctx.data_rescan();
-                    state.view_publication_reason.events |=
-                        crate::views::publication_reason::Reason::RESCAN;
-                    state.view_publication_full = true;
                     dispatch_events_received += 1;
                     // A rescan means the watcher dropped the individual
                     // changed paths, so any of them may have changed the
@@ -3351,8 +2461,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     }
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
-                    state.view_publication_reason.events |=
-                        crate::views::publication_reason::Reason::IGNORE;
                     dispatch_events_received += 1;
                     // The watcher filter drops an ignore file that ignores
                     // itself from the changed paths, so the data layer hears
@@ -3694,7 +2802,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         apply_watcher_slice(ctx, &mut state, started);
     }
 
-    publish_view_if_quiet(ctx, &mut state);
 
     let receiver_has_more = ctx
         .watcher_rx()
@@ -4907,7 +4014,6 @@ mod tests {
                 crate::semantic_index::SemanticIndex::new(root.path().to_path_buf(), 3),
             ))
             .unwrap();
-        drain_semantic_index_events(&ctx);
 
         assert!(matches!(
             &*ctx
@@ -5800,7 +4906,6 @@ mod tests {
             entries_total: Some(10),
         })
         .unwrap();
-        drain_semantic_index_events(&ctx);
         assert!(matches!(
             *ctx.semantic_index_status().read().unwrap(),
             SemanticIndexStatus::Ready { .. }
@@ -5896,7 +5001,6 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_semantic_index_rx(rx, ctx.configure_generation());
         tx.send(SemanticIndexEvent::Ready(index)).unwrap();
-        drain_semantic_index_events(&ctx);
 
         let row = ctx.memory_root_snapshot();
         assert_eq!(
@@ -5981,7 +5085,6 @@ mod tests {
             waiting.attributed_bytes >= bytes,
             "the waiting load counts toward the root's attributed bytes"
         );
-        drain_semantic_index_events(&ctx);
         assert!(installed_semantic_entries(&ctx).is_some());
         let installed = ctx.memory_root_snapshot();
         assert_eq!(installed.pending_install.estimated_bytes, Some(0));
@@ -6047,7 +5150,6 @@ mod tests {
             "a load no longer in the receiver is not waiting"
         );
         drop(dequeued);
-        drain_semantic_index_events(&ctx);
         ctx.semantic_pending_install().record(epoch, bytes);
         assert_eq!(
             ctx.memory_root_snapshot().pending_install.estimated_bytes,
@@ -6076,7 +5178,6 @@ mod tests {
             None
         );
         assert_eq!(tx.len(), 0);
-        drain_semantic_index_events(&ctx);
         assert_eq!(installed_semantic_entries(&ctx), None);
         assert_eq!(
             ctx.memory_root_snapshot().pending_install.estimated_bytes,
@@ -6100,7 +5201,6 @@ mod tests {
             Some(true)
         );
         ctx.mark_subc_unbound();
-        drain_semantic_index_events(&ctx);
         assert_eq!(installed_semantic_entries(&ctx), None);
         assert_eq!(tx.len(), 0, "the drain took the load and dropped it");
         assert_eq!(
@@ -6172,7 +5272,6 @@ mod tests {
             hand_off_semantic_load(&ctx, &new_tx, new_epoch, new_generation, new_index),
             Some(true)
         );
-        drain_semantic_index_events(&ctx);
         assert_eq!(installed_semantic_entries(&ctx), Some(new_entries));
     }
 
@@ -6348,7 +5447,6 @@ mod tests {
                 completed_paths: update.completed_paths,
             })
             .unwrap();
-        drain_semantic_refresh_events(&ctx);
         assert!(
             request_rx.try_recv().is_err(),
             "unchanged oversized skip was requeued"
@@ -6409,7 +5507,6 @@ mod tests {
             ctx.semantic_index_rx_epoch(),
         );
         tx.send(SemanticIndexEvent::Ready(borrowed)).unwrap();
-        drain_semantic_index_events(&ctx);
         assert_eq!(
             ctx.semantic_index().read().unwrap().as_ref().unwrap().len(),
             0,
@@ -6495,7 +5592,6 @@ mod tests {
                 completed_paths: update.completed_paths,
             })
             .unwrap();
-        drain_semantic_refresh_events(&ctx);
         let index = ctx.semantic_index().read().unwrap();
         let rows = index.as_ref().unwrap().search(&[1.0, 0.0, 0.0], 100);
         assert!(
@@ -6576,7 +5672,6 @@ mod tests {
                 }
             })
             .unwrap();
-        drain_semantic_refresh_events(&ctx);
         assert_eq!(
             ctx.semantic_index().read().unwrap().as_ref().unwrap().len(),
             0,
@@ -6605,7 +5700,6 @@ mod tests {
                 completed_paths: second.completed_paths,
             })
             .unwrap();
-        drain_semantic_refresh_events(&ctx);
         assert!(ctx
             .semantic_index()
             .read()
@@ -6664,7 +5758,6 @@ mod tests {
         );
         drop(event_tx);
 
-        drain_semantic_refresh_events(&ctx);
 
         assert_eq!(
             crate::commands::configure::semantic_refresh_restart_attempts_for_test(),
@@ -6745,7 +5838,6 @@ mod tests {
             ctx.semantic_index_rx_epoch(),
         );
         event_sent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        drain_semantic_refresh_events(&ctx);
         assert!(
             !ctx.completion_drains_have_work(),
             "a live worker with an empty event queue should not cause maintenance churn"
@@ -6760,7 +5852,6 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        drain_semantic_refresh_events(&ctx);
 
         assert_eq!(
             crate::commands::configure::semantic_refresh_restart_attempts_for_test(),

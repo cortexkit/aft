@@ -43,50 +43,6 @@ impl ChildEngine {
             semantic: None,
         }
     }
-
-    fn install_semantic(&mut self, session: &ParentSession, child: &Child) {
-        let Plane::Ready(semantic) = read(&session.semantic).clone() else {
-            return;
-        };
-        let Some(view) = read(&child.semantic).ready().cloned() else {
-            return;
-        };
-        // The overlay index scores the vectors admitted from the child's view
-        // with the same function a session bound to the child uses.
-        let overlay = match semantic
-            .plane
-            .overlay(&view.access, &child.root, &view.snapshot)
-        {
-            Ok(overlay) => overlay,
-            Err(error) => {
-                crate::slog_warn!(
-                    "parent folder search engine has no semantic index for {}: {}",
-                    child.root.display(),
-                    error
-                );
-                return;
-            }
-        };
-        if self
-            .semantic
-            .as_ref()
-            .is_some_and(|installed| Arc::ptr_eq(installed, &overlay.index))
-        {
-            return;
-        }
-        *self
-            .ctx
-            .semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((*overlay.index).clone());
-        *self
-            .ctx
-            .semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            crate::context::SemanticIndexStatus::ready();
-        self.semantic = Some(overlay.index);
-    }
 }
 
 /// Creates the child's engine once its trigram snapshot is loaded, and
@@ -98,9 +54,6 @@ pub(super) fn sync(session: &ParentSession, child: &Child) {
     let mut engine = lock(&child.engine);
     if engine.is_none() {
         *engine = Some(ChildEngine::new(session, child));
-    }
-    if let Some(engine) = engine.as_mut() {
-        engine.install_semantic(session, child);
     }
 }
 
@@ -421,19 +374,13 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     for (index, (child, outcome)) in children.iter().zip(outcomes).enumerate() {
         let data_child = data_children.as_ref().map(|searches| &searches[index]);
         if session.planes.trigram {
-            let reason = match data_child {
-                Some(search) => search.text.gap_reason("trigram"),
-                None => read(&child.trigram).gap_reason("trigram"),
-            };
+            let reason = data_child.and_then(|search| search.text.gap_reason("trigram"));
             if let Some(reason) = reason {
                 gaps.child(child, reason);
             }
         }
         if session.planes.semantic && semantic.ready().is_some() {
-            let reason = match data_child {
-                Some(search) => search.meaning_gap.clone(),
-                None => read(&child.semantic).gap_reason("semantic"),
-            };
+            let reason = data_child.and_then(|search| search.meaning_gap.clone());
             if let Some(reason) = reason {
                 gaps.child(child, reason);
             }

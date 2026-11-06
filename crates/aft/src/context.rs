@@ -1304,10 +1304,6 @@ impl RootHealthSummary {
             && self
                 .callgraph_store_status
                 .is_some_and(component_is_satisfied)
-            && self
-                .views
-                .as_ref()
-                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2_status.is_some_and(component_is_satisfied)
     }
 
@@ -1411,10 +1407,6 @@ impl RootHealthSnapshot {
                 .callgraph_store
                 .as_ref()
                 .is_some_and(component_is_satisfied)
-            && self
-                .views
-                .as_ref()
-                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2.as_ref().is_some_and(tier2_is_satisfied)
     }
 }
@@ -2639,10 +2631,6 @@ impl WatcherDrainSliceState {
             status_changed: false,
             scheduler_changed_path_count: 0,
             semantic_refresh_paths: Vec::new(),
-            view_publication_paths: BTreeSet::new(),
-            view_publication_full: false,
-            view_publication_reason: Default::default(),
-            view_publication_due: None,
             path_slice_count: 0,
         }
     }
@@ -2674,10 +2662,7 @@ impl WatcherDrainSliceState {
         }
         let before = self.semantic_refresh_paths.len();
         self.semantic_refresh_paths.retain(keep);
-        dropped += before - self.semantic_refresh_paths.len();
-        let before = self.view_publication_paths.len();
-        self.view_publication_paths.retain(keep);
-        dropped + before - self.view_publication_paths.len()
+        dropped + before - self.semantic_refresh_paths.len()
     }
 
     pub(crate) fn has_pending_work(&self) -> bool {
@@ -2792,12 +2777,6 @@ pub(crate) struct ConfigureMaintenanceJob {
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
     pub(crate) supersede_semantic_artifact_persistence: bool,
-    /// Allows the search worker to start once. Final configuration maintenance
-    /// sends this signal before starting the callgraph warm-up operation.
-    pub(crate) search_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
-    /// Allows the semantic worker to start once. Final configuration maintenance
-    /// waits until callgraph warm-up starts or determines that no build is needed.
-    pub(crate) semantic_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
 }
 
 impl StatusEmitter {
@@ -4815,10 +4794,6 @@ impl Drop for AppContext {
     fn drop(&mut self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
-        if let Some(view) = self.callgraph_view.get_mut().take() {
-            view.shutdown();
-        }
-        self.artifact_owner_lease.get_mut().take();
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
             let root = self
                 .canonical_cache_root
@@ -5686,15 +5661,10 @@ impl AppContext {
             Ok(snapshot) => snapshot.clone(),
             Err(_) => return RootHealthSummary::busy(),
         };
-        // Opens the view status store on disk, so it also stays ahead of the
-        // guards.
-        let views = { None };
-        // With the data layer on, its checkout's planes stand in for the
-        // search index and call-graph store below, and the views object is
-        // left out. Read here, ahead of the guards: it takes the checkout's
-        // own locks.
+        // The index store's checkout planes stand in for the search index
+        // and call-graph store below. Read here, ahead of the guards: it
+        // takes the checkout's own locks.
         let data_store = crate::data_layer::surfaces::report(self);
-        let views = if data_store.is_some() { None } else { views };
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
@@ -6609,20 +6579,15 @@ impl AppContext {
         // skip this root. Repair even if configure committed before the release.
         self.attach_ready_database_pools(&self.database_open.lock());
         self.inspect_manager.resume_root_work();
-        // A views-on semantic lane pauses its fills while the root is unbound
-        // past the grace window; resume them now rather than at the next edit.
-        self.checkout_semantic.wake();
     }
 
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
-        self.cancel_callgraph_acquisition();
         let _ = self
             .subc_lifecycle
             .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
         crate::provisional_identity_retry::cancel(self);
-        self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
@@ -6876,12 +6841,6 @@ impl AppContext {
                         || state
                             .ignore_refresh_due
                             .is_some_and(|due| Instant::now() >= due)
-                        // Publication runs in the watcher drain even after all
-                        // paths are applied. Wake at its quiet deadline, not on
-                        // every tick while the debounce is still pending.
-                        || state
-                            .view_publication_due
-                            .is_some_and(|due| Instant::now() >= due)
                 })
             })
     }
@@ -7058,9 +7017,6 @@ impl AppContext {
                     Err(std::sync::TryLockError::Poisoned(_)) => true,
                 })
         }) {
-            return true;
-        }
-        if self.view_disk_limits_due() {
             return true;
         }
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
@@ -8579,14 +8535,6 @@ impl AppContext {
             }
         });
         self.reconcile_rerank_backend(&next);
-        self.arm_view_disk_limits(false);
-        {
-            self.lexical_view.lock().take();
-            self.callgraph_view.lock().take();
-            self.callgraph_borrow.lock().take();
-            *self.lexical_load_retry.lock() = Default::default();
-            *self.callgraph_construction_retry.lock() = Default::default();
-        }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
@@ -9790,142 +9738,10 @@ impl AppContext {
         &self,
         respect_config_flag: bool,
     ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
-        if respect_config_flag && !self.config().indexes.callgraph {
-            return Ok(None);
-        }
-        if !self.heavy_root_work_allowed() {
-            return Ok(None);
-        }
-        self.revalidate_callgraph_store_generation();
-        // A pending watcher-gap comparison opens this same store on its own
-        // thread. Every open below therefore finishes before that thread
-        // starts, so the two never race as concurrent first opens inside
-        // SQLite recovery, where the loser reports SQLITE_BUSY.
-        let force_token = self.callgraph_force_token_for_build();
-        if force_token.is_none() {
-            if let Some(store) = {
-                let guard = self
-                    .callgraph_store
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.as_ref().map(Arc::clone)
-            } {
-                // A reader is already resident, so starting the pending
-                // comparison here cannot race a first open.
-                self.start_pending_callgraph_reconcile();
-                self.schedule_legacy_callgraph_migration_if_needed(
-                    store.as_ref(),
-                    store.project_root().to_path_buf(),
-                    self.callgraph_store_dir(),
-                );
-                return Ok(Some(store));
-            }
-        }
-
-        let Some(project_root) = self.callgraph_project_root() else {
-            return Ok(None);
-        };
-        let callgraph_dir = self.callgraph_store_dir();
-
-        // Preserve a readable legacy fallback while writer-capable processes
-        // migrate it on the cold-build lane. Opening before the writer path is
-        // also the cheap fast path for an already-published root generation.
-        if force_token.is_none() {
-            let reopened =
-                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
-            // This thread's first open finished before the reconcile thread
-            // starts, so the comparison opens as a second reader. The
-            // test-only count lets the ordering test observe this.
-            #[cfg(test)]
-            self.callgraph_reconcile
-                .note_ensure_open_completed_for_test();
-            self.start_pending_callgraph_reconcile();
-            if let Some(store) = reopened? {
-                let store = Arc::new(store);
-                {
-                    let mut guard = self
-                        .callgraph_store
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *guard = Some(Arc::clone(&store));
-                }
-                self.schedule_legacy_callgraph_migration_if_needed(
-                    store.as_ref(),
-                    project_root,
-                    callgraph_dir,
-                );
-                return Ok(Some(store));
-            }
-        }
-
-        if !self.callgraph_writer() {
-            return Ok(None);
-        }
-        let build_generation = self.configure_generation();
-        let persist_epoch_flag = self.callgraph_persist_epoch_flag();
-        let Some(persist_epoch) = self
-            .run_if_subc_bound_generation(build_generation, || self.next_callgraph_persist_epoch())
-        else {
-            return Ok(None);
-        };
-        // Let the store walk directly into its staging table. Keeping discovery
-        // inside the builder prevents a second corpus-sized path inventory here.
-        let built = crate::callgraph_store::with_publish_epoch(
-            persist_epoch_flag.clone(),
-            persist_epoch,
-            || {
-                crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
-                    retry_changed_callgraph_corpus(|| {
-                        if force_token.is_some() {
-                            CallGraphStore::force_cold_build_with_lease_chunked(
-                                callgraph_dir.clone(),
-                                project_root.clone(),
-                                &[],
-                                self.config().callgraph_chunk_size,
-                            )
-                            .map(|(store, _stats)| (store, ()))
-                        } else {
-                            CallGraphStore::ensure_built_with_lease_chunked(
-                                callgraph_dir.clone(),
-                                project_root.clone(),
-                                &[],
-                                self.config().callgraph_chunk_size,
-                            )
-                            .map(|(store, _stats)| (store, ()))
-                        }
-                    })
-                })
-            },
-        );
-        let (store, _stats) = match built {
-            Err(error) if error.is_corpus_change() => return Ok(None),
-            result => result?,
-        };
-        drop(store);
-
-        let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
-        // As above: the comparison starts only after this open completed.
-        self.start_pending_callgraph_reconcile();
-        let Some(store) = reopened? else {
-            return Ok(None);
-        };
-        let store = Arc::new(store);
-        self.run_if_subc_bound_generation(build_generation, || {
-            if persist_epoch_flag.current() != persist_epoch {
-                return None;
-            }
-            let mut guard = self
-                .callgraph_store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = Some(Arc::clone(&store));
-            if let Some(force_token) = force_token {
-                self.fulfill_callgraph_store_force_token(force_token);
-            }
-            Some(Arc::clone(&store))
-        })
-        .flatten()
-        .map_or(Ok(None), |store| Ok(Some(store)))
+        // Today's call-graph store is retired; the index store's checkout
+        // answers every call-graph query.
+        let _ = respect_config_flag;
+        Ok(None)
     }
 
     /// Resolve the project root used for the callgraph store: prefer the
@@ -10004,16 +9820,14 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_capped(None)
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None)
     }
 
     /// Keep inspect's graph wait inside its request budget. Retain the checkout
     /// wait outcome so inspect can name files whose edits are not in the graph.
     pub(crate) fn callgraph_store_for_ops_until(&self, deadline: Instant) -> CallgraphStoreAccess {
-        if Instant::now() >= deadline {
-            return CallgraphStoreAccess::Building;
-        }
-        self.callgraph_store_for_ops_capped(Some(deadline))
+        let _ = deadline;
+        self.callgraph_store_for_ops()
     }
 
 
@@ -10057,22 +9871,12 @@ impl AppContext {
         demand: bool,
         capacity_deferred: Option<&mut bool>,
     ) -> CallgraphStoreAccess {
-        if self.cache_unavailable_reason().is_some() {
-            return CallgraphStoreAccess::Unavailable;
-        }
-        // HOME roots and unbound roots do no heavy work at all; configure
-        // also forces the callgraph off there, so check this first to keep
-        // reporting them as unavailable rather than configured off.
-        if !self.heavy_root_work_allowed() {
-            return CallgraphStoreAccess::Unavailable;
-        }
-        // A disabled index never starts: refuse before any open or cold build.
+        // Today's call-graph store is retired: nothing opens or builds it, and
+        // the index store's checkout answers every call-graph query.
+        let _ = (wait, demand, capacity_deferred);
         if !self.config().indexes.callgraph {
             return CallgraphStoreAccess::Off;
         }
-        // The data layer serves the call graph (`data_layer::tools::callgraph`);
-        // today's store is never opened or built.
-        let _ = (wait, demand, capacity_deferred);
         CallgraphStoreAccess::Unavailable
     }
 
@@ -10082,17 +9886,7 @@ impl AppContext {
         project_root: PathBuf,
         callgraph_dir: PathBuf,
     ) {
-        if !store.is_legacy_fallback()
-            || !self.callgraph_writer()
-            || !self.heavy_root_work_allowed()
-        {
-            return;
-        }
-        let _ = self.spawn_callgraph_store_cold_build(
-            project_root,
-            callgraph_dir,
-            CallgraphBackgroundWork::LegacyMigration,
-        );
+        let _ = (store, project_root, callgraph_dir);
     }
 
     fn configured_callgraph_keys(&self, current_root: &Path) -> BTreeSet<String> {
@@ -10110,215 +9904,6 @@ impl AppContext {
             // retries when git is missing from PATH.
             .map(|root| self.memoized_artifact_cache_key(root))
             .collect()
-    }
-
-    /// Atomically mark root-keyed callgraph maintenance in flight and spawn it
-    /// on the cold-build lane. The same receiver/install path handles cold
-    /// builds and legacy migrations, so watcher edits are queued and replayed
-    /// against whichever root-keyed generation publishes.
-    fn spawn_callgraph_store_cold_build(
-        &self,
-        project_root: PathBuf,
-        callgraph_dir: PathBuf,
-        work: CallgraphBackgroundWork,
-    ) -> CallgraphBuildAdmission {
-        if !self.heavy_root_work_allowed() || !self.callgraph_writer() {
-            return CallgraphBuildAdmission::NotStarted;
-        }
-        let generation = self.configure_generation();
-        self.run_if_subc_bound_generation(generation, || {
-            self.spawn_callgraph_store_cold_build_admitted(project_root, callgraph_dir, work)
-        })
-        .unwrap_or(CallgraphBuildAdmission::NotStarted)
-    }
-
-    /// Start a callgraph worker after lifecycle admission has been acquired.
-    fn spawn_callgraph_store_cold_build_admitted(
-        &self,
-        project_root: PathBuf,
-        callgraph_dir: PathBuf,
-        work: CallgraphBackgroundWork,
-    ) -> CallgraphBuildAdmission {
-        let session_id = crate::log_ctx::current_session();
-        let chunk_size = self.config().callgraph_chunk_size;
-        let build_generation = self.configure_generation();
-        let configured_keys = self.configured_callgraph_keys(&project_root);
-        let summary_logged = Arc::clone(&self.callgraph_legacy_migration_summary_logged);
-
-        let mut rx_guard = self.callgraph_store_rx.lock();
-        if rx_guard.is_some() {
-            return CallgraphBuildAdmission::NotStarted;
-        }
-
-        let limiter = self.cold_build_limiter();
-        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::labelled_with_root(
-            project_root.display().to_string(),
-            "callgraph-background",
-            crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
-        );
-        let Some(permit) =
-            crate::cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
-        else {
-            crate::slog_info!(
-                "callgraph store background work deferred by cold build limit ({})",
-                limiter.limit()
-            );
-            return CallgraphBuildAdmission::CapacityDeferred;
-        };
-
-        let force_token = match work {
-            CallgraphBackgroundWork::ForceRebuild(token) => Some(token),
-            CallgraphBackgroundWork::Ensure | CallgraphBackgroundWork::LegacyMigration => None,
-        };
-        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
-        self.note_callgraph_store_rx_generation(build_generation);
-        self.next_callgraph_store_rx_epoch();
-        *rx_guard = Some(rx);
-        let persist_epoch = self.next_callgraph_persist_epoch();
-        let persist_epoch_flag = self.callgraph_persist_epoch_flag();
-
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-        #[cfg(test)]
-        self.callgraph_cold_build_spawn_count
-            .fetch_add(1, Ordering::SeqCst);
-        let lifecycle = self.subc_lifecycle.clone();
-        let corpus_memo = self.callgraph_corpus_memo();
-        let test_hooks = crate::callgraph_store::CallgraphBackgroundTestHooks::capture();
-
-        std::thread::spawn(move || {
-            let _test_hooks = test_hooks.install();
-            let _permit = permit;
-            let mut settlement = CallGraphStoreBuildSettlement::new(tx, force_token, persist_epoch);
-            crate::log_ctx::with_session(session_id, || {
-                wait_on_callgraph_build_start_gate(&project_root);
-                if persist_epoch_flag.current() != persist_epoch {
-                    crate::slog_info!(
-                        "callgraph store background work skipped for superseded epoch {}",
-                        persist_epoch
-                    );
-                    return;
-                }
-                // The abandonment check stops extraction at its next slice
-                // fence once the root has stayed unbound past the grace
-                // window. The persist-epoch rule above is unchanged: a
-                // transient unbind still lets the build finish and persist.
-                let built =
-                    crate::callgraph_store::with_unbound_abandonment_check(lifecycle, || {
-                        crate::callgraph_store::with_publish_epoch(
-                            persist_epoch_flag.clone(),
-                            persist_epoch,
-                            || {
-                                crate::callgraph_store::with_corpus_memo(corpus_memo, || {
-                                    retry_changed_callgraph_corpus(|| match work {
-                                        CallgraphBackgroundWork::LegacyMigration => {
-                                            CallGraphStore::migrate_legacy_with_lease(
-                                                callgraph_dir.clone(),
-                                                project_root.clone(),
-                                            )
-                                        }
-                                        CallgraphBackgroundWork::ForceRebuild(_) => {
-                                            CallGraphStore::force_cold_build_with_lease_chunked(
-                                                callgraph_dir.clone(),
-                                                project_root.clone(),
-                                                &[],
-                                                chunk_size,
-                                            )
-                                            .map(|(store, _)| Some(store))
-                                        }
-                                        CallgraphBackgroundWork::Ensure => {
-                                            CallGraphStore::ensure_built_with_lease_chunked(
-                                                callgraph_dir.clone(),
-                                                project_root.clone(),
-                                                &[],
-                                                chunk_size,
-                                            )
-                                            .map(|(store, _)| Some(store))
-                                        }
-                                    })
-                                })
-                            },
-                        )
-                    });
-                match built {
-                    Ok(Some(store)) => {
-                        if store.is_legacy_migration() {
-                            match crate::callgraph_store::all_legacy_partitions_migrated_for_keys(
-                                &callgraph_dir,
-                                &configured_keys,
-                            ) {
-                                Ok(true)
-                                    if summary_logged
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::SeqCst,
-                                            Ordering::SeqCst,
-                                        )
-                                        .is_ok() =>
-                                {
-                                    crate::slog_info!(
-                                        "all legacy callgraph partitions migrated for configured roots"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(error) => crate::slog_warn!(
-                                    "failed to inspect legacy callgraph migration completion: {}",
-                                    error
-                                ),
-                            }
-                        }
-                        if persist_epoch_flag.is_current(persist_epoch) {
-                            settlement.ready(store);
-                        } else {
-                            crate::slog_info!(
-                                "callgraph store warm build result discarded for superseded publication epoch {}",
-                                persist_epoch
-                            );
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(crate::callgraph_store::CallGraphStoreError::Superseded) => {
-                        crate::slog_info!(
-                            "callgraph store disk publication skipped for superseded epoch {}",
-                            persist_epoch
-                        );
-                    }
-                    Err(crate::callgraph_store::CallGraphStoreError::Suspended(suspension)) => {
-                        crate::slog_warn!(
-                            "callgraph store background work suspended: {}",
-                            suspension.reason
-                        );
-                        settlement.suspended(suspension);
-                    }
-                    Err(crate::callgraph_store::CallGraphStoreError::Unavailable(reason))
-                        if reason.ends_with("could not acquire writer capability") =>
-                    {
-                        crate::slog_warn!(
-                            "callgraph store background work denied writer capability: {}",
-                            reason
-                        );
-                        settlement.denied(reason);
-                    }
-                    Err(error) if error.is_corpus_change() => {
-                        // Dropping the worker's settlement sends a Settled
-                        // build event, which query operations report as
-                        // Building. Later demand gets a fresh retry budget
-                        // once the editing burst subsides.
-                        crate::slog_info!(
-                            "callgraph corpus still changing after 3 attempts; build deferred"
-                        );
-                    }
-                    Err(error) => {
-                        crate::slog_warn!("callgraph store background work failed: {}", error);
-                    }
-                }
-            });
-            crate::logging::release_index_build_start_waiters(
-                crate::logging::IndexPlane::Callgraph,
-                &project_root,
-            );
-        });
-        CallgraphBuildAdmission::Started
     }
 
     /// Access the callgraph-store background-build receiver (drained by the
@@ -10628,10 +10213,6 @@ impl AppContext {
             checkout.set_executor(executor.clone());
         }
         self.data_children.set_executor(&executor);
-        let retired = self.callgraph_view.lock().take();
-        if let Some(view) = retired {
-            view.shutdown();
-        }
     }
 
     #[cfg(test)]
@@ -10708,10 +10289,6 @@ impl AppContext {
 
     pub fn shutdown_callgraph_acquisition(&self) {
         self.mark_subc_unbound();
-        let view = self.callgraph_view.lock().take();
-        if let Some(view) = view {
-            view.shutdown();
-        }
     }
 
 
@@ -10837,7 +10414,6 @@ impl AppContext {
         let semantic_refresh_cancelled = self.semantic_refresh_event_rx.lock().is_some();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
-        let _ = self.try_release_idle_semantic_lane();
         self.reset_semantic_cold_seed_gate_for_configure();
         let _ = self.inspect_manager.discard_completions();
         let _ = self.take_new_reuse_completions();
@@ -11440,10 +11016,6 @@ impl AppContext {
     }
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
-        // Queries sample status before deciding whether semantic search can
-        // run. Wake a failed views-on lane here, even when no runtime exists
-        // yet; status polling shares the same rate limit as interactive queries.
-        self.checkout_semantic.request_retry();
         self.semantic_index_status.as_ref()
     }
 
@@ -12332,25 +11904,12 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        // A views-routed root's lexical and call-graph views hold their
-        // installed snapshots and the call graph's open reader. The next query
-        // binds a fresh view, which verifies the checkout from its published
-        // generation.
-        self.lexical_view.lock().take();
-        self.callgraph_view.lock().take();
-        self.callgraph_borrow.lock().take();
-        *self.lexical_load_retry.lock() = Default::default();
-        *self.callgraph_construction_retry.lock() = Default::default();
-        self.borrowed_index_cache.lock().clear();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
-        // A contended lane is left loaded: this eviction does not wait for it.
-        let _ = self.try_release_idle_semantic_lane();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
         self.backup.lock().release_memory();
-        self.release_view_publication_cache();
         true
     }
 
@@ -12538,9 +12097,6 @@ impl AppContext {
         let Some(mut semantic_index) = try_write_unpoisoned(&self.semantic_index) else {
             return false;
         };
-        let Some(mut borrowed_index_cache) = self.borrowed_index_cache.try_lock() else {
-            return false;
-        };
         let Some(mut backup) = self.backup.try_lock() else {
             return false;
         };
@@ -12556,25 +12112,6 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
-        // A views-routed root's lexical and call-graph views hold installed
-        // snapshots, the call graph's open reader and v3 member protection.
-        // Releasing them here, as evict_idle_artifacts does, lets storage
-        // retention evict an idle root's views for disk budget.
-        let Some(mut lexical_view) = self.lexical_view.try_lock() else {
-            return false;
-        };
-        let Some(mut callgraph_view) = self.callgraph_view.try_lock() else {
-            return false;
-        };
-        let Some(mut callgraph_borrow) = self.callgraph_borrow.try_lock() else {
-            return false;
-        };
-        let Some(mut lexical_retry) = self.lexical_load_retry.try_lock() else {
-            return false;
-        };
-        let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
-            return false;
-        };
         // The data layer's checkout keeps its published state on disk; what it
         // holds in memory (decoded call-graph slices, the update engine, the
         // text overlay's index) is rebuilt from that state at its next use.
@@ -12587,27 +12124,15 @@ impl AppContext {
         if !self.search_exact_memo.try_clear_idle() {
             return false;
         }
-        // Last, so a contended lane leaves every other handle in place too.
-        if !self.try_release_idle_semantic_lane() {
-            return false;
-        }
         callgraph_store.take();
         corpus_memo.take();
         semantic_index.take();
-        borrowed_index_cache.clear();
         backup.release_memory();
-        *lexical_retry = Default::default();
-        *callgraph_retry = Default::default();
         let released = (
             embedding_model.take(),
             refresh_events.take(),
             refresh_requests.take(),
             refresh_worker.take(),
-            // Dropping a view can close its reader and unbind its generation,
-            // so the views drop on the release thread too.
-            lexical_view.take(),
-            callgraph_view.take(),
-            callgraph_borrow.take(),
             data_checkout.take(),
             std::mem::take(&mut *data_external),
         );
@@ -12620,8 +12145,6 @@ impl AppContext {
             refresh_events,
             refresh_requests,
             refresh_worker,
-            lexical_retry,
-            callgraph_retry,
             data_checkout,
             data_external,
         ));
@@ -14904,28 +14427,6 @@ impl AppContext {
         semantic
             .counts
             .insert("worker_index_bytes".into(), worker_bytes);
-        // A views-on root serves semantic search from its checkout view. Its
-        // overlay (replacement entries not yet folded into a generation) is
-        // this root's own memory; the base runs it reads live in the family
-        // arena and are counted once process-wide, never here.
-        let overlay_bytes = match self.checkout_semantic.runtime() {
-            Some(runtime) => runtime.try_private_memory(),
-            None => Some(0),
-        };
-        match overlay_bytes {
-            Some(overlay_bytes) => {
-                semantic.estimated_bytes = semantic
-                    .estimated_bytes
-                    .map(|bytes| bytes.saturating_add(overlay_bytes));
-                semantic
-                    .counts
-                    .insert("checkout_overlay_bytes".into(), overlay_bytes);
-            }
-            None => {
-                semantic.bytes_status = "partial";
-                semantic.not_estimated.push("checkout_overlay_busy".into());
-            }
-        }
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / live semantic overlay");
         let callgraph = match self.callgraph_store.try_read() {

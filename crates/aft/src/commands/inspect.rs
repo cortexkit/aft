@@ -838,72 +838,12 @@ fn handle_inspect_payload(
         .iter()
         .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
     start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
-    // With views on, the graph-backed categories read the checkout's v3 view,
-    // pinned once for this request; an unavailable view is reported, never
-    // replaced by the legacy scanner's store.
+    // The graph-backed categories read the index store's checkout (below);
+    // no other call-graph store is pinned for the request.
     let v3_routed = false;
-    let routed_store = if tier2_enabled && (v3_routed) {
-        request_deadline.map_or_else(
-            || ctx.callgraph_store_for_query_without_wait(),
-            |deadline| {
-                ctx.callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP))
-            },
-        )
-    } else {
-        crate::context::CallgraphStoreAccess::Unavailable
-    };
-    // A checkout over `views.callgraph_copies` reads the main checkout's
-    // graph. Where its files differ, dead code and the other graph-backed
-    // categories would describe the main checkout's code, so they report the
-    // borrowed graph as unavailable instead.
-    let routed_store = match (&routed_store, v3_routed) {
-        (crate::context::CallgraphStoreAccess::Ready(_), true) => {
-            match crate::commands::callgraph_borrowed::borrowed_callgraph(ctx)
-                .filter(crate::commands::callgraph_borrowed::BorrowedCallgraph::can_differ)
-            {
-                Some(borrowed) => crate::context::CallgraphStoreAccess::Error(
-                    crate::callgraph_store::CallGraphStoreError::Unavailable(
-                        borrowed.summary_line(),
-                    ),
-                ),
-                None => routed_store,
-            }
-        }
-        _ => routed_store,
-    };
-    let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
-    // Why the v3 view could not serve, observed once from the access this
-    // request already holds: a SQLite lock is contention (pending, retry),
-    // anything else is unavailability.
-    let routed_observation = v3_routed.then(|| match &routed_store {
-        crate::context::CallgraphStoreAccess::Error(error)
-            if error.is_transient_lock_contention() =>
-        {
-            (crate::feature_status::IndexObservation::building(), true)
-        }
-        crate::context::CallgraphStoreAccess::Error(
-            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
-        ) if crate::view_storage_reserve::is_message(message) => (
-            crate::feature_status::IndexObservation::unavailable(message.clone()),
-            false,
-        ),
-        crate::context::CallgraphStoreAccess::Error(error) => (
-            crate::feature_status::IndexObservation::unavailable(error.to_string()),
-            false,
-        ),
-        access => (
-            crate::feature_status::callgraph_access_observation(ctx, access),
-            false,
-        ),
-    });
-    let checkout_store = if checkout_routed {
-        match routed_store {
-            crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let checkout_store: Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> =
+        None;
+    let routed_observation: Option<(crate::feature_status::IndexObservation, bool)> = None;
     let manager = ctx.inspect_manager();
     // Dead code reads its call graph from the root's checkout (see
     // `data_layer::tools::inspect`).
@@ -937,7 +877,6 @@ fn handle_inspect_payload(
                 crate::callgraph::walk_project_files(&snapshot.project_root).collect()
             })
     });
-    let checkout_store = { checkout_store };
     let view_callgraph_observation = if checkout_store.is_none() {
         routed_observation
     } else {
@@ -947,12 +886,7 @@ fn handle_inspect_payload(
     // graph-backed categories report the gap below rather than running the
     // legacy reuse scanner.
     let use_checkout_view = false;
-    let checkout_view_unavailability = false.then(|| {
-        manager.checkout_view_unavailability(
-            &snapshot,
-            checkout_view_files.as_deref().unwrap_or_default(),
-        )
-    });
+    let checkout_view_unavailability: Option<crate::inspect::CheckoutViewUnavailable> = None;
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -1659,7 +1593,6 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     request_deadline_terminal(next_phase(&applicability), deadline),
                 ),
             };
-            crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
             if response.success {
                 if let Some(payload) = response.data.as_object_mut() {
                     let sections = parse_sections(request.params.get("sections"))
