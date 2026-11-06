@@ -207,6 +207,19 @@ impl Parses {
         Some(slot.value.get_or_init(|| slot.decode(path)))
     }
 
+    /// `path`'s parse key, without decoding the parse when the key is known
+    /// without it.
+    pub(crate) fn key(&self, path: &str) -> Option<BlobKey> {
+        let slot = self.map.get(path)?;
+        if let Some((key, _)) = slot.value.get() {
+            return Some(key.clone());
+        }
+        if let Some((key, _)) = &slot.encoded {
+            return Some(key.clone());
+        }
+        self.get(path).map(|(key, _)| key.clone())
+    }
+
     pub(crate) fn contains_key(&self, path: &str) -> bool {
         self.map.contains_key(path)
     }
@@ -883,8 +896,11 @@ pub(crate) fn resolve_checkout_into(
                 let bytes = encoded
                     .remove(&path)
                     .expect("every parsed file was resolved");
-                let (key, _) = &inputs.parses[&path];
-                let mut file = super::fragment::decode(key, &path, &bytes)
+                let key = inputs
+                    .parses
+                    .key(&path)
+                    .expect("every resolved file is parsed");
+                let mut file = super::fragment::decode(&key, &path, &bytes)
                     .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                 file.sites = sites;
                 file.site_dependencies = dependencies;
