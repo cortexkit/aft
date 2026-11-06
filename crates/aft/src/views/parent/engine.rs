@@ -145,6 +145,17 @@ pub(super) fn sync_trigram(child: &Child) {
 // The parent's aft_search
 // ---------------------------------------------------------------------------
 
+/// Whether the parent's children answer from their checkouts in the data
+/// layer: when the process runs it, unless a test asked this thread for
+/// today's route.
+fn data_layer_answers() -> bool {
+    #[cfg(test)]
+    if crate::data_layer::tools::grep::test_hooks::today_only() {
+        return false;
+    }
+    crate::data_layer::runtime::enabled()
+}
+
 /// The page size `aft_search` uses when the request names none.
 const DEFAULT_TOP_K: usize = 10;
 
@@ -344,7 +355,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     // With the data layer, each child's engine answers from the checkout the
     // session holds for that child, as grep does: its text plane, and its
     // meaning plane reading the vectors the repository's store holds.
-    let data_children = crate::data_layer::runtime::enabled().then(|| {
+    let data_children = data_layer_answers().then(|| {
         let roots = children
             .iter()
             .map(|child| child.root.as_path())

@@ -295,6 +295,13 @@ fn daemonless_query_reads_the_data_layer_store_aft_index_wrote() {
         answer["semantic_status"], "external_unindexed",
         "the query found no index for a root aft index just indexed: {answer:?}"
     );
+    // The plan names `fallback_walk` for every regex query, whichever source
+    // answers it, so the lanes are checked on an identifier query, whose
+    // plan names the index lanes only when an index is ready to answer.
+    let mut identifier = search_request(standing_root.path());
+    identifier.params["query"] = serde_json::json!("needle_symbol");
+    let answer = response_value(handle_semantic_search(&identifier, &daemonless));
+    assert_eq!(answer["success"], true, "{answer:?}");
     assert!(
         answer["structuredContent"]["plan"]["lanes_run"]
             .as_array()

@@ -179,7 +179,12 @@ fn cold_parent_search_scans_unpublished_children_and_respects_scope() {
             value["path"] = serde_json::json!(path);
         }
         let req = serde_json::from_value(value).unwrap();
-        let answer = super::engine::search(&req, &ctx, &session);
+        // Today's route: unpublished views are scanned from disk. With the
+        // data layer, each child answers from its own checkout instead (see
+        // `data_layer::parent::tests`).
+        let answer = crate::data_layer::tools::grep::test_hooks::without_data_layer(|| {
+            super::engine::search(&req, &ctx, &session)
+        });
         assert!(answer.success, "{answer:?}");
         let rows = answer.data["results"].as_array().unwrap();
         assert_eq!(rows.len(), expected, "{answer:?}");

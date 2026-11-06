@@ -322,7 +322,7 @@ pub(crate) mod test_hooks {
         static ANSWERS: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(super) fn today_only() -> bool {
+    pub(crate) fn today_only() -> bool {
         TODAY_ONLY.with(Cell::get)
     }
 
@@ -330,7 +330,8 @@ pub(crate) mod test_hooks {
         ANSWERS.with(|answers| answers.set(answers.get() + 1));
     }
 
-    /// Runs `run` with grep and glob ignoring the data layer on this thread.
+    /// Runs `run` with grep, glob and a parent folder's `aft_search` ignoring
+    /// the data layer on this thread.
     pub(crate) fn without_data_layer<R>(run: impl FnOnce() -> R) -> R {
         struct Restore(bool);
         impl Drop for Restore {
