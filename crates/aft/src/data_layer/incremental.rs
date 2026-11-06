@@ -27,9 +27,9 @@ use std::time::Instant;
 use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion};
 use crate::callgraph_store::facts::{FactPaths, ProjectFacts};
 use crate::callgraph_store::join::{
-    rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies, ViewBindingFacts,
-    VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
-    VIEW_RUST_CRATES_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
+    rust_crate_key, rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies,
+    ViewBindingFacts, VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN,
+    VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
 use crate::callgraph_store::{go_module_map, rust_crate_map};
 
@@ -676,18 +676,20 @@ impl LiveCheckout {
             .cloned()
             .collect::<BTreeSet<_>>();
         // The Go module map and the Rust crate map are each built from a
-        // walk of the checkout, and a reader records only the map's key. The
-        // key changes when the map does, so build each map before and after
-        // whenever its inputs can have changed: a go.mod or Cargo.toml edit,
-        // a symlink (a walk may follow it), or for crates any path added or
-        // removed (a crate's `src` folder can appear).
+        // walk of the checkout, and a reader records keys for the map, not
+        // the walk. Build each map before and after whenever its inputs can
+        // have changed: a go.mod or Cargo.toml edit, a symlink (a walk may
+        // follow it), or for crates any path added or removed (a crate's
+        // `src` folder can appear). A Go reader records the module map's one
+        // key; a Rust reader records the key of each crate name it looked
+        // up, so only the names whose entry changed are set.
         let is_named = |path: &String, name: &str| {
             path == name
                 || path
                     .strip_suffix(name)
                     .is_some_and(|parent| parent.ends_with('/'))
         };
-        let maps_differ = |build: &dyn Fn(&FactPaths<'_>) -> HashMap<String, String>| {
+        let maps = |build: &dyn Fn(&FactPaths<'_>) -> HashMap<String, String>| {
             let root = std::path::Path::new("/");
             let before = build(&FactPaths {
                 root,
@@ -697,15 +699,28 @@ impl LiveCheckout {
                 root,
                 facts: &CheckoutFacts { inputs },
             });
-            before != after
+            (before, after)
         };
-        let go_modules_changed = (!links.is_empty()
-            || configs.iter().any(|path| is_named(path, "go.mod")))
-            && maps_differ(&go_module_map);
-        let rust_crates_changed = (!links.is_empty()
+        let go_modules_changed =
+            (!links.is_empty() || configs.iter().any(|path| is_named(path, "go.mod"))) && {
+                let (before, after) = maps(&go_module_map);
+                before != after
+            };
+        // Each crate name added, removed, or whose source folder moved.
+        let changed_crates = if !links.is_empty()
             || !membership.is_empty()
-            || configs.iter().any(|path| is_named(path, "Cargo.toml")))
-            && maps_differ(&rust_crate_map);
+            || configs.iter().any(|path| is_named(path, "Cargo.toml"))
+        {
+            let (before, after) = maps(&rust_crate_map);
+            before
+                .keys()
+                .chain(after.keys())
+                .filter(|name| before.get(*name) != after.get(*name))
+                .map(|name| rust_crate_key(name))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
 
         // Every checkout read a resolution made is recorded with its answer.
         // When paths, links or configuration changed, each distinct recorded
@@ -733,9 +748,7 @@ impl LiveCheckout {
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
-        if rust_crates_changed {
-            binding_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
-        }
+        binding_keys.extend(changed_crates.iter().cloned());
         let mut rebind = self.reverse.binding_of(&binding_keys);
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
@@ -833,9 +846,7 @@ impl LiveCheckout {
         if go_modules_changed {
             changed_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
-        if rust_crates_changed {
-            changed_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
-        }
+        changed_keys.extend(changed_crates);
 
         // Pass 2.
         let started = Instant::now();

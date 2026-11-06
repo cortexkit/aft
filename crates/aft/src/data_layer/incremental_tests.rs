@@ -76,25 +76,7 @@ fn update_matches_cold(
     changed: &[&str],
     caller: &str,
 ) -> Vec<(ResolutionStatus, Option<String>, Option<String>)> {
-    let mut live = LiveCheckout::cold(before, 1).unwrap();
-    let changed = changed
-        .iter()
-        .map(|path| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    live.update(after, &changed).unwrap();
-    let cold = resolve_checkout(&live.inputs, 1).unwrap();
-    assert_eq!(
-        live.resolved.keys().collect::<Vec<_>>(),
-        cold.keys().collect::<Vec<_>>()
-    );
-    for (path, ours) in live.resolved.iter() {
-        let theirs = &cold[path];
-        assert_eq!(ours.rows, theirs.rows, "{path}: rows");
-        assert_eq!(ours.sites, theirs.sites, "{path}: method-call sites");
-        assert_eq!(ours.dispatch, theirs.dispatch, "{path}: dispatch targets");
-        assert_eq!(ours.binding, theirs.binding, "{path}: recorded reads");
-    }
-    cold[caller]
+    update_checked(before, after, changed).1[caller]
         .rows
         .iter()
         .map(|row| {
@@ -107,6 +89,38 @@ fn update_matches_cold(
             )
         })
         .collect()
+}
+
+/// Updates a live resolution of `before` to `after` and checks it against a
+/// cold resolution of `after`, returning the update's counts and the cold
+/// resolution.
+fn update_checked(
+    before: CheckoutInputs,
+    after: CheckoutInputs,
+    changed: &[&str],
+) -> (
+    super::incremental::UpdateStats,
+    BTreeMap<String, super::callgraph::FileResolution>,
+) {
+    let mut live = LiveCheckout::cold(before, 1).unwrap();
+    let changed = changed
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let stats = live.update(after, &changed).unwrap();
+    let cold = resolve_checkout(&live.inputs, 1).unwrap();
+    assert_eq!(
+        live.resolved.keys().collect::<Vec<_>>(),
+        cold.keys().collect::<Vec<_>>()
+    );
+    for (path, ours) in live.resolved.iter() {
+        let theirs = &cold[path];
+        assert_eq!(ours.rows, theirs.rows, "{path}: rows");
+        assert_eq!(ours.sites, theirs.sites, "{path}: method-call sites");
+        assert_eq!(ours.dispatch, theirs.dispatch, "{path}: dispatch targets");
+        assert_eq!(ours.binding, theirs.binding, "{path}: recorded reads");
+    }
+    (stats, cold)
 }
 
 #[test]
@@ -223,6 +237,68 @@ fn a_go_module_rename_resolves_like_a_cold_build() {
     assert!(
         resolved(&cold_before["app/main.go"].rows) > after_resolved,
         "the rename did not change what the caller resolves to"
+    );
+}
+
+/// A workspace of `app`, which calls `dep::run` and `newdep::go`, and `dep`,
+/// plus `extra_files`. No crate is called `newdep` until `extra_files`
+/// adds one.
+fn workspace(extra_files: &[(&str, &str)]) -> CheckoutInputs {
+    let mut files = vec![
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        ),
+        (
+            "app/src/lib.rs",
+            "pub fn start() {\n    dep::run();\n    newdep::go();\n}\n",
+        ),
+        ("dep/Cargo.toml", "[package]\nname = \"dep\"\n"),
+        ("dep/src/lib.rs", "pub fn run() {}\n"),
+    ];
+    files.extend_from_slice(extra_files);
+    checkout(&files, &[])
+}
+
+#[test]
+fn a_new_crate_nothing_names_rebinds_only_its_own_files() {
+    // `app` looks up `dep` and `newdep`; neither entry changes when `extra`
+    // appears, so the update binds only the new crate's file. Recording the
+    // whole crate map as one key would rebind `app` too.
+    let extra = [
+        ("extra/Cargo.toml", "[package]\nname = \"extra\"\n"),
+        ("extra/src/lib.rs", "pub fn more() {}\n"),
+    ];
+    let (stats, cold) = update_checked(
+        workspace(&[]),
+        workspace(&extra),
+        &["extra/Cargo.toml", "extra/src/lib.rs"],
+    );
+    assert_eq!(stats.rebound, 1, "{stats:?}");
+    assert!(cold["app/src/lib.rs"].rows.iter().any(|row| row
+        .target_path
+        .as_deref()
+        .is_some_and(|path| path == b"dep/src/lib.rs")));
+}
+
+#[test]
+fn a_new_crate_a_file_already_names_reaches_that_file() {
+    // `app` calls `newdep::go`, which no crate defines until `newdep`
+    // appears: the miss must be recorded, or the new crate never reaches
+    // `app`.
+    let rows = update_matches_cold(
+        workspace(&[]),
+        workspace(&[
+            ("newdep/Cargo.toml", "[package]\nname = \"newdep\"\n"),
+            ("newdep/src/lib.rs", "pub fn go() {}\n"),
+        ]),
+        &["newdep/Cargo.toml", "newdep/src/lib.rs"],
+        "app/src/lib.rs",
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, path, _)| path.as_deref() == Some("newdep/src/lib.rs")),
+        "the new crate must resolve the call: {rows:?}"
     );
 }
 

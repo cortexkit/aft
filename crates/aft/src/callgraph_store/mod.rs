@@ -6207,10 +6207,13 @@ impl ResolverIndex for ProjectIndex<'_> {
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
         // The map reads every Cargo.toml of the workspace. A reader records
-        // the map's domain key, not those reads, so what it records does not
+        // keys for the map, not those reads, so what it records does not
         // depend on which reader built the map; its `Crate` answer is
-        // recorded by the surface index.
+        // recorded by the surface index. Today's views set the map's key on
+        // any change to it, the data layer only the key of each crate name
+        // whose entry changed.
         self.facts.record_domain(join::VIEW_RUST_CRATES_DOMAIN);
+        self.facts.record_domain(&join::rust_crate_key(crate_name));
         self.workspace_crate_prefixes
             .0
             .get_or_init(|| {

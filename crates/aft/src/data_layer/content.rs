@@ -23,18 +23,22 @@ use crate::callgraph_store::join::{
 use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
-/// carry it, so output from another version is extracted again. It is the
-/// call-graph producer's version with the data layer's own suffix, which
-/// counts the changes to what records hold since that producer version:
-/// 1 added the file's outline; 2 added the names inside Rust macros that
-/// could not be parsed; 3 added the method-call sites of `self` calls
-/// between the functions a `macro_rules!` template defines; 4 dropped the
-/// dynamic sites of JavaScript and TypeScript computed member calls whose
-/// member is a string literal; 5 added C++ member functions and the sites of
-/// C++ member calls whose receiver's type is declared; 6 added each symbol's
-/// entry facts (where a program starts, its entry attribute), which
-/// `trace_to` and `impact` label roots with.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-6";
+/// carry it, so output from another version is extracted again. Stored
+/// resolutions are keyed by their records, so a new version resolves every
+/// file again too, which is also how a change to what resolutions record
+/// reaches stored ones. It is the call-graph producer's version with the
+/// data layer's own suffix, which counts the changes since that producer
+/// version: 1 added the file's outline; 2 added the names inside Rust
+/// macros that could not be parsed; 3 added the method-call sites of `self`
+/// calls between the functions a `macro_rules!` template defines; 4 dropped
+/// the dynamic sites of JavaScript and TypeScript computed member calls
+/// whose member is a string literal; 5 added C++ member functions and the
+/// sites of C++ member calls whose receiver's type is declared; 6 added each
+/// symbol's entry facts (where a program starts, its entry attribute),
+/// which `trace_to` and `impact` label roots with; 7 marked Go `func init()`
+/// as a program start, and made a Rust resolution record each workspace
+/// crate name it looked up rather than only the whole crate map.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-7";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index

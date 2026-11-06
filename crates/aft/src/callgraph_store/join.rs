@@ -3456,15 +3456,30 @@ pub(crate) const VIEW_GO_MODULES_DOMAIN: &str = "\0view:go-modules";
 /// The Rust workspace's crate names and source folders, read from every
 /// `Cargo.toml`. Recorded like [`VIEW_GO_MODULES_DOMAIN`]: one key for the
 /// map, set by any `Cargo.toml` added, removed or rewritten, with the
-/// answers each reader used kept as `Crate` queries.
+/// answers each reader used kept as `Crate` queries. Today's views set this
+/// key; the data layer sets [`rust_crate_key`] for each crate name whose
+/// entry changed instead.
 pub(crate) const VIEW_RUST_CRATES_DOMAIN: &str = "\0view:rust-crates";
+
+/// The key a reader records for looking up the workspace crate `name`, found
+/// or not. A `Cargo.toml` edit that adds, removes, renames or moves a crate
+/// then reaches only the files that looked that name up, instead of every
+/// Rust file: adding a crate nothing imports rebinds nothing, and a file
+/// whose `use` named a crate that did not exist yet is rebound when it
+/// appears.
+pub(crate) fn rust_crate_key(name: &str) -> String {
+    format!("{VIEW_RUST_CRATES_DOMAIN}\0{name}")
+}
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
-            Self::Crate(_) => vec![
+            // Both crate keys: today's views set the map's key, the data
+            // layer the looked-up name's.
+            Self::Crate(name) => vec![
                 VIEW_CONFIG_MEMBERSHIP_DOMAIN.into(),
                 VIEW_RUST_CRATES_DOMAIN.into(),
+                rust_crate_key(name),
             ],
             Self::CrateRoot(file) => {
                 vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()]
