@@ -1927,7 +1927,11 @@ mod tests {
         let metadata = persistence::read_task_at(&task).unwrap();
         assert_eq!(metadata.launching_identity, Some(expected));
         assert_eq!(metadata.session_id, "head-session");
-        assert_eq!(metadata.scope, run.scope);
+        // The task belongs to the head the program ran for, under the head's
+        // own scope, so the end of the program's short-lived run scope does
+        // not end it.
+        assert_eq!(metadata.scope, head.scope);
+        assert_ne!(metadata.scope, run.scope);
         assert_eq!(
             metadata.call_key.unwrap().requester,
             "reserved:prefrontal-core"
