@@ -4456,11 +4456,21 @@ fn regex_route_collection(
             regex_route_lock_hook(true);
             return None;
         };
-        let index = guard.as_ref()?;
-        if !index.ready {
-            return None;
+        let legacy = guard
+            .as_ref()
+            .filter(|index| index.ready)
+            .map(|index| index.snapshot());
+        drop(guard);
+        match legacy {
+            Some(snapshot) => snapshot,
+            // With no index of today's, as for a repository outside the
+            // root answered from its data-layer checkout, the checkout's
+            // text plane names the candidate files, when it is ready.
+            None => match data_layer_regex_candidates(ctx, compiled)? {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Some(Err(error)),
+            },
         }
-        index.snapshot()
     };
     let scope = crate::search_index::resolve_search_scope(&grep_executor::project_root(ctx), None);
     if !scope.use_index {
@@ -4476,6 +4486,23 @@ fn regex_route_collection(
         &regex_route::keep_past_line_limit,
     );
     Some(collection)
+}
+
+/// The files the data layer's text plane admits for `compiled`, as a
+/// snapshot the regex route verifies: `None` when this root's checkout has no
+/// ready text plane.
+fn data_layer_regex_candidates(
+    ctx: &AppContext,
+    compiled: &pattern_compile::CompiledPattern,
+) -> Option<std::io::Result<crate::search_index::SearchIndexSnapshot>> {
+    let view = crate::data_layer::tools::grep::ready_view(ctx)?;
+    let scope =
+        crate::data_layer::tools::grep::ViewScope::of(view, &grep_executor::project_root(ctx))?;
+    Some(
+        scope
+            .candidates(compiled)
+            .map_err(|error| std::io::Error::other(error.to_string())),
+    )
 }
 
 fn short_regex_compile_reason(message: &str) -> Cow<'_, str> {

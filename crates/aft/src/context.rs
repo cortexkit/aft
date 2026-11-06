@@ -10120,6 +10120,11 @@ impl AppContext {
         if !crate::data_layer::runtime::enabled() {
             return None;
         }
+        if self.data_checkout_pinned.load(Ordering::Acquire) {
+            if let Some(checkout) = self.data_checkout.try_lock().and_then(|slot| slot.clone()) {
+                return Some(DataCheckoutProbe::Bound(checkout));
+            }
+        }
         if let Some(withheld) = self.data_layer_withheld() {
             return Some(DataCheckoutProbe::Withheld(withheld));
         }
