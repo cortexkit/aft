@@ -2622,12 +2622,12 @@ mod tests {
         assert_eq!(expired["entries"][0]["kind"], "expired");
     }
 
-    fn padded_result(pad: usize) -> RecordedFrame {
+    fn text_result(text: &str) -> RecordedFrame {
         RecordedFrame {
             ty: FrameType::Response,
             body: serde_json::to_vec(&json!({
                 "isError": false,
-                "content": [{"type": "text", "text": "x".repeat(pad)}],
+                "content": [{"type": "text", "text": text}],
             }))
             .unwrap(),
         }
@@ -2642,15 +2642,15 @@ mod tests {
     const PAD_PER_OVERFLOW_PAGE: usize = 2046;
 
     /// Builds an on-disk ledger for the custodian `owner`: `expired` expired
-    /// entries with the oldest seqs, then `results` unexpired results whose
-    /// text is `pad` characters long. The rows are copies of rows that
-    /// `settle` and `reduce_expired` wrote. Returns how many overflow pages
-    /// the ledger table uses.
+    /// entries with the oldest seqs, then `results` unexpired results that
+    /// each carry `text`. The rows are copies of rows that `settle` and
+    /// `reduce_expired` wrote. Returns how many overflow pages the ledger
+    /// table uses.
     fn build_ledger_file(
         path: &std::path::Path,
         results: usize,
         expired: usize,
-        pad: usize,
+        text: &str,
     ) -> i64 {
         let conn = crate::db::open(path).unwrap();
         let page_size: i64 = conn
@@ -2676,7 +2676,7 @@ mod tests {
         settle(
             &conn,
             &key("template-result"),
-            &padded_result(pad),
+            &text_result(text),
             "ok",
             None,
             100,
@@ -2820,7 +2820,7 @@ mod tests {
                 ("large", SMALL_PAD + ADDED_PAGES * PAD_PER_OVERFLOW_PAGE),
             ] {
                 let path = dir.path().join(format!("{size}-{expired}.db"));
-                let overflow_pages = build_ledger_file(&path, RESULTS, expired, pad);
+                let overflow_pages = build_ledger_file(&path, RESULTS, expired, &"x".repeat(pad));
                 let cost = cold_settle_cost(&path);
                 let conn = crate::db::open(&path).unwrap();
                 let owner_rows: usize = conn
@@ -2971,12 +2971,24 @@ mod tests {
     #[test]
     #[ignore = "manual settle-time measurement"]
     fn settle_time_on_large_ledgers() {
-        const RESULT_PAD: usize = 20_000;
+        // Source-like text, so the stored JSON has escapes as tool output does.
+        let line = "    let value = map.get(\"key\").unwrap_or(&default);\t// \u{2192} cached\n";
+        let mut text = String::new();
+        while serde_json::to_string(&text).unwrap().len() < 20_000 {
+            text.push_str(line);
+        }
         let dir = tempfile::tempdir().unwrap();
         for (results, expired) in [(1_000, 0), (1_000, 1_000), (2_000, 0)] {
             let path = dir.path().join(format!("bench-{results}-{expired}.db"));
-            build_ledger_file(&path, results, expired, RESULT_PAD);
+            build_ledger_file(&path, results, expired, &text);
             let conn = crate::db::open(&path).unwrap();
+            let entry_bytes: i64 = conn
+                .query_row(
+                    "SELECT max(octet_length(late_entry)) FROM call_ledger WHERE custodian='owner'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             let mut times = Vec::new();
             for i in 0..21 {
                 let next = Key {
@@ -2992,14 +3004,14 @@ mod tests {
                 )
                 .unwrap();
                 let started = std::time::Instant::now();
-                settle(&conn, &next, &padded_result(RESULT_PAD), "ok", None, 100).unwrap();
+                settle(&conn, &next, &text_result(&text), "ok", None, 100).unwrap();
                 times.push(started.elapsed());
             }
             let first = times.remove(0);
             times.sort();
             eprintln!(
-                "settle on {results} results of 20 KB + {expired} expired: first {first:?}, \
-                 then median {:?}, max {:?} over {} settles",
+                "settle on {results} results ({entry_bytes}-byte late entries) + {expired} expired: \
+                 first {first:?}, then median {:?}, max {:?} over {} settles",
                 times[times.len() / 2],
                 times[times.len() - 1],
                 times.len()
