@@ -988,8 +988,13 @@ impl LiveCheckout {
         let mut recompute = Vec::new();
         let mut trace_keys = changed_keys.clone();
         trace_keys.extend(membership.iter().cloned());
+        // Stale answers were asked before this update removed files; a
+        // removed file has nothing left to recompute.
         for path in &stale.dispatch {
-            if !resolve.contains(path) && !recompute.contains(path) {
+            if !resolve.contains(path)
+                && !recompute.contains(path)
+                && self.resolved.contains_key(path)
+            {
                 recompute.push(path.clone());
             }
         }

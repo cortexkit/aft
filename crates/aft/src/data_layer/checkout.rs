@@ -5095,6 +5095,71 @@ pub fn other() { callee(); }
         assert!(callers_of(&view, "src/util.rs", "callee").contains("caller"));
     }
 
+    /// A file deleted in the same batch as a file its type-qualified calls
+    /// resolve through has a recorded answer that changed. Its stale answer
+    /// must not send the refresh after a file that no longer exists.
+    #[test]
+    fn deleting_a_file_with_the_file_its_calls_resolve_through_refreshes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "web/b.ts", "export class B { go() {} }\n");
+        write(
+            root.path(),
+            "web/a.ts",
+            "import { B } from './b';\nexport function run(b: B) { b.go(); }\n",
+        );
+        write(
+            root.path(),
+            "web/c.ts",
+            "export function keep() {}\nexport function caller() { keep(); }\n",
+        );
+        write(root.path(), "package.json", "{\"name\": \"demo\"}\n");
+        write(root.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write(root.path(), "src/lib.rs", "mod a;\nmod b;\n");
+        write(
+            root.path(),
+            "src/a.rs",
+            "use crate::b::B;\npub struct A;\nimpl A { pub fn run(&self) { B::go(); demo::b::B::go(); } }\n",
+        );
+        write(
+            root.path(),
+            "src/b.rs",
+            "pub struct B;\nimpl B { pub fn go() {} }\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        // Start the engine from the publication with a first edit.
+        write(
+            root.path(),
+            "web/c.ts",
+            "export function keep() {}\nexport function caller() { keep(); keep(); }\n",
+        );
+        checkout.record_paths(&[b"web/c.ts".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+
+        std::fs::remove_file(root.path().join("web/a.ts")).unwrap();
+        std::fs::remove_file(root.path().join("web/b.ts")).unwrap();
+        std::fs::remove_file(root.path().join("src/a.rs")).unwrap();
+        write(root.path(), "src/lib.rs", "mod b;\n");
+        write(root.path(), "Cargo.toml", "[package]\nname = \"renamed\"\n");
+        write(root.path(), "package.json", "{\"name\": \"renamed\"}\n");
+        checkout
+            .record_paths(&[
+                b"web/a.ts".to_vec(),
+                b"web/b.ts".to_vec(),
+                b"src/a.rs".to_vec(),
+                b"src/lib.rs".to_vec(),
+                b"Cargo.toml".to_vec(),
+                b"package.json".to_vec(),
+            ])
+            .unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let view = checkout.view().unwrap();
+        let callers = callers_of(&view, "web/c.ts", "keep");
+        assert!(callers.contains("symbol: \"caller\""), "{callers}");
+    }
+
     #[test]
     fn a_publication_whose_records_this_build_cannot_find_serves_text_and_rebuilds() {
         let root = tempfile::tempdir().unwrap();
