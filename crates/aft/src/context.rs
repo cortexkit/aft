@@ -13981,11 +13981,6 @@ impl AppContext {
         if !self.search_exact_memo.try_clear_idle() {
             return false;
         }
-        // Publication memoization can be discarded independently of resident
-        // artifact handles, including when the semantic lane remains busy.
-        {
-            return false;
-        }
         // Last, so a contended lane leaves every other handle in place too.
         if !self.try_release_idle_semantic_lane() {
             return false;
