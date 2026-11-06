@@ -256,10 +256,14 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 predicate_name: "walk_time_limit_reached, walk_files_unbounded, bounded_fallback_walk_files_with_limits_target",
             },
+            // glob_from_view answers from the data layer's checkout listing,
+            // which never walks, so it reports walk_truncated false and no
+            // skipped mounts; a directory missing from the listing is handed
+            // to fallback_glob, whose walk can stop early.
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
