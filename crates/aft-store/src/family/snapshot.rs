@@ -163,7 +163,8 @@ impl Snapshot {
     /// # Errors
     ///
     /// As [`read_state`](Self::read_state), and when the payload is not a
-    /// well-formed state.
+    /// well-formed state. A payload holding a state layout a newer build
+    /// wrote fails with [`FamilyError::NewerFormat`].
     pub fn checkout_state(
         &self,
         checkout: CheckoutId,

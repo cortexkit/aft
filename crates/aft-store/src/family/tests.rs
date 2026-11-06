@@ -611,6 +611,10 @@ fn rewrite_segment_version(path: &Path, version: u16) -> Vec<u8> {
 }
 
 fn assert_newer(error: &FamilyError, path: &Path, file: FileKind, found: u16) {
+    assert_newer_than(error, path, file, found, 1);
+}
+
+fn assert_newer_than(error: &FamilyError, path: &Path, file: FileKind, found: u16, supported: u16) {
     assert!(!error.is_unusable_file(), "refused, not unusable: {error}");
     assert_eq!(
         error.newer_format(),
@@ -618,7 +622,7 @@ fn assert_newer(error: &FamilyError, path: &Path, file: FileKind, found: u16) {
             path: path.to_path_buf(),
             file,
             found,
-            supported: 1,
+            supported,
         }),
         "{error}"
     );
@@ -756,4 +760,106 @@ fn a_checkout_state_a_newer_build_wrote_is_refused() {
         2,
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+/// A checkout state payload labelled with state layout `format`, holding
+/// `languages` paths that each name a language of their own, so the
+/// payload's string table grows with them.
+fn state_payload(format: u8, languages: usize) -> Vec<u8> {
+    use crate::checkout::{CheckoutState, PathKind, PathRecord, StatEvidence};
+    use crate::ids::ContentKey;
+    let records = (0..languages)
+        .map(|index| PathRecord {
+            path: format!("file-{index}").into_bytes(),
+            mode: 0o100_644,
+            kind: PathKind::Text,
+            content: ContentKey::of(b"text"),
+            link: Vec::new(),
+            stat: StatEvidence::default(),
+            language: format!("{index:0>200}"),
+        })
+        .collect();
+    CheckoutState::new(Vec::new(), Digest128::of(b"conversion"), records)
+        .unwrap()
+        .encode_as(format)
+}
+
+/// A state record this build reads, holding a state layout a newer build
+/// wrote: refused by that layout's version, whether the record's first
+/// bytes show it or its string table runs past them.
+#[test]
+fn a_checkout_state_payload_a_newer_build_wrote_is_refused() {
+    for languages in [0, 400] {
+        let dir = tempfile::tempdir().unwrap();
+        let family = open(dir.path());
+        publish(&family, b"one", &state_payload(4, languages));
+        let path = family.layout.state(checkout("main"), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        if languages > 0 {
+            assert!(bytes.len() as u64 > crate::checkout::FORMAT_PEEK);
+        }
+
+        let snapshot = family.snapshot().unwrap();
+        // The record itself checks: only the layout its payload names is
+        // newer.
+        assert!(snapshot.read_state(checkout("main")).unwrap().is_some());
+        assert_newer_than(
+            &snapshot.checkout_state(checkout("main")).unwrap_err(),
+            &path,
+            FileKind::Record,
+            4,
+            3,
+        );
+        drop(snapshot);
+        assert_newer_than(
+            &family.check_formats().unwrap_err(),
+            &path,
+            FileKind::Record,
+            4,
+            3,
+        );
+        assert_newer_than(
+            &family.try_write().err().expect("the writer is refused"),
+            &path,
+            FileKind::Record,
+            4,
+            3,
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{languages} languages"
+        );
+    }
+}
+
+/// A state layout this build reads decodes, and one older than any it reads
+/// stays unusable, as before: the checkout is built again.
+#[test]
+fn a_checkout_state_payload_an_older_build_wrote_stays_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", &state_payload(3, 1));
+    assert!(
+        family
+            .snapshot()
+            .unwrap()
+            .checkout_state(checkout("main"))
+            .unwrap()
+            .is_some()
+    );
+    publish(&family, b"two", &state_payload(1, 1));
+    let error = family
+        .snapshot()
+        .unwrap()
+        .checkout_state(checkout("main"))
+        .unwrap_err();
+    assert!(matches!(error, FamilyError::Damaged { .. }), "{error}");
+    assert!(error.is_unusable_file());
+    assert_eq!(error.newer_format(), None);
+    family.check_formats().unwrap();
+    assert!(
+        family.try_write().unwrap().is_some(),
+        "a writer still starts"
+    );
 }

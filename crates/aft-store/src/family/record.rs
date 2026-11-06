@@ -68,6 +68,10 @@ pub(crate) enum RecordError {
     Invalid(&'static str),
     #[error("record format version {found} is not supported; this build reads version {supported}")]
     UnsupportedVersion { found: u16, supported: u16 },
+    /// An intact record whose payload names a layout version above the
+    /// highest this build reads for its kind: a newer build wrote it.
+    #[error("payload format {found} is not supported; this build reads up to format {supported}")]
+    NewerPayload { found: u16, supported: u16 },
     #[error("record belongs to family {found}, expected {expected}")]
     FamilyMismatch { found: FamilyId, expected: FamilyId },
 }
@@ -192,6 +196,26 @@ pub(crate) fn newer_version(
         }
         _ => None,
     }
+}
+
+/// Up to the first `limit` bytes of the record at `path`, unchecked: for a
+/// reader that looks for a version before deciding to read the whole
+/// record. `None` when the file cannot be read.
+pub(crate) fn head(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    crate::fs::open_read(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// The payload part of `head`, a record's first bytes as [`head`] reads
+/// them; empty when they end within the header.
+pub(crate) fn head_payload(head: &[u8]) -> &[u8] {
+    head.get(HEADER_LEN..).unwrap_or_default()
 }
 
 /// A cursor over a record's payload. Every read checks the remaining length

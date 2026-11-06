@@ -156,7 +156,10 @@ impl FamilyError {
                 path: path.to_path_buf(),
                 reason: format!("the record's bytes do not check ({reason})"),
             },
-            RecordError::UnsupportedVersion { found, supported } if found > supported => {
+            RecordError::UnsupportedVersion { found, supported }
+            | RecordError::NewerPayload { found, supported }
+                if found > supported =>
+            {
                 Self::NewerFormat(NewerFormat {
                     path: path.to_path_buf(),
                     file: FileKind::Record,
@@ -191,7 +194,9 @@ pub enum FileKind {
 }
 
 /// A family file that a newer build wrote, in a format version above the
-/// highest this build reads (see [`FamilyError::NewerFormat`]).
+/// highest this build reads (see [`FamilyError::NewerFormat`]). For a
+/// record, the version is the record's own or, for a checkout state, that
+/// of the state layout its payload holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewerFormat {
     pub path: PathBuf,
@@ -225,13 +230,15 @@ impl NewerFormat {
 
 impl std::fmt::Display for NewerFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A record's refusal names either its own format version or that of
+        // the layout its payload holds, so it says only "format version".
         let kind = match self.file {
-            FileKind::Record => "record",
-            FileKind::Segment => "segment",
+            FileKind::Record => "",
+            FileKind::Segment => "segment ",
         };
         write!(
             f,
-            "{}: {kind} format version {} is not supported; this build reads version {}",
+            "{}: {kind}format version {} is not supported; this build reads version {}",
             self.path.display(),
             self.found,
             self.supported
@@ -339,7 +346,9 @@ impl Family {
 
     /// Fails with [`FamilyError::NewerFormat`] when a newer build wrote the
     /// newest manifest, or a segment or checkout state it names, in a format
-    /// version above the highest this build reads: this build can then
+    /// version above the highest this build reads (for a checkout state, the
+    /// record's own version or that of the state layout its payload holds):
+    /// this build can then
     /// neither read the family whole nor write it without harming what the
     /// newer build wrote. Reads only each named file's header unless the
     /// header names a newer version. A named file that cannot be read is left
@@ -363,7 +372,9 @@ impl Family {
         }
         for state in manifest.checkouts() {
             let path = self.layout.state(state.checkout, state.number);
-            if let Some(error) = record::newer_version(&path, Kind::State, self.id, state.number) {
+            if let Some(error) = record::newer_version(&path, Kind::State, self.id, state.number)
+                .or_else(|| crate::checkout::newer_state_format(&path, self.id, state.number))
+            {
                 return Err(FamilyError::record(&path, error));
             }
         }

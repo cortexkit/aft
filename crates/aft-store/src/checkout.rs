@@ -271,8 +271,20 @@ impl CheckoutState {
     /// path's), which are small or zero for files of one checkout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_layout(STATE_FORMAT)
+    }
+
+    /// [`Self::encode`] naming layout `format` instead of [`STATE_FORMAT`], as
+    /// a build writing that layout would label these bytes: for tests of
+    /// what a reader does with a payload from a newer or older build.
+    #[cfg(test)]
+    pub(crate) fn encode_as(&self, format: u8) -> Vec<u8> {
+        self.encode_layout(format)
+    }
+
+    fn encode_layout(&self, format: u8) -> Vec<u8> {
         let mut out = Encoder::default();
-        out.byte(STATE_FORMAT);
+        out.byte(format);
         out.blob(&self.git);
         out.blob(self.conversion.as_bytes());
         out.blob(&self.root);
@@ -337,11 +349,20 @@ impl CheckoutState {
     ///
     /// # Errors
     ///
-    /// When the payload is not a well-formed state.
+    /// When the payload is not a well-formed state, and with
+    /// [`RecordError::NewerPayload`] when it names a layout above
+    /// [`STATE_FORMAT`]: a newer build wrote it, so it is refused rather than
+    /// read as damaged and built again.
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, RecordError> {
         let invalid = |error: DecodeError| RecordError::Invalid(error.0);
         let mut input = Decoder::new(payload).map_err(invalid)?;
         let format = input.byte().map_err(invalid)?;
+        if format > STATE_FORMAT {
+            return Err(RecordError::NewerPayload {
+                found: u16::from(format),
+                supported: u16::from(STATE_FORMAT),
+            });
+        }
         // Format 2 is format 3 without the root folder.
         if format != STATE_FORMAT && format != 2 {
             return Err(RecordError::Invalid("unknown checkout state format"));
@@ -462,8 +483,49 @@ impl CheckoutState {
     }
 }
 
-/// The version of [`CheckoutState::encode`]'s layout, its first byte.
+/// The version of [`CheckoutState::encode`]'s layout: the first byte after
+/// the payload's string table. A reader refuses a payload naming a higher
+/// one, since a newer build wrote it. So every later layout must keep the
+/// string table's encoding and this byte where they are, and any other
+/// change to the layout must raise this number.
 const STATE_FORMAT: u8 = 3;
+
+/// How much of a state record [`newer_state_format`] reads to find the
+/// payload's format byte: the record header and the payload's string table,
+/// which holds only the checkout's language names, fit in it many times
+/// over. A table that does not is read whole.
+pub(crate) const FORMAT_PEEK: u64 = 64 << 10;
+
+/// The refusal [`CheckoutState::decode`] gives the state record at `path`,
+/// the `number`th state of `family`'s checkout, when its payload names a
+/// layout above [`STATE_FORMAT`]. Reads only the record's first bytes
+/// unless they name such a layout, or the string table runs past them; then
+/// the record is read and checked whole, so damaged bytes are told apart
+/// from a newer payload exactly as a reader tells them. `None` for any other
+/// record, or one that cannot be read: whoever reads it later reports why.
+pub(crate) fn newer_state_format(
+    path: &Path,
+    family: crate::ids::FamilyId,
+    number: u64,
+) -> Option<RecordError> {
+    let head = crate::family::record::head(path, FORMAT_PEEK)?;
+    let format =
+        Decoder::new(crate::family::record::head_payload(&head)).and_then(|mut input| input.byte());
+    match format {
+        Ok(format) if format <= STATE_FORMAT => return None,
+        // The whole record was read and holds no format byte: it is
+        // damaged, and the reader that needs it says so.
+        Err(_) if (head.len() as u64) < FORMAT_PEEK => return None,
+        _ => {}
+    }
+    let payload =
+        crate::family::record::read(path, crate::family::record::Kind::State, family, number)
+            .ok()?;
+    match CheckoutState::decode(&payload) {
+        Err(error @ RecordError::NewerPayload { .. }) => Some(error),
+        _ => None,
+    }
+}
 
 /// The fewest bytes one path record takes in [`CheckoutState::encode`]'s
 /// layout: the 16-byte content key and its length byte, plus one byte for
