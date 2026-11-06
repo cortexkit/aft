@@ -184,7 +184,7 @@ pub(crate) fn write_segment(
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut writer = SegmentWriter::create(path, meta).map_err(|error| error.to_string())?;
-    let keys = write_sections(&mut writer, inputs, resolved, records, true, None)?;
+    let keys = write_sections(&mut writer, inputs, resolved, records, true, None, None)?;
     writer.finish().map_err(|error| error.to_string())?;
     Ok(keys)
 }
@@ -194,6 +194,10 @@ pub(crate) fn write_segment(
 /// planes' sections too. Returns each file's fragment key. With
 /// `all_records`, every file's content record must be in `records`;
 /// without, a file whose record is missing keeps the one already stored.
+///
+/// `encoded` is a content builder that already holds every record the
+/// segment needs, encoded while the caller let the decoded records go; the
+/// records are then not read from `records`.
 ///
 /// # Errors
 ///
@@ -205,13 +209,15 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     resolved: &BTreeMap<String, R>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     all_records: bool,
+    encoded: Option<ContentSectionsBuilder>,
     memory: Option<&mut Vec<(String, usize)>>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
-    let mut content = ContentSectionsBuilder::new();
+    let prebuilt = encoded.is_some();
+    let mut content = encoded.unwrap_or_default();
     // Configuration files' records too, so a reader of the segment can give
     // the resolver the same configuration bytes the build read.
     for record in inputs.state.paths() {
-        if record.language != "config" {
+        if prebuilt || record.language != "config" {
             continue;
         }
         let key = RecordKey::new(
@@ -234,6 +240,7 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
         // the records of changed contents; an unchanged one stays where the
         // publication stored it.
         match records.get(key) {
+            _ if prebuilt => {}
             Some((record_key, record)) => content.add(*record_key, record),
             None if all_records => return Err(format!("no content record for {file}")),
             None => {}

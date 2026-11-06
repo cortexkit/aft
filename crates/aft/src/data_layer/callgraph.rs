@@ -669,14 +669,22 @@ pub(crate) fn resolve_checkout_measuring(
         let bound = BindCache::default();
         bound.bind_missing(inputs, &paths)?;
         let mut resolved = resolve_files(inputs, &bound, &paths)?;
-        let mut calls = MethodCallInputs::build(inputs, &resolved);
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
             // The parses are counted by the caller; mark them seen so the
-            // parts below count only what they hold besides.
+            // part below counts only what it holds besides.
             let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
+        }
+        // Pass 4 reads each file's own inputs, built below from its parse
+        // and resolution, and never the bound surfaces.
+        drop(bound);
+        let mut calls = MethodCallInputs::build(inputs, &resolved);
+        if let Some(memory) = memory.as_deref_mut() {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push((
                 "resolve.method_call_inputs".to_string(),
                 calls.heap_bytes(&mut seen),

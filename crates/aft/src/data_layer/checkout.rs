@@ -1126,6 +1126,22 @@ impl Checkout {
                 ("scan.state".to_string(), state.heap_bytes(&mut seen)),
             ]);
         }
+        // The resolver reads the decoded parses; the segment needs only each
+        // record's encoded bytes, a fifth of the decoded size, so encode them
+        // now and let the decoded records go before resolving. Every parse
+        // `inputs` holds came from one of these records.
+        let mut encoded = aft_store::content::ContentSectionsBuilder::new();
+        for (_, (record_key, record)) in std::mem::take(&mut collected.records) {
+            encoded.add(record_key, &record);
+        }
+        if measure {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            report.memory.push((
+                "scan.records_encoded".to_string(),
+                encoded.heap_bytes(&mut seen),
+            ));
+        }
         checkpoint()?;
 
         let started = Instant::now();
@@ -1169,6 +1185,7 @@ impl Checkout {
             &resolved,
             &collected.records,
             true,
+            Some(encoded),
             measure.then_some(&mut report.memory),
         )
         .map_err(DataError::Store)?;
@@ -1925,8 +1942,16 @@ impl Checkout {
         text_units
             .write(pending.writer())
             .map_err(DataError::store)?;
-        let fragments = write_sections(pending.writer(), &inputs, &resolved, &records, false, None)
-            .map_err(DataError::Store)?;
+        let fragments = write_sections(
+            pending.writer(),
+            &inputs,
+            &resolved,
+            &records,
+            false,
+            None,
+            None,
+        )
+        .map_err(DataError::Store)?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let per_path = inputs
             .state
