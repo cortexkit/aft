@@ -996,7 +996,7 @@ fn main() {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
-        flush_indexes_on_graceful_shutdown(&registry, shutdown_started, drained_at);
+        flush_indexes_on_graceful_shutdown(shutdown_started, drained_at);
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();
@@ -1164,7 +1164,6 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
 
 /// Deadline-bounded EOF index flush, shared by the transport and its regression tests.
 fn flush_indexes_on_graceful_shutdown(
-    registry: &RuntimeRegistry,
     shutdown_started: Instant,
     drained_at: Instant,
 ) {
@@ -1174,18 +1173,6 @@ fn flush_indexes_on_graceful_shutdown(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
-    let runtime = Arc::clone(registry.current());
-    aft::slog_info!("shutdown phase=search_index_flush_start");
-    let report = aft::context::flush_search_indexes_before(
-        &[runtime],
-        (Instant::now() + aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline),
-    );
-    aft::slog_info!(
-        "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
-        report.completed == 1,
-        report.flushed == 1,
-        shutdown_started.elapsed().as_millis()
-    );
     aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
     let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
     aft::slog_info!(
@@ -4219,7 +4206,7 @@ mod graceful_shutdown_search_index_tests {
 
         ctx.set_cache_role(true, None);
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+        flush_indexes_on_graceful_shutdown(Instant::now(), Instant::now());
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")
@@ -4248,7 +4235,7 @@ mod graceful_shutdown_search_index_tests {
             .expect("cache mtime before shutdown");
 
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+        flush_indexes_on_graceful_shutdown(Instant::now(), Instant::now());
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")

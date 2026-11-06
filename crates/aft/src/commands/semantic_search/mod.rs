@@ -677,59 +677,20 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 },
             }
         } else {
-            match try_read_with_budget(self.ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
-                Some(index) if index.as_ref().is_some_and(SearchIndex::is_ready) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Ready,
-                        snapshot: index.as_ref().map(SearchIndex::snapshot).map(Arc::new),
-                        evicted: false,
-                        lock_contended: false,
-                        data_view: false,
-                    }
-                }
-                Some(index) if index.is_some() => TrigramReadiness {
-                    status: IndexStatus::Building,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                    data_view: false,
+            // No text plane serves yet: building while the checkout's first
+            // publication is on the way, otherwise a bounded scan answers.
+            let building = crate::data_layer::surfaces::report(self.ctx)
+                .is_some_and(|report| report.text.status == crate::data_layer::surfaces::BUILDING);
+            TrigramReadiness {
+                status: if building {
+                    IndexStatus::Building
+                } else {
+                    IndexStatus::Fallback
                 },
-                Some(_) => {
-                    let receiver = try_read_with_budget(
-                        self.ctx.search_index_rx(),
-                        INTERACTIVE_ARTIFACT_READ_BUDGET,
-                    );
-                    match receiver {
-                        Some(receiver) if receiver.is_some() => TrigramReadiness {
-                            status: IndexStatus::Building,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: false,
-                            data_view: false,
-                        },
-                        Some(_) => TrigramReadiness {
-                            status: IndexStatus::Fallback,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: false,
-                            data_view: false,
-                        },
-                        None => TrigramReadiness {
-                            status: IndexStatus::Building,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: true,
-                            data_view: false,
-                        },
-                    }
-                }
-                None => TrigramReadiness {
-                    status: IndexStatus::Building,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: true,
-                    data_view: false,
-                },
+                snapshot: None,
+                evicted: false,
+                lock_contended: false,
+                data_view: false,
             }
         };
 
@@ -773,14 +734,6 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         if crate::data_layer::tools::search::DataSemantic::current(self.ctx)
             .is_some_and(|data| data.serving().is_some())
         {
-            return extensions::ReadinessWait::Completed;
-        }
-        // A writer-held pointer cannot be advanced by the loader drain below;
-        // preserve the interactive contention bound instead of sleeping 2.5s.
-        if matches!(
-            self.ctx.search_index().try_read(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ) {
             return extensions::ReadinessWait::Completed;
         }
         match search_index_ready_with_budget(self.ctx, first_search_index_load_wait_budget()) {
@@ -1823,7 +1776,6 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        SearchLaneStatus::recover_evicted_trigram(ctx);
         match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Ok(ready) => ready,
             Err(SearchIndexWaitError::Cancelled) => return (plan, cancelled_search_response(req)),
@@ -2190,23 +2142,6 @@ impl SearchLaneStatus {
 
     fn not_observed(observation: &IndexObservation) -> bool {
         observation.unavailable_reason.as_deref() == Some(feature_cause::RUNTIME_NOT_OBSERVED)
-    }
-
-    /// Start reloading an idle-evicted trigram index before the request waits
-    /// for trigram readiness, so a reload that finishes inside the wait
-    /// budget serves this query (grep and glob recover the same way).
-    fn recover_evicted_trigram(ctx: &AppContext) {
-        let resident_or_loading = ctx
-            .search_index()
-            .try_read()
-            .map_or(true, |index| index.is_some())
-            || ctx
-                .search_index_rx()
-                .try_read()
-                .map_or(true, |receiver| receiver.is_some());
-        if ctx.config().indexes.trigram && !resident_or_loading {
-            super::configure::trigger_search_index_reload_if_evicted(ctx);
-        }
     }
 
     fn observe_current(ctx: &AppContext) -> Self {
@@ -2687,7 +2622,6 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    SearchLaneStatus::recover_evicted_trigram(ctx);
     let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
     {
         Ok(ready) => ready,
@@ -4450,27 +4384,10 @@ fn regex_route_collection(
     } else {
         #[cfg(test)]
         regex_route_lock_hook(false);
-        let Some(guard) =
-            try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        else {
-            #[cfg(test)]
-            regex_route_lock_hook(true);
-            return None;
-        };
-        let legacy = guard
-            .as_ref()
-            .filter(|index| index.ready)
-            .map(|index| index.snapshot());
-        drop(guard);
-        match legacy {
-            Some(snapshot) => snapshot,
-            // With no ready legacy search index (as for a repository outside
-            // the root, answered from its data-layer checkout), the
-            // checkout's text index names the candidate files, when ready.
-            None => match data_layer_regex_candidates(ctx, compiled)? {
-                Ok(snapshot) => snapshot,
-                Err(error) => return Some(Err(error)),
-            },
+        // The checkout's text index names the candidate files, when ready.
+        match data_layer_regex_candidates(ctx, compiled)? {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Some(Err(error)),
         }
     };
     let scope = crate::search_index::resolve_search_scope(&grep_executor::project_root(ctx), None);
@@ -5549,19 +5466,11 @@ fn run_engine_ranking(
     } else {
         None
     };
-    let context_index = (borrowed_index.is_none() && data_text.is_none() && lexical_view.is_none())
-        .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
     let view_snapshot =
         lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
-        .or_else(|| {
-            context_index
-                .as_ref()
-                .and_then(|guard| guard.as_ref())
-                .and_then(|guard| guard.as_ref())
-        })
         .unwrap_or(&empty_index);
     // When the data layer's meaning plane served the semantic lane, the
     // generation names its vectors too, so a fill that lands is never served
@@ -5586,8 +5495,7 @@ fn run_engine_ranking(
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
             GenerationToken::new_with_str(&with_meaning(format!(
-                "{}:{}",
-                ctx.search_index_rx_generation(),
+                "no-text-index:{}",
                 ctx.semantic_index_rx_generation()
             )))
         });
@@ -8272,7 +8180,7 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
 
 fn search_index_ready_with_budget(
     ctx: &AppContext,
-    wait_budget: Duration,
+    _wait_budget: Duration,
 ) -> Result<bool, SearchIndexWaitError> {
     if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
         return Ok(true);
@@ -8280,55 +8188,7 @@ fn search_index_ready_with_budget(
     if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
         return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
     }
-    let deadline = Instant::now() + wait_budget;
-    loop {
-        if search_cancellation_requested() {
-            return Err(SearchIndexWaitError::Cancelled);
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let read_budget = remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
-        let Some(search_index) = try_read_with_budget(ctx.search_index(), read_budget) else {
-            if Instant::now() >= deadline {
-                return Err(SearchIndexWaitError::Contended);
-            }
-            continue;
-        };
-        if search_index.as_ref().is_some_and(|index| index.ready) {
-            return Ok(true);
-        }
-        drop(search_index);
-
-        // The loader publishes through a channel; the query holds neither the
-        // index nor receiver lock while draining, so it cannot block publication.
-        let Some(search_receiver) = try_read_with_budget(ctx.search_index_rx(), read_budget) else {
-            if Instant::now() >= deadline {
-                return Err(SearchIndexWaitError::Contended);
-            }
-            continue;
-        };
-        let load_in_progress = search_receiver.is_some();
-        drop(search_receiver);
-        if !load_in_progress {
-            return Ok(false);
-        }
-
-        #[cfg(test)]
-        SEARCH_INDEX_LOAD_WAIT_HOOK.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        crate::runtime_drain::drain_search_index_events(ctx);
-        if search_cancellation_requested() {
-            return Err(SearchIndexWaitError::Cancelled);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL));
-    }
+    Ok(false)
 }
 
 /// Ranks every semantic chunk against `query_vector` with no enumeration

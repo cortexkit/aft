@@ -714,12 +714,9 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
     }
 }
 
-/// Drain all background build-completion receivers in standalone order.
-///
-/// Search installs first so watcher/pending updates apply to the freshest index,
-/// followed by callgraph store and semantic index completion.
+/// Drain all background build-completion receivers in standalone order:
+/// the call-graph store's, then the semantic index's.
 pub fn drain_build_completions(ctx: &AppContext) {
-    drain_search_index_events(ctx);
     drain_callgraph_store_events(ctx);
     drain_semantic_index_events(ctx);
 }
@@ -729,16 +726,6 @@ pub fn drain_build_completions(ctx: &AppContext) {
 /// Each receiver is checked under its own short lock; no lock is held while
 /// checking the next subsystem.
 pub fn any_build_in_flight(ctx: &AppContext) -> bool {
-    {
-        let rx = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if rx.is_some() {
-            return true;
-        }
-    }
-
     {
         let rx = ctx.callgraph_store_rx().lock();
         if rx.is_some() {
@@ -755,14 +742,8 @@ pub fn any_build_in_flight(ctx: &AppContext) -> bool {
 /// [`any_build_in_flight`] without waiting: `None` when one of the receiver
 /// slots is locked by another thread right now.
 pub fn try_any_build_in_flight(ctx: &AppContext) -> Option<bool> {
-    let search = match ctx.search_index_rx().try_read() {
-        Ok(rx) => rx.is_some(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-        Err(std::sync::TryLockError::WouldBlock) => return None,
-    };
     Some(
-        search
-            || ctx.callgraph_store_rx().try_lock()?.is_some()
+        ctx.callgraph_store_rx().try_lock()?.is_some()
             || ctx.semantic_index_rx().try_lock()?.is_some(),
     )
 }
@@ -787,24 +768,6 @@ pub fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &Path)
     }
 
     false
-}
-
-fn replay_search_index_pending_updates(
-    ctx: &AppContext,
-    index: &mut crate::search_index::SearchIndex,
-    pending_paths: Vec<std::path::PathBuf>,
-) {
-    for path in pending_paths {
-        if path.exists() {
-            if watcher_path_is_ignored_by_current_matcher(ctx, &path) {
-                index.remove_file(&path);
-            } else {
-                index.update_file(&path);
-            }
-        } else {
-            index.remove_file(&path);
-        }
-    }
 }
 
 pub fn watcher_path_is_semantic_source(path: &Path) -> bool {
@@ -857,115 +820,6 @@ fn semantic_paths_with_changed_content(
 pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
     ctx.clear_all_semantic_refresh_retry_attempts();
     ctx.reset_semantic_refresh_circuit_after_success();
-}
-
-pub fn drain_search_index_events(ctx: &AppContext) {
-    if ctx.config().views.enabled {
-        ctx.retire_search_index_rx("lexical views replace the legacy search loader");
-        return;
-    }
-    let (latest, disconnected, receiver_generation, receiver_epoch) = {
-        let rx_ref = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-
-        let mut latest = None;
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(index) => latest = Some(index),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (
-            latest,
-            disconnected,
-            ctx.search_index_rx_generation(),
-            ctx.search_index_rx_epoch(),
-        )
-    };
-    let recorded_bytes = latest
-        .as_ref()
-        .and_then(|_| ctx.take_search_pending_install(receiver_epoch));
-
-    let mut installed_index = false;
-    if let Some(mut index) = latest {
-        wait_on_artifact_drain_commit_gate_for_test(ctx);
-        installed_index = ctx
-            .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
-                let pending_paths = ctx.take_pending_search_index_paths();
-                if !pending_paths.is_empty() {
-                    replay_search_index_pending_updates(ctx, &mut index, pending_paths);
-                }
-                let mut search_index = ctx
-                    .search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *search_index = Some(index);
-                // A reload can keep the same receiver generation. Retire exact
-                // sets warmed against the previous resident index during the load.
-                ctx.search_exact_memo().clear();
-                *receiver = None;
-                true
-            })
-            .unwrap_or(false);
-        if !installed_index {
-            crate::context::log_discarded_finished_load(
-                "search index",
-                ctx.canonical_cache_root_opt().as_deref(),
-                recorded_bytes,
-                ctx.finished_load_discard_reason(
-                    receiver_generation,
-                    receiver_epoch,
-                    ctx.search_index_rx_epoch(),
-                ),
-            );
-            return;
-        }
-        ctx.note_search_index_load_succeeded();
-    } else if disconnected {
-        let cleared = ctx
-            .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
-                *receiver = None;
-                let mut search_index = ctx
-                    .search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // A build-denied index is a terminal settled state (write access
-                // refused), not an in-progress build, so keep it: clearing it
-                // would flip health back to "building" for a root that can never
-                // produce a real index here.
-                if search_index
-                    .as_ref()
-                    .is_some_and(|index| !index.ready && !index.build_denied)
-                {
-                    *search_index = None;
-                }
-                true
-            })
-            .unwrap_or(false);
-        if !cleared {
-            return;
-        }
-        // The worker dropped its sender without delivering an index (a lost
-        // load). Left alone, the root now has no index and no receiver, so health
-        // would report "building" forever — nothing reschedules the load until a
-        // later search query happens to run. Schedule one automatic replacement
-        // load (capped per configure generation) so the root recovers on its own.
-        crate::commands::configure::restart_search_index_after_load_disconnect(ctx);
-    }
-
-    if installed_index || disconnected {
-        ctx.signal_status_changed();
-    }
 }
 
 pub fn drain_callgraph_store_events(ctx: &AppContext) {
@@ -2367,188 +2221,6 @@ fn wait_on_search_rebuild_publish_gate_for_test(root: &Path) {
     }
 }
 
-pub fn spawn_search_corpus_refresh(
-    ctx: &AppContext,
-    root: std::path::PathBuf,
-    config: Arc<aft::config::Config>,
-) {
-    let generation = ctx.configure_generation();
-    let _ = ctx.run_if_subc_bound_generation(generation, || {
-        spawn_search_corpus_refresh_admitted(ctx, root, config, generation);
-    });
-}
-
-type SearchRefreshJob = Box<dyn FnOnce(&std::sync::atomic::AtomicBool) + Send>;
-
-struct PendingSearchRefresh {
-    dirty: Option<SearchRefreshJob>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// A root has one worker and one replaceable follow-up, not one thread per
-/// overflow. Replacing the follow-up also cancels the obsolete disk walk.
-#[derive(Default)]
-pub(crate) struct SearchCorpusRefreshLane {
-    roots: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, PendingSearchRefresh>>,
-    #[cfg(test)]
-    started: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, usize>>,
-}
-
-impl SearchCorpusRefreshLane {
-    fn submit(self: &Arc<Self>, root: PathBuf, job: SearchRefreshJob) {
-        let mut roots = self.roots.lock();
-        if let Some(active) = roots.get_mut(&root) {
-            active
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Release);
-            active.dirty = Some(job);
-            return;
-        }
-        roots.insert(
-            root.clone(),
-            PendingSearchRefresh {
-                dirty: Some(job),
-                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
-        drop(roots);
-        let lane = Arc::clone(self);
-        thread::spawn(move || loop {
-            let (job, cancel) = {
-                let mut roots = lane.roots.lock();
-                let active = roots.get_mut(&root).expect("refresh owns root lane");
-                let Some(job) = active.dirty.take() else {
-                    roots.remove(&root);
-                    return;
-                };
-                active.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                (job, Arc::clone(&active.cancel))
-            };
-            #[cfg(test)]
-            {
-                *lane.started.lock().entry(root.clone()).or_default() += 1;
-            }
-            job(&cancel);
-        });
-    }
-}
-
-fn spawn_search_corpus_refresh_admitted(
-    ctx: &AppContext,
-    root: std::path::PathBuf,
-    config: Arc<aft::config::Config>,
-    generation: u64,
-) {
-    if config.views.enabled || ctx.config().views.enabled {
-        return;
-    }
-    {
-        let mut search_index = ctx
-            .search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = search_index.as_mut() {
-            index.ready = false;
-        }
-    }
-
-    let (tx, rx): (
-        crossbeam_channel::Sender<aft::search_index::SearchIndex>,
-        crossbeam_channel::Receiver<aft::search_index::SearchIndex>,
-    ) = crossbeam_channel::unbounded();
-    let receiver_epoch = ctx.install_search_index_rx(rx, generation);
-    let receiver_terminal_guard = ctx.search_index_rx_terminal_guard(receiver_epoch);
-    ctx.reset_symbol_cache();
-
-    let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
-    let project_key = ctx.memoized_artifact_cache_key(&root);
-    let session_id = log_ctx::current_session();
-    let generation_flag = ctx.configure_generation_flag();
-    let content_generation = ctx.configure_content_generation();
-    let content_generation_flag = ctx.configure_content_generation_flag();
-    let persist_epoch_flag = ctx.search_persist_epoch_flag();
-    let persist_epoch = ctx.next_search_persist_epoch();
-    let publication_gate = ctx.legacy_search_publication_gate();
-    let lifecycle = ctx.subc_lifecycle_admission();
-    let cold_build_limiter = ctx.cold_build_limiter();
-    ctx.search_corpus_refresh_lane.submit(
-        root.clone(),
-        Box::new(move |cancel| {
-            let _terminal_guard = receiver_terminal_guard;
-            let _publication = publication_gate.install();
-            log_ctx::with_session(session_id, || {
-                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
-                    &cold_build_limiter,
-                    "search corpus refresh",
-                    || {
-                        !cancel.load(std::sync::atomic::Ordering::Acquire)
-                            && lifecycle.is_current(&generation_flag, generation)
-                    },
-                ) else {
-                    return;
-                };
-                if !lifecycle.is_current(&generation_flag, generation)
-                    || persist_epoch_flag.current() != persist_epoch
-                {
-                    return;
-                }
-                let cache_dir = aft::search_index::resolve_cache_dir_with_key(
-                    &project_key,
-                    config.cache_storage_dir().as_deref(),
-                );
-                let cache_lock = if shared_artifacts_read_only {
-                    None
-                } else {
-                    match aft::search_index::CacheLock::acquire(&cache_dir, &root) {
-                        Ok(lock) => Some(lock),
-                        Err(error) => {
-                            aft::slog_warn!(
-                                "failed to acquire search cache lock for ignore refresh: {}",
-                                error
-                            );
-                            None
-                        }
-                    }
-                };
-                let keep_going = || {
-                    !cancel.load(std::sync::atomic::Ordering::Acquire)
-                        && publication_gate.allowed()
-                        && lifecycle.is_current(&generation_flag, generation)
-                        && persist_epoch_flag.current() == persist_epoch
-                };
-                let Some(mut index) =
-                    aft::search_index::SearchIndex::build_with_limit_to_cache_dir_cancellable(
-                        &root,
-                        config.search_index_max_file_size,
-                        &cache_dir,
-                        &keep_going,
-                    )
-                else {
-                    return;
-                };
-                wait_on_search_rebuild_publish_gate_for_test(&root);
-                if !keep_going() {
-                    return;
-                }
-                // cache_lock is None for borrow-only roots, so ignore-refresh
-                // never writes cache.bin even when ram_overlay is on.
-                if cache_lock.is_some()
-                    && content_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        == content_generation
-                {
-                    let _ = persist_epoch_flag.run_if_current(persist_epoch, || {
-                        let head = index.stored_git_head().map(str::to_owned);
-                        index.write_to_disk(&cache_dir, head.as_deref());
-                    });
-                }
-                let _ = lifecycle.run_if_current(&generation_flag, generation, || {
-                    let _ = tx.send(index);
-                });
-            });
-        }),
-    );
-}
-
 pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
@@ -2598,12 +2270,6 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
                     reason
                 );
             }
-        }
-
-        if config.indexes.trigram && !config.views.enabled && !ctx.shared_artifacts_read_only() {
-            spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
-            status_changed = true;
-            aft::slog_info!("{}", search_refresh_started_log(reason));
         }
 
         if config.indexes.semantic && !ctx.shared_artifacts_read_only() {
@@ -2749,13 +2415,6 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
             // the overlay from disk. A load already in flight may have read
             // the disk before the lost events, so it is retired and the next
             // query starts a fresh one.
-            ctx.search_index()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if ctx.ram_overlay_active() {
-                ctx.retire_search_index_rx("a watcher rescan retired the in-flight load");
-            }
             if config.indexes.semantic {
                 ctx.semantic_index()
                     .write()
@@ -2992,37 +2651,6 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
     }
 }
 
-fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
-    if ctx.config().views.enabled {
-        return;
-    }
-    let max_file_size = ctx
-        .search_index()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(crate::search_index::SearchIndex::max_file_size);
-    let Some(max_file_size) = max_file_size else {
-        // Exact search also memoizes filesystem results before an index is ready.
-        ctx.search_exact_memo().clear();
-        return;
-    };
-    let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
-    let update = crate::search_index::prepare_search_update(path, max_file_size, remove);
-    let mut index_ref = ctx
-        .search_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(index) = index_ref.as_mut() {
-        index.apply_search_update(update);
-    }
-    // Receiver generations identify loads, not edits to a resident index.
-    // Retire exact sets (including cached absence) under the index write lock
-    // so no query can pair updated contents with an old memo. Unchanged queries
-    // still reuse their memo without hashing the corpus on each request.
-    ctx.search_exact_memo().clear();
-}
-
 /// Reconcile the final disk state when an AFT mutation finishes, including
 /// partial failures and rollback. Keep this guard outside batch validation so
 /// a queued query never depends on delivery of an OS file notification.
@@ -3032,8 +2660,6 @@ pub(crate) struct FileMutationGuard<'a> {
     revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,
     files_before: std::collections::BTreeMap<PathBuf, bool>,
-    before: MutationRefreshBudget,
-    overflowed: bool,
     _view_intent: crate::write_intent::IntentGuard,
 }
 
@@ -3126,8 +2752,7 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     let mut paths = std::collections::BTreeSet::new();
     let mut revisit = Vec::new();
     let mut before = MutationRefreshBudget::new();
-    let overflowed =
-        !collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
+    let _ = collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
     // Explicit targets also matter when ignored by the search index: a language
     // server can still watch and import a file that an agent writes there.
     let files_before = roots
@@ -3140,28 +2765,18 @@ pub(crate) fn record_file_mutation<'a, 'p>(
         revisit,
         paths,
         files_before,
-        before,
-        overflowed,
         _view_intent: view_intent,
     }
 }
 
 impl Drop for FileMutationGuard<'_> {
     fn drop(&mut self) {
-        let mut budget = MutationRefreshBudget::new();
-        let mut overflowed = self.overflowed;
-        for path in &self.paths {
-            if budget.exhausted() {
-                overflowed = true;
-                break;
-            }
-            budget.examined += 1;
-            refresh_search_index_after_write(self.ctx, path);
-            budget.refreshed += 1;
-        }
+        // The index store learns of the write from its write intent. What is
+        // left here is telling language servers which files appeared or went.
         if !self.revisit.is_empty() {
+            let mut budget = MutationRefreshBudget::new();
             let mut discovered = std::collections::BTreeSet::new();
-            overflowed |= !collect_mutation_paths(
+            let _ = collect_mutation_paths(
                 self.ctx,
                 &self.revisit,
                 &mut discovered,
@@ -3170,13 +2785,6 @@ impl Drop for FileMutationGuard<'_> {
             );
             for path in discovered.difference(&self.paths) {
                 self.files_before.entry(path.clone()).or_insert(false);
-                if budget.exhausted() {
-                    overflowed = true;
-                    break;
-                }
-                budget.examined += 1;
-                refresh_search_index_after_write(self.ctx, path);
-                budget.refreshed += 1;
             }
         }
         let events = self
@@ -3197,57 +2805,7 @@ impl Drop for FileMutationGuard<'_> {
             })
             .collect::<Vec<_>>();
         self.ctx.lsp_notify_mutation_file_events(&events);
-        let root = self.ctx.canonical_cache_root_opt();
-        if overflowed
-            && self.ctx.heavy_root_work_allowed()
-            && (!self.ctx.shared_artifacts_read_only() || self.ctx.ram_overlay_active())
-            && self.ctx.config().indexes.trigram
-        {
-            if let Some(root) = root.as_ref() {
-                // One corpus replacement also retires unvisited descendants of
-                // a deleted directory. Its existing not-ready state protects
-                // queries while the watcher-independent worker rebuilds.
-                spawn_search_corpus_refresh(self.ctx, root.clone(), self.ctx.config());
-            }
-        }
-        crate::slog_info!(
-            "mutation search refresh root={} examined={} refreshed={} skipped-ignored={} overflowed={}",
-            root.as_deref().unwrap_or_else(|| Path::new(".")).display(),
-            self.before.examined + budget.examined,
-            budget.refreshed,
-            self.before.skipped_ignored + budget.skipped_ignored,
-            overflowed,
-        );
     }
-}
-
-/// Publish AFT's own completed writes before a queued query can use the index.
-/// OS notifications can arrive after the edit response, so they cannot provide
-/// read-after-write ordering. Preparation reads at most the index's file-size
-/// limit, just as it does for a watcher update.
-pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
-    if ctx.config().views.enabled {
-        return;
-    }
-    if !ctx.heavy_root_work_allowed()
-        || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
-    {
-        return;
-    }
-    let generation = ctx.configure_generation();
-    let _ = ctx.run_if_subc_bound_generation(generation, || {
-        ctx.invalidate_warm_verify_memo();
-        if ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        {
-            // A load finishing later must replay the write onto its snapshot.
-            ctx.add_pending_search_index_paths([path.to_path_buf()]);
-        }
-        refresh_search_index_path(ctx, path);
-    });
 }
 
 fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, started: Instant) {
@@ -3308,11 +2866,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 },
             ),
             WatcherDrainApplyPhase::PendingIndexes => {
-                let search_build_in_progress = ctx
-                    .search_index_rx()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some();
                 let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
                 let semantic_corpus_refresh_in_progress = semantic_corpus_refresh_in_progress(ctx);
                 apply_watcher_path_phase(
@@ -3322,18 +2875,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     started,
                     WATCHER_DRAIN_SLICE_BUDGET,
                     |path| {
-                        // A root that applies watcher events to its RAM
-                        // index (writers, and borrowed roots with the RAM
-                        // overlay) queues them while a load is in flight so
-                        // they are replayed onto the index it delivers.
-                        if heavy_root_work_allowed
-                            && apply_ram_search_updates
-                            && search_build_in_progress
-                        {
-                            let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                                ctx.add_pending_search_index_paths([path.to_path_buf()])
-                            });
-                        }
                         if heavy_root_work_allowed
                             && (!shared_artifacts_read_only || ctx.ram_overlay_active())
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
@@ -3383,13 +2924,10 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
-                |path| {
-                    if heavy_root_work_allowed && apply_ram_search_updates {
-                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                            refresh_search_index_path(ctx, path);
-                        });
-                    }
-                },
+                // The index store receives every change in the tier-2 phase
+                // (`record_checkout_watcher_change`); no other text index
+                // takes watcher updates.
+                |_path| {},
             ),
             WatcherDrainApplyPhase::SemanticIndex => {
                 // Every root masks stale shared vectors immediately. A writer or
@@ -4020,20 +3558,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
     if state.rescan_required {
         let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
-            // The old search index cannot rule out matches in files whose
-            // changes were lost. Stop using it before deferred reconciliation,
-            // including when a retained rescan resumes after a route rebind.
-            if !ctx.config().views.enabled {
-                if let Some(index) = ctx
-                    .search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_mut()
-                {
-                    index.ready = false;
-                }
-                ctx.search_exact_memo().clear();
-            }
+            // Exact candidate sets were proven against files whose changes
+            // were lost; none of them may be reused.
+            ctx.search_exact_memo().clear();
         });
     }
     if state.rescan_required && receiver_has_more_after_receive {

@@ -630,16 +630,7 @@ fn glob_root(
             .map_err(crate::context::view_load_failure_message)?
             .into_ready()
     } else {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match search_index.as_ref() {
-            Some(index) if index.ready && search_scope.use_index && !ignored_target => {
-                Some(index.snapshot())
-            }
-            _ => None,
-        }
+        None
     };
     let index_covers_root = indexed_snapshot
         .as_ref()
@@ -683,9 +674,6 @@ fn glob_root(
         // root. A project-wide glob answers from the index even when empty.
         Some(_) => fallback_glob(project_root, &search_scope.root, pattern, ignored_target),
         None => {
-            if search_scope.use_index {
-                super::configure::trigger_search_index_reload_if_evicted(ctx);
-            }
             if !search_scope.use_index && !ignored_target {
                 let walk_started = Instant::now();
                 if let Some(outcome) =

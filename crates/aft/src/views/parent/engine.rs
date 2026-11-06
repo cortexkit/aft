@@ -25,8 +25,6 @@ use super::{display_relative, lock, read, Child, ParentSession, Plane};
 /// One child's search engine context and what is installed in it.
 pub(crate) struct ChildEngine {
     ctx: AppContext,
-    /// Retain the installed allocation so retirement cannot reuse its address.
-    trigram: Option<Arc<crate::search_index::SearchIndex>>,
     /// Fills and live edits can replace this index within the same generation.
     semantic: Option<Arc<crate::semantic_index::SemanticIndex>>,
 }
@@ -43,34 +41,8 @@ impl ChildEngine {
         config.semantic = session.semantic_config.clone();
         Self {
             ctx: AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config),
-            trigram: None,
             semantic: None,
         }
-    }
-
-    fn install_trigram(&mut self, child: &Child) {
-        let Some(trigram) = read(&child.trigram).ready().cloned() else {
-            return;
-        };
-        self.install_trigram_index(&trigram.index);
-    }
-
-    fn install_trigram_index(&mut self, index: &Arc<crate::search_index::SearchIndex>) {
-        if self
-            .trigram
-            .as_ref()
-            .is_some_and(|installed| Arc::ptr_eq(installed, index))
-        {
-            return;
-        }
-        // `SearchIndex` shares its postings through `Arc`s, so the copy the
-        // engine owns costs only the per-file tables.
-        *self
-            .ctx
-            .search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((**index).clone());
-        self.trigram = Some(index.clone());
     }
 
     fn install_semantic(&mut self, session: &ParentSession, child: &Child) {
@@ -129,15 +101,7 @@ pub(super) fn sync(session: &ParentSession, child: &Child) {
         *engine = Some(ChildEngine::new(session, child));
     }
     if let Some(engine) = engine.as_mut() {
-        engine.install_trigram(child);
         engine.install_semantic(session, child);
-    }
-}
-
-/// Installs the child's current trigram snapshot after file changes.
-pub(super) fn sync_trigram(child: &Child) {
-    if let Some(engine) = lock(&child.engine).as_mut() {
-        engine.install_trigram(child);
     }
 }
 

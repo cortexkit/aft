@@ -793,9 +793,6 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        if root.use_index && !crate::context::confinement::active() {
-            crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
-        }
         let index_status = if root.use_index && !crate::context::confinement::active() {
             current_index_status(ctx)
         } else {
@@ -865,7 +862,6 @@ fn execute_root_profiled(
 
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
-    let mut snapshot_timed_out = false;
     let mut import_building = false;
     let view_snapshot = (root.use_index && !ignored_target)
         .then(|| ctx.lexical_view_snapshot("grep"))
@@ -887,18 +883,7 @@ fn execute_root_profiled(
             }
         }
     } else {
-        match try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
-            Some(search_index) => match search_index.as_ref() {
-                Some(index) if index.ready && root.use_index && !ignored_target => {
-                    Some(index.snapshot())
-                }
-                _ => None,
-            },
-            None => {
-                snapshot_timed_out = true;
-                None
-            }
-        }
+        None
     };
     let snapshot_acquire = snapshot_started.elapsed();
     let mut index_lacks_scope = ignored_target;
@@ -953,16 +938,11 @@ fn execute_root_profiled(
         index_lacks_scope = true;
     }
 
-    if root.use_index && !index_lacks_scope && !import_building {
-        crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
-    }
     // A walk that replaces a ready index reports `Fallback`, so the response
     // discloses that these results came from the filesystem, not the index.
     let index_status = if root.use_index && !index_lacks_scope {
         if import_building {
             IndexStatus::Building
-        } else if snapshot_timed_out {
-            IndexStatus::Fallback
         } else {
             current_index_status(ctx)
         }
@@ -2707,26 +2687,17 @@ pub(crate) fn ripgrep_glob(
     Some(outcome)
 }
 
+/// How the checkout's text index stands for a reply that did not come from
+/// it: `Building` while its first publication is on the way, `Ready` once it
+/// serves (a walk then replaced it for this call), `Fallback` otherwise.
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
     if ctx.cache_unavailable_reason().is_some() {
         return IndexStatus::Fallback;
     }
-    let Some(search_index) =
-        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-    else {
-        return IndexStatus::Fallback;
-    };
-    if search_index.as_ref().is_some_and(|index| index.ready) {
-        return IndexStatus::Ready;
-    }
-
-    let build_in_progress =
-        try_read_with_budget(ctx.search_index_rx(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-            .is_some_and(|search_index_rx| search_index_rx.is_some());
-    if build_in_progress || search_index.is_some() {
-        IndexStatus::Building
-    } else {
-        IndexStatus::Fallback
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexStatus::Ready,
+        Some(crate::data_layer::surfaces::BUILDING) => IndexStatus::Building,
+        _ => IndexStatus::Fallback,
     }
 }
 

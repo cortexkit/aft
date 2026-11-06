@@ -271,67 +271,13 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
-    // With the data layer on, a bound checkout's text plane serves the
-    // lexical lanes, whatever today's index is doing.
-    if let Some(report) = crate::data_layer::surfaces::report(ctx) {
-        match report.text.status {
-            crate::data_layer::surfaces::READY => return IndexObservation::ready(),
-            crate::data_layer::surfaces::BUILDING => return IndexObservation::building(),
-            _ => {}
-        }
+    // A bound checkout's text plane in the index store serves the lexical
+    // lanes; nothing else does.
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
+        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
+        _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
-    if ctx.lexical_views_enabled() {
-        return if ctx.lexical_view_is_ready() {
-            IndexObservation::ready()
-        } else {
-            IndexObservation::building()
-        };
-    }
-    let resident = match ctx.search_index().try_read() {
-        Ok(guard) => guard.as_ref().map(|index| index.ready),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            poisoned.into_inner().as_ref().map(|index| index.ready)
-        }
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
-    match resident {
-        Some(true) => IndexObservation::ready(),
-        Some(false) => IndexObservation::building(),
-        None => {
-            let loading = match ctx.search_index_rx().try_read() {
-                Ok(guard) => guard.is_some(),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-                Err(std::sync::TryLockError::WouldBlock) => true,
-            };
-            if loading {
-                IndexObservation::building()
-            } else if trigram_disk_cache_valid(ctx) {
-                // Not resident (for example after idle eviction) but a valid
-                // persisted cache exists: the next query reloads it, so the
-                // lane is usable.
-                IndexObservation::ready()
-            } else {
-                IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED)
-            }
-        }
-    }
-}
-
-/// Whether this root's persisted trigram cache exists and has a valid header.
-/// Uses only the artifact key configure already derived; it never derives a
-/// key (a git probe) or reads the index body.
-fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
-    let Some(root) = ctx.canonical_cache_root_opt() else {
-        return false;
-    };
-    let Some(key) = ctx.cached_artifact_cache_key(&root) else {
-        return false;
-    };
-    let cache_dir = crate::search_index::resolve_cache_dir_with_key(
-        &key,
-        ctx.config().cache_storage_dir().as_deref(),
-    );
-    crate::search_index::SearchIndex::disk_cache_header_valid(&cache_dir)
 }
 
 fn observe_semantic(ctx: &AppContext) -> IndexObservation {

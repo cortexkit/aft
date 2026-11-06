@@ -424,7 +424,6 @@ fn apply_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
         source: current.source.clone(),
     };
     *write(&child.trigram) = Plane::Ready(Arc::new(session_less));
-    super::engine::sync_trigram(child);
 }
 
 /// Compares every file of `child` with its trigram snapshot and applies the
@@ -483,7 +482,6 @@ fn apply_walked_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
         index: Arc::new(index),
         source: current.source.clone(),
     }));
-    super::engine::sync_trigram(child);
 }
 
 /// Ignore files read so far for one child, with the mtime each was read at.

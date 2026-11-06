@@ -31,7 +31,7 @@ pub(super) enum UnboundRetention {
     ArtifactEvictionFailed,
 }
 
-const UNBOUND_RETENTION_KINDS: usize = 14;
+const UNBOUND_RETENTION_KINDS: usize = 13;
 
 const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "bash_waits",
@@ -45,7 +45,6 @@ const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "inspect_tier2",
     "bash_running",
     "pending_reconciliation",
-    "search_delta_unpersisted",
     "artifact_eviction_failed",
     "lock_contended",
 ];
@@ -64,9 +63,8 @@ impl UnboundRetention {
             Self::Artifact(ArtifactEvictionBlocker::InspectTier2) => 8,
             Self::Artifact(ArtifactEvictionBlocker::BashRunning) => 9,
             Self::Artifact(ArtifactEvictionBlocker::PendingReconciliation) => 10,
-            Self::Artifact(ArtifactEvictionBlocker::SearchDeltaUnpersisted) => 11,
-            Self::ArtifactEvictionFailed => 12,
-            Self::Artifact(ArtifactEvictionBlocker::LockContended) => 13,
+            Self::ArtifactEvictionFailed => 11,
+            Self::Artifact(ArtifactEvictionBlocker::LockContended) => 12,
         }
     }
 

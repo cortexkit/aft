@@ -202,31 +202,11 @@ impl AppContext {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = self.config();
 
-        // Search index status. Status is a control-path snapshot, so lock
-        // pressure is represented directly instead of delaying the caller.
-        let search_index_info = match self.search_index().try_read() {
-            Ok(index) => match index.as_ref() {
-                Some(idx) if idx.ready => {
-                    let file_count = idx.file_count();
-                    let trigram_count = idx.trigram_count();
-                    serde_json::json!({
-                        "status": "ready",
-                        "files": file_count,
-                        "trigrams": trigram_count,
-                    })
-                }
-                Some(_) => serde_json::json!({ "status": "building" }),
-                None => {
-                    let status = if config.indexes.trigram {
-                        "loading"
-                    } else {
-                        "disabled"
-                    };
-                    serde_json::json!({ "status": status })
-                }
-            },
-            Err(_) => serde_json::json!({ "status": "busy" }),
-        };
+        // The text index's status comes from the index store's report below;
+        // until a checkout is probed it reads as loading, or disabled.
+        let search_index_info = serde_json::json!({
+            "status": if config.indexes.trigram { "loading" } else { "disabled" },
+        });
 
         let semantic_status = self
             .semantic_index_status()

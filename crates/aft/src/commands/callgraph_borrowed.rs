@@ -274,60 +274,11 @@ pub fn disclose_borrowed_answer(
     );
 }
 
-/// Describe the borrowed callgraph this context answers from, or `None` when
-/// callgraph answers come from this checkout's own data: the owner checkout,
-/// a per-checkout query runtime, a checkout's v3 view or a pinned per-HEAD view.
-pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
-    if ctx.checkout_query_runtime_active() {
-        return None;
-    }
-    if ctx.callgraph_views_enabled() {
-        return view_borrowed_callgraph(ctx);
-    }
-    if !ctx.shared_artifacts_read_only() {
-        return None;
-    }
-    if ctx.config().views.enabled
-        && ctx
-            .pinned_view_runtime()
-            .is_some_and(|view| view.manifest.is_some())
-    {
-        return None;
-    }
-    let checkout_root = ctx.config().project_root.clone()?;
-    let checkout_root = canonical(&checkout_root);
-    let owner_checkout = match owner_checkout(ctx, &checkout_root) {
-        Owner::Other(path) => Some(path),
-        Owner::Unknown => None,
-        Owner::ThisCheckout => return None,
-    };
-    let owner_head = owner_checkout.as_deref().and_then(checkout_head);
-    let checkout_head = checkout_head(&checkout_root);
-    let differing =
-        files_differing_from_borrowed_graph(ctx, &checkout_root, owner_checkout.as_deref());
-    // Only a complete list gives a count and lets the edits be located; a
-    // partial one is kept for naming and searching the files it does list.
-    let complete_list = differing
-        .as_ref()
-        .filter(|differing| differing.complete)
-        .map(|differing| differing.files.as_slice());
-    let edits_in = complete_list.and_then(|differing| {
-        let same_head = matches!(
-            (&owner_head, &checkout_head),
-            (Some(owner), Some(checkout)) if owner == checkout
-        );
-        (same_head && !differing.is_empty())
-            .then(|| locate_edits(&checkout_root, differing))
-            .flatten()
-    });
-    Some(BorrowedCallgraph {
-        owner_head,
-        owner_checkout,
-        checkout_head,
-        changed_files: complete_list.map(<[String]>::len),
-        edits_in,
-        differing_files: differing,
-    })
+/// Describe the borrowed callgraph this context answers from. Always `None`:
+/// every checkout answers from its own data in the index store, so no answer
+/// is borrowed from another checkout's call graph.
+pub fn borrowed_callgraph(_ctx: &AppContext) -> Option<BorrowedCallgraph> {
+    None
 }
 
 /// With views on, a checkout over `views.callgraph_copies` reads another
@@ -422,58 +373,6 @@ fn owner_checkout(ctx: &AppContext, checkout_root: &Path) -> Owner {
 /// costs a bounded amount per answer. When it runs out, the files found so far
 /// are kept but the list is marked incomplete and the count reported unknown.
 const MAX_DISK_HASHES: usize = 256;
-
-/// The files whose content differs between the source snapshot the borrowed
-/// graph describes and this checkout's disk.
-///
-/// The graph's side is the per-file size and content hash the callgraph store
-/// recorded when it parsed each file. This checkout's side comes from the
-/// search index's RAM overlay, which has already compared the borrowed search
-/// snapshot with this checkout's files and keeps itself current from watcher
-/// events, so it holds this checkout's hashes without walking the tree. The
-/// overlay's own delta is not the answer: it is measured against the shared
-/// search snapshot, which the owner rewrites only on shutdown or a rebuild,
-/// so it also counts every file the owner changed since then, and files it
-/// never hashed (binary or oversized ones), even when this checkout matches
-/// the graph exactly.
-///
-/// `None` when nothing is known: without the overlay, or before the store or
-/// the index is ready. A comparison that would read too many files returns
-/// the files it found with `complete: false`.
-fn files_differing_from_borrowed_graph(
-    ctx: &AppContext,
-    checkout_root: &Path,
-    owner_root: Option<&Path>,
-) -> Option<DifferingFiles> {
-    if !ctx.ram_overlay_active() {
-        return None;
-    }
-    let checkout = {
-        let guard = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let index = guard.as_ref()?;
-        if !index.ready || index.build_denied {
-            return None;
-        }
-        index.live_file_identities()
-    };
-    let store = ctx
-        .callgraph_store()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()?;
-    let graph = store.file_identities().ok()?;
-    Some(compare_with_graph(
-        &graph,
-        checkout,
-        checkout_root,
-        owner_root,
-        MAX_DISK_HASHES,
-        None,
-    ))
-}
 
 /// Size and content hash of one file; a zero hash means it was never hashed.
 type FileIdentity = (u64, blake3::Hash);

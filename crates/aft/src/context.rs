@@ -766,85 +766,6 @@ impl SubcLifecycleAdmission {
     }
 }
 
-const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
-const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
-
-#[derive(Debug)]
-enum SearchIndexShutdownOutcome {
-    Flushed,
-    Skipped,
-    Failed(&'static str),
-}
-
-/// Completion messages received before the search-index shutdown deadline.
-#[doc(hidden)]
-#[derive(Debug, Default)]
-pub struct SearchIndexShutdownReport {
-    pub completed: usize,
-    pub flushed: usize,
-    pub failed_roots: Vec<PathBuf>,
-    pub unfinished_roots: Vec<PathBuf>,
-}
-
-/// Wait for each root's synchronous write to finish, bounded by the caller's
-/// exit deadline. A deadline is not a completion event: unfinished workers
-/// retain their deltas, but process exit may interrupt them, so name each root
-/// whose cache was not saved instead of reporting an aggregate success.
-#[doc(hidden)]
-pub fn flush_search_indexes_before(
-    contexts: &[Arc<AppContext>],
-    deadline: Instant,
-) -> SearchIndexShutdownReport {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut pending = std::collections::BTreeMap::new();
-    for (id, ctx) in contexts.iter().enumerate() {
-        let root = ctx
-            .canonical_cache_root_opt()
-            .unwrap_or_else(|| ctx.config().project_root.clone().unwrap_or_default());
-        pending.insert(id, root);
-        let ctx = Arc::clone(ctx);
-        let tx = tx.clone();
-        let worker = std::thread::spawn(move || {
-            let _ = tx.send((id, ctx.search_index_shutdown_outcome()));
-        });
-        #[cfg(test)]
-        crate::subc::record_exit_index_flush_worker(worker);
-        #[cfg(not(test))]
-        drop(worker);
-    }
-    drop(tx);
-    let mut report = SearchIndexShutdownReport::default();
-    while !pending.is_empty() {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok((id, outcome)) => {
-                let root = pending.remove(&id).expect("pending search flush root");
-                report.completed += 1;
-                match outcome {
-                    SearchIndexShutdownOutcome::Flushed => report.flushed += 1,
-                    SearchIndexShutdownOutcome::Skipped => {}
-                    SearchIndexShutdownOutcome::Failed(reason) => {
-                        crate::slog_warn!(
-                            "search index: shutdown flush failed root={}: {}",
-                            root.display(),
-                            reason
-                        );
-                        report.failed_roots.push(root);
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    for root in pending.into_values() {
-        crate::slog_warn!(
-            "search index: shutdown flush unfinished root={}: completion not received before exit deadline; delta may not be saved",
-            root.display()
-        );
-        report.unfinished_roots.push(root);
-    }
-    report
-}
-
 /// Numeric projection for consumers that still require the legacy status-bar
 /// shape. It is derived from [`StatusBarCountValues`], which preserves whether
 /// each category is present instead of converting missing values to zero.
@@ -2612,7 +2533,6 @@ impl Drop for WatcherDrainGuard<'_> {
 /// a transactional TTL teardown: committed (dropped) once eviction succeeds,
 /// restored when a secondary blocker aborts the eviction.
 pub(crate) struct PendingReconciliationState {
-    search: BTreeSet<PathBuf>,
     callgraph: BTreeSet<PathBuf>,
     tier2: BTreeSet<PathBuf>,
     semantic: BTreeSet<PathBuf>,
@@ -2704,9 +2624,6 @@ pub(crate) enum ArtifactEvictionBlocker {
     BashRunning,
     /// Watcher-derived paths still await reconciliation into an artifact.
     PendingReconciliation,
-    /// The resident search index holds edits that were never written to
-    /// `cache.bin`.
-    SearchDeltaUnpersisted,
     /// A lock the check reads was held by another thread, so the answer is
     /// not available without waiting. Only the non-blocking check used on the
     /// subc frame loop reports this; the reaper retries on its next sweep.
@@ -2715,11 +2632,11 @@ pub(crate) enum ArtifactEvictionBlocker {
 
 impl ArtifactEvictionBlocker {
     /// Whether a teardown job can clear this blocker on an unbound root:
-    /// writing the search delta to disk, or dropping inspect completions that
-    /// nothing drains while the root is unbound. The other blockers are either
-    /// intentional (standing roots, running bash tasks) or clear on their own.
+    /// dropping inspect completions that nothing drains while the root is
+    /// unbound. The other blockers are either intentional (standing roots,
+    /// running bash tasks) or clear on their own.
     pub(crate) fn clearable_by_unbound_teardown(self) -> bool {
-        matches!(self, Self::SearchDeltaUnpersisted | Self::InspectTier2)
+        matches!(self, Self::InspectTier2)
     }
 }
 
@@ -4949,27 +4866,7 @@ pub struct AppContext {
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
-    search_index: RwLock<Option<SearchIndex>>,
     search_exact_memo: Arc<crate::commands::semantic_search::memo::ExactMemoStore>,
-    search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
-    search_index_rx_generation: AtomicU64,
-    search_index_rx_epoch: AtomicU64,
-    search_index_rx_terminal_epoch: Arc<AtomicU64>,
-    /// Size of a finished search-index load waiting in `search_index_rx`.
-    search_pending_install: Arc<PendingInstallSlot>,
-    /// `(configure_generation, automatic_replacement_attempts)`. Caps the
-    /// drain-path replacement of a search-index load whose worker disconnected
-    /// without delivering an index, so a persistently failing worker cannot be
-    /// relaunched in a loop on the drain thread. Resets when the configure
-    /// generation advances.
-    // Generation, automatic replacement count, and the earliest time a query may
-    // probe again after repeated load disconnects.
-    search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
-    search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
-    legacy_search_publication:
-        parking_lot::Mutex<Arc<crate::search_index::LegacySearchPublicationGate>>,
-    pub(crate) search_corpus_refresh_lane: Arc<crate::runtime_drain::SearchCorpusRefreshLane>,
-    pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
     tier2_refresh_scheduler: parking_lot::Mutex<Tier2RefreshScheduler>,
@@ -5546,17 +5443,14 @@ fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGua
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IdleReapLock {
     SemanticIndexStatus,
-    SearchIndexReceiver,
     CallgraphStoreReceiver,
     SemanticIndexReceiver,
     InspectInFlight,
     BashWatchdogTasks,
-    PendingSearchPaths,
     PendingCallgraphPaths,
     PendingTier2Paths,
     PendingSemanticPaths,
     PendingCorpusRefresh,
-    SearchIndex,
     CallgraphStore,
     SemanticIndex,
     BorrowedIndexCache,
@@ -5564,19 +5458,16 @@ pub(crate) enum IdleReapLock {
 
 #[cfg(test)]
 impl IdleReapLock {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::SemanticIndexStatus,
-        Self::SearchIndexReceiver,
         Self::CallgraphStoreReceiver,
         Self::SemanticIndexReceiver,
         Self::InspectInFlight,
         Self::BashWatchdogTasks,
-        Self::PendingSearchPaths,
         Self::PendingCallgraphPaths,
         Self::PendingTier2Paths,
         Self::PendingSemanticPaths,
         Self::PendingCorpusRefresh,
-        Self::SearchIndex,
         Self::CallgraphStore,
         Self::SemanticIndex,
         Self::BorrowedIndexCache,
@@ -5595,7 +5486,6 @@ pub(crate) enum MaintenanceProbeLock {
     LspManager,
     ConfigureMaintenanceJobs,
     ParkedConfigureTail,
-    SearchIndexReceiver,
     CallgraphStoreReceiver,
     SemanticIndexReceiver,
     SemanticRefreshEvents,
@@ -5604,14 +5494,13 @@ pub(crate) enum MaintenanceProbeLock {
 
 #[cfg(test)]
 impl MaintenanceProbeLock {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::WatcherReceiver,
         Self::WatcherDrainSlice,
         Self::Tier2RefreshScheduler,
         Self::LspManager,
         Self::ConfigureMaintenanceJobs,
         Self::ParkedConfigureTail,
-        Self::SearchIndexReceiver,
         Self::CallgraphStoreReceiver,
         Self::SemanticIndexReceiver,
         Self::SemanticRefreshEvents,
@@ -5918,20 +5807,9 @@ impl AppContext {
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
-            search_index: RwLock::new(None),
             search_exact_memo: Arc::new(
                 crate::commands::semantic_search::memo::ExactMemoStore::new(),
             ),
-            search_index_rx: RwLock::new(None),
-            search_index_rx_generation: AtomicU64::new(0),
-            search_index_rx_epoch: AtomicU64::new(0),
-            search_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
-            search_pending_install: Arc::default(),
-            search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
-            search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
-            legacy_search_publication: Default::default(),
-            search_corpus_refresh_lane: Arc::default(),
-            pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager,
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
@@ -6333,14 +6211,6 @@ impl AppContext {
                 }
             }
         }
-        let search_index = match self.search_index.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        let search_index_rx = match self.search_index_rx.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
         let semantic_status = match self.semantic_index_status.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -6367,18 +6237,11 @@ impl AppContext {
         // read-only disk openers against the shared artifact. Reporting them
         // as "building" would never resolve.
         let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
+        // The index store's report below replaces this whenever a checkout
+        // is probed.
         let search_index_status = if cache_unavailable {
             crate::root_cache::CACHE_DIR_UNAVAILABLE
-        } else if search_index
-            .as_ref()
-            .is_some_and(|index| index.ready || index.build_denied)
-            || (borrows_shared_artifacts && config.indexes.trigram)
-        {
-            "ready"
-        } else if config.indexes.trigram
-            || search_index.as_ref().is_some()
-            || search_index_rx.as_ref().is_some()
-        {
+        } else if config.indexes.trigram {
             "building"
         } else {
             "disabled"
@@ -6835,7 +6698,6 @@ impl AppContext {
             pending.retain(&keep);
             before - pending.len()
         };
-        let search = retire(&mut self.pending_search_index_paths.lock());
         let semantic = retire(&mut self.pending_semantic_index_paths.lock());
         let tier2 = retire(&mut self.pending_tier2_paths.lock());
         let callgraph = retire(&mut self.pending_callgraph_store_paths.lock());
@@ -6848,8 +6710,8 @@ impl AppContext {
             .as_mut()
             .map_or(0, |state| state.retire_ignored_paths(&keep));
         crate::slog_info!(
-            "ignore queue retirement: generation={} watcher={} callgraph_pending={} callgraph_queued={} tier2={} semantic_pending={} search_pending={}",
-            generation, watcher, callgraph, callgraph_queued, tier2, semantic, search
+            "ignore queue retirement: generation={} watcher={} callgraph_pending={} callgraph_queued={} tier2={} semantic_pending={}",
+            generation, watcher, callgraph, callgraph_queued, tier2, semantic
         );
     }
 
@@ -7712,20 +7574,6 @@ impl AppContext {
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
-        let search_pending = self
-            .search_index_rx
-            .try_read()
-            .map(|slot| {
-                slot.as_ref().is_some_and(|receiver| {
-                    !receiver.is_empty()
-                        || self.search_index_rx_terminal_epoch.load(Ordering::SeqCst)
-                            == self.search_index_rx_epoch()
-                })
-            })
-            .unwrap_or(true);
-        if search_pending {
-            return true;
-        }
         // A contended receiver slot counts as pending. The health rollup and
         // callgraph access paths hold `callgraph_store_rx` while they do other
         // work, and waiting for them here once stalled the frame loop.
@@ -7887,13 +7735,6 @@ impl AppContext {
                 let _held = self.parked_configure_tail.lock();
                 while_held();
             }
-            MaintenanceProbeLock::SearchIndexReceiver => {
-                let _held = self
-                    .search_index_rx
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                while_held();
-            }
             MaintenanceProbeLock::CallgraphStoreReceiver => {
                 let _held = self.callgraph_store_rx.lock();
                 while_held();
@@ -7929,10 +7770,6 @@ impl AppContext {
                 let _held = write(&self.semantic_index_status);
                 while_held();
             }
-            IdleReapLock::SearchIndexReceiver => {
-                let _held = write(&self.search_index_rx);
-                while_held();
-            }
             IdleReapLock::CallgraphStoreReceiver => {
                 let _held = self.callgraph_store_rx.lock();
                 while_held();
@@ -7949,10 +7786,6 @@ impl AppContext {
                 self.bash_background
                     .hold_watchdog_tasks_lock_for_test(while_held);
             }
-            IdleReapLock::PendingSearchPaths => {
-                let _held = self.pending_search_index_paths.lock();
-                while_held();
-            }
             IdleReapLock::PendingCallgraphPaths => {
                 let _held = self.pending_callgraph_store_paths.lock();
                 while_held();
@@ -7967,10 +7800,6 @@ impl AppContext {
             }
             IdleReapLock::PendingCorpusRefresh => {
                 let _held = self.pending_semantic_corpus_refresh.lock();
-                while_held();
-            }
-            IdleReapLock::SearchIndex => {
-                let _held = write(&self.search_index);
                 while_held();
             }
             IdleReapLock::CallgraphStore => {
@@ -9609,11 +9438,6 @@ impl AppContext {
                 return None;
             };
             let mut next = next;
-            if next.views.enabled {
-                self.legacy_search_publication.lock().revoke();
-            } else if guard.views.enabled {
-                *self.legacy_search_publication.lock() = Arc::default();
-            }
             next.aft_search_registered = next.tool_registered("aft_search");
             #[cfg(test)]
             let next = self.app.isolate_test_config(next);
@@ -12608,17 +12432,6 @@ impl AppContext {
             .collect()
     }
 
-    /// Access the search index.
-    pub fn search_index(&self) -> &RwLock<Option<SearchIndex>> {
-        &self.search_index
-    }
-
-    pub(crate) fn legacy_search_publication_gate(
-        &self,
-    ) -> Arc<crate::search_index::LegacySearchPublicationGate> {
-        self.legacy_search_publication.lock().clone()
-    }
-
     pub(crate) fn lexical_views_enabled(&self) -> bool {
         let config = self.config();
         config.views.enabled
@@ -13267,200 +13080,6 @@ impl AppContext {
         Arc::clone(&self.search_exact_memo)
     }
 
-    /// Access the search-index build receiver.
-    pub fn search_index_rx(&self) -> &RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>> {
-        &self.search_index_rx
-    }
-
-    pub(crate) fn install_search_index_rx(
-        &self,
-        receiver: crossbeam_channel::Receiver<SearchIndex>,
-        generation: u64,
-    ) -> u64 {
-        let mut slot = self
-            .search_index_rx
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let replaced = take_undelivered_install(
-            &self.search_pending_install,
-            self.search_index_rx_epoch(),
-            slot.as_ref(),
-        );
-        self.note_search_index_rx_generation(generation);
-        let epoch = self.next_search_index_rx_epoch();
-        *slot = Some(receiver);
-        drop(slot);
-        log_discarded_pending_install(
-            "search index",
-            self.canonical_cache_root_opt().as_deref(),
-            replaced,
-            "a newer load replaced it",
-        );
-        epoch
-    }
-
-    /// The slot a search-index loader records its finished load's size in.
-    pub(crate) fn search_pending_install(&self) -> Arc<PendingInstallSlot> {
-        Arc::clone(&self.search_pending_install)
-    }
-
-    pub(crate) fn search_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
-        ReceiverTerminalGuard::new(Arc::clone(&self.search_index_rx_terminal_epoch), epoch)
-    }
-
-    /// Keep generation/epoch validation and receiver mutation under the same
-    /// lock used by receiver installation.
-    pub(crate) fn with_current_search_index_rx<R>(
-        &self,
-        generation: u64,
-        epoch: u64,
-        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<SearchIndex>>) -> R,
-    ) -> Option<R> {
-        self.run_if_subc_bound_generation(generation, || {
-            let mut receiver = self
-                .search_index_rx
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if receiver.is_none()
-                || self.search_index_rx_generation() != generation
-                || self.search_index_rx_epoch() != epoch
-            {
-                return None;
-            }
-            Some(action(&mut receiver))
-        })
-        .flatten()
-    }
-
-    /// Drop the search-index receiver. A finished load still waiting in it is
-    /// freed with it and logged with `reason`.
-    pub(crate) fn retire_search_index_rx(&self, reason: &str) {
-        let mut receiver = self
-            .search_index_rx
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let discarded = take_undelivered_install(
-            &self.search_pending_install,
-            self.search_index_rx_epoch(),
-            receiver.as_ref(),
-        );
-        *receiver = None;
-        self.next_search_index_rx_epoch();
-        drop(receiver);
-        log_discarded_pending_install(
-            "search index",
-            self.canonical_cache_root_opt().as_deref(),
-            discarded,
-            reason,
-        );
-    }
-
-    pub(crate) fn note_search_index_rx_generation(&self, generation: u64) {
-        self.search_index_rx_generation
-            .store(generation, Ordering::SeqCst);
-    }
-
-    pub(crate) fn search_index_rx_generation(&self) -> u64 {
-        self.search_index_rx_generation.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn next_search_index_rx_epoch(&self) -> u64 {
-        self.search_index_rx_epoch
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1)
-    }
-
-    pub(crate) fn search_index_rx_epoch(&self) -> u64 {
-        self.search_index_rx_epoch.load(Ordering::SeqCst)
-    }
-
-    /// Allow one automatic search-index replacement load per configure
-    /// generation. A second disconnect opens a retry cooldown so queued fallback
-    /// queries cannot each launch the same load again after the worker exits.
-    pub(crate) fn allow_search_index_disconnect_reschedule(&self) -> bool {
-        const MAX_REPLACEMENTS_PER_GENERATION: u32 = 1;
-        const QUERY_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
-        let generation = self.configure_generation();
-        let mut state = self.search_index_disconnect_reschedule.lock();
-        if state.0 != generation {
-            *state = (generation, 0, None);
-        }
-        if state.1 >= MAX_REPLACEMENTS_PER_GENERATION {
-            state.2 = Some(Instant::now() + QUERY_RETRY_COOLDOWN);
-            return false;
-        }
-        state.1 += 1;
-        true
-    }
-
-    pub(crate) fn search_index_query_reload_allowed(&self) -> bool {
-        let generation = self.configure_generation();
-        let now = Instant::now();
-        let mut state = self.search_index_disconnect_reschedule.lock();
-        if state.0 != generation {
-            *state = (generation, 0, None);
-            return true;
-        }
-        let Some(retry_at) = state.2 else {
-            return true;
-        };
-        if now < retry_at {
-            return false;
-        }
-        // Record the next retry while holding this mutex so another query cannot
-        // consume the same retry opportunity. Receiver installation is separately
-        // serialized by `artifact_reload_lock`.
-        state.2 = Some(now + Duration::from_secs(60));
-        true
-    }
-
-    /// Test hook: hold back query-triggered trigram reloads for the current
-    /// configure generation, as the retry cooldown in
-    /// `search_index_query_reload_allowed` does. A test can then observe a
-    /// root whose saved trigram cache is valid but not resident, without its
-    /// own search request starting a reload whose completion races the reply.
-    #[doc(hidden)]
-    pub fn defer_query_search_index_reloads_for_test(&self) {
-        const HOLD: Duration = Duration::from_secs(60 * 60);
-        let generation = self.configure_generation();
-        let mut state = self.search_index_disconnect_reschedule.lock();
-        let replacements = if state.0 == generation { state.1 } else { 0 };
-        *state = (generation, replacements, Some(Instant::now() + HOLD));
-    }
-
-    pub(crate) fn note_search_index_load_succeeded(&self) {
-        let generation = self.configure_generation();
-        let mut state = self.search_index_disconnect_reschedule.lock();
-        if state.0 == generation {
-            state.2 = None;
-        }
-    }
-
-    pub(crate) fn next_search_persist_epoch(&self) -> u64 {
-        self.search_persist_epoch.next()
-    }
-
-    pub(crate) fn search_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
-        self.search_persist_epoch.clone()
-    }
-
-    pub fn add_pending_search_index_paths<I>(&self, paths: I)
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        if !paths.is_empty() {
-            self.invalidate_warm_verify_memo();
-            self.pending_search_index_paths.lock().extend(paths);
-        }
-    }
-
-    pub fn take_pending_search_index_paths(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.pending_search_index_paths.lock())
-            .into_iter()
-            .collect()
-    }
-
     pub fn add_pending_semantic_index_paths<I>(&self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -13492,7 +13111,7 @@ impl AppContext {
         std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock())
     }
 
-    /// Copies of the pending search, callgraph, Tier-2 and semantic path sets
+    /// Copies of the pending callgraph, Tier-2 and semantic path sets
     /// and the corpus-refresh flag, unfiltered and left in place.
     #[cfg(test)]
     pub(crate) fn pending_reconciliation_snapshot_for_test(
@@ -13501,11 +13120,9 @@ impl AppContext {
         BTreeSet<PathBuf>,
         BTreeSet<PathBuf>,
         BTreeSet<PathBuf>,
-        BTreeSet<PathBuf>,
         bool,
     ) {
         (
-            self.pending_search_index_paths.lock().clone(),
             self.pending_callgraph_store_paths.lock().clone(),
             self.pending_tier2_paths.lock().clone(),
             self.pending_semantic_index_paths.lock().clone(),
@@ -13522,7 +13139,6 @@ impl AppContext {
     }
 
     fn clear_pending_index_updates_with_callgraph(&self, clear_callgraph: bool) {
-        self.pending_search_index_paths.lock().clear();
         if clear_callgraph {
             self.pending_callgraph_store_paths.lock().clear();
         }
@@ -13532,7 +13148,6 @@ impl AppContext {
     }
 
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
-        restore_pending_paths(&mut self.pending_search_index_paths.lock(), state.search);
         restore_pending_paths(
             &mut self.pending_callgraph_store_paths.lock(),
             state.callgraph,
@@ -13563,26 +13178,6 @@ impl AppContext {
     pub(crate) fn cancel_unbound_artifact_work(&self) {
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::cold_build_limiter::progress::cancel_root(&root);
-        }
-        // A cancelled non-ready search corpus refresh left the resident index
-        // marked not-ready; retiring its receiver alone would strand it
-        // (equivalent rebind only reloads a MISSING index). Drop the resident
-        // index too so the rebind's artifact setup reloads from disk and the
-        // retained pending paths repair it on install.
-        let search_refresh_cancelled = self
-            .search_index_rx
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        self.retire_search_index_rx("the root was unbound");
-        if search_refresh_cancelled {
-            let mut resident = self
-                .search_index
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if resident.as_ref().is_some_and(|index| !index.ready) {
-                *resident = None;
-            }
         }
         self.retire_callgraph_store_rx();
         let semantic_cancelled = self.semantic_index_rx.lock().is_some();
@@ -13629,14 +13224,9 @@ impl AppContext {
     /// may change before the watcher is restored, so a later bind must reconcile
     /// from disk instead of serving retained snapshots that missed those edits.
     pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
-        self.next_search_persist_epoch();
         self.next_semantic_persist_epoch();
         self.next_callgraph_persist_epoch();
 
-        self.search_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
         self.semantic_index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -13676,130 +13266,6 @@ impl AppContext {
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
-    }
-
-    fn drain_search_index_events_for_graceful_shutdown(&self) {
-        crate::runtime_drain::drain_watcher_events(self);
-        crate::runtime_drain::drain_search_index_events(self);
-    }
-
-    fn search_index_build_in_progress(&self) -> bool {
-        self.search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    /// Graceful EOF teardown can afford a bounded wait for an already running
-    /// search rebuild to publish. Poll the observable receiver state
-    /// directly instead of relying on fixed sleeps in callers or tests.
-    fn wait_for_search_index_build_to_settle_on_graceful_shutdown(&self) {
-        crate::runtime_drain::note_search_rebuild_shutdown_wait_for_test();
-        let deadline = Instant::now() + GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT;
-        while self.search_index_build_in_progress() && Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            std::thread::sleep(remaining.min(GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL));
-            self.drain_search_index_events_for_graceful_shutdown();
-        }
-    }
-
-    /// Flush the owner-side trigram delta during an orderly transport shutdown.
-    /// EOF/Goodbye teardown uses this best-effort path; signal and panic exits
-    /// intentionally skip it so abrupt shutdown never waits on slow recovery work.
-    ///
-    /// Borrow-only roots (including ram-overlay worktrees) return immediately
-    /// and never write the shared artifact.
-    #[doc(hidden)]
-    pub fn flush_search_index_on_graceful_shutdown(&self) -> bool {
-        matches!(
-            self.search_index_shutdown_outcome(),
-            SearchIndexShutdownOutcome::Flushed
-        )
-    }
-
-    fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
-        if self.config().views.enabled {
-            return SearchIndexShutdownOutcome::Skipped;
-        }
-        let _publication = self.legacy_search_publication_gate().install();
-        use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
-        if self.cache_unavailable_reason().is_some() {
-            return Failed("cache root is unavailable");
-        }
-        if self.shared_artifacts_read_only() {
-            return Skipped;
-        }
-
-        self.drain_search_index_events_for_graceful_shutdown();
-        if self.search_index_build_in_progress() {
-            self.wait_for_search_index_build_to_settle_on_graceful_shutdown();
-            self.drain_search_index_events_for_graceful_shutdown();
-        }
-
-        if self.search_index_build_in_progress() {
-            return Failed("search index rebuild did not settle");
-        }
-
-        {
-            let search_index = self
-                .search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(index) = search_index.as_ref() else {
-                return Skipped;
-            };
-            if !index.ready {
-                return Failed("search index is not ready");
-            }
-            if !index.has_pending_disk_changes() {
-                return Skipped;
-            }
-        }
-
-        let Some(canonical_root) = self.canonical_cache_root_opt() else {
-            return Failed("canonical cache root is unavailable");
-        };
-        let config = self.config();
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
-        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
-            &project_key,
-            config.cache_storage_dir().as_deref(),
-        );
-
-        let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(
-            &cache_dir,
-            &canonical_root,
-        ) {
-            Ok(lock) => lock,
-            Err(error) => {
-                crate::slog_warn!(
-                    "search index: skipped shutdown flush because cache lock was unavailable: {}",
-                    error
-                );
-                return Failed("cache lock unavailable");
-            }
-        };
-
-        let mut search_index = self
-            .search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(index) = search_index.as_mut() else {
-            return Skipped;
-        };
-        if !index.ready {
-            return Failed("search index is not ready");
-        }
-        if !index.has_pending_disk_changes() {
-            return Skipped;
-        }
-
-        let git_head = index.stored_git_head().map(str::to_owned);
-        if index.write_to_disk(&cache_dir, git_head.as_deref()) {
-            Flushed
-        } else {
-            Failed("disk cache write failed")
-        }
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
@@ -15179,11 +14645,7 @@ impl AppContext {
     }
 
     /// The first condition that makes artifact eviction unsafe, or `None` when
-    /// eviction may proceed. Conditions are checked in a fixed order and the
-    /// unpersisted search delta is checked last, so a result of
-    /// [`ArtifactEvictionBlocker::SearchDeltaUnpersisted`] means it is the only
-    /// blocker; the idle reaper relies on that to decide when persisting the
-    /// delta is enough to make the root evictable.
+    /// eviction may proceed. Conditions are checked in a fixed order.
     pub(crate) fn artifact_eviction_blocker(&self) -> Option<ArtifactEvictionBlocker> {
         if self.standing_artifact_exempt.load(Ordering::Acquire) {
             return Some(ArtifactEvictionBlocker::StandingRoot);
@@ -15210,7 +14672,6 @@ impl AppContext {
             return Some(ArtifactEvictionBlocker::BashRunning);
         }
         if !self.pending_callgraph_store_paths.lock().is_empty()
-            || !self.pending_search_index_paths.lock().is_empty()
             || !self.pending_tier2_paths.lock().is_empty()
             || !self.pending_semantic_index_paths.lock().is_empty()
             || *self.pending_semantic_corpus_refresh.lock()
@@ -15218,22 +14679,7 @@ impl AppContext {
             return Some(ArtifactEvictionBlocker::PendingReconciliation);
         }
 
-        // A borrow-only root (including a `worktree.ram_overlay` root that
-        // applies local edits to its in-RAM delta) never writes the shared
-        // `cache.bin`, so its delta is not pending disk work: no persist path
-        // exists for it and treating it as one would pin the root forever.
-        // Dropping it loses nothing a daemon restart would not also lose; the
-        // next load reconciles the borrowed snapshot with the checkout.
-        if self.shared_artifacts_read_only() {
-            return None;
-        }
-        let search_has_pending_disk_changes = self
-            .search_index
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(SearchIndex::has_pending_disk_changes);
-        search_has_pending_disk_changes.then_some(ArtifactEvictionBlocker::SearchDeltaUnpersisted)
+        None
     }
 
     /// Persist the resident search-index delta of an unbound root so the idle
@@ -15253,15 +14699,9 @@ impl AppContext {
         let _ = self.inspect_manager.discard_completions();
         #[cfg(test)]
         wait_on_unbound_teardown_persist_gate_for_test(self.canonical_cache_root_opt().as_deref());
-        // Unbind retires the search receiver and the watcher drain is a no-op
-        // while unbound, so the shutdown flush normally does no waiting: one
-        // 25 ms cache-lock attempt plus the delta write. A receiver present
-        // here belongs to a rebind that has already started; leave the index
-        // to it rather than wait up to the shutdown build-settle bound.
-        if self.search_index_build_in_progress() {
-            return false;
-        }
-        self.flush_search_index_on_graceful_shutdown()
+        // The index store publishes as it goes, so an unbound root has no
+        // in-memory index delta to persist.
+        false
     }
 
     /// Drop idle root-scoped artifact handles. Persistent data remains on disk;
@@ -15283,13 +14723,6 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        self.search_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Intentional idle eviction starts a new reload lifecycle; a cooldown
-        // from an earlier failed load must not suppress the first reopen.
-        self.note_search_index_load_succeeded();
         self.semantic_index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -15388,19 +14821,12 @@ impl AppContext {
         if self.shared_artifacts_read_only() {
             return None;
         }
-        match try_read_unpoisoned(&self.search_index) {
-            Some(index) => index
-                .as_ref()
-                .is_some_and(SearchIndex::has_pending_disk_changes)
-                .then_some(Blocker::SearchDeltaUnpersisted),
-            None => Some(Blocker::LockContended),
-        }
+        None
     }
 
     fn try_pending_reconciliation_present(&self) -> Option<bool> {
         Some(
             !self.pending_callgraph_store_paths.try_lock()?.is_empty()
-                || !self.pending_search_index_paths.try_lock()?.is_empty()
                 || !self.pending_tier2_paths.try_lock()?.is_empty()
                 || !self.pending_semantic_index_paths.try_lock()?.is_empty()
                 || *self.pending_semantic_corpus_refresh.try_lock()?,
@@ -15418,13 +14844,11 @@ impl AppContext {
     pub(crate) fn try_take_pending_reconciliation_state(
         &self,
     ) -> Option<PendingReconciliationState> {
-        let mut search = self.pending_search_index_paths.try_lock()?;
         let mut callgraph = self.pending_callgraph_store_paths.try_lock()?;
         let mut tier2 = self.pending_tier2_paths.try_lock()?;
         let mut semantic = self.pending_semantic_index_paths.try_lock()?;
         let mut corpus_refresh = self.pending_semantic_corpus_refresh.try_lock()?;
         Some(PendingReconciliationState {
-            search: std::mem::take(&mut *search),
             callgraph: std::mem::take(&mut *callgraph),
             tier2: std::mem::take(&mut *tier2),
             semantic: std::mem::take(&mut *semantic),
@@ -15442,7 +14866,6 @@ impl AppContext {
     ) {
         let guards = (|| {
             Some((
-                self.pending_search_index_paths.try_lock()?,
                 self.pending_callgraph_store_paths.try_lock()?,
                 self.pending_tier2_paths.try_lock()?,
                 self.pending_semantic_index_paths.try_lock()?,
@@ -15450,8 +14873,7 @@ impl AppContext {
             ))
         })();
         match guards {
-            Some((mut search, mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
-                restore_pending_paths(&mut search, state.search);
+            Some((mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
                 restore_pending_paths(&mut callgraph, state.callgraph);
                 restore_pending_paths(&mut tier2, state.tier2);
                 restore_pending_paths(&mut semantic, state.semantic);
@@ -15506,9 +14928,6 @@ impl AppContext {
             return false;
         };
         let Some(mut corpus_memo) = self.callgraph_corpus_memo.try_lock() else {
-            return false;
-        };
-        let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
             return false;
         };
         let Some(mut semantic_index) = try_write_unpoisoned(&self.semantic_index) else {
@@ -15574,7 +14993,6 @@ impl AppContext {
         }
         callgraph_store.take();
         corpus_memo.take();
-        search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
         backup.release_memory();
@@ -15617,14 +15035,10 @@ impl AppContext {
             .spawn(move || drop(released));
         drop((
             callgraph_store,
-            search_index,
             semantic_index,
             borrowed_index_cache,
             backup,
         ));
-        // Intentional idle eviction starts a new reload lifecycle; a cooldown
-        // from an earlier failed load must not suppress the first reopen.
-        self.note_search_index_load_succeeded();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
@@ -17874,13 +17288,10 @@ impl AppContext {
         )
     }
 
-    /// Shape counters of the trigram index; the outer `None` means it is
-    /// locked.
+    /// Shape counters of the in-process trigram index. The index store's
+    /// text plane is counted with the store's own memory, so there is none.
     fn trigram_memory_shape(&self) -> Option<Option<[u64; 11]>> {
-        match self.search_index.try_read().ok()?.as_ref() {
-            Some(index) => Some(Some(index.memory_shape()?)),
-            None => Some(None),
-        }
+        Some(None)
     }
 
     /// Shape counters of the symbol cache; `None` means it is locked.
@@ -17906,22 +17317,11 @@ impl AppContext {
         }
     }
 
-    /// Walk every entry of the trigram index for its memory estimate.
+    /// The in-process trigram index's memory: none, as with its shape.
     fn walk_trigram_memory(&self) -> crate::memory::MemoryEstimate {
         #[cfg(test)]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[1] += 1);
-        match self.search_index.try_read() {
-            Ok(index) => index
-                .as_ref()
-                .map(SearchIndex::estimated_memory)
-                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("files", 0)),
-            Err(TryLockError::Poisoned(error)) => error
-                .into_inner()
-                .as_ref()
-                .map(SearchIndex::estimated_memory)
-                .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("files", 0)),
-            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
-        }
+        crate::memory::MemoryEstimate::estimated(0).count("files", 0)
     }
 
     /// Read the symbol cache's running memory totals without visiting entries.
@@ -18049,7 +17449,7 @@ impl AppContext {
         ]
     }
 
-    /// Finished semantic and search loads handed to their receivers but not
+    /// Finished semantic loads handed to their receiver but not
     /// yet installed by a completion drain. They are live memory like an
     /// installed index, so they are attributed under their own label rather
     /// than disappearing between hand-off and install.
@@ -18063,38 +17463,16 @@ impl AppContext {
             semantic_receiver.as_ref(),
         );
         drop(semantic_receiver);
-        let search = match self.search_index_rx.try_read() {
-            Ok(receiver) => undelivered_install(
-                &self.search_pending_install,
-                self.search_index_rx_epoch(),
-                receiver.as_ref(),
-            ),
-            Err(TryLockError::Poisoned(error)) => undelivered_install(
-                &self.search_pending_install,
-                self.search_index_rx_epoch(),
-                error.into_inner().as_ref(),
-            ),
-            Err(TryLockError::WouldBlock) => return crate::memory::MemoryEstimate::busy(),
-        };
         let semantic_bytes = semantic.map_or(0, |pending| pending.bytes);
-        let search_bytes = search.map_or(0, |pending| pending.bytes);
-        crate::memory::MemoryEstimate::estimated(semantic_bytes.saturating_add(search_bytes))
+        crate::memory::MemoryEstimate::estimated(semantic_bytes)
             .count("semantic_loads", usize::from(semantic.is_some()))
             .count_u64("semantic_bytes", semantic_bytes)
-            .count("search_loads", usize::from(search.is_some()))
-            .count_u64("search_bytes", search_bytes)
     }
 
     /// Remove the pending-install record for receiver `epoch` once a drain has
     /// taken that receiver's events, returning the recorded size.
     pub(crate) fn take_semantic_pending_install(&self, epoch: u64) -> Option<u64> {
         self.semantic_pending_install
-            .take_for_epoch(epoch)
-            .map(|pending| pending.bytes)
-    }
-
-    pub(crate) fn take_search_pending_install(&self, epoch: u64) -> Option<u64> {
-        self.search_pending_install
             .take_for_epoch(epoch)
             .map(|pending| pending.bytes)
     }

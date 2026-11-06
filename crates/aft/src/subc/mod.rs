@@ -4698,11 +4698,6 @@ fn flush_actor_indexes_on_graceful_shutdown(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
-    tests::record_exit_index_flush_worker(worker);
-}
-
 fn flush_actor_indexes_on_graceful_shutdown_with(
     actor_contexts: &[Arc<AppContext>],
     drained_at: Instant,
@@ -4716,23 +4711,15 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
             .as_millis(),
         drained_at.elapsed().as_millis()
     );
-    // Index deltas can be rebuilt after a restart. Give the independent roots
-    // one short shared window to persist them, without extending the outage
-    // when a rebuild or a cache lock holds one root for several seconds.
     let started = Instant::now();
     let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
-    let deadline =
-        (started + crate::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline);
-    let report = crate::context::flush_search_indexes_before(actor_contexts, deadline);
     // Refreshes are reconstructible, so exit waits for them only until the
     // flush deadline and otherwise leaves them to the next start.
     let refreshed =
         crate::callgraph_store::run_exit_callgraph_flush_before(flush_deadline, callgraph_flush);
     let line = format!(
-        "subc exit phase=index_flush roots={} completed={} flushed={} callgraph={} elapsed_ms={}",
+        "subc exit phase=index_flush roots={} callgraph={} elapsed_ms={}",
         actor_contexts.len(),
-        report.completed,
-        report.flushed,
         refreshed.as_str(),
         started.elapsed().as_millis()
     );
@@ -12677,7 +12664,6 @@ fn submit_maintenance_job(
             }
             MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
-                runtime_drain::drain_search_index_events(ctx);
                 runtime_drain::drain_callgraph_store_events(ctx);
                 runtime_drain::drain_semantic_index_events(ctx);
                 runtime_drain::drain_semantic_refresh_events(ctx);
@@ -19129,8 +19115,7 @@ mod tests {
                 MaintenanceProbeLock::LspManager => MaintenanceDrainKind::Lsp,
                 MaintenanceProbeLock::ConfigureMaintenanceJobs
                 | MaintenanceProbeLock::ParkedConfigureTail => MaintenanceDrainKind::ConfigureTail,
-                MaintenanceProbeLock::SearchIndexReceiver
-                | MaintenanceProbeLock::CallgraphStoreReceiver
+                MaintenanceProbeLock::CallgraphStoreReceiver
                 | MaintenanceProbeLock::SemanticIndexReceiver
                 | MaintenanceProbeLock::SemanticRefreshEvents
                 | MaintenanceProbeLock::SemanticRefreshWorker => {

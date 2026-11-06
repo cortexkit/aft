@@ -4454,19 +4454,12 @@ fn handle_configure_inner(
             ctx.begin_configure_ack_phase("ack_ready");
             log_slow_configure_prefix(ctx, prefix_started_at);
             let artifact_owner_status = ctx.artifact_owner_status();
-            let search_index_cache_reused = next_config.indexes.trigram
-                && ctx
-                    .search_index()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some();
             return Response::success(
                 &req.id,
                 json!({
                     "project_root": root_path.display().to_string(),
                     "warnings": configure_warnings,
                     "warnings_pending": false,
-                    "search_index_cache_reused": search_index_cache_reused,
                     "artifact_owner": artifact_owner_status
                         .as_ref()
                         .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
@@ -4505,19 +4498,12 @@ fn handle_configure_inner(
                 path_count
             );
             let artifact_owner_status = ctx.artifact_owner_status();
-            let search_index_cache_reused = next_config.indexes.trigram
-                && ctx
-                    .search_index()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some();
             return Response::success(
                 &req.id,
                 json!({
                     "project_root": root_path.display().to_string(),
                     "warnings": configure_warnings,
                     "warnings_pending": false,
-                    "search_index_cache_reused": search_index_cache_reused,
                     "artifact_owner": artifact_owner_status
                         .as_ref()
                         .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
@@ -4738,19 +4724,12 @@ fn handle_configure_inner(
         ctx.begin_configure_ack_phase("ack_ready");
         log_slow_configure_prefix(ctx, prefix_started_at);
         let artifact_owner_status = ctx.artifact_owner_status();
-        let search_index_cache_reused = next_config.indexes.trigram
-            && ctx
-                .search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some();
         return Response::success(
             &req.id,
             json!({
                 "project_root": root_path.display().to_string(),
                 "warnings": configure_warnings,
                 "warnings_pending": false,
-                "search_index_cache_reused": search_index_cache_reused,
                 "artifact_owner": artifact_owner_status
                     .as_ref()
                     .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
@@ -5206,7 +5185,6 @@ fn handle_configure_inner(
     // The data layer's text plane serves search; today's index is not built.
     let search_index = false;
     let semantic_search = ctx.config().indexes.semantic;
-    let mut search_index_cache_reused = false;
 
     // Reconfigure is still the signal that this root's workspace package
     // metadata may have changed, even when the warm-maintenance key is
@@ -5216,27 +5194,8 @@ fn handle_configure_inner(
         crate::callgraph::clear_workspace_package_cache_under(root);
     }
 
-    let search_build_in_progress = ctx
-        .search_index_rx()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some();
     let (search_artifact_load_start, semantic_artifact_load_start);
     if equivalent_warm_config {
-        // The zero-work rebind path keeps the live index serving; report that
-        // honestly instead of implying the cache was dropped.
-        search_index_cache_reused = search_index
-            && ctx
-                .search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some();
-        if search_build_in_progress {
-            slog_info!(
-                "search index build adopted by equivalent reconfigure (generation {})",
-                configure_generation
-            );
-        }
         if semantic_build_in_progress {
             slog_info!(
                 "semantic index build adopted by equivalent reconfigure (generation {})",
@@ -5261,12 +5220,6 @@ fn handle_configure_inner(
         // Semantic and callgraph workers keep their receiver and dedicated
         // build epoch when that lane's inputs are unchanged. Changed lane inputs
         // invalidate the old worker at its next bounded batch or slice.
-        if search_build_in_progress {
-            slog_warn!(
-                "search index build cancelled (superseded by generation {})",
-                configure_generation
-            );
-        }
         if semantic_build_in_progress {
             if semantic_build_adopted {
                 slog_info!(
@@ -5294,26 +5247,11 @@ fn handle_configure_inner(
             }
         }
 
-        // A change to another lane's settings does not invalidate the serving
-        // trigram generation. Root and corpus-limit changes still require a reset.
-        let retain_search = cache_available
-            && !project_root_changed
-            && search_index
-            && previous_config.search_index_max_file_size == next_config.search_index_max_file_size
-            && previous_config.storage_dir == next_config.storage_dir
-            && previous_config.cache_dir == next_config.cache_dir
-            && previous_config.cache_epoch == next_config.cache_epoch;
-        if !retain_search {
-            *ctx.search_index()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        }
         let retain_semantic = cache_available
             && !semantic_build_inputs_changed
             && previous_config.storage_dir == next_config.storage_dir
             && previous_config.cache_dir == next_config.cache_dir
             && previous_config.cache_epoch == next_config.cache_epoch;
-        ctx.retire_search_index_rx("a reconfigure with different settings superseded it");
         if semantic_build_adopted {
             let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
             debug_assert!(
@@ -5487,7 +5425,6 @@ fn handle_configure_inner(
             "project_root": root_path.display().to_string(),
             "warnings": configure_warnings,
             "warnings_pending": warnings_pending,
-            "search_index_cache_reused": search_index_cache_reused,
             "artifact_owner": artifact_owner_status
                 .as_ref()
                 .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
@@ -5615,22 +5552,11 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = false;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
     let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
-
-    let search_index_missing = ctx
-        .search_index()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_none();
-    let search_not_building = ctx
-        .search_index_rx()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_none();
-    let search_missing = search_enabled && search_index_missing && search_not_building;
+    // The index store's text plane serves search; nothing loads another one.
+    let search_missing = false;
     let semantic_not_building = !matches!(
         &*ctx
             .semantic_index_status()
@@ -5739,71 +5665,6 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
         let _ = start.send(());
     }
     started
-}
-
-/// Start a trigram reload after an idle eviction. The caller keeps serving the
-/// current request through the bounded fallback walk. Read-only roots reopen the
-/// shared snapshot without acquiring a writer lease.
-///
-/// With `worktree.ram_overlay` enabled, the reopened snapshot is reconciled
-/// with this checkout's files before it is installed, so edits the previous
-/// overlay held (and any the watcher lost) are rebuilt from disk rather than
-/// dropped. Without the overlay, a read-only root serves the shared snapshot
-/// as-is.
-pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
-    if ctx.config().views.enabled {
-        return false;
-    }
-    if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
-        return false;
-    }
-    let generation = ctx.configure_generation();
-    ctx.run_if_subc_bound_generation(generation, || {
-        start_artifact_loads(schedule_missing_artifact_loads_admitted(
-            ctx, true, false, false,
-        ))
-    })
-    .unwrap_or(false)
-}
-
-/// Restart a search-index load after its build receiver disconnected without
-/// delivering an index. This includes a read-only borrowed snapshot that stopped
-/// at its bounded load budget: without one maintenance continuation, the root
-/// stays index-less until another query retries the same load. Capped via
-/// `allow_search_index_disconnect_reschedule` at one automatic replacement per
-/// configure generation; after that the query-triggered reload remains the
-/// recovery path so a persistently failing worker cannot loop on the drain
-/// thread.
-pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bool {
-    let generation = ctx.configure_generation();
-    ctx.run_if_subc_bound_generation(generation, || {
-        let _reload_guard = ctx.artifact_reload_guard();
-        // A replacement (or a completed build) may have raced ahead of the drain;
-        // only reschedule when the index is still genuinely missing and idle.
-        // `missing_artifact_loads` also enforces `config.indexes.trigram`.
-        if !missing_artifact_loads(ctx).search {
-            return false;
-        }
-        if ctx.canonical_cache_root_opt().is_none() {
-            return false;
-        }
-        // Consume the one-per-generation slot only now that every guard passed,
-        // so a raced-ahead replacement does not waste the slot.
-        if !ctx.allow_search_index_disconnect_reschedule() {
-            crate::slog_info!(
-                "search index load disconnected without an index; automatic replacement already used for this configure generation, cooling down query-triggered reloads for 60s"
-            );
-            return false;
-        }
-        let started = start_artifact_loads(schedule_artifact_loads_admitted(ctx, true, false, false));
-        if started {
-            crate::slog_info!(
-                "search index load disconnected without an index; scheduled one automatic replacement load"
-            );
-        }
-        started
-    })
-    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -6078,372 +5939,6 @@ fn schedule_artifact_loads_admitted(
     let mut search_artifact_load_start = None;
     let mut semantic_artifact_load_start = None;
 
-    if load_search {
-        let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
-        let root_for_search = canonical_cache_root.clone();
-        let symbol_cache = ctx.symbol_cache();
-        let symbol_storage = storage_dir.clone();
-        let symbol_project_key = project_key.clone();
-        let is_worktree_bridge_for_search = is_worktree_bridge;
-        let search_loads_shared_artifacts_read_only =
-            is_worktree_bridge_for_search || ctx.shared_artifacts_read_only();
-        // A borrowed snapshot that this root keeps current from its own
-        // watcher events (the same gate the watcher drain uses) must first be
-        // reconciled with this checkout's files. The worker thread cannot
-        // reach the context, so the gate is captured here.
-        let reconcile_borrowed_overlay =
-            !ctx.shared_artifacts_read_only() || ctx.ram_overlay_active();
-        let session_id_for_bg = log_ctx::current_session();
-        let search_cold_build_limiter = ctx.cold_build_limiter();
-        let search_warm_reload_limiter = warm_search_reload_limiter();
-        let search_generation = configure_generation;
-        let search_generation_flag = ctx.configure_generation_flag();
-        let search_content_generation = configure_content_generation;
-        let search_content_generation_flag = Arc::clone(&configure_content_generation_flag);
-        let search_lifecycle = subc_lifecycle.clone();
-        let (tx, rx) = unbounded::<SearchIndex>();
-        let search_rx_epoch = ctx.install_search_index_rx(rx, search_generation);
-        let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
-        let search_pending_install = ctx.search_pending_install();
-        let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
-        let search_publication_gate = ctx.legacy_search_publication_gate();
-        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-        search_artifact_load_start = Some(start_tx);
-
-        #[cfg(debug_assertions)]
-        mark_search_rebuild_spawn_for_debug();
-        thread::spawn(move || {
-            let _terminal_guard = search_rx_terminal_guard;
-            let _publication = search_publication_gate.install();
-            if start_rx.recv().is_err() {
-                #[cfg(test)]
-                note_configure_artifact_load_cancellation_for_test();
-                return;
-            }
-            delay_configure_artifact_load_after_gate_for_test();
-            if !search_lifecycle.is_current(search_generation_flag.as_ref(), search_generation) {
-                #[cfg(test)]
-                note_configure_artifact_load_cancellation_for_test();
-                return;
-            }
-            log_ctx::with_session(session_id_for_bg.clone(), || {
-                note_configure_artifact_load_attempt(&root_for_search);
-                // Borrow-only opens are bounded disk reads, not cold builds. They
-                // must stay independent of the limiter that protects paths able
-                // to fall through to `rebuild_or_refresh_with_strategy` below.
-                if search_loads_shared_artifacts_read_only {
-                    let opened = match crate::readonly_artifacts::open_search_index_background(
-                        &root_for_search,
-                        cache_dir.clone(),
-                        &|| {
-                            search_lifecycle
-                                .is_current(search_generation_flag.as_ref(), search_generation)
-                        },
-                    ) {
-                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => Some(index),
-                        crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                            Some(stale.index)
-                        }
-                        crate::readonly_artifacts::ReadOnlyArtifact::Degraded(degradation) => {
-                            slog_warn!(
-                                "search index is read-only and the shared snapshot was not adopted ({})",
-                                degradation.reason
-                            );
-                            None
-                        }
-                        crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
-                            slog_debug!("read-only search index load was cancelled");
-                            None
-                        }
-                        crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
-                            slog_warn!(
-                                "search index is read-only but no shared artifact snapshot exists"
-                            );
-                            None
-                        }
-                    };
-                    let Some(mut index) = opened else {
-                        return;
-                    };
-                    // The shared snapshot describes the checkout that built
-                    // it. With the RAM overlay on, this root must first fold
-                    // its own differences into the overlay: an index that
-                    // reports ready while missing them answers "0 matches"
-                    // for code that exists. Until the reconciled index is
-                    // delivered, the receiver stays pending and grep answers
-                    // through the fallback walk with status Building.
-                    if reconcile_borrowed_overlay {
-                        let keep_going = || {
-                            search_lifecycle
-                                .is_current(search_generation_flag.as_ref(), search_generation)
-                        };
-                        match index.reconcile_borrowed_snapshot_with_disk(&keep_going) {
-                            Some(summary) => log_borrowed_reconcile(&root_for_search, &summary),
-                            None => {
-                                slog_debug!(
-                                    "borrowed search snapshot reconciliation abandoned for stale generation {}",
-                                    search_generation
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    let symbol_files = search_index_symbol_files(&index);
-                    let prewarm_stop = SymbolPrewarmStop {
-                        lifecycle: search_lifecycle.clone(),
-                        content_generation_flag: Arc::clone(&search_content_generation_flag),
-                        content_generation: search_content_generation,
-                    };
-                    let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
-                    let root_for_log = root_for_search.clone();
-                    let published = search_lifecycle.run_if_current(
-                        search_generation_flag.as_ref(),
-                        search_generation,
-                        || {
-                            let sent = tx.send(index).is_ok();
-                            if legacy_symbol_prewarm {
-                                spawn_symbol_cache_prewarm(
-                                    root_for_search,
-                                    symbol_cache,
-                                    symbol_storage,
-                                    symbol_project_key,
-                                    symbol_cache_generation,
-                                    symbol_files,
-                                    prewarm_stop,
-                                    true,
-                                    log_ctx::current_session(),
-                                );
-                            }
-                            sent
-                        },
-                    );
-                    note_finished_load_handoff(
-                        "search index",
-                        &root_for_log,
-                        &search_lifecycle,
-                        published,
-                        &search_pending_install,
-                        search_rx_epoch,
-                        pending_bytes,
-                    );
-                    return;
-                }
-
-                let Some(search_persist_epoch) = search_lifecycle.run_if_current(
-                    search_generation_flag.as_ref(),
-                    search_generation,
-                    || search_persist_epoch_flag.next(),
-                ) else {
-                    return;
-                };
-                if search_persist_epoch_flag.current() != search_persist_epoch {
-                    return;
-                }
-                let Some(warm_permit) =
-                    crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                        &search_warm_reload_limiter,
-                        "warm search reload",
-                        &root_for_search,
-                        || {
-                            search_lifecycle
-                                .is_current(search_generation_flag.as_ref(), search_generation)
-                        },
-                    )
-                else {
-                    return;
-                };
-                let mut warm_permit = Some(warm_permit);
-                // HEAD freshness is deliberately probed after the bind ack. The
-                // helper bounds git so a wedged repository cannot pin maintenance.
-                let current_head = current_git_head(&root_for_search);
-                let _cache_lock = if is_worktree_bridge_for_search {
-                    None
-                } else {
-                    match CacheLock::acquire(&cache_dir, &root_for_search) {
-                        Ok(lock) => Some(lock),
-                        Err(error) => {
-                            slog_warn!("failed to acquire search artifact lock: {}", error);
-                            return;
-                        }
-                    }
-                };
-                let cache_path = cache_dir.join("cache.bin");
-                let artifact_generation = cache_freshness::artifact_generation(&cache_path);
-                let verify_ticket = cache_freshness::capture_verify_ticket(&root_for_search);
-                let verify_plan = cache_freshness::warm_verify_plan(
-                    &root_for_search,
-                    VerifyArtifact::Search,
-                    artifact_generation,
-                );
-                let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
-                let mut persist_to_disk = true;
-                let mut record_completed_verify = true;
-                let mut warm_verification = None;
-                let refreshed = match baseline {
-                    Some(mut index)
-                        if index.stored_git_head() == current_head.as_deref()
-                            && index.configured_max_file_size() == search_index_max_file_size =>
-                    {
-                        index.set_ready(false);
-                        match verify_plan {
-                            WarmVerifyPlan::Skip => {
-                                index.set_ready(true);
-                                persist_to_disk = false;
-                                record_completed_verify = false;
-                                Some(index)
-                            }
-                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => index
-                                .verify_against_disk_with_warm_budget(
-                                    current_head.clone(),
-                                    &cache_dir,
-                                )
-                                .map(|(disk_changed, verification)| {
-                                    warm_verification = Some(verification);
-                                    persist_to_disk =
-                                        disk_changed || index.has_pending_disk_changes();
-                                    index
-                                }),
-                        }
-                    }
-                    baseline => {
-                        let strategy = match verify_plan {
-                            WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                            WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
-                                VerifyStrategy::StatFirst
-                            }
-                        };
-                        // Git-diff paths and disk-only changes share one warm budget.
-                        baseline.and_then(|baseline| {
-                            SearchIndex::refresh_cached_with_strategy(
-                                baseline,
-                                &root_for_search,
-                                search_index_max_file_size,
-                                current_head.clone(),
-                                strategy,
-                            )
-                        })
-                    }
-                };
-                let mut index = if let Some(index) = refreshed {
-                    index
-                } else {
-                    drop(warm_permit.take());
-                    // Incompatible or over-budget refreshes share the cold-build
-                    // limit with embedding builds, including same-HEAD disk edits.
-                    let Some(_permit) =
-                        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                            &search_cold_build_limiter,
-                            "search index post-configure load",
-                            &root_for_search,
-                            || {
-                                search_lifecycle
-                                    .is_current(search_generation_flag.as_ref(), search_generation)
-                            },
-                        )
-                    else {
-                        return;
-                    };
-                    if search_persist_epoch_flag.current() != search_persist_epoch {
-                        return;
-                    }
-                    let Some(index) = SearchIndex::build_with_limit_to_cache_dir_cancellable(
-                        &root_for_search,
-                        search_index_max_file_size,
-                        &cache_dir,
-                        &|| search_publication_gate.allowed(),
-                    ) else {
-                        return;
-                    };
-                    delay_search_rebuild_publish_for_debug();
-                    index
-                };
-                // Once admitted, a build may finish generation-safe disk
-                // persistence after its last route closes. This avoids throwing
-                // away expensive completed work and rebuilding it on rebind.
-                // Lifecycle admission still gates permit acquisition, in-memory
-                // publication, refresh-worker startup, and symbol prewarming.
-                let generation_current = || {
-                    search_content_generation_flag.load(Ordering::SeqCst)
-                        == search_content_generation
-                };
-                let mut persistence_succeeded = !persist_to_disk;
-                // Borrow-only / worktree roots never persist, overlay or not.
-                // `write_to_disk` also fail-closes via artifact_write_allowed.
-                if generation_current() && !is_worktree_bridge_for_search && persist_to_disk {
-                    let published =
-                        search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
-                            let head = index.stored_git_head().map(str::to_owned);
-                            persist_loaded_search_index(&mut index, &cache_dir, head.as_deref())
-                                .succeeded()
-                        });
-                    persistence_succeeded = published == Some(true);
-                    if published.is_none() {
-                        slog_info!(
-                            "search index persistence skipped for superseded worker epoch {}",
-                            search_persist_epoch
-                        );
-                    }
-                }
-                if generation_current() && record_completed_verify && persistence_succeeded {
-                    let verified = cache_freshness::record_verify_completed_if_unchanged(
-                        &root_for_search,
-                        VerifyArtifact::Search,
-                        cache_freshness::artifact_generation(&cache_path),
-                        verify_ticket,
-                    );
-                    if verified && !is_worktree_bridge_for_search {
-                        if let Some(verification) = warm_verification {
-                            search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
-                                if let Err(error) =
-                                    index.persist_warm_verification(&cache_dir, verification)
-                                {
-                                    slog_warn!("failed to persist search verification: {}", error);
-                                }
-                            });
-                        }
-                    }
-                }
-                let symbol_files = search_index_symbol_files(&index);
-                let prewarm_stop = SymbolPrewarmStop {
-                    lifecycle: search_lifecycle.clone(),
-                    content_generation_flag: Arc::clone(&search_content_generation_flag),
-                    content_generation: search_content_generation,
-                };
-                let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
-                let root_for_log = root_for_search.clone();
-                let published = search_lifecycle.run_if_current(
-                    search_generation_flag.as_ref(),
-                    search_generation,
-                    || {
-                        let sent = tx.send(index).is_ok();
-                        if legacy_symbol_prewarm {
-                            spawn_symbol_cache_prewarm(
-                                root_for_search,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                prewarm_stop,
-                                false,
-                                log_ctx::current_session(),
-                            );
-                        }
-                        sent
-                    },
-                );
-                note_finished_load_handoff(
-                    "search index",
-                    &root_for_log,
-                    &search_lifecycle,
-                    published,
-                    &search_pending_install,
-                    search_rx_epoch,
-                    pending_bytes,
-                );
-            });
-        });
-    }
 
     // With the data layer on, its meaning plane serves this root's semantic
     // search and its checkout fills it (see `data_layer::meaning`); neither
@@ -8924,11 +8419,10 @@ fn run_configure_maintenance_unit_inner(
             // and only if this job's configure generation is still active.
             if ctx
                 .run_if_subc_bound_generation(job.generation, || {
-                    if job.supersede_search_artifact_persistence {
-                        ctx.next_search_persist_epoch();
-                        if job.supersede_semantic_artifact_persistence {
-                            ctx.next_semantic_persist_epoch();
-                        }
+                    if job.supersede_search_artifact_persistence
+                        && job.supersede_semantic_artifact_persistence
+                    {
+                        ctx.next_semantic_persist_epoch();
                     }
                     if job.supersede_callgraph_artifact_persistence {
                         ctx.next_callgraph_persist_epoch();
