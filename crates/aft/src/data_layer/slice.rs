@@ -121,6 +121,23 @@ pub(crate) struct FileSlice {
 }
 
 impl FileSlice {
+    /// A slice of `path` with no symbols, references or edges.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            record_key: String::new(),
+            nodes: Vec::new(),
+            refs: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            ordinary: HashMap::new(),
+            scoped: HashMap::new(),
+            kinds: HashMap::new(),
+            node_index: HashMap::new(),
+        }
+    }
+
     /// The node id a row targeting `symbol` in this file links to.
     pub(crate) fn target_node(&self, symbol: &str, lookup: TargetLookup) -> Option<&str> {
         match lookup {

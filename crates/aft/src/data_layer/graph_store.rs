@@ -476,8 +476,16 @@ pub(crate) struct StoredSlices {
     segments: Vec<Arc<Segment>>,
     paths: BTreeMap<String, Located>,
     by_fragment: HashMap<(u32, u32), String>,
-    cache: Mutex<HashMap<String, Arc<FileSlice>>>,
+    /// This set's key in the process's shared cache of decoded files
+    /// ([`super::slice_cache`]), which bounds what all checkouts hold.
+    token: super::slice_cache::SourceToken,
     failures: Mutex<Vec<String>>,
+}
+
+impl Drop for StoredSlices {
+    fn drop(&mut self) {
+        super::slice_cache::shared().forget(self.token);
+    }
 }
 
 /// Finds `key` in the newest of `segments` that holds it.
@@ -598,7 +606,7 @@ impl StoredSlices {
             segments,
             paths,
             by_fragment,
-            cache: Mutex::new(HashMap::new()),
+            token: super::slice_cache::SourceToken::next(),
             failures: Mutex::new(Vec::new()),
         }))
     }
@@ -870,24 +878,13 @@ fn record_key_of(key: &str) -> Result<RecordKey, String> {
 
 impl SliceSource for StoredSlices {
     fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
-        if let Some(slice) = self
-            .cache
-            .lock()
-            .expect("no panics while holding it")
-            .get(path)
-        {
-            return Some(Arc::clone(slice));
+        let cache = super::slice_cache::shared();
+        if let Some(slice) = cache.get(self.token, path) {
+            return Some(slice);
         }
         let located = self.paths.get(path)?;
         match self.load(path, located) {
-            Ok(slice) => {
-                let slice = Arc::new(slice);
-                self.cache
-                    .lock()
-                    .expect("no panics while holding it")
-                    .insert(path.to_string(), Arc::clone(&slice));
-                Some(slice)
-            }
+            Ok(slice) => Some(cache.insert(self.token, path, Arc::new(slice))),
             Err(error) => {
                 self.fail(format!("{path}: {error}"));
                 None
@@ -928,6 +925,6 @@ aft_store::heap_bytes_of_fields!(StoredSlices {
     segments,
     paths,
     by_fragment,
-    cache,
+    token,
     failures,
 });

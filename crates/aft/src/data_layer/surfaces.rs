@@ -907,19 +907,41 @@ pub(crate) fn checkout_estimate(
 pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
     let (stats, measured) = super::runtime::block_cache_memory()?;
     let resident = u64::try_from(stats.resident_bytes).unwrap_or(u64::MAX);
-    let estimate = match measured {
-        Some(bytes) => MemoryEstimate::estimated(u64::try_from(bytes).unwrap_or(u64::MAX)),
-        None => MemoryEstimate::partial(resident).gap("block_cache_tables_busy"),
+    // The cache of decoded call-graph files is the data layer's other cache
+    // shared by every checkout, so it is counted here too, once, and its own
+    // counters are named `slice_*`.
+    let slices = super::slice_cache::shared().stats();
+    let slice_bytes = slices.map_or(0, |slices| {
+        u64::try_from(slices.resident_bytes).unwrap_or(u64::MAX)
+    });
+    let mut estimate = match (measured, slices) {
+        (Some(bytes), Some(_)) => MemoryEstimate::estimated(
+            u64::try_from(bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(slice_bytes),
+        ),
+        (Some(bytes), None) => MemoryEstimate::partial(u64::try_from(bytes).unwrap_or(u64::MAX))
+            .gap("slice_cache_busy"),
+        (None, _) => MemoryEstimate::partial(resident.saturating_add(slice_bytes))
+            .gap("block_cache_tables_busy"),
     };
-    Some(
-        estimate
-            .count_u64("resident_bytes", resident)
-            .count("budget_bytes", stats.budget_bytes)
-            .count("blocks", stats.blocks)
-            .count_u64("hits", stats.hits)
-            .count_u64("misses", stats.misses)
-            .count_u64("evictions", stats.evictions),
-    )
+    estimate = estimate
+        .count_u64("resident_bytes", resident)
+        .count("budget_bytes", stats.budget_bytes)
+        .count("blocks", stats.blocks)
+        .count_u64("hits", stats.hits)
+        .count_u64("misses", stats.misses)
+        .count_u64("evictions", stats.evictions);
+    if let Some(slices) = slices {
+        estimate = estimate
+            .count_u64("slice_resident_bytes", slice_bytes)
+            .count("slice_budget_bytes", slices.budget_bytes)
+            .count("slices", slices.slices)
+            .count_u64("slice_hits", slices.hits)
+            .count_u64("slice_misses", slices.misses)
+            .count_u64("slice_evictions", slices.evictions);
+    }
+    Some(estimate)
 }
 
 /// Rewrites a status payload for the data layer: `search_index` and

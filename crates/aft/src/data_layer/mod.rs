@@ -26,6 +26,7 @@ pub(crate) mod query;
 pub mod reuse;
 pub(crate) mod runtime;
 pub(crate) mod slice;
+pub(crate) mod slice_cache;
 pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;
