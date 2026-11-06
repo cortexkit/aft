@@ -796,6 +796,17 @@ pub(crate) fn resolve_checkout_into(
     fn refs(batch: &[String]) -> Vec<&String> {
         batch.iter().collect()
     }
+    let mut started = std::time::Instant::now();
+    let mut lap = |memory: &mut Option<&mut Vec<(String, usize)>>, stage: &str| {
+        if let Some(memory) = memory.as_deref_mut() {
+            let ms = started.elapsed().as_millis();
+            memory.push((
+                format!("ms.{stage}"),
+                usize::try_from(ms).unwrap_or(usize::MAX),
+            ));
+        }
+        started = std::time::Instant::now();
+    };
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
@@ -817,6 +828,7 @@ pub(crate) fn resolve_checkout_into(
         }
         bound.set_lists(lists);
         relieve_allocator();
+        lap(&mut memory, "bind");
         let mut resolved = Vec::with_capacity(paths.len());
         for batch in paths.chunks(BATCH) {
             let parses = &inputs.parses;
@@ -840,6 +852,7 @@ pub(crate) fn resolve_checkout_into(
             let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
         }
+        lap(&mut memory, "resolve");
         // Pass 4 reads each file's own inputs, built above from its parse
         // and resolution, and never the bound surfaces.
         drop(bound);
@@ -881,6 +894,7 @@ pub(crate) fn resolve_checkout_into(
         }
         drop(calls);
         relieve_allocator();
+        lap(&mut memory, "sites_and_fragments");
         Ok(())
     })
 }

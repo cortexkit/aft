@@ -1122,8 +1122,15 @@ impl Checkout {
         // The segment needs only each record's encoded bytes, a fifth of the
         // decoded size, and the resolver decodes each parse from them when it
         // reads it; the decoded records go before resolving.
+        let taking = Instant::now();
         let (mut inputs, encoded) = collected.take_inputs(&state);
         report.parsed_files = inputs.parses.len();
+        if measure {
+            report.memory.push((
+                "ms.take_inputs".to_string(),
+                usize::try_from(taking.elapsed().as_millis()).unwrap_or(usize::MAX),
+            ));
+        }
         if measure {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
