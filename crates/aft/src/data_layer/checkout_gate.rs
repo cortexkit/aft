@@ -964,6 +964,148 @@ fn segment_files(family_dir: &Path) -> usize {
         .unwrap_or_default()
 }
 
+/// Memory samples for finding what the gate's process holds, written to
+/// stderr as `memory {json}` lines when `CHECKOUT_GATE_MEMORY_EVERY` is set
+/// to N: after every N of A's edits, and after each build, publication,
+/// cold build and comparison. Each sample has the process's resident and
+/// peak memory and thread count, what the allocator holds, the block
+/// cache, the snapshots the family's readers lease, and what each named
+/// checkout holds ([`Checkout::memory`]). Reading them takes no lock a
+/// checkout waits on.
+struct MemoryLog {
+    every: usize,
+    edits: std::cell::Cell<usize>,
+}
+
+impl MemoryLog {
+    fn from_env() -> Self {
+        Self {
+            every: std::env::var("CHECKOUT_GATE_MEMORY_EVERY")
+                .ok()
+                .and_then(|every| every.parse().ok())
+                .unwrap_or(0),
+            edits: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Whether this edit of A's is one to sample after: every `every`th.
+    fn due(&self) -> bool {
+        if self.every == 0 {
+            return false;
+        }
+        self.edits.set(self.edits.get() + 1);
+        self.edits.get() % self.every == 0
+    }
+
+    fn sample(
+        &self,
+        label: &str,
+        commit: usize,
+        checkouts: &[(&str, &Checkout)],
+        layer: &DataLayer,
+        family_dir: &Path,
+    ) {
+        if self.every == 0 {
+            return;
+        }
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let mib = |bytes: u64| bytes / (1 << 20);
+        let leases = std::fs::read_dir(family_dir.join("leases"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lease"))
+                    .count()
+            })
+            .unwrap_or_default();
+        let parts = checkouts
+            .iter()
+            .map(|(name, checkout)| {
+                let memory = checkout.memory();
+                let live = memory.live.map(|live| {
+                    serde_json::json!({
+                        "state_paths": live.state_paths,
+                        "state_kib": live.state_bytes / 1024,
+                        "text_paths": live.text_overlay_paths,
+                        "text_kib": live.text_overlay_bytes / 1024,
+                        "changes": live.changes,
+                        "pending": live.pending_callgraph_paths,
+                        "refreshed": live.refreshed_files,
+                        "dead_code_files": live.dead_code_files,
+                    })
+                });
+                (
+                    (*name).to_string(),
+                    serde_json::json!({"live": live, "engine": format!("{:?}", memory.engine)}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let (malloc_in_use, malloc_held) = allocator_bytes();
+        let cache = layer.cache_stats();
+        eprintln!(
+            "memory {}",
+            serde_json::json!({
+                "label": label,
+                "commit": commit,
+                "rss_mib": field("VmRSS:").map(|kib| kib / 1024),
+                "peak_rss_mib": field("VmHWM:").map(|kib| kib / 1024),
+                "threads": field("Threads:"),
+                "malloc_in_use_mib": malloc_in_use.map(mib),
+                "malloc_held_mib": malloc_held.map(mib),
+                "cache_mib": cache.resident_bytes / (1 << 20),
+                "leases": leases,
+                "segments": segment_files(family_dir),
+                "checkouts": parts,
+            })
+        );
+    }
+}
+
+/// Hands the pages the allocator holds free back to the system, as AFT's
+/// own allocator relief (`crate::memory`) does in a running process once it
+/// holds enough of them. Between comparisons the gate frees whole cold
+/// builds, engines and resolver thread pools; glibc keeps the pages they
+/// leave free in its per-thread arenas, so without this the gate's resident
+/// memory grows with every comparison while what it uses does not.
+fn release_free_memory() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = crate::memory::relieve_allocator_pressure();
+}
+
+/// What glibc's allocator hands out now, and what it holds from the system
+/// (`mallinfo2`: in use, and arenas with large mappings); `None` elsewhere
+/// or before glibc 2.33.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn allocator_bytes() -> (Option<u64>, Option<u64>) {
+    type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
+    // SAFETY: looking a symbol up by name has no other effect.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+    if symbol.is_null() {
+        return (None, None);
+    }
+    // SAFETY: glibc declares mallinfo2 as `struct mallinfo2 (*)(void)`.
+    let mallinfo2 = unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2>(symbol) };
+    // SAFETY: mallinfo2 only reads the allocator's counters.
+    let info = unsafe { mallinfo2() };
+    let mapped = info.hblkhd as u64;
+    (
+        Some((info.uordblks as u64).saturating_add(mapped)),
+        Some((info.arena as u64).saturating_add(mapped)),
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn allocator_bytes() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
 /// The checkout in `slot`, which is empty only while it is down.
 fn live(slot: &Option<Checkout>) -> Result<&Checkout, String> {
     slot.as_ref()
@@ -1095,7 +1237,9 @@ impl Summary {
 /// `CHECKOUT_GATE_ONLY` (comma-separated path prefixes) keeps only the
 /// pack's paths under them, for a shorter run; `CHECKOUT_GATE_PUBLISH_EDITS`
 /// sets how many of A's edits pass between publications of its changes
-/// within a commit (8 by default; 0 publishes at commit ends only).
+/// within a commit (8 by default; 0 publishes at commit ends only);
+/// `CHECKOUT_GATE_MEMORY_EVERY=N` writes memory samples to stderr (see
+/// `MemoryLog`).
 ///
 /// # Errors
 ///
@@ -1162,7 +1306,6 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
     };
     let noise = vec![format!("{PROBE}/main.ts").into_bytes()];
     let mut summary = Summary::default();
-
     // A: bound and built as a first open builds it.
     let mut a = Some(bind(&a_root)?);
     live(&a)?.build().map_err(|error| error.to_string())?;
@@ -1188,6 +1331,23 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
     let mut b_events =
         vec!["opened by the runtime over a publication of its text index alone".to_string()];
     let mut b_wait = RUNTIME_WAIT;
+    let memory = MemoryLog::from_env();
+    // Samples memory with A and B, and any other checkout named, as they
+    // are now.
+    macro_rules! sample {
+        ($label:expr, $commit:expr $(, $name:expr => $checkout:expr)*) => {{
+            let mut parts: Vec<(&str, &Checkout)> = Vec::new();
+            if let Some(checkout) = a.as_ref() {
+                parts.push(("a", checkout));
+            }
+            if let Some(handle) = b.as_deref() {
+                parts.push(("b", handle.checkout()));
+            }
+            $(parts.push(($name, $checkout));)*
+            memory.sample($label, $commit, &parts, &layer, &family_dir);
+        }};
+    }
+    sample!("a built, b opened", 0);
 
     for (index, (commit, edits)) in commits.iter().enumerate() {
         let commit = usize::try_from(*commit).unwrap_or_default();
@@ -1198,6 +1358,7 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             events.push(format!(
                 "built again while a watcher recorded {recorded} times, with {PROBE}/unwatched.ts changed and never recorded"
             ));
+            sample!("a built again", commit);
         }
         let restart = index == restart_at;
         let mut stored_inputs_missing = None;
@@ -1230,7 +1391,13 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             since_publication += 1;
             if publish_every > 0 && since_publication >= publish_every {
                 since_publication = 0;
-                summary.publish(checkout, &noise, &mut events)?;
+                if summary.publish(checkout, &noise, &mut events)? {
+                    release_free_memory();
+                    sample!("a published", commit);
+                }
+            }
+            if memory.due() {
+                sample!("a edited", commit);
             }
         }
         if restart {
@@ -1245,6 +1412,7 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
                 .map_err(|error| error.to_string())?;
             refresh_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             events.push(format!("{} paths changed while down", edits.len()));
+            sample!("a restarted", commit);
         }
 
         // The probe's ignore rule moves in A's second commit, and the symlink
@@ -1256,6 +1424,7 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             &format!("cold-a-{commit}"),
             (index >= 1, index > restart_at),
         )?;
+        sample!("cold a built", commit, "cold" => &cold.checkout);
         let mut record = CommitRecord {
             commit,
             checkout: "a".to_string(),
@@ -1275,6 +1444,7 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
         cold.compare(live(&a)?, &a_files, &mut record)?;
         record.segment_files = segment_files(&family_dir);
         summary.emit(out, &record)?;
+        sample!("a compared", commit, "cold" => &cold.checkout);
         if index % 3 == 2 {
             let mut events = Vec::new();
             if !summary.publish(live(&a)?, &noise, &mut events)? {
@@ -1307,8 +1477,11 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             cold.compare(&fresh, &a_files, &mut record)?;
             record.segment_files = segment_files(&family_dir);
             summary.emit(out, &record)?;
+            sample!("a published and bound again, compared", commit, "cold" => &cold.checkout, "a bound again" => &fresh);
         }
         drop(cold);
+        release_free_memory();
+        sample!("cold a dropped", commit);
         if restart {
             let record = restart_over_shared_fragments(
                 &mut a,
@@ -1329,6 +1502,9 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             cold.compare(live(&a)?, &a_files, &mut record)?;
             record.segment_files = segment_files(&family_dir);
             summary.emit(out, &record)?;
+            sample!("a restarted over b, compared", commit, "cold" => &cold.checkout);
+            drop(cold);
+            release_free_memory();
         }
 
         // B takes the commit `lag` before A's, as the watcher reports it.
@@ -1367,6 +1543,7 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             // by waiting longer; later comparisons fail without the wait.
             b_wait = Duration::from_secs(5);
         }
+        sample!("b settled", commit);
         // B's ignore rule moves once B takes the second commit. B's chain
         // does not pass through the symlink retargeted at A's restart, so its
         // `main.ts` keeps calling `real/lib.ts`.
@@ -1392,6 +1569,9 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
         cold.compare(handle.checkout(), &b_files, &mut record)?;
         record.segment_files = segment_files(&family_dir);
         summary.emit(out, &record)?;
+        sample!("b compared", commit, "cold" => &cold.checkout);
+        drop(cold);
+        release_free_memory();
     }
     if summary.comparisons == 0 {
         return Err("nothing was compared".to_string());

@@ -10,9 +10,10 @@
 //! (comma-separated path prefixes) keeps only the pack's paths under them,
 //! for a shorter run; `CHECKOUT_GATE_PUBLISH_EDITS` sets how many edits pass
 //! between publications of a checkout's changes within a commit (8 by
-//! default). Exits nonzero when any comparison differs, when nothing was
-//! compared, or when checkout A never read from enough segments for a
-//! build to fold them.
+//! default); `CHECKOUT_GATE_MEMORY_EVERY=N` writes a `memory {json}` line
+//! to stderr every N edits and around each build and comparison. Exits
+//! nonzero when any comparison differs, when nothing was compared, or when
+//! checkout A never read from enough segments for a build to fold them.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
