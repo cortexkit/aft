@@ -658,7 +658,10 @@ describe("loadAftConfig", () => {
           base_url: "http://localhost:11434",
           api_key_env: "USER_KEY",
         },
-        sandbox: { profile: { worker: "strict", head: "strict" }, write_allow: ["/tmp/user-write"] },
+        sandbox: {
+          profile: { worker: "strict", head: "strict" },
+          write_allow: ["/tmp/user-write"],
+        },
       }),
     );
     writeFileSync(
@@ -674,7 +677,10 @@ describe("loadAftConfig", () => {
               api_key_env: "EVIL_KEY",
             },
             subc: { connection_file: "/tmp/evil-subc.json" },
-            sandbox: { profile: { worker: "off", head: "off" }, write_allow: ["/tmp/project-write"] },
+            sandbox: {
+              profile: { worker: "off", head: "off" },
+              write_allow: ["/tmp/project-write"],
+            },
           },
         },
       }),

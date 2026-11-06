@@ -9,10 +9,12 @@ import {
   DATA_LAYER_RETIRED_PATHS,
   dropRemovedDataLayerKeys,
   getRunningRelease,
+  LEGACY_TOOL_ALIASES,
   legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
   parseRelease,
+  REFUSED_RETIRED_PATHS,
   REMOVED_DATA_LAYER_NOTES,
   RETIRED_ENABLED_FALSE_INDEXES_NOTE,
   RETIRED_HANG_THRESHOLD_NOTE,
@@ -74,6 +76,60 @@ describe("feature-config policy", () => {
       // refused only from DATA_LAYER_KEYS_REFUSED_FROM.
       const release = fixture.release === undefined ? undefined : parseRelease(fixture.release);
       expect(removedConfigKeyErrors(fixture.doc, release), fixture.name).toEqual(fixture.errors);
+    }
+  });
+
+  test("every name retired in 0.62 or earlier is refused, and the translation doctor --fix uses removes it", () => {
+    const documents: Array<[string, Record<string, unknown>]> = [
+      ["sandbox.enabled", { sandbox: { enabled: true } }],
+      ["tool_surface", { tool_surface: "minimal" }],
+      ["hoist_builtin_tools", { hoist_builtin_tools: false }],
+      ["enabled", { enabled: false }],
+      ["search_index", { search_index: false }],
+      ["experimental_search_index", { experimental_search_index: false }],
+      ["semantic_search", { semantic_search: false }],
+      ["experimental_semantic_search", { experimental_semantic_search: false }],
+      ["callgraph_store", { callgraph_store: false }],
+      ["github.enabled", { github: { enabled: false } }],
+      ["gh_read", { gh_read: { enabled: true } }],
+      ["gh_shim.enabled", { gh_shim: { enabled: false, binary_path: "/opt/aft/bin/aft" } }],
+      ["experimental_lsp_ty", { experimental_lsp_ty: true }],
+      ["experimental_bash_rewrite", { experimental_bash_rewrite: true }],
+      ["experimental_bash_compress", { experimental_bash_compress: true }],
+      ["experimental_bash_background", { experimental_bash_background: true }],
+      ["experimental.bash", { experimental: { bash: { background: true } } }],
+      [
+        "experimental.bash",
+        { experimental: { bash: { long_running_reminder_interval_ms: 5000 } } },
+      ],
+      ["idle.lsp_ttl_minutes", { idle: { lsp_ttl_minutes: 10 } }],
+      ["inspect.tier2_soft_deadline_ms", { inspect: { tier2_soft_deadline_ms: 50 } }],
+      ["inspect.max_drill_down_items", { inspect: { max_drill_down_items: 20 } }],
+      ...Object.keys(LEGACY_TOOL_ALIASES).map((name): [string, Record<string, unknown>] => [
+        name,
+        { disabled_tools: [name] },
+      ]),
+    ];
+    const listed = new Set(documents.map(([name]) => name));
+    for (const path of REFUSED_RETIRED_PATHS) expect(listed.has(path), path).toBe(true);
+    for (const [name, base] of documents) {
+      for (const [prefix, doc] of [
+        ["", structuredClone(base)],
+        ["harnesses.pi.", { harnesses: { pi: structuredClone(base) } }],
+      ] as const) {
+        const label = JSON.stringify(doc);
+        expect(removedConfigKeyErrors(doc), label).toEqual([
+          `removed_config_key:${prefix}${name}; run npx @cortexkit/aft doctor --fix`,
+        ]);
+        // The plugins pass false for the user file, which the binary rewrites.
+        expect(removedConfigKeyErrors(doc, getRunningRelease(), false), label).toEqual([]);
+        for (const tier of ["user", "project"] as const) {
+          const translated = structuredClone(doc);
+          const out = translateConfigDocument(translated, tier);
+          expect(out.legacyInput, label).toBe(true);
+          expect(removedConfigKeyErrors(translated), `${tier}: ${label}`).toEqual([]);
+        }
+      }
     }
   });
 
