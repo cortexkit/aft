@@ -144,46 +144,133 @@ const REFRESH_REQUEST: &str = "data-layer-refresh";
 const RESCAN_REQUEST: &str = "data-layer-rescan";
 const FILL_REQUEST: &str = "data-layer-meaning-fill";
 
-/// Where a checkout's background work runs. Under the daemon it runs as the
-/// root's maintenance on its executor: the executor runs none while the root
-/// is unbound, and a root that unbinds cancels it at its checkpoints. A
-/// standalone AFT has no executor and serves one root that is always bound,
-/// so there the work runs on a thread of its own.
+/// The process-wide pool a kind of background work runs in. Each pool runs
+/// at most `cap` jobs at once, across every checkout, and queues the rest in
+/// submission order.
+#[derive(Clone, Copy, Debug)]
+enum Pool {
+    /// Builds: CPU- and memory-heavy, so few at once.
+    Build,
+    /// Meaning-search fill rounds, which mostly wait on an embedding backend.
+    Fill,
+    /// Call-graph refreshes and rescans after edits: short, and wanted soon.
+    Refresh,
+}
+
+impl Pool {
+    fn cap(self) -> usize {
+        match self {
+            Pool::Build => 2,
+            Pool::Fill => 2,
+            Pool::Refresh => 4,
+        }
+    }
+
+    fn state(self) -> &'static parking_lot::Mutex<PoolState> {
+        static BUILD: parking_lot::Mutex<PoolState> = parking_lot::Mutex::new(PoolState::new());
+        static FILL: parking_lot::Mutex<PoolState> = parking_lot::Mutex::new(PoolState::new());
+        static REFRESH: parking_lot::Mutex<PoolState> = parking_lot::Mutex::new(PoolState::new());
+        match self {
+            Pool::Build => &BUILD,
+            Pool::Fill => &FILL,
+            Pool::Refresh => &REFRESH,
+        }
+    }
+
+    /// Runs `job` when a place in the pool is free.
+    fn submit(self, job: PoolJob) {
+        let mut state = self.state().lock();
+        if state.running >= self.cap() {
+            state.queue.push_back(job);
+            return;
+        }
+        state.running += 1;
+        drop(state);
+        self.spawn(job);
+    }
+
+    /// A thread that runs `job`, then whatever queued behind it, until the
+    /// queue is empty.
+    fn spawn(self, job: PoolJob) {
+        let spawned = std::thread::Builder::new()
+            .name(format!("aft-data-{self:?}").to_lowercase())
+            .spawn(move || {
+                let mut next = Some(job);
+                while let Some(job) = next.take() {
+                    job();
+                    let mut state = self.state().lock();
+                    next = state.queue.pop_front();
+                    if next.is_none() {
+                        state.running -= 1;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            self.state().lock().running -= 1;
+            crate::slog_warn!("data layer could not start a {self:?} worker: {error}");
+        }
+    }
+}
+
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct PoolState {
+    running: usize,
+    queue: std::collections::VecDeque<PoolJob>,
+}
+
+impl PoolState {
+    const fn new() -> Self {
+        Self {
+            running: 0,
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Where a checkout's background work runs. Under the daemon the root's
+/// executor admits it first, so a root that is unbound starts none, and the
+/// work then runs in a [`Pool`], never on an executor worker. A build, a fill
+/// round or a refresh can take seconds to minutes; run as executor work it
+/// held the root's lanes and the executor's heavy-build places for that long,
+/// and every tool call on the root, and every other root's build, waited
+/// behind it. The pool job carries the root's cancellation, so a root that
+/// unbinds still stops it at its next checkpoint. A standalone AFT has no
+/// executor and serves one root that is always bound, so there the work goes
+/// straight to its pool.
 struct Runner {
     root: PathBuf,
     executor: parking_lot::Mutex<Option<RootMaintenanceExecutor>>,
 }
 
 impl Runner {
-    /// Runs `work` on `lane`. Work the executor refuses (the root is
+    /// Runs `work` in `pool`. Work the executor refuses (the root is
     /// unbound, or the executor shut down) is dropped unrun, so anything it
     /// captured to mark itself running is released with it. Never falls back
-    /// to a thread under the daemon: that would put a retired root to work.
-    fn run(&self, request_id: &'static str, lane: Lane, work: impl FnOnce() + Send + 'static) {
+    /// to running unadmitted under the daemon: that would put a retired root
+    /// to work.
+    fn run(&self, request_id: &'static str, pool: Pool, work: impl FnOnce() + Send + 'static) {
         let executor = self.executor.lock().clone();
         let Some(executor) = executor else {
-            if let Err(error) = std::thread::Builder::new()
-                .name(format!("aft-{request_id}"))
-                .spawn(work)
-            {
-                crate::slog_warn!(
-                    "data layer could not start {request_id} for {}: {error}",
-                    self.root.display()
-                );
-            }
+            pool.submit(Box::new(work));
             return;
         };
         let cancellation = JobCancellation::new().with_root(&self.root);
-        let token = cancellation.clone();
+        // The admission job only hands the work to its pool, so it holds the
+        // root's maintenance lane for no longer than that.
         executor.submit_maintenance(
             request_id,
-            lane,
+            Lane::MaintenanceCommit,
             cancellation,
             Box::new(move |_| {
-                let _cancel = crate::executor::current_job_cancellation()
-                    .is_none()
-                    .then(|| crate::executor::install_job_cancellation(token));
-                work();
+                // The executor gave the admitted job the root's lifecycle; a
+                // fresh token with the same root and lifecycle lets the pool
+                // job see the root unbind at its checkpoints.
+                let token = crate::executor::current_job_cancellation().map(|token| token.fresh());
+                pool.submit(Box::new(move || {
+                    let _cancel = token.map(crate::executor::install_job_cancellation);
+                    work();
+                }));
                 crate::protocol::Response::success(request_id, serde_json::Value::Null)
             }),
         );
@@ -241,7 +328,7 @@ impl Work {
         }
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let work = Arc::clone(self);
-        self.runner.run(BUILD_REQUEST, Lane::HeavyInit, move || {
+        self.runner.run(BUILD_REQUEST, Pool::Build, move || {
             let result = work.checkout.build();
             drop(flag);
             if !matches!(result, Err(DataError::Cancelled)) {
@@ -325,44 +412,43 @@ impl Work {
         let flag = ClearOnDrop(Arc::clone(&self.refreshing));
         let work = Arc::clone(self);
         // A refresh changes only the checkout, behind its own lock, so it
-        // runs beside the root's reads, one at a time per root, without
-        // taking a heavy build's slot.
-        self.runner
-            .run(REFRESH_REQUEST, Lane::MaintenanceCommit, move || {
-                let mut flag = Some(flag);
-                loop {
-                    let result = work.checkout.refresh_callgraph();
-                    if !matches!(result, Ok(None) | Err(DataError::Cancelled)) {
-                        work.notify_status_change();
-                    }
-                    if matches!(result, Ok(Some(_))) {
-                        continue;
-                    }
-                    match &result {
-                        Err(DataError::Cancelled) => return,
-                        Err(error) => crate::slog_warn!(
-                            "data layer call-graph refresh failed for {}: {error}",
-                            work.checkout.root().display()
-                        ),
-                        Ok(_) => work.maybe_publish(publish),
-                    }
-                    drop(flag.take());
-                    match result {
-                        Err(DataError::Damaged(_)) => {
-                            work.start_build();
-                            return;
-                        }
-                        // The changes stay pending; the next change or query
-                        // that waits for the call graph tries again.
-                        Err(_) => return,
-                        Ok(_) => {}
-                    }
-                    if !pending(&work.checkout) || work.refreshing.swap(true, Ordering::AcqRel) {
+        // runs beside the root's reads and edits, one at a time per root
+        // (the `refreshing` flag), in the refresh pool.
+        self.runner.run(REFRESH_REQUEST, Pool::Refresh, move || {
+            let mut flag = Some(flag);
+            loop {
+                let result = work.checkout.refresh_callgraph();
+                if !matches!(result, Ok(None) | Err(DataError::Cancelled)) {
+                    work.notify_status_change();
+                }
+                if matches!(result, Ok(Some(_))) {
+                    continue;
+                }
+                match &result {
+                    Err(DataError::Cancelled) => return,
+                    Err(error) => crate::slog_warn!(
+                        "data layer call-graph refresh failed for {}: {error}",
+                        work.checkout.root().display()
+                    ),
+                    Ok(_) => work.maybe_publish(publish),
+                }
+                drop(flag.take());
+                match result {
+                    Err(DataError::Damaged(_)) => {
+                        work.start_build();
                         return;
                     }
-                    flag = Some(ClearOnDrop(Arc::clone(&work.refreshing)));
+                    // The changes stay pending; the next change or query
+                    // that waits for the call graph tries again.
+                    Err(_) => return,
+                    Ok(_) => {}
                 }
-            });
+                if !pending(&work.checkout) || work.refreshing.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                flag = Some(ClearOnDrop(Arc::clone(&work.refreshing)));
+            }
+        });
     }
 
     /// Publishes the changes a refresh resolved, when `publish` asks for it,
@@ -433,20 +519,19 @@ impl Work {
             }
         }
         let ended = Ended(Arc::clone(self));
-        self.runner
-            .run(RESCAN_REQUEST, Lane::MaintenanceCommit, move || {
-                let work = Arc::clone(&ended.0);
-                if let Err(error) = work.checkout.rescan() {
-                    if !matches!(error, DataError::Cancelled) {
-                        crate::slog_warn!(
-                            "data layer could not compare {} with its files: {error}",
-                            work.checkout.root().display()
-                        );
-                    }
+        self.runner.run(RESCAN_REQUEST, Pool::Refresh, move || {
+            let work = Arc::clone(&ended.0);
+            if let Err(error) = work.checkout.rescan() {
+                if !matches!(error, DataError::Cancelled) {
+                    crate::slog_warn!(
+                        "data layer could not compare {} with its files: {error}",
+                        work.checkout.root().display()
+                    );
                 }
-                drop(ended);
-                work.catch_up(Publish::WhenMany);
-            });
+            }
+            drop(ended);
+            work.catch_up(Publish::WhenMany);
+        });
     }
 
     /// Starts a round of meaning search's fill, unless semantic search is
@@ -473,7 +558,7 @@ impl Work {
         }
         let flag = ClearOnDrop(Arc::clone(&self.filling));
         let work = Arc::clone(self);
-        self.runner.run(FILL_REQUEST, Lane::HeavyInit, move || {
+        self.runner.run(FILL_REQUEST, Pool::Fill, move || {
             if crate::executor::current_job_cancelled() {
                 // Runs again when the root is bound and a search asks.
                 return;
@@ -1154,6 +1239,83 @@ mod tests {
         };
         assert!(view.status().callgraph_published);
         assert!(!handle.checkout().needs_build());
+    }
+
+    /// Background work the executor admits runs in its pool, not on an
+    /// executor worker, so it holds neither the root's lanes nor another
+    /// pool's places. Two fill rounds stuck on an embedding backend used to
+    /// hold both heavy-build places and the root's maintenance for minutes:
+    /// builds of other roots waited behind them, and the root's tool calls
+    /// queued for up to a minute.
+    #[test]
+    fn admitted_work_runs_off_the_executor_and_blocks_no_other_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ));
+        ctx.mark_subc_bound();
+        let executor = crate::executor::Executor::new();
+        let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+        assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
+        let maintenance = ctx
+            .callgraph_executor_for_test()
+            .expect("registering the actor installs its executor");
+        let runner = Runner {
+            root: root.clone(),
+            executor: parking_lot::Mutex::new(Some(maintenance)),
+        };
+
+        // Fill every place in the fill pool with rounds that wait until the
+        // test lets them go.
+        let release = Arc::new(std::sync::Barrier::new(Pool::Fill.cap() + 1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        for _ in 0..Pool::Fill.cap() {
+            let release = Arc::clone(&release);
+            let started = started_tx.clone();
+            runner.run(FILL_REQUEST, Pool::Fill, move || {
+                started
+                    .send(crate::executor::current_thread_is_executor_worker())
+                    .unwrap();
+                release.wait();
+            });
+        }
+        for _ in 0..Pool::Fill.cap() {
+            let on_worker = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(!on_worker, "a fill round ran on an executor worker");
+        }
+
+        // A build still starts while every fill is stuck.
+        let (built_tx, built_rx) = std::sync::mpsc::channel();
+        runner.run(BUILD_REQUEST, Pool::Build, move || {
+            built_tx
+                .send(crate::executor::current_thread_is_executor_worker())
+                .unwrap();
+        });
+        let on_worker = built_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a build waited behind stuck fill rounds");
+        assert!(!on_worker, "a build ran on an executor worker");
+
+        // And a tool call on the same root runs at once.
+        let started = Instant::now();
+        let response = executor
+            .submit(
+                root_id,
+                Lane::PureRead,
+                "read".to_string(),
+                Box::new(|_| crate::protocol::Response::success("read", serde_json::Value::Null)),
+            )
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a read on the root never ran");
+        assert!(response.success);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a read on the root waited {:?} behind its background work",
+            started.elapsed()
+        );
+        release.wait();
     }
 
     /// Under the daemon a checkout's build is its root's maintenance: while
