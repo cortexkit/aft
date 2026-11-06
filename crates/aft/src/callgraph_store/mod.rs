@@ -5707,6 +5707,26 @@ pub(crate) struct ReexportIndex {
     wildcard: bool,
 }
 
+aft_store::heap_bytes_none!(LangId);
+aft_store::heap_bytes_of_fields!(DbFileIndex {
+    lang,
+    exports,
+    default_export,
+    export_aliases,
+    node_by_scoped,
+    node_by_bare,
+    node_kind_by_id,
+    module_targets,
+    declared_module_targets,
+    macro_use_module_targets,
+    reexports,
+});
+aft_store::heap_bytes_of_fields!(ReexportIndex {
+    target_file,
+    named,
+    wildcard,
+});
+
 #[derive(Clone)]
 pub(crate) struct ProjectIndex<'a> {
     facts: Rc<dyn ProjectFacts + 'a>,

@@ -395,3 +395,5 @@ impl<'s> TextSegment<'s> {
         SegmentError::new(self.segment.path(), ErrorKind::Malformed(reason))
     }
 }
+
+crate::heap_bytes_none!(TextSections);

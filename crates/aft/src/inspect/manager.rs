@@ -2707,6 +2707,18 @@ impl InspectManager {
             .count_u64("callgraph_projection_snapshot_bytes", bytes)
     }
 
+    /// The full-graph projection this root's manager holds, if any, so a
+    /// memory census that reaches the same snapshot elsewhere (the data
+    /// layer's dead-code memo) leaves it to the projection's figure. `None`
+    /// when there is none, or when its slot is held: that figure then counts
+    /// nothing.
+    pub(crate) fn try_callgraph_projection_snapshot(&self) -> Option<Arc<CallgraphSnapshot>> {
+        let projection = self.callgraph_projection.try_lock().ok()?;
+        projection
+            .as_ref()
+            .map(|projection| Arc::clone(&projection.snapshot))
+    }
+
     fn cached_callgraph_projection(
         &self,
         identity: &CallgraphProjectionIdentity,

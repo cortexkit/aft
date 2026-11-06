@@ -1113,3 +1113,30 @@ mod test_support_tests {
         assert!(!is_test_support_file("src/my_corpora_loader.rs"));
     }
 }
+aft_store::heap_bytes_of_fields!(CallgraphSnapshot {
+    generated_at,
+    files,
+    exported_symbols,
+    outbound_calls,
+    go_initializers,
+    entry_points,
+    entry_point_symbols,
+});
+aft_store::heap_bytes_of_fields!(GoInitializerGroup {
+    caller_file,
+    callers,
+    targets,
+});
+aft_store::heap_bytes_of_fields!(CallgraphExport {
+    file,
+    symbol,
+    kind,
+    line,
+});
+aft_store::heap_bytes_of_fields!(CallgraphOutboundCall {
+    caller_file,
+    caller_symbol,
+    target,
+    line,
+    provenance,
+});

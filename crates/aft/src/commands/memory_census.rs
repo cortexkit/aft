@@ -182,8 +182,11 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
         "evictable_bytes": detail.evictable_bytes(),
         "lsp_children": { "count": 0, "rss_bytes": 0 },
     });
-    // Present only while the data layer runs: the root's checkout there,
-    // with its gaps named, so a partial figure never reads as complete.
+    // Present only while the data layer runs. The bytes each of its planes
+    // holds alone are already in `search`, `callgraph` and `semantic`; this
+    // plane is what they share (the checkout state lists, open segments and
+    // snapshot). The object itemises every figure and names any part a
+    // contended lock kept out, so a partial figure never reads as complete.
     if let Some(data_layer) = &detail.data_layer {
         row["planes"]["data_layer"] = json!(data_layer.estimated_bytes.unwrap_or(0));
         row["data_layer"] = json!(data_layer);
@@ -206,6 +209,8 @@ struct RootRowInputs {
     semantic_worker: u64,
     semantic_overlay: u64,
     evictable: u64,
+    /// Rendered whole as the row's `data_layer` object.
+    data_layer: Option<crate::memory::MemoryEstimate>,
 }
 
 impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
@@ -241,6 +246,7 @@ impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
                 .copied()
                 .unwrap_or(0),
             evictable: detail.evictable_bytes(),
+            data_layer: detail.data_layer.clone(),
         }
     }
 }
@@ -446,6 +452,39 @@ mod tests {
         let second = cache.render(&snapshot);
         assert_eq!(second["/repo"]["exact_memo"]["candidates"], 4);
         assert_eq!(second["/repo"]["attributed_bytes"], 600);
+    }
+
+    #[test]
+    fn census_row_cache_follows_the_data_layer() {
+        let mut snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        cache.render(&snapshot);
+        let detail = snapshot
+            .roots
+            .remove("/repo")
+            .unwrap()
+            .with_data_layer(Some(
+                MemoryEstimate::estimated(64).count("bound_checkouts", 1),
+            ));
+        snapshot.roots.insert("/repo".into(), detail);
+        let bound = cache.render(&snapshot);
+        assert_eq!(bound["/repo"]["planes"]["data_layer"], 64);
+        assert_eq!(bound["/repo"]["attributed_bytes"], 64);
+        assert_eq!(bound["/repo"]["evictable_bytes"], 64);
+        // A change to the data layer's counts alone is rendered too.
+        snapshot
+            .roots
+            .get_mut("/repo")
+            .unwrap()
+            .data_layer
+            .as_mut()
+            .unwrap()
+            .counts
+            .insert("bound_checkouts".into(), 0);
+        assert_eq!(
+            cache.render(&snapshot)["/repo"]["data_layer"]["bound_checkouts"],
+            0
+        );
     }
 
     #[test]

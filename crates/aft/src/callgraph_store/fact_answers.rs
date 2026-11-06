@@ -119,6 +119,29 @@ fn truncate(hash: &blake3::Hash) -> [u8; 16] {
     digest
 }
 
+impl aft_store::heap::HeapBytes for FactQuestion {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::IsFile(path)
+            | Self::IsDir(path)
+            | Self::Link(path)
+            | Self::Canonical(path)
+            | Self::ListDir(path)
+            | Self::Config(path) => path.heap_bytes(seen),
+            Self::ConfigField(path, name) => path.heap_bytes(seen) + name.heap_bytes(seen),
+        }
+    }
+}
+
+impl aft_store::heap::HeapBytes for FactAnswer {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Bool(_) | Self::Digest(_) => 0,
+            Self::Path(path) => path.heap_bytes(seen),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

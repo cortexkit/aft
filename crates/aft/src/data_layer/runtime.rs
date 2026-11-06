@@ -972,11 +972,14 @@ impl WriteIntentListener for EditListener {
     }
 }
 
-/// The shared block cache's counters, or `None` while no checkout of this
-/// process has bound (asking never creates the data layer).
+/// The shared block cache's counters and its measured bytes in memory
+/// (`None` while another thread holds its lock), or `None` while no checkout
+/// of this process has bound (asking never creates the data layer).
 #[must_use]
-pub(crate) fn block_cache_stats() -> Option<aft_store::cache::CacheStats> {
-    LAYER.get().map(|layer| layer.cache_stats())
+pub(crate) fn block_cache_memory() -> Option<(aft_store::cache::CacheStats, Option<usize>)> {
+    LAYER
+        .get()
+        .map(|layer| (layer.cache_stats(), layer.cache_memory_bytes()))
 }
 
 /// Binds the checkout at `root`, with its family store under `storage`,
@@ -1082,6 +1085,23 @@ impl DataCheckout {
     /// What the last fill round reported, if a fill ran.
     pub(crate) fn meaning_progress(&self) -> Option<super::vectors::FillProgress> {
         self.work.meaning.progress()
+    }
+
+    /// Gives meaning search `config` as [`Self::configure_meaning`] does,
+    /// without starting a fill, so a test can read how the plane reports
+    /// before any model loads.
+    #[cfg(test)]
+    pub(crate) fn configure_meaning_without_fill_for_test(
+        &self,
+        config: Option<&crate::config::SemanticBackendConfig>,
+    ) {
+        self.work.meaning.configure(config);
+    }
+
+    /// What meaning search holds in memory for this checkout; see
+    /// [`super::meaning::Meaning::memory`].
+    pub(crate) fn meaning_memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
+        self.work.meaning.memory(seen)
     }
 }
 

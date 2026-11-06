@@ -720,6 +720,25 @@ fn evaluate(
     })
 }
 
+crate::heap_bytes_none!(Place, Located);
+crate::heap_bytes_of_fields!(TextMembership { places, missing });
+crate::heap_bytes_of_fields!(TextMembers { segments });
+crate::heap_bytes_of_fields!(SegmentMembers {
+    members,
+    ordinals,
+    first,
+});
+crate::heap_bytes_of_fields!(TextOverlay { entries });
+
+impl crate::heap::HeapBytes for OverlayEntry {
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        match self {
+            Self::Content(trigrams) => crate::heap::HeapBytes::heap_bytes(trigrams, seen),
+            Self::Unindexed | Self::Deleted => 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

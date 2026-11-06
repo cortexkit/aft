@@ -96,9 +96,12 @@ pub struct RootMemorySnapshot {
     pub pending_install: MemoryEstimate,
     pub exact_memo: MemoryEstimate,
     pub compression_filters: MemoryEstimate,
-    /// The root's checkout in the data layer, apart from the block cache
-    /// every checkout shares (counted once per process). Present only while
-    /// the data layer runs.
+    /// What the root's checkout in the data layer holds that its planes
+    /// share: the checkout state lists, its open segments and its snapshot.
+    /// The bytes each plane holds alone are in `trigram` (text), `callgraph`
+    /// and `semantic` (meaning search), each as `data_layer_bytes`; the
+    /// block cache every checkout shares is counted once per process.
+    /// Present only while the data layer runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_layer: Option<MemoryEstimate>,
 }
@@ -260,9 +263,12 @@ impl RootMemorySnapshot {
         self.rollup().not_estimated_subsystems
     }
 
-    /// Bytes released by `evict_idle_artifacts`: retained index handles, symbol
-    /// data, and inspect caches. This deliberately shares the already-collected
-    /// estimates instead of taking a second estimate on the reply path.
+    /// Bytes released when the root goes idle: retained index handles,
+    /// symbol data, inspect caches, and the data layer's checkout, which the
+    /// idle reaper's release drops (its planes' bytes are in `trigram`,
+    /// `semantic` and `callgraph`, what they share in `data_layer`). This
+    /// deliberately shares the already-collected estimates instead of taking
+    /// a second estimate on the reply path.
     pub fn evictable_bytes(&self) -> u64 {
         [
             &self.trigram,
@@ -273,6 +279,7 @@ impl RootMemorySnapshot {
             &self.exact_memo,
         ]
         .into_iter()
+        .chain(self.data_layer.as_ref())
         .filter_map(|estimate| estimate.estimated_bytes)
         .fold(0, u64::saturating_add)
     }
@@ -1960,9 +1967,15 @@ mod tests {
         let snapshot = ProcessMemorySnapshot::from_roots(&BTreeMap::new(), &shared);
         assert_eq!(snapshot.sqlite.status, "measured");
         assert!(snapshot.sqlite.memory_highwater_bytes >= snapshot.sqlite.memory_used_bytes);
+        // The data layer's block cache is counted once for the process when
+        // a test of this process has bound a checkout.
         assert_eq!(
             snapshot.total_attributed_bytes,
-            snapshot.sqlite.memory_used_bytes.saturating_add(7)
+            snapshot
+                .sqlite
+                .memory_used_bytes
+                .saturating_add(7)
+                .saturating_add(snapshot.data_layer_block_cache_bytes.unwrap_or(0))
         );
 
         let serialized = serde_json::to_value(&snapshot).expect("serialize process memory");

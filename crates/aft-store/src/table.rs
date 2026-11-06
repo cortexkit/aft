@@ -357,6 +357,8 @@ impl<'s> LookupTable<'s> {
     }
 }
 
+crate::heap_bytes_none!(UnitTableParts);
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

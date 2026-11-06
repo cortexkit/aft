@@ -3793,6 +3793,18 @@ fn build_health_diagnostic_rollup_from_actors(
                     semantic.remove("total_chunks");
                     semantic.remove("current_batch");
                     semantic.remove("total_batches");
+                    // The meaning plane's fill progress stops with the
+                    // backend too; its failure counts stay.
+                    for progress in [
+                        "files",
+                        "files_embedded",
+                        "files_pending",
+                        "files_too_large",
+                        "files_past_cap",
+                        "filling",
+                    ] {
+                        semantic.remove(progress);
+                    }
                 }
             }
             cache.annotate_plane_timings(&root_label, &mut value);
@@ -9418,6 +9430,65 @@ mod tests {
         assert!(ready["roots"][0]["semantic_index"]
             .get("total_chunks")
             .is_none());
+    }
+
+    /// A one-root reply has room for the data layer's meaning fill at its
+    /// largest: a fill that waits for another, with every count present,
+    /// large, and a failure, keeps the root's full row within the budget.
+    #[test]
+    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+        use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
+        let executor = Executor::new();
+        let (_dir, root) = test_root("meaning-fill-health-budget");
+        let ctx = test_ctx();
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let app = App::default_shared();
+        let dispatch = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let mut report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+            .metrics
+            .expect("health metrics");
+        let baseline = report["metrics_bytes"].as_u64().unwrap();
+        let fill = MeaningReport {
+            plane: MeaningPlane::Serving {
+                complete: false,
+                coverage: MeaningCoverage {
+                    files: 123_456,
+                    files_embedded: 100_000,
+                    files_too_large: 1_234,
+                    files_failed: 1_234,
+                    files_pending: 20_988,
+                    files_past_cap: 99_999,
+                    chunks: 9_999_999,
+                    chunks_embedded: 8_888_888,
+                    chunks_failed: 12_345,
+                },
+                error: Some("embedding backend: the request timed out after 30 s".into()),
+            },
+            filling: true,
+            waiting: true,
+        };
+        let fill = serde_json::to_value(fill.health()).unwrap();
+        let semantic = report["roots"][0]["semantic_index"]
+            .as_object_mut()
+            .expect("the root's semantic_index");
+        for (key, value) in fill.as_object().unwrap() {
+            semantic.insert(key.clone(), value.clone());
+        }
+        let mut metrics = report.as_object().unwrap().clone();
+        budget_health_metrics(&mut metrics);
+        let bytes = metrics["metrics_bytes"].as_u64().unwrap();
+        eprintln!(
+            "one-root health reply: {baseline} bytes; {bytes} with the meaning fill at its largest"
+        );
+        assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        assert_eq!(metrics["root_details_omitted"], 0);
+        let row = &metrics["roots"][0];
+        assert!(row.get("abbreviated").is_none(), "{row}");
+        assert_eq!(row["semantic_index"]["files_pending"], 20_988);
+        assert_eq!(row["semantic_index"]["stage"], "waiting_for_another_fill");
+        assert_eq!(row["semantic_index"]["filling"], true);
     }
 
     #[test]

@@ -1417,3 +1417,44 @@ impl ProjectFacts for CheckoutFacts<'_> {
             .collect()
     }
 }
+
+aft_store::heap_bytes_of_fields!(CheckoutInputs {
+    state,
+    parses,
+    configs,
+});
+aft_store::heap_bytes_of_fields!(Parses { map });
+aft_store::heap_bytes_of_fields!(ParseSlot { value, stored });
+aft_store::heap_bytes_of_fields!(Resolutions { map });
+aft_store::heap_bytes_of_fields!(ResolutionSlot { value, stored });
+aft_store::heap_bytes_of_fields!(FileResolution {
+    rows,
+    binding,
+    dispatch,
+    sites,
+    site_dependencies,
+});
+aft_store::heap_bytes_of_fields!(SiteResolution { site, resolution });
+aft_store::heap_bytes_of_fields!(BoundFile { surface, binding });
+aft_store::heap_bytes_of_fields!(FileLists {
+    rust,
+    module_declaring,
+});
+aft_store::heap_bytes_of_fields!(BindCache { files, lists });
+aft_store::heap_bytes_of_fields!(OrdinaryCalls {
+    syntax,
+    associated,
+    edges,
+});
+aft_store::heap_bytes_of_fields!(SiteFile {
+    facts,
+    parse,
+    ordinary,
+});
+aft_store::heap_bytes_of_fields!(MethodCallInputs {
+    files,
+    stored,
+    own,
+    methods,
+    go_required,
+});

@@ -3840,3 +3840,140 @@ fn binding_caller_node_lookup_is_linear_and_preserves_first_duplicate() {
         assert_eq!(reference.caller_node, expected);
     }
 }
+aft_store::heap_bytes_none!(BlobRefKind, ResolutionStatus);
+aft_store::heap_bytes_of_fields!(ParseBlob {
+    entry_point_symbols,
+    dispatch,
+    extractor_version,
+    language,
+    ast_nodes,
+    symbols,
+    default_export_symbol,
+    exported_symbols,
+    callable_symbols,
+    imports,
+    python_bindings,
+    refs,
+});
+aft_store::heap_bytes_of_fields!(AstPreorderNode {
+    ordinal,
+    kind,
+    byte_start,
+    byte_end,
+});
+aft_store::heap_bytes_of_fields!(BlobSymbol {
+    is_test,
+    ordinal,
+    name,
+    scoped_name,
+    kind,
+    exported,
+    is_default_export,
+    start_line,
+    start_col,
+    end_line,
+    end_col,
+    signature,
+    program_start,
+    entry_attribute,
+});
+aft_store::heap_bytes_of_fields!(BlobRef {
+    ordinal,
+    kind,
+    caller_symbol,
+    short_name,
+    full_ref,
+    module_path,
+    line,
+    byte_start,
+    byte_end,
+    path_override,
+    local_name,
+    requested_name,
+    namespace_alias,
+    wildcard,
+    import_kind,
+});
+aft_store::heap_bytes_of_fields!(BlobImport {
+    ordinal,
+    module_path,
+    names,
+    default_import,
+    namespace_import,
+    byte_start,
+    byte_end,
+    raw_text,
+    type_only,
+    side_effect,
+});
+aft_store::heap_bytes_of_fields!(DerivedRow {
+    caller_blob_key,
+    ref_ordinal,
+    caller_path,
+    kind,
+    status,
+    target_path,
+    target_symbol,
+});
+aft_store::heap_bytes_of_fields!(DispatchTypeTargets { targets, trace });
+aft_store::heap_bytes_of_fields!(DispatchTypeTargetTrace {
+    queries,
+    probes,
+    answers,
+});
+aft_store::heap_bytes_of_fields!(ViewBindingDependencies {
+    references,
+    dependencies,
+    consulted_facts,
+    unattributed,
+    binding_facts,
+    resolution_facts,
+    binding_probes,
+    resolved_dependencies,
+    surface_queries,
+    binding_answers,
+    resolution_answers,
+    surface,
+});
+aft_store::heap_bytes_of_fields!(ConfigConsultations {
+    facts,
+    reads,
+    unattributed,
+});
+aft_store::heap_bytes_of_fields!(ViewFileSurface {
+    language,
+    exports,
+    default_export,
+    export_aliases,
+    node_by_scoped,
+    node_by_bare,
+    node_kind_by_id,
+    module_targets,
+    declared_module_targets,
+    macro_use_module_targets,
+    reexports,
+});
+
+impl aft_store::heap::HeapBytes for ViewSurfaceQuery {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Language(a)
+            | Self::MacroUse(a)
+            | Self::Parent(a)
+            | Self::Reexports(a)
+            | Self::Default(a)
+            | Self::Contains(a)
+            | Self::Crate(a)
+            | Self::CrateRoot(a) => a.heap_bytes(seen),
+            Self::Module(a, b)
+            | Self::Node(a, b)
+            | Self::Callable(a, b)
+            | Self::Alias(a, b)
+            | Self::Export(a, b) => a.heap_bytes(seen) + b.heap_bytes(seen),
+            Self::Inline(a, names, b) => {
+                a.heap_bytes(seen) + names.heap_bytes(seen) + b.heap_bytes(seen)
+            }
+            Self::GoPackage(a, b) => a.heap_bytes(seen) + b.heap_bytes(seen),
+        }
+    }
+}

@@ -1431,6 +1431,9 @@ fn census_counts_a_family_arena_once_across_its_views() {
         process.total_attributed_bytes,
         snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0)
             + process.semantic_arena_bytes
+            // Counted once for the process when a test of this process has
+            // bound a checkout in the data layer.
+            + process.data_layer_block_cache_bytes.unwrap_or(0)
             + process.sqlite.memory_used_bytes,
         "the arena is not in the process total exactly once"
     );

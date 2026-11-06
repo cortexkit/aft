@@ -217,3 +217,13 @@ impl ChunkMapKey {
         })
     }
 }
+
+crate::heap_bytes_none!(ModelId, TextDigest, ChunkMapKey);
+crate::heap_bytes_of_fields!(ModelIdentity {
+    name,
+    revision,
+    dimensions,
+    normalized,
+    text_template,
+    chunk_template,
+});

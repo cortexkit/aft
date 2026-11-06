@@ -3065,6 +3065,52 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
     }
 }
 
+aft_store::heap_bytes_of_fields!(DispatchFacts {
+    go_package,
+    types,
+    methods,
+    sites,
+    fields,
+    returns,
+});
+aft_store::heap_bytes_of_fields!(FieldHint { owner, name, ty });
+aft_store::heap_bytes_of_fields!(ReturnHint { symbol, ty });
+aft_store::heap_bytes_of_fields!(TypeHint {
+    name,
+    bases,
+    interface,
+    closed,
+});
+aft_store::heap_bytes_of_fields!(MethodHint {
+    owner,
+    trait_name,
+    name,
+    symbol,
+    has_body,
+    shape,
+    private,
+});
+aft_store::heap_bytes_of_fields!(SiteHint {
+    ordinal,
+    caller,
+    line,
+    member,
+    receiver,
+    dynamic,
+});
+aft_store::heap_bytes_of_fields!(Target {
+    file,
+    symbol,
+    provenance,
+});
+aft_store::heap_bytes_of_fields!(Resolution {
+    targets,
+    protected,
+    unresolved,
+    external,
+    dynamic,
+});
+
 #[cfg(test)]
 #[path = "dispatch/tests.rs"]
 mod tests;

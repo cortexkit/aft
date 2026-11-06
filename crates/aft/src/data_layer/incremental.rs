@@ -1046,3 +1046,50 @@ impl LiveCheckout {
         Ok(stats)
     }
 }
+
+aft_store::heap_bytes_of_fields!(Readers {
+    kind,
+    by_key,
+    keys_of,
+    replaced,
+});
+aft_store::heap_bytes_of_fields!(ReverseInputs {
+    binding,
+    resolution,
+    dispatch,
+    sites,
+    subjects,
+    stored,
+});
+
+impl LiveCheckout {
+    /// What the engine holds in memory, measured as the [`aft_store::heap`]
+    /// module describes: the bytes of its copy of the checkout's state, and
+    /// the bytes of everything else (the parses and resolutions decoded so
+    /// far, the bound files, and the inputs and reverse inputs of each
+    /// pass). Its thread pool owns threads, not heap, and is not counted.
+    pub(crate) fn memory(&self, seen: &mut aft_store::heap::Seen) -> (usize, usize) {
+        use aft_store::heap::HeapBytes as _;
+        let Self {
+            inputs:
+                CheckoutInputs {
+                    state,
+                    parses,
+                    configs,
+                },
+            bound,
+            resolved,
+            calls,
+            reverse,
+            pool: _,
+        } = self;
+        let state = state.heap_bytes(seen);
+        let rest = parses.heap_bytes(seen)
+            + configs.heap_bytes(seen)
+            + bound.heap_bytes(seen)
+            + resolved.heap_bytes(seen)
+            + calls.heap_bytes(seen)
+            + reverse.heap_bytes(seen);
+        (state, rest)
+    }
+}

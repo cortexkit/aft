@@ -283,3 +283,12 @@ pub(super) fn fresh_id() -> Digest128 {
     hasher.update(&(std::ptr::from_ref(&local) as usize).to_le_bytes());
     Digest128::from_hash(&hasher.finalize())
 }
+
+/// A lease's path. Its owner is shared by every lease of the process and
+/// counted with none of them.
+impl crate::heap::HeapBytes for LeaseFile {
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        let Self { path, owner: _ } = self;
+        crate::heap::HeapBytes::heap_bytes(path, seen)
+    }
+}

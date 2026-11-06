@@ -458,3 +458,30 @@ fn check_layout(rows: &[Row], header: &Header) -> Result<(), ErrorKind> {
     }
     Ok(())
 }
+
+crate::heap_bytes_none!(SectionInfo, SectionHandle);
+crate::heap_bytes_of_fields!(OpenSection {
+    info,
+    offset,
+    digest,
+    block_digests,
+});
+
+/// What an open segment holds in memory: its path and its section table
+/// with each section's block checksums. The file handle owns no heap, and
+/// the block cache its reads go through is shared by every segment, so it
+/// is counted once for the process, never here.
+impl crate::heap::HeapBytes for Segment {
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        let Self {
+            path,
+            file: _,
+            token: _,
+            cache: _,
+            header: _,
+            sections,
+        } = self;
+        crate::heap::HeapBytes::heap_bytes(path, seen)
+            + crate::heap::HeapBytes::heap_bytes(sections, seen)
+    }
+}

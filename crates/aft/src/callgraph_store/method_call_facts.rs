@@ -195,3 +195,20 @@ impl FileFacts {
         }
     }
 }
+aft_store::heap_bytes_of_fields!(ImportFact {
+    module_path,
+    names,
+    default_import,
+});
+aft_store::heap_bytes_of_fields!(FileFacts {
+    language,
+    go_package,
+    types,
+    methods,
+    fields,
+    returns,
+    imports,
+    default_export_symbol,
+    import_targets,
+    type_targets,
+});

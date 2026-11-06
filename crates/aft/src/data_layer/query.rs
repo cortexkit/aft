@@ -23,7 +23,9 @@ use crate::error::AftError;
 use crate::parser::LangId;
 
 /// Where queries find slices and the lookups that narrow which to read.
-pub(crate) trait SliceSource {
+/// Every source can say what it holds in memory, so the memory census can
+/// count a checkout's call graph through the source it serves.
+pub(crate) trait SliceSource: aft_store::heap::HeapBytes {
     fn slice(&self, path: &str) -> Option<Arc<FileSlice>>;
     /// Every file with an edge to `target_symbol` in `target_file`.
     fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String>;
@@ -1028,3 +1030,10 @@ impl<S: SliceSource> SliceReader<S> {
         count
     }
 }
+aft_store::heap_bytes_of_fields!(MemorySlices {
+    slices,
+    callers,
+    ref_names,
+    symbol_names,
+    languages,
+});

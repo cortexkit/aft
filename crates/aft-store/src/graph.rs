@@ -395,6 +395,8 @@ fn malformed(segment: &Segment, reason: &'static str) -> SegmentError {
     SegmentError::new(segment.path(), ErrorKind::Malformed(reason))
 }
 
+crate::heap_bytes_none!(TermKind);
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

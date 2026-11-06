@@ -14,6 +14,7 @@ pub mod checkout;
 pub mod content;
 pub mod family;
 pub mod graph;
+pub mod heap;
 pub mod ids;
 pub mod postings;
 pub mod scan;

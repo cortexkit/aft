@@ -116,3 +116,14 @@ impl<B: SliceSource> SliceSource for OverlaySlices<B> {
         files.into_iter().collect()
     }
 }
+
+impl<B: aft_store::heap::HeapBytes> aft_store::heap::HeapBytes for OverlaySlices<B> {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        let Self {
+            base,
+            replaced,
+            removed,
+        } = self;
+        base.heap_bytes(seen) + replaced.heap_bytes(seen) + removed.heap_bytes(seen)
+    }
+}

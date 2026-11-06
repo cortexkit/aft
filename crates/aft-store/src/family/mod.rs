@@ -554,3 +554,12 @@ fn names_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<(String, PathBuf)>,
     }
     Ok(found)
 }
+
+crate::heap_bytes_of_fields!(Layout { dir });
+crate::heap_bytes_none!(FileKind);
+crate::heap_bytes_of_fields!(NewerFormat {
+    path,
+    file,
+    found,
+    supported,
+});

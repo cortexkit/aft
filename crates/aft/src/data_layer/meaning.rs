@@ -174,6 +174,35 @@ impl Meaning {
         *lock(&self.progress)
     }
 
+    /// What meaning search holds in memory for the checkout, measured as the
+    /// [`aft_store::heap`] module describes: its plane (see
+    /// [`VectorPlane::memory`]) and the last fill failure's text. `None`
+    /// while another thread holds the plane's slot; nothing here waits. The
+    /// embedding model a fill keeps between its rounds is not counted: a
+    /// local model is shared by the process and counted once with its
+    /// embedding sessions, and a remote one holds no model in this process.
+    pub(crate) fn memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
+        use aft_store::heap::HeapBytes as _;
+        let plane = match self.plane.try_lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .map(|configured| Arc::clone(&configured.plane)),
+            Err(std::sync::TryLockError::Poisoned(slot)) => slot
+                .into_inner()
+                .as_ref()
+                .map(|configured| Arc::clone(&configured.plane)),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let plane = plane.map_or(0, |plane| {
+            if seen.first(Arc::as_ptr(&plane)) {
+                std::mem::size_of::<VectorPlane>() + plane.memory(seen)
+            } else {
+                0
+            }
+        });
+        Some(plane + self.failure.heap_bytes(seen))
+    }
+
     /// Runs one round of the fill for `checkout`: loads the model if no
     /// round of this fill has, makes the plane if no round under this
     /// configuration has, and fills one round of files.

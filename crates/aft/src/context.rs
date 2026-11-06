@@ -1090,6 +1090,45 @@ pub struct SemanticHealthComponentSnapshot {
     pub current_batch: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_batches: Option<usize>,
+    /// The data layer's meaning plane: how far its fill has got and what it
+    /// could not embed. Present only while that plane reports for the root.
+    #[serde(flatten)]
+    pub fill: Option<SemanticFillHealth>,
+}
+
+/// The fill of the data layer's meaning plane as each root's health carries
+/// it inside `semantic_index`, beside the status, `stage` and `reason`.
+/// Health replies are held to a byte budget, so only what says something is
+/// present: `files` while files still wait for vectors, every other count
+/// only when it is above zero, and `filling` only while true. A fill that
+/// waits for another fill of the repository says so in `stage`
+/// (`waiting_for_another_fill`).
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SemanticFillHealth {
+    /// Files meaning search applies to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
+    /// Files whose every chunk has a vector or a recorded failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_embedded: Option<usize>,
+    /// Files within `semantic.max_files` still waiting for vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_pending: Option<usize>,
+    /// Files over the size limit, which get no chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_too_large: Option<usize>,
+    /// Files past `semantic.max_files` that no checkout has embedded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_past_cap: Option<usize>,
+    /// Files that could not be read or cut into chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_failed: Option<usize>,
+    /// Chunks the embedder refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks_failed: Option<usize>,
+    /// A fill round is queued or running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filling: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -6342,6 +6381,7 @@ impl AppContext {
                 total_chunks: None,
                 current_batch: None,
                 total_batches: None,
+                fill: None,
             }
         } else {
             match &*semantic_status {
@@ -6363,6 +6403,7 @@ impl AppContext {
                     total_chunks: None,
                     current_batch: None,
                     total_batches: None,
+                    fill: None,
                 },
                 SemanticIndexStatus::Building { stage, .. } => {
                     let progress = semantic_build_progress
@@ -6379,6 +6420,7 @@ impl AppContext {
                         total_chunks: progress.as_ref().map(|progress| progress.total_chunks),
                         current_batch: progress.as_ref().map(|progress| progress.current_batch),
                         total_batches: progress.as_ref().map(|progress| progress.total_batches),
+                        fill: None,
                     }
                 }
                 SemanticIndexStatus::Disabled => SemanticHealthComponentSnapshot {
@@ -6392,6 +6434,7 @@ impl AppContext {
                     total_chunks: None,
                     current_batch: None,
                     total_batches: None,
+                    fill: None,
                 },
                 SemanticIndexStatus::Failed(message)
                     if crate::semantic_admission::is_not_opened_status(message) =>
@@ -6407,6 +6450,7 @@ impl AppContext {
                         total_chunks: None,
                         current_batch: None,
                         total_batches: None,
+                        fill: None,
                     }
                 }
                 SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
@@ -6420,9 +6464,22 @@ impl AppContext {
                     total_chunks: None,
                     current_batch: None,
                     total_batches: None,
+                    fill: None,
                 },
             }
         };
+        // The data layer's meaning plane, once it reports for the root,
+        // stands in for today's semantic index, as on the status tool. An
+        // unreachable embedding backend still reports as such: no fill can
+        // embed either.
+        if semantic_backend.available {
+            if let Some(meaning) = data_store
+                .as_ref()
+                .and_then(|report| report.meaning.as_ref())
+            {
+                semantic_index = meaning.health();
+            }
+        }
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         if cache_unavailable {
             semantic_index.status = crate::root_cache::CACHE_DIR_UNAVAILABLE;
@@ -18506,8 +18563,25 @@ impl AppContext {
     /// A contended subsystem is represented as `busy` rather than delaying the
     /// status control path.
     pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
-        Self::memory_root_snapshot_from(self.memory_estimates())
-            .with_data_layer(crate::data_layer::surfaces::memory_estimate(self))
+        let mut estimates = self.memory_estimates();
+        let data_layer = Self::fold_data_layer_memory(
+            &mut estimates,
+            crate::data_layer::surfaces::memory_estimate(self),
+        );
+        Self::memory_root_snapshot_from(estimates).with_data_layer(data_layer)
+    }
+
+    /// Adds the data layer's text, call-graph and meaning bytes to this
+    /// root's `search` (trigram), `callgraph` and `semantic` estimates, and
+    /// returns what its planes share, the root's `data_layer` estimate; see
+    /// [`crate::data_layer::surfaces::DataLayerMemory`]. `None` while the
+    /// data layer is off.
+    fn fold_data_layer_memory(
+        estimates: &mut [crate::memory::MemoryEstimate; 12],
+        data_layer: Option<crate::data_layer::surfaces::DataLayerMemory>,
+    ) -> Option<crate::memory::MemoryEstimate> {
+        let [semantic, trigram, _, callgraph, ..] = estimates;
+        data_layer.map(|memory| memory.fold_into(trigram, callgraph, semantic))
     }
 
     fn memory_root_snapshot_from(
@@ -18622,8 +18696,11 @@ impl AppContext {
         let measured_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / index shape checks and cached estimates");
-        let estimates = self.memory_estimates_from(walked);
-        let data_layer = crate::data_layer::surfaces::memory_estimate(self);
+        let mut estimates = self.memory_estimates_from(walked);
+        let data_layer = Self::fold_data_layer_memory(
+            &mut estimates,
+            crate::data_layer::surfaces::memory_estimate(self),
+        );
         let rollup = Self::memory_root_rollup_from(&estimates, data_layer.as_ref())
             .with_measured_age_ms(measured_age_ms);
         (
@@ -26626,6 +26703,7 @@ mod data_layer_health_tests {
                 total_chunks: None,
                 current_batch: None,
                 total_batches: None,
+                fill: None,
             }),
             callgraph_store_status: Some(callgraph),
             tier2_status: Some("ready"),

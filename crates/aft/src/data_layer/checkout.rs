@@ -3041,11 +3041,35 @@ impl DataLayer {
     pub fn cache_stats(&self) -> aft_store::cache::CacheStats {
         self.cache.stats()
     }
+
+    /// The shared block cache's bytes in memory, for the memory census; see
+    /// [`aft_store::cache::BlockCache::memory_bytes`].
+    #[must_use]
+    pub fn cache_memory_bytes(&self) -> Option<usize> {
+        self.cache.memory_bytes()
+    }
 }
 
-/// What one checkout holds in memory, for the memory census. Taken without
-/// waiting for any lock: a part whose lock was held is reported as busy
-/// rather than delaying the caller.
+/// What one checkout holds in memory, for the memory census, measured as
+/// the [`aft_store::heap`] module describes and split by who reads it:
+///
+/// - shared by the planes: the checkout state lists (the publication's, the
+///   current one while changes are recorded, the ones the call graph's
+///   engine and its last refresh resolved over), each changed path's record,
+///   and the publication's open segments and snapshot;
+/// - the text plane: the publication's text membership and section handles,
+///   each published path's memoised text-index status (indexed with its
+///   distinct trigram count, not indexed, or excluded), the text overlay of
+///   changed contents, and the text members trigram lookups share;
+/// - the call graph: the publication's stored slices with every slice
+///   decoded so far, the call graph served with the files resolved since laid
+///   over it, the last refresh's parses and resolutions, the dead-code
+///   snapshot, the parses of changed files, and the incremental engine.
+///
+/// An allocation reached from more than one part is counted once, with the
+/// part the walk reaches first. Taken without waiting for any lock: a part
+/// another thread holds is left out and counted in the walk's
+/// [`aft_store::heap::Seen::contended`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CheckoutMemory {
     /// The publication and the changes since; `None` when their lock was
@@ -3060,14 +3084,16 @@ pub struct CheckoutMemory {
 pub struct LiveMemory {
     /// Paths in the published state; zero before the first publication.
     pub state_paths: usize,
-    /// Estimated bytes of the checkout states held: the publication's, the
-    /// current one while changes are recorded, and the one the last
-    /// call-graph refresh resolved.
-    pub state_bytes: u64,
+    /// Bytes of what the planes share (see [`CheckoutMemory`]).
+    pub shared_bytes: u64,
+    /// Bytes the text plane holds, the overlay's included.
+    pub text_bytes: u64,
     /// Paths whose changed text queries read from memory.
     pub text_overlay_paths: usize,
-    /// Estimated bytes of those paths and their trigrams.
+    /// Bytes of those paths and their trigrams.
     pub text_overlay_bytes: u64,
+    /// Bytes the call graph holds apart from its engine.
+    pub callgraph_bytes: u64,
     /// Paths changed since the publication.
     pub changes: usize,
     /// Changed paths the call graph has not resolved yet.
@@ -3088,8 +3114,15 @@ pub enum EngineMemory {
     NotStarted,
     /// A refresh holds it.
     Busy,
-    /// Started: its parse and resolution slots (each decoded on first use).
-    Running { parses: usize, resolutions: usize },
+    /// Started: its parse and resolution slots (each decoded on first use),
+    /// the bytes of the checkout state lists it holds, and the bytes of
+    /// everything else it holds.
+    Running {
+        parses: usize,
+        resolutions: usize,
+        state_bytes: u64,
+        bytes: u64,
+    },
 }
 
 impl DeadCodeMemo {
@@ -3101,25 +3134,89 @@ impl DeadCodeMemo {
     }
 }
 
-/// An estimate of the bytes `state` holds in memory.
-fn state_bytes(state: &CheckoutState) -> u64 {
-    let records = state
-        .paths()
-        .iter()
-        .map(|record| {
-            std::mem::size_of::<PathRecord>()
-                + record.path.capacity()
-                + record.link.capacity()
-                + record.language.capacity()
-        })
-        .sum::<usize>();
-    let fragments = if state.has_fragments() {
-        state.paths().len() * std::mem::size_of::<Option<Digest128>>()
-    } else {
-        0
-    };
-    let bytes = std::mem::size_of::<CheckoutState>() + state.git.capacity() + records + fragments;
-    u64::try_from(bytes).unwrap_or(u64::MAX)
+impl aft_store::heap::HeapBytes for DeadCodeMemo {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        self.0.heap_bytes(seen)
+    }
+}
+
+impl aft_store::heap::HeapBytes for PathTextMemo {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        self.0.heap_bytes(seen)
+    }
+}
+
+impl aft_store::heap::HeapBytes for Extracted {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Nothing => 0,
+            Self::Parse(key, parse, record) => {
+                key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
+            }
+            Self::Config(bytes, record) => bytes.heap_bytes(seen) + record.heap_bytes(seen),
+        }
+    }
+}
+
+/// Bytes counted for each part of a checkout (see [`CheckoutMemory`]).
+#[derive(Default)]
+struct MemoryParts {
+    shared: usize,
+    text: usize,
+    callgraph: usize,
+}
+
+impl MemoryParts {
+    /// Counts `published`, unless the walk has counted it already: its
+    /// state, segments and snapshot as shared, its text lookups as the text
+    /// plane's, and its stored slices, unparsed paths and dead-code snapshot
+    /// as the call graph's.
+    fn published(&mut self, published: &Arc<Published>, seen: &mut aft_store::heap::Seen) {
+        use aft_store::heap::HeapBytes as _;
+        if !seen.first(Arc::as_ptr(published)) {
+            return;
+        }
+        let Published {
+            root,
+            identity,
+            state,
+            segments,
+            texts,
+            membership,
+            graph,
+            graph_built: _,
+            unparsed,
+            dead_code,
+            path_texts,
+            _snapshot,
+        } = &**published;
+        self.shared += aft_store::heap::COUNTS
+            + std::mem::size_of::<Published>()
+            + root.heap_bytes(seen)
+            + identity.heap_bytes(seen)
+            + state.heap_bytes(seen)
+            + segments.heap_bytes(seen)
+            + _snapshot.heap_bytes(seen);
+        self.text +=
+            texts.heap_bytes(seen) + membership.heap_bytes(seen) + path_texts.heap_bytes(seen);
+        self.callgraph +=
+            graph.heap_bytes(seen) + unparsed.heap_bytes(seen) + dead_code.heap_bytes(seen);
+    }
+
+    /// Counts what a call-graph refresh resolved: the state it resolved
+    /// over as shared, the rest as the call graph's.
+    fn refreshed(&mut self, refreshed: &Refreshed, seen: &mut aft_store::heap::Seen) {
+        use aft_store::heap::HeapBytes as _;
+        let Refreshed {
+            state,
+            replaced,
+            removed,
+            dead_code,
+        } = refreshed;
+        self.shared += state.heap_bytes(seen);
+        self.callgraph +=
+            replaced.heap_bytes(seen) + removed.heap_bytes(seen) + dead_code.heap_bytes(seen);
+    }
 }
 
 impl Checkout {
@@ -3129,19 +3226,46 @@ impl Checkout {
         self.family.dir()
     }
 
-    /// What this checkout holds in memory now, for the memory census. Never
-    /// waits: a part whose lock is held is reported as busy.
-    #[must_use]
-    pub fn memory(&self) -> CheckoutMemory {
+    /// What this checkout holds in memory now, for the memory census (see
+    /// [`CheckoutMemory`]). `seen` carries the allocations already counted
+    /// elsewhere. Never waits: a part whose lock is held is left out and
+    /// counted in `seen` as contended.
+    pub fn memory(&self, seen: &mut aft_store::heap::Seen) -> CheckoutMemory {
+        use aft_store::heap::HeapBytes as _;
+        let to_u64 = |bytes: usize| u64::try_from(bytes).unwrap_or(u64::MAX);
         let live = self.live.try_read().ok().map(|live| {
-            let published = live.published.as_ref();
-            let mut bytes = published.map_or(0, |published| state_bytes(&published.state));
-            if let Some(state) = &live.state {
-                bytes = bytes.saturating_add(state_bytes(state));
+            let mut parts = MemoryParts::default();
+            if let Some(published) = &live.published {
+                parts.published(published, seen);
             }
+            let text_overlay = live.text.heap_bytes(seen);
+            parts.text += text_overlay + live.text_members.heap_bytes(seen);
+            parts.shared += live.state.heap_bytes(seen)
+                + live.early.heap_bytes(seen)
+                + live.failure.as_ref().map_or(0, |failure| {
+                    failure.error.heap_bytes(seen) + failure.refusal.heap_bytes(seen)
+                });
+            // A changed path's record is the checkout's; what the call graph
+            // reads from it (its parse, or a configuration file's bytes) is
+            // the call graph's.
+            parts.shared += aft_store::heap::btree_bytes(
+                live.changes.len(),
+                std::mem::size_of::<Vec<u8>>() + std::mem::size_of::<Change>(),
+            );
+            for (path, change) in &live.changes {
+                parts.shared += path.heap_bytes(seen) + change.record.heap_bytes(seen);
+                parts.callgraph += change.extracted.heap_bytes(seen);
+            }
+            parts.callgraph += live.unparsed.heap_bytes(seen)
+                + live.callgraph_pending.heap_bytes(seen)
+                + live.graph.heap_bytes(seen);
             if let Some(refreshed) = &live.refreshed {
-                bytes = bytes.saturating_add(state_bytes(&refreshed.state));
+                if seen.first(Arc::as_ptr(refreshed)) {
+                    parts.shared += aft_store::heap::COUNTS + std::mem::size_of::<Refreshed>();
+                    parts.refreshed(refreshed, seen);
+                }
             }
+            let published = live.published.as_ref();
             // The memo of the call graph views serve now.
             let dead_code_files = match &live.refreshed {
                 Some(refreshed) => refreshed.dead_code.try_files(),
@@ -3149,9 +3273,11 @@ impl Checkout {
             };
             LiveMemory {
                 state_paths: published.map_or(0, |published| published.state.paths().len()),
-                state_bytes: bytes,
+                shared_bytes: to_u64(parts.shared),
+                text_bytes: to_u64(parts.text),
                 text_overlay_paths: live.text.len(),
-                text_overlay_bytes: live.text.estimated_bytes(),
+                text_overlay_bytes: to_u64(text_overlay),
+                callgraph_bytes: to_u64(parts.callgraph),
                 changes: live.changes.len(),
                 pending_callgraph_paths: live.callgraph_pending.len(),
                 refreshed_files: live.refreshed.as_ref().map_or(0, |refreshed| {
@@ -3162,10 +3288,30 @@ impl Checkout {
         });
         let engine = match self.engine.try_lock() {
             Ok(engine) => match engine.as_ref() {
-                Some(engine) => EngineMemory::Running {
-                    parses: engine.live.inputs.parses.len(),
-                    resolutions: engine.live.resolved.len(),
-                },
+                Some(engine) => {
+                    let GraphEngine {
+                        published,
+                        live: resolution,
+                        applied,
+                        overlay,
+                        refreshed,
+                    } = engine;
+                    // The engine started from the publication the checkout
+                    // serves, counted above, unless a newer one replaced it
+                    // since; an older one it still holds is the engine's.
+                    let mut parts = MemoryParts::default();
+                    parts.published(published, seen);
+                    let (state, rest) = resolution.memory(seen);
+                    parts.shared += state;
+                    parts.callgraph += rest + applied.heap_bytes(seen) + overlay.heap_bytes(seen);
+                    parts.refreshed(refreshed, seen);
+                    EngineMemory::Running {
+                        parses: resolution.inputs.parses.len(),
+                        resolutions: resolution.resolved.len(),
+                        state_bytes: to_u64(parts.shared),
+                        bytes: to_u64(parts.text + parts.callgraph),
+                    }
+                }
                 None => EngineMemory::NotStarted,
             },
             Err(_) => EngineMemory::Busy,
@@ -3387,6 +3533,58 @@ mod tests {
     }
 
     /// A small Rust crate whose `caller` calls `util::callee`.
+    /// The census measures what a checkout holds rather than guessing it:
+    /// walking a copy of its state, a decoded call-graph slice and a decoded
+    /// parse adds up what the allocator handed out to make that copy. A
+    /// state and a parse are vectors and strings, so the two agree to the
+    /// byte; a slice's B-tree maps are counted as full nodes, a lower bound
+    /// on what a copy allocates.
+    #[test]
+    fn the_census_walk_adds_up_what_the_allocator_gave_a_copy() {
+        use aft_store::heap::heap_bytes_of;
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+
+        let state = view.state().clone();
+        let (copy, allocated) = crate::test_allocations::count_bytes(|| state.clone());
+        assert!(allocated > 0);
+        assert_eq!(heap_bytes_of(&copy), allocated);
+
+        let graph = Arc::clone(&view.published.graph);
+        let slice = graph.slice("src/lib.rs").expect("a stored slice");
+        let (copy, allocated) = crate::test_allocations::count_bytes(|| FileSlice::clone(&slice));
+        let walked = heap_bytes_of(&copy);
+        assert!(
+            walked <= allocated && 2 * walked > allocated,
+            "walked {walked}, allocated {allocated}"
+        );
+
+        let (parses, _) = graph.resolutions().unwrap();
+        let parse = Arc::clone(&parses["src/lib.rs"].1);
+        let (copy, allocated) = crate::test_allocations::count_bytes(|| ParseBlob::clone(&parse));
+        assert!(allocated > 0);
+        assert_eq!(heap_bytes_of(&copy), allocated);
+
+        // A walk of the whole checkout counts each part once: the slice
+        // decoded above is in the call graph's bytes, and walking again with
+        // everything already seen adds nothing.
+        let mut seen = aft_store::heap::Seen::new();
+        let memory = checkout.memory(&mut seen);
+        let live = memory.live.unwrap();
+        assert!(live.shared_bytes > 0 && live.text_bytes > 0 && live.callgraph_bytes > 0);
+        assert_eq!(seen.contended(), 0);
+        let again = checkout.memory(&mut seen).live.unwrap();
+        assert_eq!(
+            (again.shared_bytes, again.text_bytes, again.callgraph_bytes),
+            (0, 0, 0)
+        );
+    }
+
     fn demo(root: &Path) {
         write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
         write(

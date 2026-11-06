@@ -562,6 +562,24 @@ fn optional(input: &mut Decoder<'_>) -> Result<Option<u64>, RecordError> {
     }
 }
 
+crate::heap_bytes_none!(StatEvidence, PathKind);
+crate::heap_bytes_of_fields!(PathRecord {
+    path,
+    mode,
+    kind,
+    content,
+    link,
+    stat,
+    language,
+});
+crate::heap_bytes_of_fields!(CheckoutState {
+    git,
+    conversion,
+    root,
+    paths,
+    fragments,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;

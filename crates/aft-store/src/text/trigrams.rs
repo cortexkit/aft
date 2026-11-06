@@ -86,6 +86,8 @@ impl ContentTrigrams {
     }
 }
 
+crate::heap_bytes_of_fields!(ContentTrigrams { entries });
+
 #[cfg(test)]
 mod tests {
     use super::*;

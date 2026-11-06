@@ -186,6 +186,15 @@ fn count(len: usize) -> u32 {
     u32::try_from(len).expect("a manifest names fewer than 4 billion entries")
 }
 
+crate::heap_bytes_none!(SegmentEntry, StateRef);
+crate::heap_bytes_of_fields!(Manifest {
+    generation,
+    created_unix_ms,
+    next_segment,
+    segments,
+    checkouts,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;

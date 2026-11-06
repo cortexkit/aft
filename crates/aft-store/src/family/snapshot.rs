@@ -183,3 +183,11 @@ impl Snapshot {
         })
     }
 }
+
+crate::heap_bytes_of_fields!(Snapshot {
+    manifest,
+    layout,
+    family,
+    skipped_manifests,
+    _lease,
+});

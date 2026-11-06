@@ -705,6 +705,131 @@ fn decode_outline(input: &mut Decoder<'_>) -> Result<Vec<OutlineSymbol>, DecodeE
     Ok(outline)
 }
 
+crate::heap_bytes_none!(RecordKey, RefKind);
+crate::heap_bytes_of_fields!(Symbol {
+    is_test,
+    ordinal,
+    name,
+    scoped_name,
+    kind,
+    exported,
+    is_default_export,
+    start_line,
+    start_col,
+    end_line,
+    end_col,
+    signature,
+    program_start,
+    entry_attribute,
+});
+crate::heap_bytes_of_fields!(Reference {
+    ordinal,
+    kind,
+    caller_symbol,
+    short_name,
+    full_ref,
+    module_path,
+    line,
+    byte_start,
+    byte_end,
+    path_override,
+    local_name,
+    requested_name,
+    namespace_alias,
+    wildcard,
+    import_kind,
+});
+crate::heap_bytes_of_fields!(Import {
+    ordinal,
+    module_path,
+    names,
+    default_import,
+    namespace_import,
+    byte_start,
+    byte_end,
+    raw_text,
+    type_only,
+    side_effect,
+});
+crate::heap_bytes_of_fields!(PythonBinding {
+    byte_start,
+    byte_end,
+    target,
+});
+crate::heap_bytes_of_fields!(TypeFact {
+    name,
+    bases,
+    interface,
+    closed,
+});
+crate::heap_bytes_of_fields!(MethodFact {
+    owner,
+    trait_name,
+    name,
+    symbol,
+    has_body,
+    shape,
+    private,
+});
+crate::heap_bytes_of_fields!(FieldFact { owner, name, ty });
+crate::heap_bytes_of_fields!(ReturnFact { symbol, ty });
+crate::heap_bytes_of_fields!(CallSite {
+    ordinal,
+    caller,
+    line,
+    member,
+    receiver,
+    dynamic,
+});
+crate::heap_bytes_of_fields!(Surface {
+    symbols,
+    default_export_symbol,
+    exported_symbols,
+    callable_symbols,
+    entry_point_symbols,
+    go_package,
+    types,
+    methods,
+    fields,
+    returns,
+});
+crate::heap_bytes_of_fields!(OutlineSymbol {
+    name,
+    kind,
+    start_line,
+    start_col,
+    end_line,
+    end_col,
+    signature,
+    scope_chain,
+    exported,
+    parent,
+});
+crate::heap_bytes_of_fields!(Body {
+    imports,
+    python_bindings,
+    references,
+    call_sites,
+    outline,
+});
+crate::heap_bytes_of_fields!(ContentRecord {
+    language,
+    extractor_version,
+    data,
+});
+
+impl crate::heap::HeapBytes for RecordBody {
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        match self {
+            Self::Parsed { surface, body } => {
+                crate::heap::HeapBytes::heap_bytes(surface, seen)
+                    + crate::heap::HeapBytes::heap_bytes(body, seen)
+            }
+            Self::Config { source } => crate::heap::HeapBytes::heap_bytes(source, seen),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -878,3 +878,19 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     pub report: SearchReport,
 }
+
+crate::heap_bytes_none!(UnitRef, Member);
+crate::heap_bytes_of_fields!(SharedVectorIndex {
+    token,
+    model,
+    model_id,
+    segments,
+    by_text,
+});
+crate::heap_bytes_of_fields!(MemberSet {
+    index_token,
+    members,
+    slot_of,
+    slots,
+    segment_slots,
+});

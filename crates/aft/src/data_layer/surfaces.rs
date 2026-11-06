@@ -28,7 +28,7 @@ use super::checkout::{
     INDEX_STORE,
 };
 use super::runtime::{DataCheckout, DataFailure};
-use crate::context::AppContext;
+use crate::context::{AppContext, SemanticFillHealth, SemanticHealthComponentSnapshot};
 use crate::memory::MemoryEstimate;
 use aft_store::family::NewerFormat;
 
@@ -172,11 +172,11 @@ pub(crate) struct DataStoreReport {
     pub(crate) refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
-    /// Meaning search's plane: the status tool's `semantic_index`. `None`
-    /// while semantic search is off for the checkout, or before anything
-    /// gave it the root's semantic configuration; today's index then
-    /// reports.
-    pub(crate) meaning: Option<Value>,
+    /// Meaning search's plane: the status tool's and each root's health
+    /// `semantic_index`. `None` while semantic search is off for the
+    /// checkout, or before anything gave it the root's semantic
+    /// configuration; today's index then reports.
+    pub(crate) meaning: Option<MeaningReport>,
 }
 
 impl DataStoreReport {
@@ -333,72 +333,241 @@ pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
         checkout.last_failure(),
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
-    report.meaning = meaning_json(checkout);
+    report.meaning = meaning_report(checkout);
     report
 }
 
-/// The status tool's `semantic_index` for `checkout`'s meaning plane: ready
-/// once every file meaning search applies to is filled; building while the
-/// fill is under way (with how many files it has accounted for) or before it
-/// has learned the model; failed when no fill could start. `None` while
-/// semantic search is off for the checkout.
-fn meaning_json(checkout: &DataCheckout) -> Option<Value> {
+/// Meaning search's plane as the status tool and each root's health report
+/// it: ready once every file meaning search applies to is filled; building
+/// while the fill is under way (with how many files it has accounted for)
+/// or before it has learned the model; failed when no fill could start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MeaningReport {
+    pub(crate) plane: MeaningPlane,
+    /// A fill round is queued or running.
+    pub(crate) filling: bool,
+    /// The running fill round waits for another fill of the repository, in
+    /// this process or another, and embeds nothing until that one publishes.
+    pub(crate) waiting: bool,
+}
+
+/// How the meaning plane stands; see [`MeaningReport`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MeaningPlane {
+    /// The plane serves the files filled so far: complete, or partial while
+    /// files wait for vectors. `error` is the last fill's failure, kept until
+    /// a fill succeeds.
+    Serving {
+        complete: bool,
+        coverage: MeaningCoverage,
+        error: Option<String>,
+    },
+    /// Nothing can be served yet; `stage` says what the fill is doing, and
+    /// the counts are files once the fill has surveyed them.
+    Building {
+        stage: String,
+        files: Option<usize>,
+        entries_done: Option<usize>,
+        entries_total: Option<usize>,
+    },
+    /// No fill could start, with why.
+    Failed(String),
+    Disabled,
+    Ready,
+}
+
+/// The meaning plane's coverage counts (see [`super::vectors::Coverage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MeaningCoverage {
+    pub(crate) files: usize,
+    pub(crate) files_embedded: usize,
+    pub(crate) files_too_large: usize,
+    pub(crate) files_failed: usize,
+    pub(crate) files_pending: usize,
+    pub(crate) files_past_cap: usize,
+    pub(crate) chunks: usize,
+    pub(crate) chunks_embedded: usize,
+    pub(crate) chunks_failed: usize,
+}
+
+impl MeaningCoverage {
+    fn of(coverage: &super::vectors::Coverage) -> Self {
+        Self {
+            files: coverage.files,
+            files_embedded: coverage.files_embedded,
+            files_too_large: coverage.files_too_large,
+            files_failed: coverage.files_failed.len(),
+            files_pending: coverage.pending.len(),
+            files_past_cap: coverage.past_cap,
+            chunks: coverage.chunks,
+            chunks_embedded: coverage.chunks_embedded,
+            chunks_failed: coverage.chunks_failed.len(),
+        }
+    }
+}
+
+impl MeaningReport {
+    /// The status tool's `semantic_index` object.
+    pub(crate) fn status_json(&self) -> Value {
+        let mut value = match &self.plane {
+            MeaningPlane::Serving {
+                complete,
+                coverage,
+                error,
+            } => {
+                let mut value = json!({
+                    "status": if *complete { READY } else { BUILDING },
+                    "files": coverage.files,
+                    "files_embedded": coverage.files_embedded,
+                    "files_too_large": coverage.files_too_large,
+                    "files_failed": coverage.files_failed,
+                    "files_pending": coverage.files_pending,
+                    "files_past_cap": coverage.files_past_cap,
+                    "chunks": coverage.chunks,
+                    "chunks_embedded": coverage.chunks_embedded,
+                    "chunks_failed": coverage.chunks_failed,
+                });
+                if !complete {
+                    value["stage"] = json!(super::meaning::FILLING_STAGE);
+                }
+                if let Some(error) = error {
+                    value["error"] = json!(error);
+                }
+                value
+            }
+            MeaningPlane::Building {
+                stage,
+                files,
+                entries_done,
+                entries_total,
+            } => json!({
+                "status": BUILDING,
+                "stage": stage,
+                "files": files,
+                "entries_done": entries_done,
+                "entries_total": entries_total,
+            }),
+            MeaningPlane::Failed(error) => json!({ "status": "failed", "error": error }),
+            MeaningPlane::Disabled => json!({ "status": "disabled" }),
+            MeaningPlane::Ready => json!({ "status": READY }),
+        };
+        if self.waiting {
+            value["stage"] = json!(super::meaning::WAITING_STAGE);
+        }
+        value["state"] = value["status"].clone();
+        value["refreshing_count"] = json!(0);
+        value["filling"] = json!(self.filling);
+        value["waiting_for_another_fill"] = json!(self.waiting);
+        value
+    }
+
+    /// Each root's health `semantic_index`, in the shape health gives
+    /// today's index: `status`, `stage` (which also says when the fill waits
+    /// for another fill), `reason` (the fill's failure) and
+    /// `embedded_chunks`/`total_chunks`, with the fill's file counts beside
+    /// them (see [`SemanticFillHealth`] for which are present when). A
+    /// failed plane reports `degraded`, as health reports a failed index.
+    pub(crate) fn health(&self) -> SemanticHealthComponentSnapshot {
+        let nonzero = |count: usize| (count > 0).then_some(count);
+        let mut fill = SemanticFillHealth {
+            filling: self.filling.then_some(true),
+            ..SemanticFillHealth::default()
+        };
+        let mut health = SemanticHealthComponentSnapshot {
+            status: READY,
+            reason: None,
+            since_ms: None,
+            next_retry_ms: None,
+            paused_until_ms: None,
+            stage: None,
+            embedded_chunks: None,
+            total_chunks: None,
+            current_batch: None,
+            total_batches: None,
+            fill: None,
+        };
+        match &self.plane {
+            MeaningPlane::Serving {
+                complete,
+                coverage,
+                error,
+            } => {
+                health.reason.clone_from(error);
+                if !complete {
+                    health.status = BUILDING;
+                    health.stage = Some(super::meaning::FILLING_STAGE.to_string());
+                    health.embedded_chunks = Some(coverage.chunks_embedded);
+                    health.total_chunks = Some(coverage.chunks);
+                    fill.files = Some(coverage.files);
+                    fill.files_embedded = nonzero(coverage.files_embedded);
+                    fill.files_pending = nonzero(coverage.files_pending);
+                    fill.files_too_large = nonzero(coverage.files_too_large);
+                    fill.files_past_cap = nonzero(coverage.files_past_cap);
+                }
+                fill.files_failed = nonzero(coverage.files_failed);
+                fill.chunks_failed = nonzero(coverage.chunks_failed);
+            }
+            MeaningPlane::Building { stage, files, .. } => {
+                health.status = BUILDING;
+                health.stage = Some(stage.clone());
+                fill.files = *files;
+            }
+            MeaningPlane::Failed(error)
+                if crate::semantic_admission::is_not_opened_status(error) =>
+            {
+                health.status = crate::semantic_admission::NOT_OPENED_LABEL;
+            }
+            MeaningPlane::Failed(error) => {
+                health.status = "degraded";
+                health.reason = Some(error.clone());
+            }
+            MeaningPlane::Disabled => health.status = "disabled",
+            MeaningPlane::Ready => {}
+        }
+        if self.waiting {
+            health.stage = Some(super::meaning::WAITING_STAGE.to_string());
+        }
+        health.fill = (fill != SemanticFillHealth::default()).then_some(fill);
+        health
+    }
+}
+
+/// How `checkout`'s meaning plane stands; `None` while semantic search is
+/// off for the checkout.
+fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
     use crate::context::SemanticIndexStatus;
     use crate::data_layer::tools::search::DataSemantic;
     let semantic = DataSemantic::of_checkout(checkout)?;
     let filling = checkout.filling();
-    let mut value = match &semantic {
-        DataSemantic::Serving(meaning) => {
-            let coverage = meaning.coverage();
-            let mut value = json!({
-                "status": if meaning.complete() { READY } else { BUILDING },
-                "files": coverage.files,
-                "files_embedded": coverage.files_embedded,
-                "files_too_large": coverage.files_too_large,
-                "files_failed": coverage.files_failed.len(),
-                "files_pending": coverage.pending.len(),
-                "files_past_cap": coverage.past_cap,
-                "chunks": coverage.chunks,
-                "chunks_embedded": coverage.chunks_embedded,
-                "chunks_failed": coverage.chunks_failed.len(),
-            });
-            if !meaning.complete() {
-                value["stage"] = json!(super::meaning::FILLING_STAGE);
-            }
-            if let Some(error) = meaning.failure() {
-                value["error"] = json!(error);
-            }
-            value
-        }
+    let plane = match semantic {
+        DataSemantic::Serving(meaning) => MeaningPlane::Serving {
+            complete: meaning.complete(),
+            coverage: MeaningCoverage::of(meaning.coverage()),
+            error: meaning.failure().map(str::to_string),
+        },
         DataSemantic::NotServing(SemanticIndexStatus::Building {
             stage,
             files,
             entries_done,
             entries_total,
-        }) => json!({
-            "status": BUILDING,
-            "stage": stage,
-            "files": files,
-            "entries_done": entries_done,
-            "entries_total": entries_total,
-        }),
-        DataSemantic::NotServing(SemanticIndexStatus::Failed(error)) => {
-            json!({ "status": "failed", "error": error })
-        }
-        DataSemantic::NotServing(SemanticIndexStatus::Disabled) => json!({ "status": "disabled" }),
-        DataSemantic::NotServing(SemanticIndexStatus::Ready { .. }) => json!({ "status": READY }),
+        }) => MeaningPlane::Building {
+            stage,
+            files,
+            entries_done,
+            entries_total,
+        },
+        DataSemantic::NotServing(SemanticIndexStatus::Failed(error)) => MeaningPlane::Failed(error),
+        DataSemantic::NotServing(SemanticIndexStatus::Disabled) => MeaningPlane::Disabled,
+        DataSemantic::NotServing(SemanticIndexStatus::Ready { .. }) => MeaningPlane::Ready,
     };
     // A fill round waiting for another fill of the repository, in this
     // process or another, embeds nothing until that one publishes.
     let waiting = filling && checkout.meaning_progress().is_some_and(|step| step.waiting);
-    if waiting {
-        value["stage"] = json!(super::meaning::WAITING_STAGE);
-    }
-    value["state"] = value["status"].clone();
-    value["refreshing_count"] = json!(0);
-    value["filling"] = json!(filling);
-    value["waiting_for_another_fill"] = json!(waiting);
-    Some(value)
+    Some(MeaningReport {
+        plane,
+        filling,
+        waiting,
+    })
 }
 
 /// How a bound checkout with `status` stands, given the paths of its view
@@ -466,88 +635,192 @@ fn dir_bytes(dir: &Path) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
-/// The per-root `data_layer` memory estimate: what the root's checkout
-/// holds beyond the shared block cache, which the process counts once.
-/// `None` when the data layer is off.
-pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<MemoryEstimate> {
+/// The data layer's memory for one root's checkout, measured as the
+/// [`aft_store::heap`] module describes (see
+/// [`super::checkout::CheckoutMemory`] for what each part holds). The text
+/// plane's bytes belong in the root's `search` plane, the call graph's in
+/// `callgraph`, and meaning search's in `semantic`: [`Self::fold_into`]
+/// adds them there. `shared` is what the planes share, the root's
+/// `data_layer` plane, with every figure itemised in its counts. The block
+/// cache every checkout shares is counted once for the process
+/// ([`block_cache_estimate`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DataLayerMemory {
+    pub(crate) shared: MemoryEstimate,
+    pub(crate) text: u64,
+    pub(crate) callgraph: u64,
+    pub(crate) meaning: u64,
+}
+
+impl DataLayerMemory {
+    /// Nothing held: no checkout is bound.
+    fn unbound() -> Self {
+        Self {
+            shared: MemoryEstimate::estimated(0).count("bound_checkouts", 0),
+            text: 0,
+            callgraph: 0,
+            meaning: 0,
+        }
+    }
+
+    /// Adds the text, call-graph and meaning bytes to the root's `search`,
+    /// `callgraph` and `semantic` planes, each with its share named
+    /// `data_layer_bytes`, and returns the root's `data_layer` plane: what
+    /// the planes share.
+    pub(crate) fn fold_into(
+        self,
+        search: &mut MemoryEstimate,
+        callgraph: &mut MemoryEstimate,
+        semantic: &mut MemoryEstimate,
+    ) -> MemoryEstimate {
+        for (plane, bytes) in [
+            (search, self.text),
+            (callgraph, self.callgraph),
+            (semantic, self.meaning),
+        ] {
+            plane.counts.insert("data_layer_bytes".into(), bytes);
+            if bytes == 0 {
+                continue;
+            }
+            plane.estimated_bytes = Some(match plane.estimated_bytes {
+                Some(own) => own.saturating_add(bytes),
+                // Today's store for the plane could not be read; the data
+                // layer's share still counts, and the plane says it is
+                // partial.
+                None => {
+                    plane.bytes_status = "partial";
+                    bytes
+                }
+            });
+        }
+        self.shared
+    }
+}
+
+/// The data layer's memory for `ctx`'s root (see [`DataLayerMemory`]);
+/// `None` when the data layer is off. Never binds the checkout and never
+/// waits for a lock.
+pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
     Some(match ctx.probe_data_checkout()? {
         // Nothing is held for a checkout that is not bound.
         DataCheckoutProbe::NotBound
         | DataCheckoutProbe::BindFailed(_)
-        | DataCheckoutProbe::Withheld(_) => {
-            MemoryEstimate::estimated(0).count("bound_checkouts", 0)
+        | DataCheckoutProbe::Withheld(_) => DataLayerMemory::unbound(),
+        DataCheckoutProbe::Binding => DataLayerMemory {
+            shared: MemoryEstimate::busy().gap("checkout_binding"),
+            ..DataLayerMemory::unbound()
+        },
+        DataCheckoutProbe::Bound(checkout) => {
+            let mut seen = aft_store::heap::Seen::new();
+            // aft_inspect's dead-code scan may hold the same snapshot the
+            // checkout's dead-code memo holds; the root's
+            // `callgraph_projection` plane counts it then.
+            if let Some(snapshot) = ctx.inspect_manager().try_callgraph_projection_snapshot() {
+                seen.counted_elsewhere(Arc::as_ptr(&snapshot));
+            }
+            let memory = checkout.checkout().memory(&mut seen);
+            let meaning = checkout.meaning_memory(&mut seen);
+            checkout_estimate(memory, meaning, seen.contended())
         }
-        DataCheckoutProbe::Binding => MemoryEstimate::busy().gap("checkout_binding"),
-        DataCheckoutProbe::Bound(checkout) => checkout_estimate(checkout.checkout().memory()),
     })
 }
 
-/// A bound checkout's memory as a census estimate. The bytes cover its
-/// checkout states and its text overlay; what it holds without a byte
-/// figure yet is named as a gap, so the estimate is partial, never a
-/// silent zero.
-pub(crate) fn checkout_estimate(memory: CheckoutMemory) -> MemoryEstimate {
-    let mut estimate = match memory.live {
-        Some(live) => {
-            let mut estimate =
-                MemoryEstimate::partial(live.state_bytes.saturating_add(live.text_overlay_bytes))
-                    .count("state_paths", live.state_paths)
-                    .count_u64("state_bytes", live.state_bytes)
-                    .count("text_overlay_paths", live.text_overlay_paths)
-                    .count_u64("text_overlay_bytes", live.text_overlay_bytes)
-                    .count("changed_paths", live.changes)
-                    .count("pending_callgraph_paths", live.pending_callgraph_paths)
-                    .count("refreshed_callgraph_files", live.refreshed_files);
-            if live.state_paths > 0 {
-                // The publication's per-path text locations and its decoded
-                // call-graph slices.
-                estimate = estimate
-                    .gap("published_text_membership")
-                    .gap("published_call_graph_slices");
-            }
-            if live.changes > 0 {
-                estimate = estimate.gap("changed_file_parses");
-            }
-            if live.refreshed_files > 0 {
-                estimate = estimate.gap("refreshed_call_graph");
-            }
-            if let Some(files) = live.dead_code_files {
-                // Shared with aft_inspect, which may hold the same snapshot.
-                estimate = estimate
-                    .count("dead_code_snapshot_files", files)
-                    .gap("dead_code_snapshot");
-            }
-            estimate
-        }
-        None => MemoryEstimate::busy().gap("checkout_state_busy"),
+/// A bound checkout's memory as the census reports it, from what its walk
+/// measured: `meaning` is meaning search's bytes (`None` when its plane's
+/// slot was held), and `contended` how many parts the whole walk left out
+/// because another thread held them. A part left out is named, so a figure
+/// that misses it reads as partial, never as complete.
+pub(crate) fn checkout_estimate(
+    memory: CheckoutMemory,
+    meaning: Option<usize>,
+    contended: usize,
+) -> DataLayerMemory {
+    let meaning = meaning.map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    let Some(live) = memory.live else {
+        return DataLayerMemory {
+            shared: MemoryEstimate::busy()
+                .gap("checkout_state_busy")
+                .count("bound_checkouts", 1),
+            ..DataLayerMemory::unbound()
+        };
     };
-    estimate = estimate.count("bound_checkouts", 1);
-    match memory.engine {
-        EngineMemory::NotStarted => estimate.count("callgraph_engine_started", 0),
-        EngineMemory::Busy => estimate
+    let (engine_state, engine_bytes) = match memory.engine {
+        EngineMemory::Running {
+            state_bytes, bytes, ..
+        } => (state_bytes, bytes),
+        EngineMemory::NotStarted | EngineMemory::Busy => (0, 0),
+    };
+    let shared_bytes = live.shared_bytes.saturating_add(engine_state);
+    let callgraph = live.callgraph_bytes.saturating_add(engine_bytes);
+    let mut shared = MemoryEstimate::estimated(shared_bytes)
+        .count("bound_checkouts", 1)
+        .count("state_paths", live.state_paths)
+        .count("text_overlay_paths", live.text_overlay_paths)
+        .count_u64("text_overlay_bytes", live.text_overlay_bytes)
+        .count("changed_paths", live.changes)
+        .count("pending_callgraph_paths", live.pending_callgraph_paths)
+        .count("refreshed_callgraph_files", live.refreshed_files)
+        // Already in the root's `search`, `callgraph` and `semantic` planes.
+        .count_u64("search_bytes", live.text_bytes)
+        .count_u64("callgraph_bytes", callgraph)
+        .count_u64("semantic_bytes", meaning.unwrap_or(0));
+    if let Some(files) = live.dead_code_files {
+        shared = shared.count("dead_code_snapshot_files", files);
+    }
+    shared = match memory.engine {
+        EngineMemory::NotStarted => shared.count("callgraph_engine_started", 0),
+        EngineMemory::Busy => shared
             .count("callgraph_engine_started", 1)
             .gap("callgraph_engine_busy"),
         EngineMemory::Running {
             parses,
             resolutions,
-        } => estimate
+            bytes,
+            ..
+        } => shared
             .count("callgraph_engine_started", 1)
             .count("callgraph_engine_parses", parses)
             .count("callgraph_engine_resolutions", resolutions)
-            .gap("callgraph_engine"),
+            .count_u64("callgraph_engine_bytes", bytes),
+    };
+    if meaning.is_none() {
+        shared = shared.gap("meaning_plane_busy");
+    }
+    if contended > 0 {
+        shared = shared.count("locked_parts", contended).gap("locked_parts");
+    }
+    if !shared.not_estimated.is_empty() {
+        shared.bytes_status = "partial";
+    }
+    DataLayerMemory {
+        shared,
+        text: live.text_bytes,
+        callgraph,
+        meaning: meaning.unwrap_or(0),
     }
 }
 
 /// The process's shared block cache as a census estimate, counted once for
 /// every checkout; `None` while the data layer is off or no checkout of
-/// this process has bound.
+/// this process has bound. Its bytes are measured as the
+/// [`aft_store::heap`] module describes: every cached block in its shared
+/// allocation and the cache's two lookup tables. `resident_bytes` is the
+/// block data alone, which the cache keeps within `budget_bytes`. While
+/// another thread holds the cache's lock the tables are left out and the
+/// figure is partial.
 pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
     if !super::runtime::enabled() {
         return None;
     }
-    let stats = super::runtime::block_cache_stats()?;
+    let (stats, measured) = super::runtime::block_cache_memory()?;
+    let resident = u64::try_from(stats.resident_bytes).unwrap_or(u64::MAX);
+    let estimate = match measured {
+        Some(bytes) => MemoryEstimate::estimated(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        None => MemoryEstimate::partial(resident).gap("block_cache_tables_busy"),
+    };
     Some(
-        MemoryEstimate::estimated(u64::try_from(stats.resident_bytes).unwrap_or(u64::MAX))
+        estimate
+            .count_u64("resident_bytes", resident)
             .count("budget_bytes", stats.budget_bytes)
             .count("blocks", stats.blocks)
             .count_u64("hits", stats.hits)
@@ -565,7 +838,7 @@ pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
         // The model and backend labels still come from the configuration.
-        let mut semantic = meaning.clone();
+        let mut semantic = meaning.status_json();
         for label in ["backend", "model"] {
             if let Some(value) = payload["semantic_index"].get(label).cloned() {
                 semantic[label] = value;
@@ -1237,11 +1510,33 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let ctx = context(&root, storage.path());
+        let data_layer_bytes =
+            |plane: &MemoryEstimate| plane.counts.get("data_layer_bytes").copied();
+        // The root's census row and the sum of its planes.
+        let census_row = |memory: &crate::memory::RootMemorySnapshot| {
+            let snapshot = crate::memory::MemorySnapshot::new(
+                "ready",
+                [(root.display().to_string(), memory.clone())].into(),
+            );
+            let census = crate::commands::memory_census::render_memory_census(&snapshot, None);
+            let row = census["roots"][root.display().to_string()].clone();
+            let planes = row["planes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|bytes| bytes.as_u64().unwrap())
+                .sum::<u64>();
+            (row, planes)
+        };
 
         // Not bound: nothing held, said so.
-        let unbound = ctx.memory_root_snapshot().data_layer.unwrap();
-        assert_eq!(unbound.estimated_bytes, Some(0));
-        assert_eq!(unbound.counts["bound_checkouts"], 0);
+        let unbound = ctx.memory_root_snapshot();
+        let shared = unbound.data_layer.clone().unwrap();
+        assert_eq!(shared.estimated_bytes, Some(0));
+        assert_eq!(shared.counts["bound_checkouts"], 0);
+        for plane in [&unbound.trigram, &unbound.callgraph, &unbound.semantic] {
+            assert_eq!(data_layer_bytes(plane), Some(0));
+        }
         {
             let _binding = ctx.hold_data_checkout_slot_for_test();
             let binding = ctx.memory_root_snapshot();
@@ -1254,105 +1549,336 @@ mod tests {
         // A query reads through the block cache.
         let view = ctx.data_view().unwrap();
         view.path_text(b"src/lib.rs").unwrap();
+        drop(view);
         let root_memory = ctx.memory_root_snapshot();
-        let data_layer = root_memory.data_layer.clone().unwrap();
-        assert_eq!(data_layer.status, "ready");
-        assert_eq!(data_layer.bytes_status, "partial");
-        assert!(data_layer.estimated_bytes.unwrap() > 0);
-        assert_eq!(data_layer.counts["bound_checkouts"], 1);
-        assert_eq!(data_layer.counts["state_paths"], 3);
-        for gap in ["published_text_membership", "published_call_graph_slices"] {
-            assert!(
-                data_layer.not_estimated.iter().any(|named| named == gap),
-                "{gap}"
-            );
-        }
-        assert!(
-            root_memory.attributed_bytes >= data_layer.estimated_bytes.unwrap(),
-            "the root's total includes the data layer"
+        let shared = root_memory.data_layer.clone().unwrap();
+        assert_eq!(shared.status, "ready");
+        // Every part is measured: nothing is left as a gap.
+        assert_eq!(shared.bytes_status, "estimated");
+        assert!(shared.not_estimated.is_empty(), "{shared:?}");
+        assert!(shared.estimated_bytes.unwrap() > 0);
+        assert_eq!(shared.counts["bound_checkouts"], 1);
+        assert_eq!(shared.counts["state_paths"], 3);
+        // Each plane's share is in the plane, and itemised.
+        let search = shared.counts["search_bytes"];
+        let callgraph = shared.counts["callgraph_bytes"];
+        assert!(search > 0 && callgraph > 0, "{shared:?}");
+        assert_eq!(data_layer_bytes(&root_memory.trigram), Some(search));
+        assert_eq!(data_layer_bytes(&root_memory.callgraph), Some(callgraph));
+        assert_eq!(
+            data_layer_bytes(&root_memory.semantic),
+            Some(shared.counts["semantic_bytes"])
         );
+        assert!(root_memory.trigram.estimated_bytes.unwrap() >= search);
+        assert!(root_memory.callgraph.estimated_bytes.unwrap() >= callgraph);
 
         let snapshot = crate::memory::MemorySnapshot::new(
             "ready",
-            [(root.display().to_string(), root_memory)].into(),
+            [(root.display().to_string(), root_memory.clone())].into(),
         );
         let cache = snapshot.data_layer_block_cache.clone().unwrap();
+        assert_eq!(cache.bytes_status, "estimated");
         assert!(cache.counts["budget_bytes"] > 0);
+        assert!(cache.counts["blocks"] > 0);
+        assert!(
+            cache.estimated_bytes.unwrap() > cache.counts["resident_bytes"],
+            "the cache's figure is its blocks and its tables: {cache:?}"
+        );
         assert_eq!(
             snapshot.process.data_layer_block_cache_bytes,
             cache.estimated_bytes
         );
-        assert!(
-            snapshot.process.total_attributed_bytes
-                >= cache.estimated_bytes.unwrap() + data_layer.estimated_bytes.unwrap()
-        );
-        let census = crate::commands::memory_census::render_memory_census(&snapshot, None);
-        let row = &census["roots"][root.display().to_string()];
+        let (row, planes_sum) = census_row(&root_memory);
         assert_eq!(
             row["planes"]["data_layer"],
-            json!(data_layer.estimated_bytes.unwrap())
+            json!(shared.estimated_bytes.unwrap())
         );
-        assert_eq!(row["data_layer"]["bytes_status"], "partial");
         assert_eq!(
-            census["process"]["data_layer_block_cache_bytes"],
-            json!(cache.estimated_bytes)
+            row["planes"]["search"],
+            json!(root_memory.trigram.estimated_bytes.unwrap())
+        );
+        assert_eq!(row["data_layer"]["search_bytes"], json!(search));
+
+        // Nothing is counted twice: the root's total is the sum of its
+        // planes, and the process's total is the sum of its roots and of
+        // what it counts once for every root.
+        assert_eq!(row["attributed_bytes"], json!(planes_sum));
+        assert_eq!(root_memory.attributed_bytes, planes_sum);
+        let process = &snapshot.process;
+        assert_eq!(
+            process.total_attributed_bytes,
+            planes_sum
+                + snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0)
+                + process.semantic_arena_bytes
+                + process.data_layer_block_cache_bytes.unwrap()
+                + process.embedding_model_bytes
+                + process.sqlite.memory_used_bytes
         );
 
-        // An edit adds its overlay and names the parse it holds.
+        // An edit adds its overlay, and its refresh starts the call graph's
+        // engine, whose bytes are the call graph's.
         let extra = write(&root, "src/extra.rs", "pub fn other() {}\n");
         ctx.data_note_paths(&[extra]);
-        let edited = ctx.memory_root_snapshot().data_layer.unwrap();
-        assert_eq!(edited.counts["changed_paths"], 1);
-        assert!(edited.counts["text_overlay_bytes"] > 0);
-        assert!(edited
-            .not_estimated
-            .iter()
-            .any(|gap| gap == "changed_file_parses"));
+        let checkout = ctx.data_checkout().unwrap();
+        checkout.checkout().refresh_callgraph().unwrap();
+        let edited = ctx.memory_root_snapshot();
+        let edited_shared = edited.data_layer.clone().unwrap();
+        assert_eq!(edited_shared.counts["changed_paths"], 1);
+        assert!(edited_shared.counts["text_overlay_bytes"] > 0);
+        assert!(edited_shared.counts["search_bytes"] >= edited_shared.counts["text_overlay_bytes"]);
+        assert_eq!(edited_shared.counts["callgraph_engine_started"], 1);
+        let engine = edited_shared.counts["callgraph_engine_bytes"];
+        assert!(engine > 0);
+        assert!(edited_shared.counts["callgraph_bytes"] > engine);
+        let (edited_row, edited_planes) = census_row(&edited);
+        assert_eq!(edited_row["attributed_bytes"], json!(edited_planes));
+        assert_eq!(edited.attributed_bytes, edited_planes);
+
+        // Releasing the idle checkout drops its share.
+        drop(checkout);
+        settled(&ctx);
+        let started = Instant::now();
+        while !ctx.try_release_idle_checkout_views() {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the idle release never ran"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let released = ctx.memory_root_snapshot();
+        assert_eq!(
+            released.data_layer.as_ref().unwrap().counts["bound_checkouts"],
+            0
+        );
+        assert_eq!(
+            released.data_layer.as_ref().unwrap().estimated_bytes,
+            Some(0)
+        );
+        for plane in [&released.trigram, &released.callgraph, &released.semantic] {
+            assert_eq!(data_layer_bytes(plane), Some(0));
+        }
+        assert!(
+            released.attributed_bytes
+                <= edited.attributed_bytes
+                    - edited_shared.estimated_bytes.unwrap()
+                    - edited_shared.counts["search_bytes"]
+                    - edited_shared.counts["callgraph_bytes"],
+            "{} after release, {} before",
+            released.attributed_bytes,
+            edited.attributed_bytes
+        );
+    }
+
+    /// Once meaning search has the root's semantic configuration, its
+    /// plane, not today's index, is the root's `semantic_index` in health,
+    /// as it is on the status tool.
+    #[test]
+    fn health_reports_the_meaning_plane_once_it_has_a_configuration() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context(&root, storage.path());
+        let checkout = ctx.data_checkout().unwrap();
+        settled(&ctx);
+        let starting = Some(crate::data_layer::meaning::STARTING_STAGE.to_string());
+        let before = ctx.try_health_snapshot(&root).semantic_index.unwrap();
+        assert_ne!(before.stage, starting, "today's index reports until then");
+
+        checkout.configure_meaning_without_fill_for_test(Some(&ctx.config().semantic));
+        let health = ctx.try_health_snapshot(&root).semantic_index.unwrap();
+        assert_eq!(health.status, BUILDING);
+        assert_eq!(health.stage, starting);
+        assert_eq!(
+            health.fill, None,
+            "no fill is running and nothing is counted yet"
+        );
+        let payload = ctx.build_status_snapshot();
+        assert_eq!(payload["semantic_index"]["stage"], json!(starting));
+    }
+
+    /// Health carries the meaning plane's fill in the shape it gives
+    /// today's index, and only the counts that say something.
+    #[test]
+    fn health_reports_the_meaning_fill_and_its_failures() {
+        let coverage = MeaningCoverage {
+            files: 40,
+            files_embedded: 30,
+            files_too_large: 1,
+            files_failed: 2,
+            files_pending: 7,
+            files_past_cap: 0,
+            chunks: 300,
+            chunks_embedded: 280,
+            chunks_failed: 3,
+        };
+        let filling = MeaningReport {
+            plane: MeaningPlane::Serving {
+                complete: false,
+                coverage,
+                error: Some("embedder timed out".into()),
+            },
+            filling: true,
+            waiting: true,
+        };
+        let health = serde_json::to_value(filling.health()).unwrap();
+        assert_eq!(
+            health,
+            json!({
+                "status": "building",
+                "reason": "embedder timed out",
+                "stage": "waiting_for_another_fill",
+                "embedded_chunks": 280,
+                "total_chunks": 300,
+                "files": 40,
+                "files_embedded": 30,
+                "files_pending": 7,
+                "files_too_large": 1,
+                "files_failed": 2,
+                "chunks_failed": 3,
+                "filling": true,
+            })
+        );
+        // The status tool keeps its full shape.
+        let status = filling.status_json();
+        assert_eq!(status["status"], "building");
+        assert_eq!(status["stage"], "waiting_for_another_fill");
+        assert_eq!(status["files_pending"], 7);
+        assert_eq!(status["chunks_embedded"], 280);
+        assert_eq!(status["error"], "embedder timed out");
+        assert_eq!(status["filling"], true);
+        assert_eq!(status["waiting_for_another_fill"], true);
+
+        // Filled: ready, with only the failures it recorded.
+        let ready = MeaningReport {
+            plane: MeaningPlane::Serving {
+                complete: true,
+                coverage: MeaningCoverage {
+                    files_pending: 0,
+                    files_failed: 0,
+                    ..coverage
+                },
+                error: None,
+            },
+            filling: false,
+            waiting: false,
+        };
+        assert_eq!(
+            serde_json::to_value(ready.health()).unwrap(),
+            json!({"status": "ready", "chunks_failed": 3})
+        );
+
+        let failed = MeaningReport {
+            plane: MeaningPlane::Failed("embedding model: no backend".into()),
+            filling: false,
+            waiting: false,
+        };
+        assert_eq!(
+            serde_json::to_value(failed.health()).unwrap(),
+            json!({"status": "degraded", "reason": "embedding model: no backend"})
+        );
+        let starting = MeaningReport {
+            plane: MeaningPlane::Building {
+                stage: crate::data_layer::meaning::STARTING_STAGE.into(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            },
+            filling: true,
+            waiting: false,
+        };
+        assert_eq!(
+            serde_json::to_value(starting.health()).unwrap(),
+            json!({"status": "building", "stage": "loading_embedding_model", "filling": true})
+        );
     }
 
     #[test]
-    fn a_checkout_estimate_names_every_part_it_cannot_size() {
-        let estimate = checkout_estimate(CheckoutMemory {
-            live: Some(LiveMemory {
-                state_paths: 4,
-                state_bytes: 100,
-                text_overlay_paths: 1,
-                text_overlay_bytes: 20,
-                changes: 1,
-                pending_callgraph_paths: 1,
-                refreshed_files: 2,
-                dead_code_files: Some(3),
-            }),
-            engine: EngineMemory::Running {
-                parses: 4,
-                resolutions: 2,
+    fn a_checkout_estimate_splits_the_planes_and_names_what_it_left_out() {
+        let live = LiveMemory {
+            state_paths: 4,
+            shared_bytes: 100,
+            text_bytes: 50,
+            text_overlay_paths: 1,
+            text_overlay_bytes: 20,
+            callgraph_bytes: 70,
+            changes: 1,
+            pending_callgraph_paths: 1,
+            refreshed_files: 2,
+            dead_code_files: Some(3),
+        };
+        let memory = checkout_estimate(
+            CheckoutMemory {
+                live: Some(live),
+                engine: EngineMemory::Running {
+                    parses: 4,
+                    resolutions: 2,
+                    state_bytes: 10,
+                    bytes: 30,
+                },
             },
-        });
-        assert_eq!(estimate.estimated_bytes, Some(120));
-        assert_eq!(estimate.bytes_status, "partial");
+            Some(40),
+            0,
+        );
         assert_eq!(
-            estimate.not_estimated,
+            (memory.text, memory.callgraph, memory.meaning),
+            (50, 100, 40)
+        );
+        let shared = &memory.shared;
+        assert_eq!(shared.estimated_bytes, Some(110));
+        assert_eq!(shared.bytes_status, "estimated");
+        assert!(shared.not_estimated.is_empty());
+        assert_eq!(shared.counts["search_bytes"], 50);
+        assert_eq!(shared.counts["callgraph_bytes"], 100);
+        assert_eq!(shared.counts["callgraph_engine_bytes"], 30);
+        assert_eq!(shared.counts["semantic_bytes"], 40);
+        assert_eq!(shared.counts["callgraph_engine_parses"], 4);
+        assert_eq!(shared.counts["dead_code_snapshot_files"], 3);
+
+        // Folding adds each share to its plane; the shared part stays.
+        let mut search = MemoryEstimate::estimated(5);
+        let mut callgraph = MemoryEstimate::busy();
+        let mut semantic = MemoryEstimate::estimated(0);
+        let folded = memory.fold_into(&mut search, &mut callgraph, &mut semantic);
+        assert_eq!(folded.estimated_bytes, Some(110));
+        assert_eq!(search.estimated_bytes, Some(55));
+        assert_eq!(semantic.estimated_bytes, Some(40));
+        // A plane today's store could not read still counts the data
+        // layer's share, and says it is partial.
+        assert_eq!(callgraph.estimated_bytes, Some(100));
+        assert_eq!(callgraph.bytes_status, "partial");
+        assert_eq!(callgraph.status, "busy");
+
+        let partial = checkout_estimate(
+            CheckoutMemory {
+                live: Some(live),
+                engine: EngineMemory::Busy,
+            },
+            None,
+            2,
+        );
+        assert_eq!(partial.shared.bytes_status, "partial");
+        assert_eq!(
+            partial.shared.not_estimated,
             [
-                "published_text_membership",
-                "published_call_graph_slices",
-                "changed_file_parses",
-                "refreshed_call_graph",
-                "dead_code_snapshot",
-                "callgraph_engine",
+                "callgraph_engine_busy",
+                "meaning_plane_busy",
+                "locked_parts"
             ]
         );
-        assert_eq!(estimate.counts["callgraph_engine_parses"], 4);
-        assert_eq!(estimate.counts["dead_code_snapshot_files"], 3);
+        assert_eq!(partial.shared.counts["locked_parts"], 2);
 
-        let busy = checkout_estimate(CheckoutMemory {
-            live: None,
-            engine: EngineMemory::Busy,
-        });
-        assert_eq!(busy.status, "busy");
-        assert_eq!(
-            busy.not_estimated,
-            ["checkout_state_busy", "callgraph_engine_busy"]
+        let busy = checkout_estimate(
+            CheckoutMemory {
+                live: None,
+                engine: EngineMemory::Busy,
+            },
+            Some(0),
+            0,
         );
+        assert_eq!(busy.shared.status, "busy");
+        assert_eq!(busy.shared.not_estimated, ["checkout_state_busy"]);
+        assert_eq!((busy.text, busy.callgraph, busy.meaning), (0, 0, 0));
     }
 
     #[test]

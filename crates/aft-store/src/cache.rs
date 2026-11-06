@@ -148,6 +148,25 @@ impl BlockCache {
         }
     }
 
+    /// The bytes the cache holds in memory, measured as [`crate::heap`]
+    /// describes: every cached block in its shared allocation, and the two
+    /// tables that find a block and order blocks by use. `None` while
+    /// another thread holds the cache's lock: the memory census never waits
+    /// for it.
+    #[must_use]
+    pub fn memory_bytes(&self) -> Option<usize> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let mut seen = crate::heap::Seen::new();
+        Some(
+            crate::heap::HeapBytes::heap_bytes(&state.entries, &mut seen)
+                + crate::heap::HeapBytes::heap_bytes(&state.by_use, &mut seen),
+        )
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("block cache lock poisoned")
     }
@@ -194,6 +213,9 @@ impl State {
     }
 }
 
+crate::heap_bytes_none!(FileToken, BlockKey);
+crate::heap_bytes_of_fields!(Entry { bytes, used_at });
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +230,31 @@ mod tests {
 
     fn block(fill: u8) -> Arc<[u8]> {
         Arc::from(vec![fill; BLOCK_LEN])
+    }
+
+    #[test]
+    fn memory_counts_every_block_and_the_tables_that_find_them() {
+        let cache = BlockCache::new(4 * BLOCK_LEN);
+        assert_eq!(cache.memory_bytes(), Some(0));
+        let file = FileToken::next();
+        for index in 0..3 {
+            cache
+                .get_or_load(key(file, index), || Ok::<_, ()>(block(1)))
+                .unwrap();
+        }
+        let measured = cache.memory_bytes().unwrap();
+        let blocks = 3 * (crate::heap::COUNTS + BLOCK_LEN);
+        assert!(measured > blocks, "{measured} <= {blocks}");
+        assert!(
+            measured < blocks + 2048,
+            "tables of three entries: {measured}"
+        );
+        let _held = cache.lock();
+        assert_eq!(
+            cache.memory_bytes(),
+            None,
+            "a held lock is never waited for"
+        );
     }
 
     #[test]

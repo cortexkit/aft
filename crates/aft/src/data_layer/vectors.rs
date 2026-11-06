@@ -1489,6 +1489,64 @@ pub(crate) fn needed_vector_segments(
     Ok(needed)
 }
 
+aft_store::heap_bytes_of_fields!(Coverage {
+    files,
+    files_embedded,
+    files_too_large,
+    files_failed,
+    pending,
+    past_cap,
+    chunks,
+    chunks_embedded,
+    chunks_failed,
+});
+aft_store::heap_bytes_of_fields!(Loaded {
+    generation,
+    _snapshot,
+    shared,
+    maps,
+    other,
+    open,
+});
+aft_store::heap_bytes_of_fields!(SearchFile {
+    path,
+    content,
+    holder,
+});
+aft_store::heap_bytes_of_fields!(Subset { set, positions });
+aft_store::heap_bytes_of_fields!(Members {
+    view,
+    generation,
+    files,
+    members,
+    file_of,
+    chunk_of,
+    set,
+    coverage,
+    subset,
+});
+
+impl VectorPlane {
+    /// What the plane holds in memory, measured as the [`aft_store::heap`]
+    /// module describes: the generation of vectors it loaded last (its
+    /// snapshot, the index of every vector's text digest, each chunk map's
+    /// holder and the segments it opened) and the members it built for the
+    /// view searched last. The vectors themselves are read through the
+    /// shared block cache, which the process counts once. The checkout the
+    /// plane belongs to is counted with the checkout, not here.
+    pub(crate) fn memory(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        use aft_store::heap::HeapBytes as _;
+        let Self {
+            checkout: _,
+            producer: Producer { model, caps: _ },
+            max_files: _,
+            loaded,
+            members,
+        } = self;
+        model.heap_bytes(seen) + loaded.heap_bytes(seen) + members.heap_bytes(seen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1603,6 +1661,41 @@ mod tests {
             "#[test]\nfn opens_the_store() {\n    assert_eq!(demo::open_store(\"ab\"), 4);\n}\n",
         );
         write(root, "README.md", "# Demo\n\nNothing to embed here.\n");
+    }
+
+    /// The plane's memory is what it loaded and built: an unfilled plane
+    /// holds its model's identity alone; a filled and searched one also
+    /// holds the index of every vector's text and the members of the view
+    /// it searched, each at least one entry per vector or member.
+    #[test]
+    fn the_plane_measures_what_it_loaded_and_built() {
+        use aft_store::heap::{heap_bytes_of, Seen};
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let identity = heap_bytes_of(&plane.producer.model);
+        let empty = plane.memory(&mut Seen::new());
+        assert!(empty >= identity);
+
+        fill(&plane, &mut Recorder::default(), 100);
+        let view = checkout.view().unwrap();
+        let snapshot = plane.snapshot(&view).unwrap();
+        let chunks = snapshot.chunks();
+        assert!(chunks > 0);
+        let loaded = heap_bytes_of(&*plane.loaded.lock().unwrap());
+        let members = heap_bytes_of(&*plane.members.lock().unwrap());
+        let vectors = snapshot.loaded.shared.as_ref().unwrap().vectors();
+        assert!(
+            loaded >= vectors * std::mem::size_of::<(TextDigest, aft_store::vector::UnitRef)>(),
+            "{loaded} bytes for {vectors} vectors"
+        );
+        assert!(
+            members >= chunks * std::mem::size_of::<Member>(),
+            "{members} bytes for {chunks} members"
+        );
+        assert_eq!(plane.memory(&mut Seen::new()), identity + loaded + members);
     }
 
     fn bind(store: &Path, root: &Path) -> Arc<Checkout> {

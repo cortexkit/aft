@@ -963,6 +963,18 @@ pub(crate) fn f32s(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+crate::heap_bytes_of_fields!(VectorSegmentParts {
+    model,
+    units,
+    center,
+    scan,
+    vectors,
+    maps,
+    map_data,
+    details_index,
+    details,
+});
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

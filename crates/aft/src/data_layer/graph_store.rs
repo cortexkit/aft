@@ -712,3 +712,16 @@ impl SliceSource for StoredSlices {
         self.paths.keys().cloned().collect()
     }
 }
+
+aft_store::heap_bytes_of_fields!(Located {
+    record_key,
+    record,
+    fragment,
+});
+aft_store::heap_bytes_of_fields!(StoredSlices {
+    segments,
+    paths,
+    by_fragment,
+    cache,
+    failures,
+});
