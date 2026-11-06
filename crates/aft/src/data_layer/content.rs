@@ -39,8 +39,10 @@ use crate::parser::LangId;
 /// as a program start, made a Rust resolution record each workspace crate
 /// name it looked up rather than only the whole crate map, and made a
 /// resolution record each config file it found by its path rather than one
-/// key for every config file.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-7";
+/// key for every config file; 8 stopped parsing minified bundles, and made
+/// a JavaScript workspace package lookup record the looked-up name's key
+/// rather than every member's manifest.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-8";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -74,11 +76,14 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
 
 /// The language the call graph parses the file at `path` as, `"config"`
 /// for resolver configuration it reads raw, or `None` for a file the call
-/// graph does not read.
+/// graph does not read, a minified bundle among them.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
         return Some("config".to_string());
+    }
+    if crate::file_kind::is_minified(path, source) {
+        return None;
     }
     let path = Path::new(path);
     let language = if path.extension().is_some_and(|extension| extension == "h") {

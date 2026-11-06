@@ -2160,6 +2160,20 @@ impl Checkout {
             .len()
     }
 
+    /// How many files the call graph resolved again, or dropped, since the
+    /// publication: what the engine holds until the changes are published.
+    #[must_use]
+    pub fn refreshed_files(&self) -> usize {
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .refreshed
+            .as_ref()
+            .map_or(0, |refreshed| {
+                refreshed.replaced.len() + refreshed.removed.len()
+            })
+    }
+
     /// The incremental state for `published`: every stored resolution, and
     /// the parses and configuration the publication was built from.
     fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
@@ -4353,6 +4367,32 @@ pub fn other() { callee(); }
         let theirs = callers_of(&cold.view().unwrap(), "other/lib.ts", "run");
         assert!(theirs.contains("main"), "{theirs}");
         assert_eq!(ours, theirs);
+    }
+
+    /// A minified bundle is searched by grep but neither parsed for the
+    /// call graph nor left as a gap the call graph does not cover.
+    #[test]
+    fn a_minified_bundle_is_searched_but_not_parsed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "web/app.js",
+            "import { helper } from './vendor.min.js';\nexport function run() { helper(); }\n",
+        );
+        write(
+            root.path(),
+            "web/vendor.min.js",
+            "export function helper(){return 1}export function zzbundled(){helper()}\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        assert_eq!(candidates_for(&view, "zzbundled"), ["web/vendor.min.js"]);
+        let callers = callers_of(&view, "web/vendor.min.js", "helper");
+        assert!(!callers.contains("zzbundled"), "{callers}");
+        assert_eq!(view.status().unparsed, 0, "a bundle is not a gap");
     }
 
     /// A second worktree of a repository stores only what the first one's

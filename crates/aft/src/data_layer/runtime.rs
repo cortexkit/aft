@@ -122,6 +122,13 @@ pub(crate) enum Fresh {
 /// otherwise when the checkout goes quiet.
 const PUBLISH_AT: usize = 64;
 
+/// A refresh also publishes once the call graph has resolved this many files
+/// again since the publication. An edit to a widely used type re-resolves
+/// hundreds of files whose callers' method calls it reaches, and the engine
+/// holds each resolution, about half a megabyte in a large repository, until
+/// the changes are published.
+const PUBLISH_AT_REFRESHED: usize = 256;
+
 /// A checkout whose text and call graph read from more segments than this
 /// is built again whole, which writes everything it reads into one segment
 /// and retires what no other checkout reads; each publication of its
@@ -132,7 +139,8 @@ const COMPACT_AT: usize = 8;
 /// Whether a refresh publishes the changes it resolved.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Publish {
-    /// Only past [`PUBLISH_AT`] changed paths.
+    /// Only past [`PUBLISH_AT`] changed paths, or [`PUBLISH_AT_REFRESHED`]
+    /// files resolved again.
     WhenMany,
     /// Whenever any path changed: the checkout went quiet.
     Always,
@@ -467,7 +475,8 @@ impl Work {
     /// piled up.
     fn maybe_publish(self: &Arc<Self>, publish: Publish) {
         let changed = self.checkout.changed_paths();
-        if changed == 0 || (publish == Publish::WhenMany && changed < PUBLISH_AT) {
+        let many = changed >= PUBLISH_AT || self.checkout.refreshed_files() >= PUBLISH_AT_REFRESHED;
+        if changed == 0 || (publish == Publish::WhenMany && !many) {
             return;
         }
         match self.checkout.publish_changes() {

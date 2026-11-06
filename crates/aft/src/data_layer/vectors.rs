@@ -195,6 +195,11 @@ pub fn cut_file(root: &Path, path: &[u8], bytes: &[u8], caps: EmbedTextCaps) -> 
     let Some(relative) = native_path(path) else {
         return Cut::Failed("the path cannot be named on this platform".to_string());
     };
+    // A minified bundle's chunks say nothing a search could use: it is a
+    // file with nothing to embed, as one the chunker does not read is.
+    if std::str::from_utf8(path).is_ok_and(|path| crate::file_kind::is_minified(path, bytes)) {
+        return Cut::Chunks(Vec::new());
+    }
     match chunk_view_file(root, &relative, bytes, caps) {
         Ok(chunks) => Cut::Chunks(
             chunks
