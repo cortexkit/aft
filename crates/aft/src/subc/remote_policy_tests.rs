@@ -2972,7 +2972,7 @@ fn sibling_plan(siblings: &[&Path], readable: &[&Path]) -> Value {
     }})
 }
 
-/// Core's fetches for a mason launched with a sibling checkout, in core's
+/// Core's fetches for a worker launched with a sibling checkout, in core's
 /// order and with the same plan each time: the launch approval and the plan
 /// composed at the first send, both under the head's scope, then the shell
 /// schema read under the worker's own scope over core's connection. Broca
