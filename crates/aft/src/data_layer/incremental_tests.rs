@@ -297,6 +297,13 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
         ),
         ("app/src/inner.rs", "pub fn help() {}\n"),
         ("tools/src/lib.rs", "pub fn tool() {}\n"),
+        ("web/package.json", r#"{"name":"web"}"#),
+        ("web/tsconfig.json", "{}"),
+        (
+            "web/src/a.ts",
+            "import { b } from './b';\nexport function a() { b(); }\n",
+        ),
+        ("web/src/b.ts", "export function b() {}\n"),
     ];
     let mut after = base.to_vec();
     after.push(("tools/Cargo.toml", "[package]\nname = \"tools\"\n"));
@@ -305,6 +312,7 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
     let readers = LiveCheckout::cold(checkout(&base, &[]), 1)
         .unwrap()
         .binding_readers_of(crate::callgraph_store::join::VIEW_CONFIG_MEMBERSHIP_DOMAIN);
+    eprintln!("config-membership readers: {readers:?}");
     let (stats, cold) = update_checked(
         checkout(&base, &[]),
         checkout(&after, &[]),
