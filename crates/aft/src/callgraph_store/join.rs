@@ -3568,10 +3568,10 @@ impl ViewSurfaceQuery {
 }
 
 /// A resolver index over one file's resolution that records each surface
-/// query it answers. Everything it records for the file ends up in one set
-/// (the binding's surface queries, and its facts), so an answer computed
-/// once for the file is kept and not computed, or recorded, again: a large
-/// file asks the same crate-root and module questions for every reference.
+/// query it answers. The callers gather what every reference of the file
+/// recorded into one set for the whole file, so a question already answered
+/// for this file is not asked, or recorded, again. A large file asks the
+/// same crate-root and module questions for every reference.
 struct ViewSurfaceIndex<'a, I> {
     inner: &'a I,
     queries: std::cell::RefCell<BTreeMap<ViewSurfaceQuery, String>>,
