@@ -1005,7 +1005,8 @@ impl VectorPlane {
     }
 
     /// The vector the family's newest generation holds for `text` under
-    /// this plane's model, if any: for gates that compare stores.
+    /// this plane's model, if any: for measurements that compare the
+    /// vectors of two stores.
     ///
     /// # Errors
     ///
@@ -1654,7 +1655,10 @@ impl VectorPlane {
             members,
             old,
         } = self;
-        model.heap_bytes(seen) + loaded.heap_bytes(seen) + members.heap_bytes(seen) + old.heap_bytes(seen)
+        model.heap_bytes(seen)
+            + loaded.heap_bytes(seen)
+            + members.heap_bytes(seen)
+            + old.heap_bytes(seen)
     }
 }
 

@@ -286,8 +286,8 @@ fn read_section(
         return Err(format!("its vectors have {dimension} dimensions"));
     }
     let rows = input.count()?;
-    let identity =
-        String::from_utf8(input.bytes()?).map_err(|_| "its fingerprint is not UTF-8".to_string())?;
+    let identity = String::from_utf8(input.bytes()?)
+        .map_err(|_| "its fingerprint is not UTF-8".to_string())?;
     compatible(&identity, dimension, configured)?;
 
     let listed = input.count()?;
@@ -426,8 +426,8 @@ fn read_frame(
     if input.u64()? != sequence {
         return Err(format!("frame {sequence} is out of order"));
     }
-    let identity =
-        String::from_utf8(input.bytes()?).map_err(|_| "a frame's fingerprint is not UTF-8".to_string())?;
+    let identity = String::from_utf8(input.bytes()?)
+        .map_err(|_| "a frame's fingerprint is not UTF-8".to_string())?;
     let dimension = input.u32()? as usize;
     compatible(&identity, dimension, configured)?;
     let mut tombstones = HashSet::new();
@@ -445,10 +445,7 @@ fn read_frame(
         return Err("a frame's snapshot has bytes after it".to_string());
     }
     let replaced = section.files.keys().chain(&section.unlisted);
-    if replaced
-        .into_iter()
-        .any(|path| !tombstones.contains(path))
-    {
+    if replaced.into_iter().any(|path| !tombstones.contains(path)) {
         return Err("a frame has rows of a file it does not replace".to_string());
     }
     Ok(Frame::Read {
@@ -859,7 +856,10 @@ mod tests {
 
     /// The model the tests configure.
     fn configured() -> SemanticIndexFingerprint {
-        SemanticIndexFingerprint::for_config_dimension(&SemanticBackendConfig::default(), DIMENSIONS)
+        SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            DIMENSIONS,
+        )
     }
 
     /// The fingerprint as the old index stored it: the model's, with the
@@ -881,11 +881,16 @@ mod tests {
     /// What the old index stored for `text`: unlike [`model_vector`], so a
     /// stored vector tells where it came from.
     fn old_vector(text: &str) -> Vec<f32> {
-        model_vector(text).iter().map(|value| -1.0 - value).collect()
+        model_vector(text)
+            .iter()
+            .map(|value| -1.0 - value)
+            .collect()
     }
 
     fn old_code(kind: &SymbolKind) -> u8 {
-        (0..=10).find(|code| old_kind(*code).as_ref() == Some(kind)).unwrap()
+        (0..=10)
+            .find(|code| old_kind(*code).as_ref() == Some(kind))
+            .unwrap()
     }
 
     fn write(root: &Path, path: &str, text: &str) {
@@ -1076,16 +1081,22 @@ mod tests {
     /// snapshot is left as it was.
     fn fill_over(root: &Path, bytes: &[u8]) -> Filled {
         let storage = tempfile::tempdir().unwrap();
-        let path = storage.path().join("semantic/0123456789abcdef/semantic.bin");
+        let path = storage
+            .path()
+            .join("semantic/0123456789abcdef/semantic.bin");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         let store = tempfile::tempdir().unwrap();
         let family = FamilyId::from_digest(Digest128::of(b"old index tests"));
-        let checkout =
-            Checkout::bind(Arc::new(DataLayer::new(8 << 20, 2)), store.path(), family, root)
-                .unwrap();
+        let checkout = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            store.path(),
+            family,
+            root,
+        )
+        .unwrap();
         checkout.build().unwrap();
         let plane = VectorPlane::new(
             Arc::new(checkout),
@@ -1125,13 +1136,20 @@ mod tests {
         let embedded: BTreeSet<&str> = sent.iter().map(String::as_str).collect();
         assert_eq!(embedded.len(), sent.len(), "a text was embedded twice");
         let filled = Filled { report, sources };
-        assert_eq!(embedded, filled.embedded(), "the model got what was not imported");
+        assert_eq!(
+            embedded,
+            filled.embedded(),
+            "the model got what was not imported"
+        );
         assert_eq!(filled.report.chunks_imported, filled.imported().len());
         assert_eq!(filled.report.chunks_embedded, filled.embedded().len());
 
         // The old snapshot is only read.
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
         let listed: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -1221,7 +1239,10 @@ mod tests {
         old.files[1].1 = *blake3::hash(b"other bytes").as_bytes();
         assert_eq!(old.files[1].0, "src/util.rs");
         let filled = fill_over(root.path(), &snapshot_bytes(&old));
-        assert_eq!(owned(filled.embedded()), texts_of(root.path(), "src/util.rs"));
+        assert_eq!(
+            owned(filled.embedded()),
+            texts_of(root.path(), "src/util.rs")
+        );
         let mut rest = all_texts(root.path());
         rest.retain(|text| !texts_of(root.path(), "src/util.rs").contains(text));
         assert_eq!(owned(filled.imported()), rest);
@@ -1255,7 +1276,11 @@ mod tests {
             change(&mut old.rows[at]);
             let filled = fill_over(root.path(), &snapshot_bytes(&old));
             let chunk = pristine.rows[at].text.clone();
-            assert_eq!(owned(filled.embedded()), BTreeSet::from([chunk.clone()]), "{what}");
+            assert_eq!(
+                owned(filled.embedded()),
+                BTreeSet::from([chunk.clone()]),
+                "{what}"
+            );
             let mut rest = all_texts(root.path());
             rest.remove(&chunk);
             assert_eq!(owned(filled.imported()), rest, "{what}");
@@ -1271,7 +1296,10 @@ mod tests {
         let mut old = old_of(root.path());
         old.refused.push("tool/main.py".to_string());
         let filled = fill_over(root.path(), &snapshot_bytes(&old));
-        assert_eq!(owned(filled.embedded()), texts_of(root.path(), "tool/main.py"));
+        assert_eq!(
+            owned(filled.embedded()),
+            texts_of(root.path(), "tool/main.py")
+        );
     }
 
     /// Frames a refresh appended replace their files' rows; a final frame

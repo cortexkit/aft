@@ -35,6 +35,7 @@ fn ms(started: Instant) -> f64 {
 }
 
 /// The process's peak resident memory so far, in bytes.
+#[cfg(unix)]
 fn peak_rss() -> u64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage writes the struct it is given.
@@ -49,6 +50,12 @@ fn peak_rss() -> u64 {
     } else {
         max * 1024
     }
+}
+
+/// The process's peak resident memory so far; not measured here.
+#[cfg(not(unix))]
+fn peak_rss() -> u64 {
+    0
 }
 
 /// Binds `root` to a fresh store at `store` and builds it.
@@ -97,7 +104,13 @@ fn chunks_of(root: &Path, fingerprint: &SemanticIndexFingerprint) -> BTreeMap<St
     let listed = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .output()
         .unwrap();
     let mut chunks = BTreeMap::new();
@@ -206,8 +219,7 @@ fn main() {
         config.max_files,
     )
     .reusing_old_index(OldIndex::of_checkout(&storage, &root, fingerprint.clone()));
-    let (imported_report, imported_ms, imported_sent) =
-        fill("imported", &imported, &model, budget);
+    let (imported_report, imported_ms, imported_sent) = fill("imported", &imported, &model, budget);
     let rss_after_import = peak_rss();
 
     let embedded_checkout = bind(&layer, &work.join("embedded"), &root);
