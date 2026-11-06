@@ -724,8 +724,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        if self.ctx.lexical_views_enabled()
-            || crate::data_layer::tools::search::DataText::ready(self.ctx).is_some()
+        if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some()
         {
             return extensions::ReadinessWait::Completed;
         }
@@ -901,7 +900,7 @@ fn handle_semantic_search_with_disk_fallback(
     allow_disk_fallback: bool,
 ) -> Response {
     let config = ctx.config();
-    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
+    let _pin = false.then(|| ctx.pin_config_to(config));
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {

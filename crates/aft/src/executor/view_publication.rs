@@ -353,41 +353,6 @@ pub(crate) fn running_for(ctx: &AppContext) -> bool {
     })
 }
 
-/// What the queued or running view publications for `ctx` have yet to
-/// install: `None` when none is running, otherwise the root-relative paths
-/// they carry. An empty set means a publication of the whole checkout (after
-/// lost watcher events or an ignore-rule change, for example), whose changed
-/// files are not known in advance.
-pub(crate) fn unpublished_paths_for(ctx: &AppContext) -> Option<BTreeSet<Vec<u8>>> {
-    let address = ctx as *const AppContext as usize;
-    let jobs = JOBS.lock();
-    let mut running = jobs
-        .values()
-        .filter(|job| {
-            job.context == address
-                || job
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| Arc::as_ptr(&pending.target.ctx) as usize == address)
-        })
-        .peekable();
-    running.peek()?;
-    let mut paths = BTreeSet::new();
-    for job in running {
-        if job.paths.is_empty() {
-            return Some(BTreeSet::new());
-        }
-        paths.extend(job.paths.iter().cloned());
-        if let Some(pending) = &job.pending {
-            if pending.paths.is_empty() {
-                return Some(BTreeSet::new());
-            }
-            paths.extend(pending.paths.iter().cloned());
-        }
-    }
-    Some(paths)
-}
-
 /// True when [`schedule`] called on this thread for `ctx` hands the work to a
 /// detached worker instead of publishing inline on the calling thread.
 pub(crate) fn detaches_for(ctx: &AppContext) -> bool {
@@ -675,9 +640,7 @@ pub(crate) fn schedule_with_reason(
     // A root whose reads all go through its v3 checkout views has no reader
     // of the content-addressed v1 view, so nothing is assembled, put into
     // the v1 blob store or published for it.
-    if ctx.views_route_root() {
-        return Ok(());
-    }
+    
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
         if ctx
@@ -783,10 +746,8 @@ pub(crate) fn schedule_with_reason(
                     Some("publication cancellation was requested")
                 } else if target.ctx.configure_content_generation() != content_generation {
                     Some("view configuration was replaced")
-                } else if !target.ctx.config().views.enabled {
-                    Some("views were disabled")
                 } else {
-                    None
+                    Some("views were disabled")
                 };
                 if let Some(_reason) = stop_reason {
                     #[cfg(test)]
@@ -902,14 +863,8 @@ pub(crate) fn schedule_with_reason(
                         // would leave readers attached to a vanished checkout.
                         let stop_reason = if target.ctx.retire_deleted_view_root() {
                             Some("view root was retired")
-                        } else if target.ctx.view_runtime_snapshot().is_none() {
-                            Some("view runtime was removed")
-                        } else if token.cancel_requested_before_commit() {
-                            Some("publication cancellation was requested")
-                        } else if target.ctx.configure_content_generation() != content_generation {
-                            Some("view configuration was replaced")
                         } else {
-                            None
+                            Some("view runtime was removed")
                         };
                         if let Some(_reason) = stop_reason {
                             #[cfg(test)]

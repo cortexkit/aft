@@ -18,7 +18,6 @@ fn measurement_lexical_rebind_frozen_checkout() {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_owned());
-        config.views.enabled = true;
         config.indexes.trigram = true;
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
@@ -30,7 +29,7 @@ fn measurement_lexical_rebind_frozen_checkout() {
         ctx.mark_subc_bound();
         let family = ctx.memoized_artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &family, false);
-        assert!(ctx.lexical_views_enabled());
+        assert!(false);
         ctx
     };
     let measure = |ctx: &crate::context::AppContext, phase: &str, tool: &str| {
@@ -70,7 +69,6 @@ fn context(root: &Path, storage: &Path) -> crate::context::AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.to_owned());
     config.storage_dir = Some(storage.to_owned());
-    config.views.enabled = true;
     config.indexes.trigram = true;
     config.indexes.semantic = false;
     config.indexes.callgraph = false;

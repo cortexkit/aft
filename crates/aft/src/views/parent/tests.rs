@@ -108,7 +108,6 @@ fn child_view_failures_reach_the_parent_roots_health() {
         storage_dir: Some(storage.path().to_path_buf()),
         ..crate::config::Config::default()
     };
-    config.views.enabled = true;
     let ctx =
         crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let health = ctx.try_health_snapshot(&root);
@@ -154,7 +153,6 @@ fn cold_parent_search_scans_unpublished_children_and_respects_scope() {
     let storage = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
-    config.views.enabled = true;
     let ctx =
         crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     assert!(prepare(&root, PLANES));

@@ -7,55 +7,6 @@ use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 use crate::views::semantic_runtime::CoordinationState;
 
 // Operator-only copy: never use these lines as fill errors or agent reply reasons.
-const PENDING_REASON: &str =
-    "Waiting for another AFT process that is embedding the same new code; results will follow.";
-const ERROR_REASON: &str = "Can't coordinate embedding with other AFT processes";
-
-fn coordination_detail(detail: &str) -> String {
-    let redacted = crate::log_redact::aft_redactor(detail);
-    let single_line = redacted
-        .chars()
-        .map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    single_line.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn project_semantic_coordination(info: &mut serde_json::Value, state: CoordinationState) {
-    match state {
-        CoordinationState::Contended => {
-            info["pending_reason"] = serde_json::json!(PENDING_REASON);
-        }
-        CoordinationState::BaseBusy { owner_pid, attempt } => {
-            info["pending_reason"] = serde_json::json!(PENDING_REASON);
-            info["pending_owner"] = serde_json::json!({
-                "kind": "base_claim", "pid": owner_pid, "attempt": attempt,
-            });
-        }
-        CoordinationState::Error { failure, retry_in } => {
-            let detail = coordination_detail(&failure.detail);
-            let line = match retry_in {
-                Some(wait) => format!(
-                    "{ERROR_REASON}: {detail}. Retrying in {}.",
-                    crate::lsp::manager::format_retry_delay(wait)
-                ),
-                None => format!("{ERROR_REASON}: {detail}. No retry is scheduled."),
-            };
-            info["pending_reason"] = serde_json::json!(line);
-            info["coordination_error"] = serde_json::json!({
-                "state": "error", "kind": failure.kind_label(), "reason": ERROR_REASON,
-                "detail": detail, "retryable": failure.retryable,
-                "retry_scheduled": retry_in.is_some(),
-                "retry_in_ms": retry_in.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
-            });
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CompressionStats {
@@ -361,18 +312,7 @@ impl AppContext {
             semantic_index_info
         };
 
-        if config.views.enabled && config.indexes.semantic {
-            if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(
-                runtime,
-            ))) = self.checkout_semantic().try_state()
-            {
-                if let Some(coordination) = runtime.coordination_state() {
-                    // Existing semantic vectors remain queryable; expose coordination
-                    // diagnostics only in operator status output.
-                    project_semantic_coordination(&mut semantic_index_info, coordination);
-                }
-            }
-        }
+        
 
         // Disk cache sizes — scoped to the **current project** only.
         //
@@ -659,10 +599,7 @@ impl AppContext {
                 "checkpoints": session_checkpoints,
             },
         });
-        if config.views.enabled {
-            payload["views"] = serde_json::to_value(self.view_health_snapshot())
-                .unwrap_or(serde_json::Value::Null);
-        }
+        
         // With the data layer on, its planes replace today's stores for text
         // and the call graph on every status surface.
         if let Some(report) = &data_store_report {
@@ -899,7 +836,6 @@ mod tests {
             let mut config = Config::default();
             config.project_root = Some(dir.path().to_path_buf());
             config.storage_dir = Some(dir.path().join("storage"));
-            config.views.enabled = views;
             config.indexes.semantic = semantic;
             let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
             crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.set(0));

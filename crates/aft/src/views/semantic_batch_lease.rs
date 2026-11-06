@@ -51,13 +51,6 @@ impl LeaseError {
         }
     }
 
-    pub(crate) fn kind_label(&self) -> &'static str {
-        match self.kind {
-            LeaseErrorKind::MalformedOwner => "malformed_owner",
-            LeaseErrorKind::Storage(_) => "storage",
-            LeaseErrorKind::OwnershipLost => "ownership_lost",
-        }
-    }
 }
 
 impl fmt::Display for LeaseError {

@@ -859,7 +859,6 @@ mod disk_reserve_tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_path_buf());
-        config.views.enabled = true;
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,

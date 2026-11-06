@@ -841,7 +841,7 @@ fn handle_inspect_payload(
     // With views on, the graph-backed categories read the checkout's v3 view,
     // pinned once for this request; an unavailable view is reported, never
     // replaced by the legacy scanner's store.
-    let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
+    let v3_routed = false;
     let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
         request_deadline.map_or_else(
             || ctx.callgraph_store_for_query_without_wait(),
@@ -925,7 +925,7 @@ fn handle_inspect_payload(
     // Reuse the blocking request's inventory, or collect it once for a warm
     // request. Explaining an unavailable view must not walk the project again.
     let checkout_view_files =
-        (needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed).then(|| {
+        false.then(|| {
             observed_stats
                 .map(|stats| {
                     stats
@@ -939,22 +939,10 @@ fn handle_inspect_payload(
                 })
         });
     let checkout_store =
-        if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
-            manager.current_checkout_view(
-                &snapshot,
-                checkout_view_files.as_deref().unwrap_or_default(),
-                observed_stats.map(|stats| stats.0.as_slice()),
-            )
-        } else {
+        {
             checkout_store
         };
-    let view_callgraph_observation = if needs_ephemeral_view
-        && snapshot.config.views.enabled
-        && !checkout_routed
-        && checkout_store.is_none()
-    {
-        Some(crate::feature_status::observe_callgraph_query_with_contention(ctx))
-    } else if checkout_store.is_none() {
+    let view_callgraph_observation = if checkout_store.is_none() {
         routed_observation
     } else {
         None
@@ -962,13 +950,8 @@ fn handle_inspect_payload(
     // A v3-routed request scans only with a reader in hand; without one its
     // graph-backed categories report the gap below rather than running the
     // legacy reuse scanner.
-    let use_checkout_view = (needs_ephemeral_view || v3_routed)
-        && snapshot.config.views.enabled
-        && (checkout_store.is_some() || (checkout_routed && !v3_routed));
-    let checkout_view_unavailability = (needs_ephemeral_view
-        && snapshot.config.views.enabled
-        && !checkout_routed
-        && checkout_store.is_none())
+    let use_checkout_view = false;
+    let checkout_view_unavailability = false
     .then(|| {
         manager.checkout_view_unavailability(
             &snapshot,
@@ -1225,7 +1208,6 @@ fn handle_inspect_payload(
                     JobOutcome::Failed { message } => message.clone(),
                     JobOutcome::Stale { .. } => "cached analysis freshness could not be verified".into(),
                     _ if reserve_reason.is_some() => reserve_reason.unwrap().clone(),
-                    _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
@@ -1285,7 +1267,7 @@ fn handle_inspect_payload(
                 };
                 // Enabling checkout views requests real scoped Tier-2 analysis.
                 // A missing or stale view is a gap, not an intentional skip.
-                if !snapshot.config.views.enabled {
+                {
                     payload["not_computed"] = Value::Bool(true);
                 }
                 *outcome = JobOutcome::Fresh { payload };
@@ -8561,7 +8543,6 @@ mod deferred_terminal_tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_path_buf());
-        config.views.enabled = false;
         config.indexes.trigram = false;
         config.indexes.semantic = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
@@ -9462,7 +9443,6 @@ mod deferred_terminal_tests {
         .unwrap();
         let ctx = deferred_test_context(&root);
         let mut config = ctx.config().as_ref().clone();
-        config.views.enabled = false;
         config.indexes.callgraph = true;
         let snapshot = InspectSnapshot::new(
             root.clone(),

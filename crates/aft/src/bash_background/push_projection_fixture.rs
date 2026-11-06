@@ -33,7 +33,6 @@ fn build() -> BusyRoot {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.storage_dir = Some(storage.clone());
-    config.views.enabled = true;
     let ctx = Arc::new(AppContext::from_app(app.clone(), config));
     ctx.set_canonical_cache_root(root.clone());
     let key = ctx.memoized_artifact_cache_key(&root);

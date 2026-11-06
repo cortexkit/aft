@@ -5713,105 +5713,6 @@ fn checkout_idle_policy_path(paths: &StoragePaths, root: &Path) -> PathBuf {
     ))
 }
 
-/// Update the last-use time for every active view in a checkout, including
-/// views the current call does not read. One busy checkout writes at most
-/// once a minute; changing its timeout is persisted immediately unless a
-/// previous failure is backing off. Lock contention leaves the touch pending.
-pub(crate) fn touch_view_checkout(
-    paths: &StoragePaths,
-    family: &str,
-    root: &Path,
-    hours: u32,
-    now: u64,
-) -> io::Result<()> {
-    #[derive(Clone, Copy)]
-    enum Attempt {
-        Written { at: u64, hours: u32 },
-        Failed { at: u64 },
-    }
-    type Key = (PathBuf, PathBuf, String, PathBuf);
-    type Stamp = Arc<Mutex<Option<Attempt>>>;
-    static WRITTEN: OnceLock<Mutex<HashMap<Key, Stamp>>> = OnceLock::new();
-    let key = (
-        paths.durable.clone(),
-        paths.artifacts.clone(),
-        family.to_owned(),
-        root.to_owned(),
-    );
-    let stamp = WRITTEN
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(key)
-        .or_default()
-        .clone();
-    // Another request may already be doing the touch. Do not wait behind its
-    // registry or filesystem I/O on the request path.
-    let mut attempt = match stamp.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
-    };
-    let recent = |at| now >= at && now - at < 60_000;
-    if attempt.is_some_and(|attempt| match attempt {
-        Attempt::Written { at, hours: policy } => policy == hours && recent(at),
-        Attempt::Failed { at } => recent(at),
-    }) {
-        return Ok(());
-    }
-    let result = (|| -> io::Result<bool> {
-        #[cfg(test)]
-        test_hook(&paths.artifacts, "views-checkout-touch-attempt");
-        let policy = checkout_idle_policy_path(paths, root);
-        let registry_path = paths
-            .artifacts
-            .join("blobs/v3")
-            .join(family)
-            .join("members.sqlite");
-        if registry_path.try_exists()? {
-            let v3 = |e: crate::blob_store::v3::Error| io::Error::other(e.to_string());
-            let lock = match crate::blob_store::v3::ReservationLock::acquire_until(
-                &paths.artifacts,
-                Instant::now(),
-            ) {
-                Ok(lock) => lock,
-                Err(error) if reservation_lock_busy(&error) => return Ok(false),
-                Err(error) => return Err(v3(error)),
-            };
-            let mut registry = crate::blob_store::v3::RegistryWriter::open_for_barrier(
-                &paths.artifacts,
-                family,
-                &lock,
-            )
-            .map_err(v3)?;
-            registry.with_barrier(|tx| {
-            tx.execute(
-                "UPDATE members SET last_bind_ms=MAX(last_bind_ms,?2) WHERE kind='view' AND root=?1 AND state='active'",
-                rusqlite::params![crate::blob_store::v3::encode_root(root), now],
-            )?;
-            atomic_json(&policy, &hours)?;
-            Ok(())
-        }).map_err(v3)?;
-        } else {
-            // Configure can precede the first view registration. Do not create a
-            // v3 namespace just to remember the checkout's policy.
-            atomic_json(&policy, &hours)?;
-        }
-        Ok(true)
-    })();
-    match result {
-        Ok(true) => *attempt = Some(Attempt::Written { at: now, hours }),
-        Ok(false) => {}
-        Err(error) => {
-            // The caller logs this error. Suppress both another attempt and
-            // another warning until the checkout's next one-minute window.
-            *attempt = Some(Attempt::Failed { at: now });
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
 fn v3_member(tx: &rusqlite::Transaction<'_>, scope: &str) -> rusqlite::Result<Option<V3Member>> {
     use rusqlite::OptionalExtension;
     tx.query_row(
@@ -15171,7 +15072,6 @@ mod v3_collector_tests {
             storage_dir: Some(temp.join("storage")),
             ..Default::default()
         };
-        config.views.enabled = true;
         config.idle.checkout_hours = 1;
         config.indexes.semantic = false;
         let ctx = crate::context::AppContext::new(

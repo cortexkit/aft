@@ -889,7 +889,6 @@ impl ExternalSearch {
         config.project_root = Some(root.to_path_buf());
         config.storage_dir = Some(storage);
         // The engine reads only the pinned checkout, never a view of its own.
-        config.views.enabled = false;
         config.indexes.trigram = true;
         config.indexes.semantic = session.indexes.semantic;
         config.indexes.callgraph = false;

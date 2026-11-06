@@ -100,7 +100,6 @@ fn synthetic_bound_roots() {
             experimental_bash_background: true,
             ..Default::default()
         };
-        config.views.enabled = true;
         let ctx = Arc::new(AppContext::from_app(app.clone(), config));
         ctx.mark_subc_bound();
         let req = serde_json::from_value(json!({

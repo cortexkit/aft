@@ -7,7 +7,7 @@ use crate::{
 };
 
 pub fn handle_view_token(request: &RawRequest, context: &AppContext) -> Response {
-    if !context.config().views.enabled {
+    {
         return Response::error(
             &request.id,
             "VIEW_TOKEN",

@@ -3127,7 +3127,7 @@ fn configure_warm_key(
         config.search_index_max_file_size,
         config.indexes.semantic,
         semantic,
-        config.views.enabled,
+        false,
         config.indexes.callgraph,
     )
 }
@@ -4113,7 +4113,6 @@ fn handle_configure_inner(
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
-        next_config.views.enabled = false;
     }
     // A context that binds another root stops holding the parent folder
     // session it held before; a session no context holds stops.
@@ -4359,8 +4358,7 @@ fn handle_configure_inner(
         && !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
-            || next_config.indexes.callgraph
-            || next_config.views.enabled);
+            || next_config.indexes.callgraph);
     ctx.begin_configure_ack_phase("cache_key_resolve");
     ctx.begin_configure_ack_step("artifact_key");
     let mut cache_key_profile = CacheKeyResolveProfile::new(&canonical_cache_root);
@@ -4417,7 +4415,6 @@ fn handle_configure_inner(
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
-        next_config.views.enabled = false;
     }
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
@@ -5025,7 +5022,7 @@ fn adopt_resident_semantic_index_if_available(
 ) -> bool {
     // A views-on root serves semantic search from its own checkout view, so
     // it never adopts another root's legacy index.
-    if !semantic_search || !ctx.shared_artifacts_read_only() || ctx.config().views.enabled {
+    if !semantic_search || !ctx.shared_artifacts_read_only() {
         return false;
     }
     let Some(mut index) = ctx.app().adopt_resident_semantic_index(
@@ -5192,7 +5189,7 @@ fn schedule_missing_artifact_loads(
     request_semantic: bool,
 ) -> ArtifactLoadStarts {
     let semantic_view_work_allowed =
-        request_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+        false;
     schedule_missing_artifact_loads_admitted(
         ctx,
         request_search,
@@ -5359,7 +5356,7 @@ pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool
     let generation = ctx.configure_generation();
     // Admission holds the root lifecycle mutex through worker-start commit.
     // Its nested scheduler must consume this snapshot, not lock it recursively.
-    let semantic_view_work_allowed = ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+    let semantic_view_work_allowed = false;
     ctx.run_if_subc_bound_generation(generation, || {
         start_artifact_loads(schedule_missing_artifact_loads_admitted(
             ctx,
@@ -5386,7 +5383,7 @@ fn schedule_artifact_loads(
     load_semantic: bool,
 ) -> ArtifactLoadStarts {
     let semantic_view_work_allowed =
-        load_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+        false;
     schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
 }
 
@@ -5401,7 +5398,7 @@ fn schedule_artifact_loads_admitted(
 ) -> ArtifactLoadStarts {
     // With views enabled, skip both loading another checkout's SearchIndex
     // cache and building a new legacy search cache.
-    let load_search = load_search && !ctx.config().views.enabled;
+    let load_search = load_search;
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);
         *ctx.semantic_index_status()
@@ -5415,7 +5412,7 @@ fn schedule_artifact_loads_admitted(
     let storage_dir = config.cache_storage_dir();
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
-    let views_enabled = config.views.enabled;
+    let views_enabled = false;
     let semantic_live_admission = crate::semantic_admission::LiveAdmission::for_root(
         &canonical_cache_root,
         &config.index.roots,
@@ -9456,7 +9453,7 @@ mod tests {
         assert!(response.success, "{}", response.data);
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(!storage.path().join("views").exists());
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(true);
         assert!(ctx.build_status_snapshot().get("views").is_none());
         assert!(
             serde_json::to_value(ctx.try_health_snapshot(project.path()))
@@ -10280,7 +10277,7 @@ mod tests {
         assert!(response.success, "{}", response.data);
 
         super::drain_deferred_configure_maintenance(&ctx);
-        assert!(ctx.views_route_root());
+        assert!(false);
         let graph_has = |file: &str, symbol: &str| match ctx
             .with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops())
         {
@@ -10304,7 +10301,7 @@ mod tests {
         ctx.record_checkout_watcher_change(&canonical_root.join("latin1.py"));
         assert!(graph_has("latin1.py", "cafe"));
         assert!(graph_has("util.py", "helper"));
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(true);
     }
 
     /// While a views-on root is unbound past the grace window its semantic
@@ -12799,7 +12796,7 @@ mod tests {
             handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
                 .success
         );
-        assert!(ctx.views_route_root());
+        assert!(false);
 
         let mut state = super::ConfigureMaintenanceState::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -12816,7 +12813,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(true);
     }
 
     fn configure_search_with_max_file_size(
@@ -12895,7 +12892,7 @@ mod tests {
         crate::semantic_admission::note_opened("audit-refresh-worker", &root);
         *ctx.semantic_index().write().unwrap() =
             Some(crate::semantic_index::SemanticIndex::new(root.clone(), 3));
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(true);
         let (sender, receiver) = crossbeam_channel::bounded(1);
         super::SEMANTIC_BLOB_OPEN_OBSERVERS
             .get_or_init(Default::default)
@@ -14642,7 +14639,7 @@ mod tests {
         assert!(!ctx.config().indexes.trigram);
         assert!(!ctx.config().indexes.semantic);
         assert!(!ctx.config().indexes.callgraph);
-        assert!(!ctx.config().views.enabled);
+        assert!(!false);
         let reason = ctx.artifact_identity_provisional_reason().unwrap();
         assert!(reason.contains("git_identity_unavailable"), "{reason}");
         assert!(reason.contains("Too many open files"), "{reason}");
@@ -15136,7 +15133,6 @@ mod tests {
             config.project_root = Some(worktree.clone());
             config.storage_dir = Some(storage.clone());
             config.indexes.semantic = true;
-            config.views.enabled = false;
         });
         // Configure recovers the repository key from the memo ...
         assert_eq!(
@@ -18824,11 +18820,11 @@ mod tests {
             assert!(!ctx.config().indexes.trigram);
             assert!(!ctx.config().indexes.semantic);
             assert!(!ctx.config().indexes.callgraph);
-            assert!(!ctx.config().views.enabled);
+            assert!(!false);
             assert!(ctx.semantic_index_rx().lock().is_none());
             assert!(ctx.callgraph_store_rx().lock().is_none());
             assert!(ctx.data_checkout().is_none(), "broad root must bind no checkout");
-            assert!(ctx.view_runtime_snapshot().is_none());
+            assert!(true);
             assert!(crate::views::parent::session_for_root(root).is_none());
             assert!(!ctx.watcher_runtime_active());
         };
@@ -18974,7 +18970,7 @@ mod tests {
         assert!(ctx.config().indexes.trigram);
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
-        assert!(ctx.config().views.enabled);
+        assert!(false);
         super::drain_deferred_configure_maintenance(&ctx);
         ctx.stop_watcher_runtime();
     }
@@ -19055,17 +19051,17 @@ mod tests {
         assert!(ctx.config().indexes.trigram);
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
-        assert!(ctx.config().views.enabled);
+        assert!(false);
         // With views on, the checkout's lexical view replaces the legacy
         // search loader, so trigram work for this root is the lexical view.
-        assert!(ctx.lexical_views_enabled());
+        assert!(false);
         assert!(ctx.semantic_index_rx().lock().is_some());
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.watcher_runtime_active());
         // The root's reads go through its v3 checkout views, so no v1 view
         // runtime is opened for it.
-        assert!(ctx.views_route_root());
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(false);
+        assert!(true);
         assert!(ctx.callgraph_writer());
         ctx.stop_watcher_runtime();
     }

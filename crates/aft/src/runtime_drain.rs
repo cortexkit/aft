@@ -32,7 +32,6 @@ pub const WATCHER_PATH_DRAIN_BATCH_CAP: usize = 2_048;
 pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
 // View assembly may waste one superseded build, but it must not inherit the
 // semantic embedder's human-edit debounce before publishing callgraph data.
-const VIEW_PUBLICATION_QUIET_WINDOW: Duration = Duration::from_secs(1);
 const IGNORE_RULE_REFRESH_QUIET_WINDOW: Duration = Duration::from_secs(5);
 const IGNORE_RULE_CHANGED_PATHS_RETAINED: usize = 8;
 const IGNORE_RULE_CHANGED_PATHS_LOGGED: usize = 3;
@@ -1276,37 +1275,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         let _ = crate::commands::configure::ensure_ready_semantic_refresh_worker(ctx);
     }
 
-    if terminal
-        && ctx.config().views.enabled
-        && matches!(
-            &*ctx
-                .semantic_index_status()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            SemanticIndexStatus::Ready { .. }
-        )
-    {
-        // A refresh completing only matters to the view for the paths whose
-        // semantic plane was still pending; republishing the whole checkout
-        // on every refresh re-derived every entry and rescanned the live index
-        // for nothing (soak finding, 2026-09-12).
-        if let Some(pending) = semantic_ready_view_publication_paths(
-            ctx.view_runtime_snapshot()
-                .map(|snapshot| snapshot.pending_paths),
-        ) {
-            if let Err(error) = crate::executor::view_publication::schedule_with_reason(
-                ctx,
-                pending,
-                true,
-                crate::views::publication_reason::Reason {
-                    events: crate::views::publication_reason::Reason::SEMANTIC,
-                    ..Default::default()
-                },
-            ) {
-                aft::slog_warn!("semantic-ready view publication failed: {}", error);
-            }
-        }
-    }
+    
 
     if disconnected && !terminal {
         let committed =
@@ -2411,11 +2380,7 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
 fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
     // A views-routed root reads its call graph from its v3 view only, so no
     // legacy store refresh runs for it.
-    ctx.views_route_root()
-        || ctx.config().views.enabled
-            && ctx
-                .view_runtime_snapshot()
-                .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
+    false
 }
 
 fn enqueue_legacy_callgraph_refresh_for_watcher(
@@ -3163,11 +3128,6 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_reason.periodic = true;
         state.view_publication_due = Some(Instant::now());
     }
-    if !ctx.config().views.enabled
-        || !matches!(state.phase, WatcherDrainPhase::Collect)
-        || state
-            .view_publication_due
-            .is_none_or(|due| Instant::now() < due)
     {
         return;
     }
@@ -3181,7 +3141,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_reason = Default::default();
         return;
     }
-    if ctx.view_runtime_snapshot().is_none() {
+    {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
         state.view_publication_full = false;
@@ -3230,7 +3190,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             state.view_publication_due = None;
         }
         Err(error) => {
-            if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
+            if ctx.retire_deleted_view_root() || true {
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
                 state.view_publication_full = false;
@@ -3649,18 +3609,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_refresh_due = None;
             state.ignore_changed_paths.clear();
             state.ignore_changed_path_count = 0;
-            if ctx.config().views.enabled {
-                // Lost events: the checkout may have changed in any way.
-                ctx.note_checkout_changed_for_callgraph();
-                ctx.reset_view_publication_retry();
-                state.view_publication_paths.clear();
-                state.view_publication_full = true;
-                // An earlier publication can consume the event's reason while
-                // a follow-up rescan remains pending. Record the completed rescan's cause.
-                state.view_publication_reason.events |=
-                    crate::views::publication_reason::Reason::RESCAN;
-                state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
-            }
+            
         }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
@@ -3684,24 +3633,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_refresh_due = None;
                 state.ignore_changed_paths.clear();
                 state.ignore_changed_path_count = 0;
-                if ctx.config().views.enabled {
-                    // Changed ignore rules change which files the checkout has.
-                    ctx.note_checkout_changed_for_callgraph();
-                    if ctx.views_route_root() {
-                        // The v3 checkout views reconcile their membership
-                        // in full at their next read.
-                        ctx.record_checkout_watcher_overflow();
-                    }
-                    ctx.reset_view_publication_retry();
-                    state.view_publication_paths.clear();
-                    state.view_publication_full = true;
-                    // File edits can publish before the ignore refresh finishes
-                    // and consume its recorded reason. Record the completed refresh's cause.
-                    state.view_publication_reason.events |=
-                        crate::views::publication_reason::Reason::IGNORE;
-                    state.view_publication_due =
-                        Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
-                }
+                
             }
         }
 
@@ -3726,26 +3658,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
             } else {
-                let git_head_paths = if ctx.config().views.enabled {
-                    ctx.refresh_view_head_for_watcher(paths.make_contiguous())
-                } else {
-                    BTreeSet::new()
-                };
-                if !git_head_paths.is_empty() {
-                    state.view_publication_reason.events |=
-                        crate::views::publication_reason::Reason::HEAD_METADATA;
-                }
-                paths.retain(|path| !git_head_paths.contains(path));
-                if ctx.config().views.enabled {
-                    // An edit or a HEAD move: the main checkout's call graph no
-                    // longer answers for a linked worktree, even before the
-                    // change is published.
-                    ctx.note_checkout_changed_for_callgraph();
-                    ctx.reset_view_publication_retry();
-                    state.view_publication_paths.extend(paths.iter().cloned());
-                    state.view_publication_due =
-                        Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
-                }
                 state.path_slice_count += 1;
                 state.scheduler_changed_path_count = if ignore_changed {
                     paths.len().max(1)
@@ -7171,7 +7083,6 @@ mod watcher_slice_tests {
         let _env = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
-        ctx.update_config(|config| config.views.enabled = true);
         tx.send(WatcherDispatchEvent::Paths(vec![temp
             .path()
             .join("changed.rs")]))
@@ -7204,10 +7115,9 @@ mod watcher_slice_tests {
         let (ctx, tx) = context_with_watcher(root.path());
         ctx.update_config(|config| {
             config.indexes.callgraph = true;
-            config.views.enabled = true;
         });
         ctx.set_cache_writer_capabilities(false, false);
-        assert!(ctx.views_route_root());
+        assert!(false);
         reset_legacy_watcher_refreshes_for_test();
         tx.send(WatcherDispatchEvent::Paths(vec![root
             .path()
@@ -7229,9 +7139,8 @@ mod watcher_slice_tests {
         }
         drain_watcher_to_completion_for_test(&ctx, 1);
         assert_eq!(ctx.view_publication_attempts_for_test(), 0);
-        assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(true);
 
-        ctx.update_config(|config| config.views.enabled = false);
         tx.send(WatcherDispatchEvent::Paths(vec![root
             .path()
             .join("legacy.rs")]))

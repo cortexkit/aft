@@ -85,128 +85,6 @@ pub(crate) struct VerifiedCallgraphFile {
     expected_key: String,
 }
 
-fn verification_stat(path: &std::path::Path) -> std::io::Result<(u64, std::time::SystemTime)> {
-    #[cfg(test)]
-    VERIFICATION_IO.with(|io| {
-        let mut count = io.get();
-        count.files_statd += 1;
-        io.set(count);
-    });
-    let metadata = std::fs::metadata(path)?;
-    Ok((metadata.len(), metadata.modified()?))
-}
-
-/// Stat-first verification of an immutable manifest. The owner clears `verified`
-/// on the same watcher invalidation ticket used by search verification, so an
-/// event always rechecks content even if a writer preserved size and mtime.
-/// Blocking inspect can reuse its already collected root stats instead of
-/// issuing another metadata walk just for this reader.
-pub(crate) fn callgraph_paths_match_cached(
-    manifest: &super::Manifest,
-    root: &std::path::Path,
-    paths: &[PathBuf],
-    observed: Option<&[(PathBuf, u64, std::time::SystemTime)]>,
-    verified: &mut std::collections::BTreeMap<PathBuf, VerifiedCallgraphFile>,
-) -> super::Result<bool> {
-    let observed = observed.map(|files| {
-        files
-            .iter()
-            .map(|(path, size, modified)| (path.as_path(), (*size, *modified)))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    });
-    for path in paths {
-        let Ok(relative) = path.strip_prefix(root) else {
-            note_checkout_verification_refusal!(
-                "verification_root_mismatch: path={path:?} root={root:?}"
-            );
-            return Ok(false);
-        };
-        let key = super::RelPath::from_os_path(relative).map_err(|error| {
-            note_checkout_verification_refusal!("verification_relative_path_invalid: path={path:?} relative={relative:?} error={error}");
-            error
-        })?;
-        let language = if crate::callgraph_extractor::is_resolution_input(key.as_bytes()) {
-            Some("config".to_string())
-        } else {
-            crate::parser::detect_language(path).map(|lang| format!("{lang:?}").to_lowercase())
-        };
-        let Some(language) = language else { continue };
-        let Some(super::ManifestEntry::Regular { planes, .. }) = manifest.get(&key) else {
-            note_checkout_verification_refusal!(
-                "verification_regular_entry_missing: path={path:?} key={key:?} entry={:?}",
-                manifest.get(&key)
-            );
-            return Ok(false);
-        };
-        let Some(expected_key) = planes.callgraph.as_ref() else {
-            note_checkout_verification_refusal!(
-                "verification_callgraph_key_missing: path={path:?} key={key:?} planes={planes:?}"
-            );
-            return Ok(false);
-        };
-        let stats = match observed
-            .as_ref()
-            .and_then(|files| files.get(path.as_path()))
-            .copied()
-            .map(Ok)
-            .unwrap_or_else(|| verification_stat(path))
-        {
-            Ok(stats) => stats,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                note_checkout_verification_refusal!(
-                    "verification_stat_not_found: path={path:?} error={error}"
-                );
-                return Ok(false);
-            }
-            Err(error) => {
-                note_checkout_verification_refusal!(
-                    "verification_stat_error: path={path:?} error={error}"
-                );
-                return Err(error.into());
-            }
-        };
-        if verified.get(path).is_some_and(|previous| {
-            previous.size == stats.0
-                && previous.modified == stats.1
-                && previous.expected_key == *expected_key
-        }) {
-            continue;
-        }
-        let source = read_verification_source(path).map_err(|error| {
-            note_checkout_verification_refusal!(
-                "verification_source_read_error: path={path:?} stats={stats:?} error={error}"
-            );
-            error
-        })?;
-        let actual_key = verification_key(&source, language, crate::callgraph_extractor::PRODUCER);
-        if actual_key != *expected_key {
-            note_checkout_verification_refusal!("verification_source_key_mismatch: path={path:?} expected_key={expected_key} actual_key={actual_key} stats={stats:?} source_bytes={}", source.len());
-            verified.remove(path);
-            return Ok(false);
-        }
-        // Do not associate verified bytes with metadata from before an edit.
-        let after_stats = verification_stat(path).map_err(|error| {
-            note_checkout_verification_refusal!(
-                "verification_post_read_stat_error: path={path:?} before={stats:?} error={error}"
-            );
-            error
-        })?;
-        if after_stats != stats {
-            note_checkout_verification_refusal!("verification_post_read_stat_changed: path={path:?} before={stats:?} after={after_stats:?}");
-            return Ok(false);
-        }
-        verified.insert(
-            path.clone(),
-            VerifiedCallgraphFile {
-                size: stats.0,
-                modified: stats.1,
-                expected_key: expected_key.clone(),
-            },
-        );
-    }
-    Ok(true)
-}
-
 /// Why a view generation published with the call graph off is not served.
 pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.callgraph=false): this view generation was published without call graph data";
 pub(crate) const CALLGRAPH_READINESS_BUSY: &str = "callgraph_readiness_busy";
@@ -398,14 +276,6 @@ static DIVERGED_CHECKOUTS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::OnceLock::new();
 
-pub(crate) fn note_checkout_diverged(project_root: &std::path::Path) {
-    DIVERGED_CHECKOUTS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(project_root.to_path_buf());
-}
-
 fn checkout_diverged(project_root: &std::path::Path) -> bool {
     DIVERGED_CHECKOUTS.get().is_some_and(|roots| {
         roots
@@ -439,25 +309,6 @@ pub(crate) fn main_checkout_root(project_root: &std::path::Path) -> Option<PathB
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(project_root.to_path_buf(), main.clone());
     Some(main)
-}
-
-/// True when the checkout's current view generation (the v1 view under
-/// `<storage>/views/<scope>`) exists and was published without call graph
-/// data. Read-only: nothing is created when the view is absent.
-pub(crate) fn current_generation_lacks_callgraph(
-    storage: &std::path::Path,
-    root: &std::path::Path,
-) -> bool {
-    let view_dir = storage
-        .join("views")
-        .join(crate::path_identity::project_scope_key(root));
-    let Some(store) = super::ViewStore::existing_dir(view_dir.clone()) else {
-        return false;
-    };
-    let Ok(Some(generation)) = store.current_generation_read_only() else {
-        return false;
-    };
-    matches!(generation_has_callgraph(&view_dir, &generation), Ok(false))
 }
 
 /// Whether `generation` was published with call graph data. Generations are

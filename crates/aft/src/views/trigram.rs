@@ -2009,7 +2009,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_path_buf());
-        config.views.enabled = true;
         config.indexes.trigram = true;
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
@@ -2022,9 +2021,9 @@ mod tests {
         let family = ctx.memoized_artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &family, false);
         assert!(
-            ctx.lexical_views_enabled(),
+            false,
             "views={} trigram={} heavy={} cache_unavailable={:?}",
-            ctx.config().views.enabled,
+            false,
             ctx.config().indexes.trigram,
             ctx.heavy_root_work_allowed(),
             ctx.cache_unavailable_reason(),

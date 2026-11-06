@@ -598,33 +598,6 @@ struct ChildLoadFailures {
     logged: HashMap<&'static str, (Option<Instant>, u64)>,
 }
 
-/// The parent folder's child view load failures for its root health: counts
-/// keyed `parent_<plane>:<cause>` and the latest failure. `Some(None)` when
-/// none were recorded; `None` when the record is locked right now.
-#[allow(clippy::type_complexity)]
-pub(crate) fn try_child_load_failures(
-    root: &Path,
-) -> Option<
-    Option<(
-        std::collections::BTreeMap<String, u64>,
-        Option<crate::context::ViewLoadFailure>,
-        std::collections::BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
-    )>,
-> {
-    let failures = match CHILD_LOAD_FAILURES.try_lock() {
-        Ok(failures) => failures,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return None,
-    };
-    Some(failures.get(root).map(|failures| {
-        (
-            failures.by_cause.clone(),
-            failures.last.clone(),
-            failures.disk_reserve.clone(),
-        )
-    }))
-}
-
 /// Counts a failed child view load under the parent `root` by plane and
 /// cause, keeping the full error (prefixed with the child's path) for the
 /// parent root's health, and logs it at error level at most once a minute per

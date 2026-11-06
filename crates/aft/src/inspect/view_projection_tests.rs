@@ -51,7 +51,6 @@ fn view_projection_fixture_with_files(files: &[(&str, &str)]) -> (
     job.scope_files = files;
     let config = Arc::make_mut(&mut job.config);
     config.storage_dir = Some(storage.path().to_path_buf());
-    config.views.enabled = true;
     job.callgraph_writer = true;
     let request = crate::views::assembly::AssemblyRequest {
         storage: storage.path().to_path_buf(),
@@ -684,13 +683,11 @@ fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
     );
     crate::views::assembly::publish_checkout(&request).unwrap();
 
-    Arc::make_mut(&mut snapshot.config).views.enabled = false;
     let disabled = refusal(&snapshot, None);
     assert!(
         disabled.contains("config_gate: views.enabled=false indexes.callgraph=true"),
         "{disabled}"
     );
-    Arc::make_mut(&mut snapshot.config).views.enabled = true;
 
     crate::views::cache_head_fingerprint(job.project_root.clone(), "different-head".to_string());
     let head = refusal(&snapshot, None);
@@ -783,10 +780,8 @@ fn views_tier2_and_legacy_dead_code_verdicts_match() {
         // Publication makes the immutable generation current before its
         // detached checkpoint closes the last writer; wait for readability.
         crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        Arc::make_mut(&mut job.config).views.enabled = true;
         let view =
             build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
-        Arc::make_mut(&mut job.config).views.enabled = false;
         let legacy =
             build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
         job.callgraph_snapshot = Some(legacy);

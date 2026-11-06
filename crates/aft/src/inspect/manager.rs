@@ -1742,140 +1742,6 @@ impl InspectManager {
         payload
     }
 
-    /// Open only this checkout's published view and prove its source keys still
-    /// describe the files used by the scan. This does not acquire a legacy writer.
-    pub(crate) fn current_checkout_view(
-        &self,
-        snapshot: &InspectSnapshot,
-        files: &[PathBuf],
-        observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
-    ) -> Option<Arc<ReadonlyCallGraphStore>> {
-        #[cfg(test)]
-        let _ = take_checkout_view_refusal();
-        if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
-            note_checkout_view_refusal!(
-                "config_gate: views.enabled={} indexes.callgraph={}",
-                snapshot.config.views.enabled,
-                snapshot.config.indexes.callgraph
-            );
-            return None;
-        }
-        let (store, generation) = checkout_view_some!(
-            current_view_projection_store(
-                &snapshot.project_root,
-                &snapshot.inspect_dir,
-                &snapshot.config,
-                &[],
-            ),
-            "projection_unavailable: root={:?} inspect_dir={:?}",
-            snapshot.project_root,
-            snapshot.inspect_dir
-        );
-        let cache_storage = snapshot.config.cache_storage_dir();
-        let storage = checkout_view_some!(
-            cache_storage.as_ref(),
-            "verification_storage_missing: config.storage_dir=None root={:?}",
-            snapshot.project_root
-        );
-        let view = checkout_view_ok!(
-            crate::views::ViewStore::open(
-                storage,
-                &crate::path_identity::project_scope_key(&snapshot.project_root),
-            ),
-            "verification_view_open: storage={storage:?} root={:?}",
-            snapshot.project_root
-        );
-        let manifest = checkout_view_ok!(
-            view.load_manifest(&generation),
-            "verification_manifest_load: generation={generation} view_dir={:?}",
-            view.view_dir()
-        );
-        // The graph must cover the complete source set, not merely the files
-        // that still exist. Deletions and untracked additions can change liveness.
-        if files
-            .iter()
-            .filter(|path| callgraph_store_indexes_path(path))
-            .any(|path| {
-                let Ok(relative) = path.strip_prefix(&snapshot.project_root) else {
-                    note_checkout_view_refusal!("coverage_root_mismatch: path={path:?} root={:?}", snapshot.project_root);
-                    return true;
-                };
-                crate::views::RelPath::from_os_path(relative)
-                    .map_err(|_error| {
-                        note_checkout_view_refusal!("coverage_relative_path_invalid: path={path:?} relative={relative:?} error={_error}");
-                        _error
-                    })
-                    .ok()
-                    .is_none_or(|relative| {
-                        let missing = manifest.get(&relative).is_none();
-                        if missing {
-                            note_checkout_view_refusal!("coverage_manifest_missing: path={path:?} relative={relative:?} generation={generation} manifest_files={} observed_files={}", manifest.entries().count(), files.len());
-                        }
-                        missing
-                    })
-            })
-        {
-            return None;
-        }
-        let manifest_paths = manifest.entries().filter_map(|(path, entry)| {
-            matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
-                .then(|| crate::views::segment_store::rel_path_to_os(path).map_err(|_error| {
-                    note_checkout_view_refusal!("manifest_path_decode: path={path:?} generation={generation} error={_error}");
-                    _error
-                }).ok().map(|path| snapshot.project_root.join(path)))
-        }).collect::<Option<Vec<_>>>();
-        let manifest_paths = checkout_view_some!(
-            manifest_paths,
-            "manifest_paths_unavailable: generation={generation}"
-        );
-        let ticket = crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
-        let mut verification = checkout_view_ok!(
-            self.checkout_view_verification.lock(),
-            "verification_mutex_poisoned: root={:?}",
-            snapshot.project_root
-        );
-        if verification
-            .as_ref()
-            .is_none_or(|cached| cached.root != snapshot.project_root || cached.ticket != ticket)
-        {
-            *verification = Some(CheckoutViewVerification {
-                root: snapshot.project_root.clone(),
-                ticket,
-                files: BTreeMap::new(),
-            });
-        }
-        if !checkout_view_ok!(
-            crate::views::read::callgraph_paths_match_cached(
-                &manifest,
-                &snapshot.project_root,
-                &manifest_paths,
-                observed_stats,
-                &mut checkout_view_some!(
-                    verification.as_mut(),
-                    "verification_memo_missing: root={:?} ticket={ticket}",
-                    snapshot.project_root
-                )
-                .files,
-            ),
-            "source_verification_error: root={:?} generation={generation}",
-            snapshot.project_root
-        ) {
-            note_checkout_view_refusal!("source_verification_false: root={:?} generation={generation} manifest_files={} observed_files={:?}", snapshot.project_root, manifest_paths.len(), observed_stats.map(<[_]>::len));
-            return None;
-        }
-        let completed_ticket =
-            crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
-        if completed_ticket != ticket {
-            note_checkout_view_refusal!(
-                "invalidation_ticket_changed: root={:?} before={ticket} after={completed_ticket}",
-                snapshot.project_root
-            );
-            *verification = None;
-            return None;
-        }
-        Some(Arc::new(store))
-    }
-
     pub(crate) fn checkout_view_unavailability(
         &self,
         snapshot: &InspectSnapshot,
@@ -2007,15 +1873,7 @@ impl InspectManager {
         if !snapshot.config.indexes.callgraph {
             return false;
         }
-        if snapshot.config.views.enabled {
-            return current_view_projection_store(
-                &snapshot.project_root,
-                &snapshot.inspect_dir,
-                &snapshot.config,
-                &[],
-            )
-            .is_some();
-        }
+        
         callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
             .into_iter()
             .any(|dir| {
@@ -3766,7 +3624,6 @@ impl InspectManager {
 
         if job.category == InspectCategory::DeadCode
             && job.config.indexes.callgraph
-            && !job.config.views.enabled
             && callgraph_store_busy_for_dead_code(&job.inspect_dir, &job.project_root)
         {
             return callgraph_pending_result(&job, started.elapsed());
@@ -4208,9 +4065,7 @@ impl InspectManager {
                         phases.projection_cost += projection_cost;
                     }
                     None => {
-                        phases.projection_skip_reason = Some(if job.config.views.enabled {
-                            "view_unavailable"
-                        } else {
+                        phases.projection_skip_reason = Some({
                             "no_callgraph"
                         })
                     }
@@ -4346,9 +4201,7 @@ impl InspectManager {
                             phases.projection_cost += projection_cost;
                         }
                         None => {
-                            phases.projection_skip_reason = Some(if job.config.views.enabled {
-                                "view_unavailable"
-                            } else {
+                            phases.projection_skip_reason = Some({
                                 "no_callgraph"
                             })
                         }
@@ -4434,9 +4287,7 @@ impl InspectManager {
                     phases.projection_cost += projection_cost;
                 }
                 None => {
-                    phases.projection_skip_reason = Some(if job.config.views.enabled {
-                        "view_unavailable"
-                    } else {
+                    phases.projection_skip_reason = Some({
                         "no_callgraph"
                     })
                 }
@@ -4446,39 +4297,7 @@ impl InspectManager {
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            if job.config.views.enabled {
-                let reason = current_view_projection_result(
-                    &job.project_root,
-                    &job.inspect_dir,
-                    &job.config,
-                    &callgraph_refresh_files,
-                )
-                .err()
-                .unwrap_or(CheckoutViewUnavailable::Unverified);
-                // Publication may finish between the projection attempt and
-                // recording its pending result. Preserve its epoch so the next
-                // maintenance tick can recover the missed publication wakeup.
-                if matches!(reason, CheckoutViewUnavailable::Pending)
-                    || (matches!(reason, CheckoutViewUnavailable::Unverified)
-                        && self.view_publication_epoch(&job.project_root) != view_epoch)
-                {
-                    self.note_view_pending(&job.project_root, view_epoch);
-                }
-                phases.projection_skip_reason = Some(reason.kind());
-                phases.log(job.category, &job.project_root);
-                // Preserve the last complete aggregate while publication is pending.
-                // Publishing the view requests a fresh pass even without another query.
-                return Ok(InspectScanSuccess {
-                    scanned_files: scan_files,
-                    contributions: Vec::new(),
-                    aggregate: serde_json::json!({
-                        "callgraph_available": false, "complete": false,
-                        "status": if matches!(reason, CheckoutViewUnavailable::Pending | CheckoutViewUnavailable::Busy) { "pending" } else { "unavailable" }, "code": reason.kind(),
-                        "reason": reason.reason(),
-                        "gaps": [{"kind": reason.kind(), "reason": reason.reason()}],
-                    }),
-                });
-            }
+            
             if options.require_callgraph_snapshot {
                 if let Some(reason) = callgraph_path_identity_gap(job)? {
                     return Ok(InspectScanSuccess {
@@ -5453,9 +5272,7 @@ thread_local! {
 }
 
 fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallGraphStoreError> {
-    if job.config.views.enabled {
-        return Ok(None);
-    }
+    
     for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
     {
         let store = match CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone()) {
@@ -5513,15 +5330,6 @@ impl CheckoutViewUnavailable {
             Self::Failed(error) => format!("checkout call graph view could not be read: {error}; retry aft_inspect after indexing recovers"),
         }
     }
-}
-
-fn current_view_projection_store(
-    project_root: &Path,
-    inspect_dir: &Path,
-    config: &crate::config::Config,
-    refresh_paths: &[PathBuf],
-) -> Option<(ReadonlyCallGraphStore, String)> {
-    current_view_projection_result(project_root, inspect_dir, config, refresh_paths).ok()
 }
 
 fn current_view_projection_result(
@@ -6817,7 +6625,6 @@ fn filter_outcome_for_scope_with_contributions(
     // Fresh source files do not establish graph liveness while its store is busy.
     if category == InspectCategory::DeadCode
         && snapshot.config.indexes.callgraph
-        && !snapshot.config.views.enabled
         && callgraph_store_busy_for_dead_code(&snapshot.inspect_dir, &snapshot.project_root)
     {
         return JobOutcome::Fresh {
@@ -9170,7 +8977,6 @@ export function bannerUnused() {}
     fn views_snapshot_job(root: &Path, inspect_dir: &Path) -> InspectJob {
         let mut job = snapshot_job(root, inspect_dir, true);
         let mut config = (*job.config).clone();
-        config.views.enabled = true;
         job.config = Arc::new(config);
         job
     }

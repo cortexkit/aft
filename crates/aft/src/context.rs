@@ -277,10 +277,6 @@ const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 /// checkout's semantic index has finished loading.
 pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
     "semantic view publication is waiting for the semantic index";
-/// Refusal of a content-addressed v1 view publication on a root whose views
-/// route every read through its v3 checkout views.
-pub(crate) const VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT: &str =
-    "v1 view publication is stopped: this root's views read its v3 checkout views";
 /// The publication phase that takes the query pin for a newly assembled
 /// generation. Before it, publication walks source paths, assembles the
 /// generation, and opens the view to load its manifest.
@@ -5666,9 +5662,7 @@ impl AppContext {
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
         let compression_aggregates = bash_background.compression_aggregate_cache();
-        let view_disk_limits_next_ms = AtomicU64::new(if config.views.enabled {
-            0
-        } else {
+        let view_disk_limits_next_ms = AtomicU64::new({
             VIEW_DISK_LIMITS_OFF
         });
         let checkpoint_store = CheckpointStore::new();
@@ -6116,9 +6110,7 @@ impl AppContext {
         };
         // Opens the view status store on disk, so it also stays ahead of the
         // guards.
-        let views = if !cache_unavailable && config.views.enabled {
-            self.view_health_snapshot()
-        } else {
+        let views = {
             None
         };
         // With the data layer on, its checkout's planes stand in for the
@@ -6148,27 +6140,7 @@ impl AppContext {
         };
         // A parent folder's worker reads its children's views itself; their
         // failures are recorded under the parent root and reported here too.
-        if config.views.enabled {
-            if let Some(root) = config.project_root.as_deref() {
-                match crate::views::parent::try_child_load_failures(root) {
-                    Some(Some((counts, last, reserves))) => {
-                        view_load_failures.extend(counts);
-                        view_storage_reserve.extend(reserves);
-                        if last.as_ref().is_some_and(|last| {
-                            view_load_failure_last
-                                .as_ref()
-                                .is_none_or(|own: &ViewLoadFailure| {
-                                    own.last_at_ms <= last.last_at_ms
-                                })
-                        }) {
-                            view_load_failure_last = last;
-                        }
-                    }
-                    Some(None) => {}
-                    None => return RootHealthSummary::busy(),
-                }
-            }
-        }
+        
         let semantic_status = match self.semantic_index_status.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -7344,7 +7316,7 @@ impl AppContext {
     /// Probe subsystem state without blocking the dispatch frame loop; only
     /// the verification registry's short map lookup may wait.
     pub(crate) fn view_full_verification_due(&self) -> bool {
-        if !self.config().views.enabled {
+        {
             return false;
         }
         let runtime = match self.view_runtime.try_read() {
@@ -7443,7 +7415,7 @@ impl AppContext {
             };
         }
         let project_root = self.callgraph_project_root();
-        if !self.config().views.enabled && self.callgraph_writer() {
+        if self.callgraph_writer() {
             if let Some(root) = project_root.clone() {
                 // Observe real comparisons, including one this command starts
                 // when it installs a reused generation. An unopened store is
@@ -7476,46 +7448,13 @@ impl AppContext {
             shown.to_string_lossy().replace('\\', "/")
         };
         let unflushed = unflushed.iter().map(|path| relative(path));
-        if self.config().views.enabled {
-            changes.view_paths.extend(unflushed);
-        } else {
+        {
             changes.store_paths.extend(unflushed);
         }
         changes
             .store_paths
             .extend(store_paths.iter().map(|path| relative(path)));
-        if self.config().views.enabled {
-            // A view answers for every file the call graph indexes; edits to
-            // other files (an editor's temporary save file, for example) are
-            // published too but cannot change a call-graph answer. The drain's
-            // publication paths are read before the publication jobs they are
-            // handed to.
-            if let Some(state) = self.watcher_drain_slice.lock().as_ref() {
-                if state.view_publication_due.is_some()
-                    && (state.view_publication_full || state.view_publication_paths.is_empty())
-                {
-                    changes.whole_checkout = true;
-                }
-                changes.view_paths.extend(
-                    state
-                        .view_publication_paths
-                        .iter()
-                        .filter(|path| crate::parser::detect_language(path).is_some())
-                        .map(|path| relative(path)),
-                );
-            }
-            if let Some(paths) = crate::executor::view_publication::unpublished_paths_for(self) {
-                if paths.is_empty() {
-                    changes.whole_checkout = true;
-                }
-                changes.view_paths.extend(
-                    paths
-                        .iter()
-                        .map(|path| String::from_utf8_lossy(path).into_owned())
-                        .filter(|path| crate::parser::detect_language(Path::new(path)).is_some()),
-                );
-            }
-        }
+        
         QueryPendingChanges {
             watcher,
             callgraph: changes,
@@ -7585,7 +7524,7 @@ impl AppContext {
     /// run for users who did not enable views. Takes locks; the drain calls
     /// it, never the work probe.
     pub(crate) fn checkout_view_registry(&self) -> Option<crate::views::registry::FamilyRegistry> {
-        if !self.config().views.enabled {
+        {
             return None;
         }
         match self.checkout_semantic.runtime()?.access() {
@@ -9057,19 +8996,7 @@ impl AppContext {
     pub fn note_request(&self) {
         *self.last_request_at.lock() = Instant::now();
         let config = self.config();
-        if config.views.enabled && config.project_root.is_some() {
-            let root = crate::root_cache::canonical_root(config.project_root.as_deref().unwrap());
-            let family = self.memoized_artifact_cache_key(&root);
-            if let Err(error) = crate::storage_retention::touch_view_checkout(
-                &self.storage_paths(),
-                &family,
-                &root,
-                config.idle.checkout_hours,
-                crate::clock::now_ms(),
-            ) {
-                crate::slog_warn!("views checkout activity: {error}");
-            }
-        }
+        
     }
 
     pub fn last_request_at(&self) -> Instant {
@@ -9423,8 +9350,8 @@ impl AppContext {
             }
         });
         self.reconcile_rerank_backend(&next);
-        self.arm_view_disk_limits(next.views.enabled);
-        if !next.views.enabled || project_root_changed {
+        self.arm_view_disk_limits(false);
+        {
             self.lexical_view.lock().take();
             self.callgraph_view.lock().take();
             self.callgraph_borrow.lock().take();
@@ -10458,7 +10385,7 @@ impl AppContext {
     }
 
     pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
-        if !self.config().views.enabled {
+        {
             return None;
         }
         // Read before taking the view runtime lock, so this never holds one
@@ -10542,72 +10469,6 @@ impl AppContext {
             .map(|state| state.snapshot.clone())
     }
 
-    pub(crate) fn refresh_view_head_for_watcher(&self, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
-        if self.retire_deleted_view_root() {
-            return BTreeSet::new();
-        }
-        let Some(root) = self.canonical_cache_root_opt() else {
-            return BTreeSet::new();
-        };
-        let Some(snapshot) = self.view_runtime_snapshot() else {
-            return BTreeSet::new();
-        };
-        let matched = paths
-            .iter()
-            .filter(|path| snapshot.head_metadata.matches_path(path))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if matched.is_empty() {
-            return matched;
-        }
-        let refreshed = (|| {
-            let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
-            let fingerprint = crate::views::assembly::head_tree_fingerprint(&head);
-            // Worded as an alias error, like the head-tree read above.
-            let metadata =
-                crate::git_head::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
-                    .map_err(|error| crate::alias::AliasError::from(error).to_string())?;
-            Ok::<_, String>((fingerprint, metadata))
-        })();
-        let mut runtime = self
-            .view_runtime
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(state) = runtime.as_mut() else {
-            return matched;
-        };
-        match refreshed {
-            Ok((fingerprint, metadata)) => {
-                crate::views::cache_head_fingerprint(root.clone(), fingerprint.clone());
-                state.snapshot.head_fingerprint = fingerprint;
-                state.snapshot.head_metadata = metadata;
-            }
-            Err(error) => {
-                crate::views::cache_head_fingerprint(root.clone(), String::new());
-                state.snapshot.head_fingerprint.clear();
-                crate::slog_warn!(
-                    "view HEAD refresh failed root={}: {}",
-                    root.display(),
-                    error
-                );
-            }
-        }
-        matched
-    }
-
-    pub(crate) fn pinned_view_runtime(&self) -> Option<ViewRuntimeSnapshot> {
-        self.view_runtime
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .filter(|state| state.pin.is_some() && state.snapshot.generation.is_some())
-            .map(|state| {
-                let mut snapshot = state.snapshot.clone();
-                snapshot.query_pin = state.pin.clone();
-                snapshot
-            })
-    }
-
     pub(crate) fn publish_view_paths(
         &self,
         changed_paths: BTreeSet<Vec<u8>>,
@@ -10673,9 +10534,7 @@ impl AppContext {
         }
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
-        if self.views_route_root() {
-            return Err(VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT.to_owned());
-        }
+        
         if self.retire_deleted_view_root() {
             return Err("view publication root was deleted".to_owned());
         }
@@ -10811,7 +10670,7 @@ impl AppContext {
         crate::executor::view_publication::PublicationFailure,
     > {
         if self.configure_content_generation() != prepared.content_generation
-            || !self.config().views.enabled
+            || true
         {
             return Err("view publication configuration was superseded"
                 .to_owned()
@@ -11498,25 +11357,13 @@ impl AppContext {
     /// main checkout whose graph could answer for it.
     pub(crate) fn callgraph_build_on_demand(&self) -> bool {
         let config = self.config();
-        self.is_worktree_bridge()
-            && self.git_common_dir().is_some()
-            && config.views.enabled
-            && config.indexes.callgraph
+        false
     }
 
     /// Whether the next view publication may leave the derived call graph
     /// unbuilt: an on-demand root that no query has needed the graph of yet.
     pub(crate) fn defer_callgraph_build(&self) -> bool {
         self.callgraph_build_on_demand() && !self.lazy_callgraph.demanded.load(Ordering::Acquire)
-    }
-
-    /// The watcher saw this checkout change (an edit, commit, checkout or a
-    /// lost-event rescan). From now on the main checkout's graph no longer
-    /// answers for it, even before the change is published.
-    pub(crate) fn note_checkout_changed_for_callgraph(&self) {
-        if let Some(root) = self.canonical_cache_root_opt() {
-            crate::views::read::note_checkout_diverged(&root);
-        }
     }
 
     /// A query needed this worktree's own graph and the current view
@@ -12164,15 +12011,6 @@ impl AppContext {
             .collect()
     }
 
-    pub(crate) fn lexical_views_enabled(&self) -> bool {
-        let config = self.config();
-        config.views.enabled
-            && config.indexes.trigram
-            && config.project_root.is_some()
-            && self.heavy_root_work_allowed()
-            && self.cache_unavailable_reason().is_none()
-    }
-
     #[cfg(test)]
     pub(crate) fn lexical_source_for_test(
         &self,
@@ -12215,7 +12053,7 @@ impl AppContext {
         &self,
         tool: &str,
     ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
-        if !self.lexical_views_enabled() {
+        {
             return None;
         }
         if let Some(snapshot) = LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
@@ -12432,29 +12270,6 @@ impl AppContext {
         std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
     }
 
-    /// With views enabled, call-graph reads (navigation, zoom, inspect) use
-    /// the checkout's v3 view rather than the legacy store or a v1 view. An
-    /// explicitly installed checkout query runtime keeps precedence.
-    pub(crate) fn callgraph_views_enabled(&self) -> bool {
-        self.views_route_root() && self.config().indexes.callgraph
-    }
-
-    /// True when views serve this root through its own v3 checkout views
-    /// (lexical, call graph and semantic) rather than the content-addressed
-    /// v1 view or the legacy stores. Such a root runs none of the legacy
-    /// views-on writers: no v1 view publication or import, no v1 blob puts
-    /// and no import into the old semantic runtime. Compatible pre-view caches
-    /// may still be imported into v3 on background workers. A checkout query
-    /// runtime keeps the older route.
-    pub(crate) fn views_route_root(&self) -> bool {
-        let config = self.config();
-        config.views.enabled
-            && config.project_root.is_some()
-            && self.heavy_root_work_allowed()
-            && self.cache_unavailable_reason().is_none()
-            && !self.checkout_query_runtime_active()
-    }
-
     pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
         let lifecycle = self.subc_lifecycle_admission();
         let generation = self.configure_generation_flag();
@@ -12509,13 +12324,6 @@ impl AppContext {
         })
     }
 
-    pub(crate) fn callgraph_view_is_ready(&self) -> bool {
-        self.callgraph_view
-            .lock()
-            .as_ref()
-            .is_some_and(|view| view.is_ready())
-    }
-
     #[cfg(test)]
     pub(crate) fn install_callgraph_source_for_test(
         &self,
@@ -12549,7 +12357,7 @@ impl AppContext {
     /// whose interactive acquisition wait remains three seconds.
     #[doc(hidden)]
     pub fn with_ready_callgraph_for_test<T>(&self, read: impl FnOnce() -> T) -> T {
-        if !self.callgraph_views_enabled() {
+        {
             return read();
         }
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -12582,7 +12390,7 @@ impl AppContext {
         >,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
     {
-        if !self.callgraph_views_enabled() {
+        {
             return None;
         }
         if let Some(reader) = CALLGRAPH_QUERY_READERS.with(|readers| {
@@ -18757,7 +18565,6 @@ mod callgraph_store_for_ops_tests {
         let _serial = v3::serial_for_test();
         let (_dirs, ctx) = cold_build_context();
         let mut config = (*ctx.config()).clone();
-        config.views.enabled = true;
         ctx.set_config(config);
         let root = ctx.callgraph_project_root().unwrap();
         ctx.set_canonical_cache_root(root.clone());
@@ -19175,7 +18982,6 @@ mod callgraph_store_for_ops_tests {
         let mut config = first.config().as_ref().clone();
         config.indexes.trigram = false;
         config.indexes.semantic = false;
-        config.views.enabled = false;
         config.project_root = None;
         drop(first);
         let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
@@ -19199,7 +19005,7 @@ mod callgraph_store_for_ops_tests {
         let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
         ctx.advance_configure_generation();
         assert!(
-            !ctx.config().views.enabled,
+            !false,
             "measurement must use the legacy store"
         );
         println!(

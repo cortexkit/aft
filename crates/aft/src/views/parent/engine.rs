@@ -34,7 +34,6 @@ impl ChildEngine {
         let mut config = crate::config::Config::default();
         config.project_root = Some(child.root.clone());
         // The engine reads the indexes installed below, never a view of its own.
-        config.views.enabled = false;
         config.indexes.trigram = session.planes.trigram;
         config.indexes.semantic = session.planes.semantic;
         config.indexes.callgraph = false;

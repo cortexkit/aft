@@ -1011,13 +1011,6 @@ pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde
     let mut aggregate = callgraph_unavailable_aggregate(job.scope_files.len());
     let disabled = if !job.config.indexes.callgraph {
         Some("call graph is disabled (indexes.callgraph=false)")
-    } else if job.config.views.enabled
-        && crate::views::read::current_generation_lacks_callgraph(
-            &crate::root_cache::cache_root(&job.config),
-            &job.project_root,
-        )
-    {
-        Some(crate::views::read::CALLGRAPH_DISABLED)
     } else {
         None
     };

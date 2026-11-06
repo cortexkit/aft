@@ -1701,7 +1701,7 @@ impl Executor {
             )
             && self
                 .actor_context(&root_id)
-                .is_some_and(|ctx| ctx.callgraph_views_enabled())
+                .is_some_and(|ctx| false)
         {
             Lane::PureRead
         } else {

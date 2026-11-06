@@ -72,7 +72,6 @@ fn semantic_batch_lease_operator_copy_never_enters_finalized_agent_replies() {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.path().to_path_buf());
     config.storage_dir = Some(storage.path().to_path_buf());
-    config.views.enabled = true;
     config.indexes.semantic = true;
     let ctx =
         crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
@@ -166,7 +165,6 @@ fn semantic_batch_lease_permanent_error_is_visible_without_a_retry_timer() {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.path().to_path_buf());
     config.storage_dir = Some(storage.path().to_path_buf());
-    config.views.enabled = true;
     config.indexes.semantic = true;
     let ctx = Arc::new(crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
