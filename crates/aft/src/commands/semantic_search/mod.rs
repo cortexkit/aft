@@ -12567,7 +12567,10 @@ mod tests {
         crate::semantic_index::clear_embedding_backend_retry_status(&root);
 
         assert_eq!(response["success"], true, "{response}");
-        assert_eq!(response["semantic_status"], "backend_unavailable", "{response}");
+        assert_eq!(
+            response["semantic_status"], "backend_unavailable",
+            "{response}"
+        );
         let text = response["text"].as_str().expect("text");
         assert!(
             text.starts_with(&format!("Semantic backend unavailable ({base_url}): ")),
@@ -12584,7 +12587,9 @@ mod tests {
         assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
         assert_eq!(semantic["backend_url"], base_url.as_str(), "{semantic}");
         assert!(
-            semantic["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+            semantic["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
             "{semantic}"
         );
     }

@@ -283,9 +283,8 @@ pub(crate) fn search_children(
         .map(|checkout| match checkout {
             Ok(checkout) => ChildSearch {
                 text: text_plane(&checkout),
-                meaning_gap: meaning.and_then(|(config, fingerprint)| {
-                    meaning_gap(&checkout, config, fingerprint)
-                }),
+                meaning_gap: meaning
+                    .and_then(|(config, fingerprint)| meaning_gap(&checkout, config, fingerprint)),
                 checkout: Some(checkout),
             },
             Err(error) => ChildSearch {

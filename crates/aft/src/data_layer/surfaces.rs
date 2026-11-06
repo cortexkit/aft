@@ -1155,9 +1155,8 @@ pub fn warm_meaning(ctx: &AppContext) -> Option<WarmState> {
         DataSemantic::Serving(meaning) if meaning.complete() => WarmState::Ready,
         DataSemantic::Serving(meaning) => {
             let coverage = meaning.coverage();
-            let accounted = coverage.files_embedded
-                + coverage.files_too_large
-                + coverage.files_failed.len();
+            let accounted =
+                coverage.files_embedded + coverage.files_too_large + coverage.files_failed.len();
             let total = coverage.files.saturating_sub(coverage.past_cap);
             let mut detail = format!("filling, files={accounted}/{total}");
             if let Some(failure) = meaning.failure() {
