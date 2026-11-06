@@ -617,6 +617,19 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
     }
+
+    #[cfg(feature = "test-timing-hooks")]
+    async fn assert_foreign_task_is_concealed(&mut self, task: &str, session: &str) {
+        // Direct is admitted for observation but differs from the Broca caller,
+        // so this tests ownership concealment rather than an admission refusal.
+        self.bind_route(90, 1, "direct", None, false, session, false)
+            .await;
+        let text = self.status(90, task).await;
+        assert!(
+            text.contains(&format!("background task not found: {task}")),
+            "{text}"
+        );
+    }
 }
 fn shell(key: Option<&str>, background: bool, seconds: u64) -> Value {
     let mut call = json!({"name":"bash","preset":"head","arguments":{"command":sleep_command(seconds),"background":background,"timeout":20000}});
@@ -652,20 +665,24 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
-    daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
-        .await;
-    daemon.bind(2, 1, "direct", None, false).await;
     if cfg!(windows) {
+        daemon
+            .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+            .await;
         daemon
             .assert_windows_strict_refusal(1, gated_shell(&root, Some("drained")))
             .await;
         return;
     }
+    // Broca's runner is admitted for shell observation in production. The
+    // synthetic reserved:owner principal is not, even for its own task.
+    daemon
+        .bind(1, 1, "broca", Some(stamp("broca", 1)), false)
+        .await;
+    daemon.bind(2, 1, "direct", None, false).await;
     let keyed = daemon
         .start(1, 1, gated_shell(&root, Some("drained")))
         .await;
-    daemon.allow(1).await;
     let plain = daemon.start(2, 1, gated_shell(&root, None)).await;
     running_task(&mut daemon, 1, keyed).await;
     running_task(&mut daemon, 2, plain).await;
@@ -689,7 +706,7 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
         assert_eq!(response["detail"]["late_results"], late);
         tasks.push(response["detail"]["task_id"].as_str().unwrap().to_owned());
     }
-    for task in &tasks {
+    for (index, task) in tasks.iter().enumerate() {
         let records = task_metadata(&root);
         let record = &records
             .iter()
@@ -697,6 +714,14 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
             .unwrap()
             .1;
         assert_eq!(record["status"], "running", "{record}");
+        assert_eq!(
+            record["launching_identity"],
+            json!({
+                "principal": if index == 0 { "reserved:broca" } else { "direct" },
+                "harness": "runner", "session": format!("session-{}", index + 1),
+            }),
+            "{record}"
+        );
     }
     assert!(daemon
         .next_matching(Duration::from_millis(100), |frame| frame.header.ty
@@ -708,17 +733,37 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &[]).await;
     daemon
-        .bind(1, 1, "direct", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "broca", Some(stamp("broca", 1)), false)
         .await;
     daemon.bind(2, 1, "direct", None, false).await;
     daemon
-        .bind(3, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(3, 1, "broca", Some(stamp("broca", 1)), false)
         .await;
     for (index, task) in tasks.iter().enumerate() {
         daemon
             .wait_status(index as u16 + 1, task, "completed (exit 0)")
             .await;
     }
+    daemon
+        .bind_route(4, 1, "direct", None, false, "session-1", true)
+        .await;
+    let foreign = body(
+        &daemon
+            .call(
+                4,
+                json!({
+                    "name":"bash_status", "preset":"head", "arguments":{"taskId":tasks[0]},
+                }),
+            )
+            .await,
+    );
+    assert!(
+        foreign["isError"] == true
+            && foreign
+                .to_string()
+                .contains(&format!("background task not found: {}", tasks[0])),
+        "{foreign}"
+    );
     let page = body(
         &daemon
             .call(3, json!({"name":"late_results","arguments":{}}))
@@ -890,7 +935,13 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     daemon
-        .bind(1, 1, "owner-a", Some(stamp("owner-a", 1)), false)
+        .bind(
+            1,
+            1,
+            if cfg!(windows) { "owner-a" } else { "broca" },
+            Some(stamp("owner-a", 1)),
+            false,
+        )
         .await;
     daemon
         .bind(2, 1, "owner-b", Some(stamp("owner-b", 1)), false)
@@ -908,10 +959,15 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
         return;
     }
     let _first = daemon.start(1, 1, shell(Some("first"), false, 15)).await;
-    daemon.allow(1).await;
     let _other = daemon.start(2, 1, shell(Some("other"), true, 15)).await;
     daemon.allow(2).await;
     let first = running_task(&mut daemon, 1, _first).await.1;
+    assert_eq!(
+        first["launching_identity"],
+        json!({
+            "principal":"reserved:broca", "harness":"runner", "session":"session-1",
+        })
+    );
     let other = running_task(&mut daemon, 2, _other).await.1;
     assert_eq!(first["scope"]["owner"]["module_id"], "owner-a");
     let held = daemon.start(3, 1, shell(Some("prepared"), false, 15)).await;
@@ -936,10 +992,10 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
     daemon
         .bind(4, 1, "owner-a", Some(stamp("owner-a", 1)), false)
         .await;
-    // Rebind channel 1 to session-1: bash_status only exposes tasks
-    // started in the caller's session.
+    // The scope owner remains owner-a; the task's caller remains Broca even
+    // when a new channel epoch is bound to read the revoked task.
     daemon
-        .bind(1, 2, "direct", Some(stamp("owner-a", 1)), false)
+        .bind(1, 2, "broca", Some(stamp("owner-a", 1)), false)
         .await;
     let corr = daemon
         .start(
@@ -950,9 +1006,20 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
         .await;
     let status = body(&daemon.reply(1, corr).await).to_string();
     assert!(
-        status.contains("killed") && status.contains("scope_revoked"),
+        status.contains("killed") && status.contains("scope revoked"),
         "{status}"
     );
+    // The legacy wire renders the reason as text; the persisted record keeps
+    // the machine code that distinguishes a scope end from another kill.
+    let revoked = task_metadata(&root)
+        .into_iter()
+        .find(|(_, record)| record["task_id"] == task)
+        .unwrap()
+        .1;
+    assert_eq!(revoked["status_reason"], "scope_revoked");
+    daemon
+        .assert_foreign_task_is_concealed(task, "session-1")
+        .await;
     assert_eq!(
         task_metadata(&root)
             .iter()
@@ -1219,7 +1286,13 @@ async fn restart_recovers_stamped_task_and_polls_only_after_interval() {
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(
+            1,
+            1,
+            if cfg!(windows) { "owner" } else { "broca" },
+            Some(stamp("owner", 1)),
+            false,
+        )
         .await;
     let marker = root.join("project/started");
     let mut call = gated_shell(&root, Some("recovered"));
@@ -1243,8 +1316,13 @@ async fn restart_recovers_stamped_task_and_polls_only_after_interval() {
         call["arguments"]["command"].as_str().unwrap()
     ));
     let corr = daemon.start(1, 1, call).await;
-    daemon.allow(1).await;
     let task = running_task(&mut daemon, 1, corr).await.1;
+    assert_eq!(
+        task["launching_identity"],
+        json!({
+            "principal":"reserved:broca", "harness":"runner", "session":"session-1",
+        })
+    );
     // A running metadata record can precede wrapper startup. Wait for the
     // command itself, and gate its exit so restart latency cannot finish it.
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1257,14 +1335,24 @@ async fn restart_recovers_stamped_task_and_polls_only_after_interval() {
     }
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
-    // Recover the original session under a new epoch without revoking it.
+    // A new scope epoch is a rebind, not a new caller. Preserve the principal,
+    // harness and session while the stamped work epoch advances.
     daemon
-        .bind(1, 1, "direct", Some(stamp("owner", 2)), false)
+        .bind(1, 1, "broca", Some(stamp("owner", 2)), false)
         .await;
     // Opening aft.db does not acknowledge restoration of task records
     // into the registry. Await bash_status confirming the live command.
     daemon
         .wait_status(1, task["task_id"].as_str().unwrap(), "running")
+        .await;
+    let restored = task_metadata(&root)
+        .into_iter()
+        .find(|(_, record)| record["task_id"] == task["task_id"])
+        .unwrap()
+        .1;
+    assert_eq!(restored["launching_identity"], task["launching_identity"]);
+    daemon
+        .assert_foreign_task_is_concealed(task["task_id"].as_str().unwrap(), "session-1")
         .await;
     let poll = daemon.describe().await;
     daemon.answer(&poll, "not_live", true, 1).await;
@@ -1336,7 +1424,13 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
     let root = directory.path().join("module");
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(
+            1,
+            1,
+            if cfg!(windows) { "owner" } else { "broca" },
+            Some(stamp("owner", 1)),
+            false,
+        )
         .await;
     if cfg!(windows) {
         daemon
@@ -1345,8 +1439,13 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
         return;
     }
     let corr = daemon.start(1, 1, shell(Some("lost"), false, 15)).await;
-    daemon.allow(1).await;
     let task = running_task(&mut daemon, 1, corr).await.1;
+    assert_eq!(
+        task["launching_identity"],
+        json!({
+            "principal":"reserved:broca", "harness":"runner", "session":"session-1",
+        })
+    );
     daemon.writer.shutdown().await.unwrap();
     daemon.reader.abort();
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1362,12 +1461,15 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     daemon
-        .bind(1, 1, "direct", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "broca", Some(stamp("owner", 1)), false)
         .await;
     assert!(daemon
         .status(1, task["task_id"].as_str().unwrap())
         .await
         .contains("running"));
+    daemon
+        .assert_foreign_task_is_concealed(task["task_id"].as_str().unwrap(), "session-1")
+        .await;
     assert!(daemon
         .next_matching(Duration::from_millis(700), |frame| frame.header.ty
             == FrameType::Request
@@ -1391,8 +1493,19 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("hold-sandbox-start"), b"hold").unwrap();
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    // Broca is admitted for observation. Select strict explicitly so the head
+    // fixture still exercises the delayed native launcher rather than bypassing it.
+    std::fs::write(
+        root.join("project/.cortexkit/aft.jsonc"),
+        serde_json::to_vec(&json!({
+            "indexes":{"callgraph":false,"trigram":false,"semantic":false},
+            "sandbox":{"profile":{"head":"strict"}},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     daemon
-        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "broca", Some(stamp("owner", 1)), false)
         .await;
     let mut request = gated_shell(&root, Some("delayed-sandbox"));
     request["arguments"]["command"] = json!(format!(
@@ -1400,8 +1513,14 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
         request["arguments"]["command"].as_str().unwrap()
     ));
     let corr = daemon.start(1, 1, request).await;
-    daemon.allow(1).await;
     let task = running_task(&mut daemon, 1, corr).await.1;
+    assert_eq!(
+        task["launching_identity"],
+        json!({
+            "principal":"reserved:broca", "harness":"runner", "session":"session-1",
+        })
+    );
+    assert_eq!(task["sandbox_native"], true, "{task}");
     let until = tokio::time::Instant::now() + Duration::from_secs(15);
     while !root.join("sandbox-start.ready").exists() {
         assert!(
@@ -1443,12 +1562,15 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     daemon
-        .bind(1, 1, "direct", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "broca", Some(stamp("owner", 1)), false)
         .await;
     assert!(daemon
         .status(1, task["task_id"].as_str().unwrap())
         .await
         .contains("running"));
+    daemon
+        .assert_foreign_task_is_concealed(task["task_id"].as_str().unwrap(), "session-1")
+        .await;
     daemon
         .call(
             1,

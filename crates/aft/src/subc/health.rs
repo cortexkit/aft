@@ -1218,7 +1218,8 @@ impl DispatchPathMetrics {
         let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
             return;
         };
-        for ((root, session), channels) in subscriptions {
+        for ((root, identity), channels) in subscriptions {
+            let session = &identity.session;
             if channels.is_empty() {
                 continue;
             }
@@ -1262,9 +1263,9 @@ impl DispatchPathMetrics {
         if let Ok(mut events) = self.bg_events.lock() {
             events.retain(|key, record| {
                 now.saturating_duration_since(record.window_start) < BG_OBSERVABILITY_INTERVAL
-                    || subscriptions
-                        .get(&(key.root.clone(), key.session.clone()))
-                        .is_some_and(|channels| !channels.is_empty())
+                    || subscriptions.iter().any(|((root, identity), channels)| {
+                        root == &key.root && identity.session == key.session && !channels.is_empty()
+                    })
             });
         }
     }
@@ -10332,7 +10333,10 @@ mod observability_retention_tests {
         let now = start + BG_OBSERVABILITY_INTERVAL;
         metrics.record_bg_event_at(&root, "recent", BgEventKind::ArmHit, now);
         let subscriptions = HashMap::from([(
-            (root, "active".to_string()),
+            (
+                root.clone(),
+                crate::subc::test_support::route_identity(&root, "active").task_identity(),
+            ),
             std::collections::HashSet::from([super::super::route_key(42, 1)]),
         )]);
         metrics.prune_bg_event_records(&subscriptions, now);

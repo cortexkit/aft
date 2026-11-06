@@ -2338,6 +2338,9 @@ pub(super) fn submit_deferred_bash(
             submit_request_id,
             "bash",
             Box::new(move |ctx| {
+                let _task_identity = crate::bash_background::task_identity_scope(
+                    crate::bash_background::TaskIdentity::from_principal(&spawn_principal),
+                );
                 let _progress = crate::context::progress_origin_guard(
                     &request_id_for_spawn, route.channel, route.epoch, corr,
                 );
