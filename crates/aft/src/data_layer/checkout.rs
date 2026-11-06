@@ -31,7 +31,7 @@ use aft_store::text::{
 
 use super::callgraph::{CheckoutInputs, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
-use super::graph_store::{write_sections, StoredSlices};
+use super::graph_store::{write_sections, Held, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
 use super::overlay::OverlaySlices;
 use super::query::{SliceReader, SliceSource};
@@ -2594,7 +2594,30 @@ impl Published {
                 FragmentKey::from_digest(fragment),
             ));
         }
-        let graph = StoredSlices::open_files(segments.clone(), &files).map_err(DataError::Store)?;
+        // A state an older extractor version published names records this
+        // build keys differently, so none is found. Its text still serves;
+        // its call graph counts as not built, so the checkout's own bind
+        // builds it again (see `needs_build`) and a read-only bind of it
+        // answers text alone instead of failing.
+        let (graph, graph_built) = match StoredSlices::open_files_if_held(segments.clone(), &files)
+            .map_err(DataError::Store)?
+        {
+            Held::All(graph) => (graph, graph_built),
+            Held::Missing(what) => {
+                crate::slog_info!(
+                    "index store call graph of {} needs a rebuild: {what}",
+                    root.display()
+                );
+                let graph = match StoredSlices::open_files_if_held(segments.clone(), &[])
+                    .map_err(DataError::Store)?
+                {
+                    Held::All(graph) => graph,
+                    Held::Missing(what) => return Err(DataError::Store(what)),
+                };
+                unparsed.clear();
+                (graph, false)
+            }
+        };
         let path_texts = PathTextMemo::new(state.paths().len());
         Ok(Self {
             root,
@@ -5004,6 +5027,62 @@ pub fn other() { callee(); }
             (status.text, status.callgraph),
             (PlaneStatus::Off, PlaneStatus::Ready)
         );
+        let view = checkout.view().unwrap();
+        assert!(callers_of(&view, "src/util.rs", "callee").contains("caller"));
+    }
+
+    #[test]
+    fn a_publication_whose_records_this_build_cannot_find_serves_text_and_rebuilds() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let built =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        built.build().unwrap();
+        let published = built.view().unwrap().state().clone();
+        let id = built.checkout;
+        drop(built);
+        // An older extractor version keyed its records differently: publish
+        // the same state with each parsed path's record key changed, so no
+        // segment holds the records it names.
+        let paths = published
+            .paths()
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                if !record.language.is_empty() {
+                    record.language.push_str("-older");
+                }
+                record
+            })
+            .collect::<Vec<_>>();
+        let fragments = (0..paths.len())
+            .map(|index| published.fragment(index))
+            .collect::<Vec<_>>();
+        let older = CheckoutState::new(published.git.clone(), published.conversion, paths)
+            .unwrap()
+            .with_root_of(&published)
+            .with_fragments(fragments)
+            .unwrap();
+        let family_store = Family::open(store.path(), family()).unwrap();
+        let mut writer = family_store.try_write().unwrap().unwrap();
+        let written = writer.write_checkout_state(id, &older).unwrap();
+        writer
+            .publish(&Publication {
+                states: vec![written],
+                ..Publication::default()
+            })
+            .unwrap();
+        drop(writer);
+
+        // A fresh bind serves the publication's text, and counts its call
+        // graph as not built, so the checkout's own bind builds it again.
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        let view = checkout.view().unwrap();
+        assert!(!candidates_for(&view, "callee").is_empty());
+        assert!(checkout.needs_build());
+        checkout.build().unwrap();
         let view = checkout.view().unwrap();
         assert!(callers_of(&view, "src/util.rs", "callee").contains("caller"));
     }

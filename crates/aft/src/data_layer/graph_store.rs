@@ -497,6 +497,14 @@ fn find_newest<T>(
     Ok(None)
 }
 
+/// What [`StoredSlices::open_files_if_held`] found.
+pub(crate) enum Held {
+    /// Every file's record and fragment.
+    All(StoredSlices),
+    /// The first file whose record or fragment no segment holds, named.
+    Missing(String),
+}
+
 impl StoredSlices {
     /// Opens the slices of `inputs`'s parsed files in `segments` (oldest
     /// first), each with the fragment `fragments` names for it.
@@ -534,6 +542,24 @@ impl StoredSlices {
         segments: Vec<Arc<Segment>>,
         files: &[(String, String, FragmentKey)],
     ) -> Result<Self, String> {
+        match Self::open_files_if_held(segments, files)? {
+            Held::All(slices) => Ok(slices),
+            Held::Missing(what) => Err(what),
+        }
+    }
+
+    /// [`Self::open_files`], telling apart a file whose record or fragment
+    /// no segment holds ([`Held::Missing`]) from a segment that cannot be
+    /// read (the error). A state an older extractor version published names
+    /// records this build keys differently, so its records are all missing.
+    ///
+    /// # Errors
+    ///
+    /// When a segment is malformed.
+    pub(crate) fn open_files_if_held(
+        segments: Vec<Arc<Segment>>,
+        files: &[(String, String, FragmentKey)],
+    ) -> Result<Held, String> {
         let mut paths = BTreeMap::new();
         let mut by_fragment = HashMap::new();
         {
@@ -549,10 +575,14 @@ impl StoredSlices {
                 .map_err(|error| error.to_string())?;
             for (file, key, fragment_key) in files {
                 let record_key = record_key_of(key)?;
-                let record = find_newest(&contents, |content| content.find(record_key))?
-                    .ok_or_else(|| format!("no stored record for {file}"))?;
-                let fragment = find_newest(&graphs, |graph| graph.find(*fragment_key))?
-                    .ok_or_else(|| format!("no stored fragment for {file}"))?;
+                let Some(record) = find_newest(&contents, |content| content.find(record_key))?
+                else {
+                    return Ok(Held::Missing(format!("no stored record for {file}")));
+                };
+                let Some(fragment) = find_newest(&graphs, |graph| graph.find(*fragment_key))?
+                else {
+                    return Ok(Held::Missing(format!("no stored fragment for {file}")));
+                };
                 by_fragment.insert(fragment, file.clone());
                 paths.insert(
                     file.clone(),
@@ -564,13 +594,13 @@ impl StoredSlices {
                 );
             }
         }
-        Ok(Self {
+        Ok(Held::All(Self {
             segments,
             paths,
             by_fragment,
             cache: Mutex::new(HashMap::new()),
             failures: Mutex::new(Vec::new()),
-        })
+        }))
     }
 
     /// Reads that failed.

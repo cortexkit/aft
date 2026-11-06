@@ -845,6 +845,33 @@ pub(crate) struct ExternalSearch {
     just_bound: std::sync::atomic::AtomicBool,
 }
 
+/// How long a repository whose store could not be bound is answered by the
+/// folder scan before its store is tried again.
+const BIND_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn failed_binds(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
+    static FAILED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+fn recently_failed(root: &Path) -> bool {
+    failed_binds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .is_some_and(|at| at.elapsed() < BIND_RETRY_AFTER)
+}
+
+fn note_failure(root: &Path) {
+    failed_binds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), std::time::Instant::now());
+}
+
 impl ExternalSearch {
     /// The search of the repository at `root` for `ctx`, bound now if `ctx`
     /// holds none: `None` when the data layer is off, or nothing has
@@ -878,10 +905,17 @@ impl ExternalSearch {
         if !published {
             return None;
         }
+        // A store that cannot be bound is not retried on every query: each
+        // try reads the publication again, and an agent's searches of one
+        // other repository can come many times a minute.
+        if recently_failed(root) {
+            return None;
+        }
         let checkout =
             crate::data_layer::runtime::DataCheckout::open_planes(root, &storage, None, planes)
                 .map_err(|error| {
                     crate::slog_warn!("data layer could not bind {}: {error}", root.display());
+                    note_failure(root);
                 })
                 .ok()?;
         let session = ctx.config();
