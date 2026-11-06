@@ -5,7 +5,10 @@
 //! that context. Queries search those indexes, or use the bounded disk scan
 //! when no usable index is available. These query contexts never write a
 //! store. The parent merges child results without applying a second set of
-//! ranking rules.
+//! ranking rules. With the data layer on, each engine instead answers from
+//! the checkout the session holds for its child in the data layer: its text
+//! plane, and its meaning plane, which only reads the vectors the child's
+//! repository already stored (see `data_layer::parent::search_children`).
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -338,11 +341,36 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         .into_iter()
         .filter(|child| child.root.starts_with(&scope) || scope.starts_with(&child.root))
         .collect::<Vec<_>>();
+    // With the data layer, each child's engine answers from the checkout the
+    // session holds for that child, as grep does: its text plane, and its
+    // meaning plane reading the vectors the repository's store holds.
+    let data_children = crate::data_layer::runtime::enabled().then(|| {
+        let roots = children
+            .iter()
+            .map(|child| child.root.as_path())
+            .collect::<Vec<_>>();
+        let meaning = semantic
+            .ready()
+            .filter(|_| session.planes.semantic)
+            .map(|semantic| (&session.semantic_config, &semantic.fingerprint));
+        crate::data_layer::parent::search_children(ctx, session.root(), &roots, meaning)
+    });
+    let checkouts = match &data_children {
+        Some(searches) => searches
+            .iter()
+            .map(|search| search.checkout.clone())
+            .collect::<Vec<_>>(),
+        None => vec![None; children.len()],
+    };
     let run = |child: &Child,
+               checkout: Option<&Arc<crate::data_layer::runtime::DataCheckout>>,
                lent: Option<crate::semantic_index::EmbeddingModel>,
                vector: Option<&Vec<f32>>| {
         let mut engine = lock(&child.engine);
         let engine = engine.get_or_insert_with(|| ChildEngine::new(session, child));
+        if let Some(checkout) = checkout {
+            engine.ctx.pin_data_checkout(Arc::clone(checkout));
+        }
         let mut params = json!({
             "id": req.id,
             "command": "semantic_search",
@@ -390,8 +418,8 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     };
     let outcomes = if model.is_some() {
         let mut outcomes = Vec::new();
-        for child in &children {
-            let (outcome, returned) = run(child, model.take(), None);
+        for (child, checkout) in children.iter().zip(&checkouts) {
+            let (outcome, returned) = run(child, checkout.as_ref(), model.take(), None);
             model = returned;
             outcomes.push(outcome);
         }
@@ -403,7 +431,8 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         use rayon::prelude::*;
         children
             .par_iter()
-            .map(|child| run(child, None, vector.as_ref()).0)
+            .zip(checkouts.par_iter())
+            .map(|(child, checkout)| run(child, checkout.as_ref(), None, vector.as_ref()).0)
             .collect::<Vec<_>>()
     };
 
@@ -415,14 +444,23 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     let mut lexical_only_fallback = false;
     let mut bounded_disk_fallback = false;
     let mut semantic_statuses = Vec::new();
-    for (child, outcome) in children.iter().zip(outcomes) {
+    for (index, (child, outcome)) in children.iter().zip(outcomes).enumerate() {
+        let data_child = data_children.as_ref().map(|searches| &searches[index]);
         if session.planes.trigram {
-            if let Some(reason) = read(&child.trigram).gap_reason("trigram") {
+            let reason = match data_child {
+                Some(search) => search.text.gap_reason("trigram"),
+                None => read(&child.trigram).gap_reason("trigram"),
+            };
+            if let Some(reason) = reason {
                 gaps.child(child, reason);
             }
         }
         if session.planes.semantic && semantic.ready().is_some() {
-            if let Some(reason) = read(&child.semantic).gap_reason("semantic") {
+            let reason = match data_child {
+                Some(search) => search.meaning_gap.clone(),
+                None => read(&child.semantic).gap_reason("semantic"),
+            };
+            if let Some(reason) = reason {
                 gaps.child(child, reason);
             }
         }
@@ -637,6 +675,10 @@ pub(super) mod tests {
             model: Mutex::new(None),
             plane: plane.clone(),
             producer_id: producer.id(),
+            fingerprint: crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(
+                &session.semantic_config,
+                2,
+            ),
         }));
         let child = Child::new(root.path(), root.path().to_path_buf());
         *write(&child.semantic) = Plane::Ready(Arc::new(SemanticChild {

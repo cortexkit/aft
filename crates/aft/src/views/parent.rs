@@ -1022,6 +1022,9 @@ pub(crate) struct ParentSemantic {
     pub model: Mutex<Option<crate::semantic_index::EmbeddingModel>>,
     pub plane: Arc<SemanticPlane>,
     pub producer_id: String,
+    /// The model's identity, which names the vectors each child's checkout
+    /// in the data layer reads (see `data_layer::parent::search_children`).
+    pub fingerprint: crate::semantic_index::SemanticIndexFingerprint,
 }
 
 /// A parent folder's session state, shared by every context bound to it.

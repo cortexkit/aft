@@ -4868,6 +4868,10 @@ pub struct AppContext {
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
     /// `data_layer::runtime`).
     data_checkout: parking_lot::Mutex<Option<Arc<crate::data_layer::runtime::DataCheckout>>>,
+    /// Set when `data_checkout` was handed to this context
+    /// ([`Self::pin_data_checkout`]) rather than bound by it: it is then kept
+    /// whatever this context's own root and index switches say.
+    data_checkout_pinned: AtomicBool,
     /// The configure generation a standalone AFT last bound the data
     /// layer's checkout after (see
     /// [`crate::runtime_drain::follow_configure_with_data_layer`]).
@@ -5867,6 +5871,7 @@ impl AppContext {
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
             data_checkout: parking_lot::Mutex::new(None),
+            data_checkout_pinned: AtomicBool::new(false),
             data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
@@ -10005,7 +10010,13 @@ impl AppContext {
     /// no root is configured, the root is a parent folder of repositories,
     /// or its store cannot be opened.
     pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
-        if !crate::data_layer::runtime::enabled() || self.data_layer_withheld().is_some() {
+        if !crate::data_layer::runtime::enabled() {
+            return None;
+        }
+        if self.data_checkout_pinned.load(Ordering::Acquire) {
+            return self.data_checkout.lock().clone();
+        }
+        if self.data_layer_withheld().is_some() {
             return None;
         }
         let root = self.canonical_cache_root_opt()?;
@@ -10058,6 +10069,19 @@ impl AppContext {
             };
         }
         slot.clone()
+    }
+
+    /// Makes `checkout` this context's checkout in the data layer, kept
+    /// until another is pinned: for the search engine a parent folder's
+    /// session runs for one child repository, which answers from the
+    /// checkout the session holds for that child (see
+    /// `data_layer::parent::search_children`), never one of its own.
+    pub(crate) fn pin_data_checkout(&self, checkout: Arc<crate::data_layer::runtime::DataCheckout>) {
+        let mut slot = self.data_checkout.lock();
+        if !slot.as_ref().is_some_and(|pinned| Arc::ptr_eq(pinned, &checkout)) {
+            *slot = Some(checkout);
+        }
+        self.data_checkout_pinned.store(true, Ordering::Release);
     }
 
     /// This root's checkout in the data layer as status, health and the

@@ -475,3 +475,132 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].ends_with("one/src/added.rs"), "{found:?}");
 }
+
+/// With the data layer on, a parent folder's `aft_search` reads each
+/// child's meaning plane without filling it: `alpha`, whose vectors another
+/// checkout of its repository stored, answers from them; `beta`, whose store
+/// holds none, is the named gap; and no file of either child is embedded,
+/// since semantic search is not admitted for a repository no session opened.
+#[test]
+fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
+    use crate::config::{SemanticBackend, SemanticBackendConfig};
+    use crate::data_layer::meaning::MeaningState;
+    crate::views::parent::set_default_refresh_interval(Duration::from_millis(100));
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    for name in ["alpha", "beta"] {
+        init_repo(&root.join(name), name);
+    }
+    let (base_url, gate) = crate::data_layer::tools::search::meaning::tests::serve("never-held");
+    gate.open();
+    let semantic = SemanticBackendConfig {
+        backend: SemanticBackend::OpenAiCompatible,
+        model: "test-hashed".to_string(),
+        base_url: Some(base_url.clone()),
+        timeout_ms: 120_000,
+        query_timeout_ms: 30_000,
+        ..SemanticBackendConfig::default()
+    };
+    // A session of its own filled alpha's vectors; nothing filled beta's.
+    let alpha_fill = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        crate::data_layer::surfaces::fill_root(&root.join("alpha"), &storage, &semantic)
+            .expect("alpha's fill")
+    };
+    assert!(alpha_fill.chunks > 0, "{alpha_fill:?}");
+
+    let parent = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let doc = json!({
+            "indexes": {"trigram": true, "semantic": true, "callgraph": false},
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "test-hashed",
+                "base_url": base_url,
+                "timeout_ms": 120_000,
+                "query_timeout_ms": 30_000,
+            },
+        });
+        let response = crate::commands::configure::handle_configure(
+            &request(json!({
+                "id": "configure",
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": root,
+                "storage_dir": storage,
+                "config": [{"tier": "user", "source": "/u/aft.jsonc", "doc": doc.to_string()}],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "configure failed: {response:?}");
+        crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+        ctx
+    };
+    let session = parent_session(&parent);
+    assert_eq!(session.children().len(), 2);
+    crate::data_layer::runtime::force_on_for_test();
+
+    let search = request(json!({
+        "id": "parent-meaning",
+        "command": "semantic_search",
+        "query": "where does the helper give back one",
+        "top_k": 10,
+    }));
+    let beta_gap = child_gap(
+        "beta",
+        Some(crate::data_layer::parent::NO_VECTORS.to_string()),
+    );
+    // Each child builds its checkout on first use; once both have
+    // published, only beta is named, for its missing vectors.
+    let reply = settled(
+        || routed(&parent, &search).data,
+        |reply| {
+            let gaps = child_gaps(reply);
+            gaps.contains(&beta_gap) && gaps.iter().all(|gap| gap["path"] == "beta")
+        },
+    );
+    let files = reply["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("aft_search failed: {reply:#}"))
+        .iter()
+        .filter_map(|row| row["file"].as_str())
+        .map(|file| file.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    assert!(
+        files.iter().any(|file| file.contains("alpha/src/")),
+        "{reply:#}"
+    );
+
+    let children = parent.data_children().bound_for_test();
+    let child = |name: &str| {
+        children
+            .iter()
+            .find(|checkout| checkout.root() == root.join(name))
+            .unwrap_or_else(|| panic!("{name} has no checkout"))
+            .clone()
+    };
+    match child("alpha").meaning_status() {
+        MeaningState::Serving { snapshot, .. } => {
+            assert_eq!(snapshot.chunks(), alpha_fill.chunks);
+            assert!(snapshot.coverage().complete(), "{:?}", snapshot.coverage());
+        }
+        state => panic!("alpha's plane does not serve: {state:?}"),
+    }
+    let beta = child("beta");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!beta.filling(), "a fill of beta was started");
+    match beta.meaning_status() {
+        MeaningState::Serving { snapshot, .. } => assert_eq!(snapshot.chunks(), 0),
+        state => panic!("beta's plane is not read: {state:?}"),
+    }
+}

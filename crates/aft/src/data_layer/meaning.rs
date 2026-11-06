@@ -148,7 +148,19 @@ pub(crate) struct Meaning {
     /// When the fill under way started and when a fill last stored what
     /// it filled, for health (see [`FillTimes`]).
     times: Mutex<FillTimes>,
+    /// Set for a checkout a parent folder's session holds for one of its
+    /// child repositories ([`Self::read_only`]): its plane only reads the
+    /// vectors the repository's store already holds, and no fill runs for
+    /// it, since semantic search is not admitted for a repository no session
+    /// has opened.
+    reads_only: std::sync::atomic::AtomicBool,
+    /// When a read-only plane last looked for a newer generation.
+    refreshed_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a read-only plane serves the generation it read before it looks
+/// for a newer one: looking costs a directory listing and a file read.
+const READ_ONLY_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// When meaning search's fill moved, for health's stuck-plane check. Both
 /// in milliseconds since the Unix epoch.
@@ -194,7 +206,62 @@ impl Meaning {
         *lock(&self.failure) = None;
         *lock(&self.progress) = None;
         *lock(&self.times) = FillTimes::default();
+        *lock(&self.refreshed_at) = None;
         true
+    }
+
+    /// Makes this checkout's meaning search read only the vectors its
+    /// repository's store holds for `config`'s model, whose identity is
+    /// `fingerprint`, whichever checkout embedded them: no fill ever runs
+    /// for it, and files without vectors stay unfilled. Reads the newest
+    /// generation now if the last read is over [`READ_ONLY_REFRESH`] old.
+    ///
+    /// # Errors
+    ///
+    /// When the plane cannot be made.
+    pub(crate) fn read_only(
+        &self,
+        checkout: &Arc<Checkout>,
+        config: &SemanticBackendConfig,
+        fingerprint: &crate::semantic_index::SemanticIndexFingerprint,
+    ) -> Result<(), String> {
+        self.reads_only
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.configure(Some(config));
+        self.plane_for(checkout, config, || Ok(fingerprint.clone()))?;
+        self.refresh_read_only();
+        Ok(())
+    }
+
+    /// Whether this checkout's meaning search only reads (see
+    /// [`Self::read_only`]).
+    pub(crate) fn reads_only(&self) -> bool {
+        self.reads_only.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// For a read-only plane, reads the store's newest generation if the
+    /// last read is over [`READ_ONLY_REFRESH`] old; does nothing otherwise.
+    pub(crate) fn refresh_read_only(&self) {
+        if !self.reads_only() {
+            return;
+        }
+        let Some(plane) = lock(&self.plane)
+            .as_ref()
+            .map(|configured| Arc::clone(&configured.plane))
+        else {
+            return;
+        };
+        {
+            let mut refreshed_at = lock(&self.refreshed_at);
+            if refreshed_at.is_some_and(|at| at.elapsed() < READ_ONLY_REFRESH) {
+                return;
+            }
+            *refreshed_at = Some(std::time::Instant::now());
+        }
+        *lock(&self.failure) = plane
+            .refresh()
+            .err()
+            .map(|error| FillFailure::Failed(error.to_string()));
     }
 
     /// Takes `config()` as the root's semantic configuration unless one was
@@ -311,6 +378,9 @@ impl Meaning {
         let Some(config) = self.config() else {
             return Round::Idle;
         };
+        if self.reads_only() {
+            return Round::Idle;
+        }
         if checkout.view().is_none() {
             // The build that publishes the checkout starts the next fill.
             return Round::Idle;

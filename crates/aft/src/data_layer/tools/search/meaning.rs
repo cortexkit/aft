@@ -282,7 +282,7 @@ impl MeaningIndex<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
@@ -308,17 +308,17 @@ mod tests {
 
     /// Holds every embedding request whose input names `marker` until
     /// [`Gate::open`] is called.
-    struct Gate {
+    pub(crate) struct Gate {
         marker: &'static str,
         open: Mutex<bool>,
         opened: Condvar,
         held: AtomicUsize,
         /// Texts embedded, the fingerprint probe aside.
-        texts: AtomicUsize,
+        pub(crate) texts: AtomicUsize,
     }
 
     impl Gate {
-        fn open(&self) {
+        pub(crate) fn open(&self) {
             *self.open.lock().unwrap() = true;
             self.opened.notify_all();
         }
@@ -338,7 +338,7 @@ mod tests {
     /// A loopback OpenAI-compatible embedding server answering every text
     /// with [`vector_of`], holding requests that name `marker` until the
     /// returned gate opens. Returns its base URL.
-    fn serve(marker: &'static str) -> (String, Arc<Gate>) {
+    pub(crate) fn serve(marker: &'static str) -> (String, Arc<Gate>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let gate = Arc::new(Gate {

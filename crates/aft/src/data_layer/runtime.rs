@@ -484,7 +484,7 @@ impl Work {
     /// them. A failed round is tried again after a wait that doubles each
     /// time, as a failed build is.
     fn start_fill(self: &Arc<Self>) {
-        if !self.meaning.enabled() {
+        if !self.meaning.enabled() || self.meaning.reads_only() {
             return;
         }
         {
@@ -1056,6 +1056,7 @@ impl DataCheckout {
         config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
     ) -> MeaningState {
         self.work.meaning.configure_once(config);
+        self.work.meaning.refresh_read_only();
         let state = self.meaning_status();
         let wanted = match &state {
             MeaningState::Off | MeaningState::Unpublished => false,
@@ -1072,6 +1073,24 @@ impl DataCheckout {
     /// starts nothing.
     pub(crate) fn meaning_status(&self) -> MeaningState {
         self.work.meaning.state(self.view().as_ref())
+    }
+
+    /// Makes this checkout's meaning search read only the vectors its
+    /// repository's store already holds for `config`'s model (identified by
+    /// `fingerprint`), and never fill: for a child repository of a parent
+    /// folder's session. See [`super::meaning::Meaning::read_only`].
+    ///
+    /// # Errors
+    ///
+    /// When the plane cannot be made.
+    pub(crate) fn read_meaning_only(
+        &self,
+        config: &crate::config::SemanticBackendConfig,
+        fingerprint: &crate::semantic_index::SemanticIndexFingerprint,
+    ) -> Result<(), String> {
+        self.work
+            .meaning
+            .read_only(&self.work.checkout, config, fingerprint)
     }
 
     /// Whether a fill round is queued or running.

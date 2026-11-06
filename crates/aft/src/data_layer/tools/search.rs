@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-mod meaning;
+pub(crate) mod meaning;
 
 pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex, DATA_LAYER_BUILD_STAGE};
 

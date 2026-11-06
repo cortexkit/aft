@@ -683,6 +683,7 @@ fn start_semantic(session: &ParentSession) {
             model: std::sync::Mutex::new(Some(model)),
             plane,
             producer_id,
+            fingerprint,
         })
     })();
     *write(&session.semantic) = match started {

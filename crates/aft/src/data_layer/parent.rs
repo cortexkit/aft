@@ -5,8 +5,10 @@
 //! the process runs the data layer, each child repository that session
 //! found gets a checkout of its own, bound the first time a query reaches
 //! it, and grep, glob and the call-graph commands answer from the
-//! children's views (`views::parent::query`). The parent folder's own root
-//! binds no checkout.
+//! children's views (`views::parent::query`), as does `aft_search`
+//! (`views::parent::engine`), whose meaning lane reads each child's meaning
+//! plane without ever filling it ([`search_children`]). The parent folder's
+//! own root binds no checkout.
 //!
 //! The children are bound with the parent root's executor, so each child's
 //! builds and refreshes run as the parent root's maintenance, as jobs of
@@ -24,10 +26,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::SemanticBackendConfig;
 use crate::context::AppContext;
 use crate::data_layer::checkout::{CheckoutView, PlaneStatus, Planes};
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::executor::RootMaintenanceExecutor;
+use crate::semantic_index::SemanticIndexFingerprint;
 use crate::views::parent::Plane;
 
 /// One child's checkout, bound on first use. Each child has a lock of its
@@ -242,6 +246,83 @@ pub(crate) fn callgraph_plane(
         Fresh::Ready(view) => Plane::Ready(Arc::new(view)),
         Fresh::Building => Plane::Loading,
         Fresh::Failed(reason) => Plane::Gap(reason),
+    }
+}
+
+/// One child repository as a parent folder's `aft_search` reads it.
+pub(crate) struct ChildSearch {
+    /// Its checkout, which the child's search engine answers from; `None`
+    /// when it could not be bound, and `text` says why.
+    pub(crate) checkout: Option<Arc<DataCheckout>>,
+    /// Its text plane, as grep reads it.
+    pub(crate) text: Plane<CheckoutView>,
+    /// Why its meaning search has nothing to answer from, when it has not.
+    pub(crate) meaning_gap: Option<String>,
+}
+
+/// The words a parent folder's `aft_search` names a child with, when the
+/// child's repository store holds no vectors for any of its files.
+pub(crate) const NO_VECTORS: &str = "no semantic view has been published for this repository yet";
+
+/// Each of `children` (child roots of the parent folder `parent` that `ctx`
+/// is bound to) for the parent's `aft_search`, in the order of `children`:
+/// its checkout, bound if it is not yet, and its text plane. With
+/// `meaning` (the session's semantic configuration and its model's
+/// identity), the child's meaning plane is made read only: it reads the
+/// vectors the repository's store holds, whichever checkout embedded
+/// them, and never fills, since semantic search is not admitted for a
+/// repository no session has opened.
+pub(crate) fn search_children(
+    ctx: &AppContext,
+    parent: &Path,
+    children: &[&Path],
+    meaning: Option<(&SemanticBackendConfig, &SemanticIndexFingerprint)>,
+) -> Vec<ChildSearch> {
+    checkouts(ctx, parent, children)
+        .into_iter()
+        .map(|checkout| match checkout {
+            Ok(checkout) => ChildSearch {
+                text: text_plane(&checkout),
+                meaning_gap: meaning.and_then(|(config, fingerprint)| {
+                    meaning_gap(&checkout, config, fingerprint)
+                }),
+                checkout: Some(checkout),
+            },
+            Err(error) => ChildSearch {
+                checkout: None,
+                text: Plane::Gap(error),
+                meaning_gap: None,
+            },
+        })
+        .collect()
+}
+
+/// Makes `checkout`'s meaning plane read only for `config`'s model
+/// (identified by `fingerprint`), and says why it has nothing to answer
+/// from, when it has not: no vectors stored for any of its files, or the
+/// store could not be read. A checkout with nothing published yet is the
+/// text plane's gap.
+fn meaning_gap(
+    checkout: &DataCheckout,
+    config: &SemanticBackendConfig,
+    fingerprint: &SemanticIndexFingerprint,
+) -> Option<String> {
+    use crate::data_layer::meaning::MeaningState;
+    if let Err(error) = checkout.read_meaning_only(config, fingerprint) {
+        return Some(format!("semantic view unavailable: {error}"));
+    }
+    match checkout.meaning_status() {
+        MeaningState::Serving {
+            failure: Some(failure),
+            ..
+        } => Some(format!("semantic view unreadable: {}", failure.message())),
+        MeaningState::Serving { snapshot, .. } => (snapshot.chunks() == 0
+            && crate::data_layer::meaning::waiting(snapshot.coverage()))
+        .then(|| NO_VECTORS.to_string()),
+        MeaningState::Blocked(failure) => {
+            Some(format!("semantic view unreadable: {}", failure.message()))
+        }
+        MeaningState::Off | MeaningState::Unpublished | MeaningState::Starting => None,
     }
 }
 
