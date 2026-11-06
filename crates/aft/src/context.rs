@@ -5209,41 +5209,6 @@ pub enum CallgraphStoreAccess {
     Error(CallGraphStoreError),
 }
 
-pub(crate) fn checkout_view_callgraph_access(
-    reader: Option<
-        Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>,
-    >,
-) -> CallgraphStoreAccess {
-    match reader {
-        Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
-        Some(Err(error)) if error.building => CallgraphStoreAccess::Building,
-        // Pending verification and transient contention say nothing about the
-        // graph's validity. Use the existing busy error, which every caller
-        // presents as busy/pending with a retry.
-        Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(error.reason),
-            ),
-        )),
-        Some(Err(error))
-            if error
-                .reason
-                .contains(crate::views::read::CALLGRAPH_DISABLED) =>
-        {
-            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
-        }
-        Some(Err(error)) if crate::view_storage_reserve::is_message(&error.reason) => {
-            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
-        }
-        Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(format!(
-            "callgraph view unavailable: {}",
-            view_load_failure_message(error)
-        ))),
-        None => CallgraphStoreAccess::Unavailable,
-    }
-}
-
 /// Acquisition diagnostics for the checkout callgraph view, including the full
 /// cause of retryable SQLite contention and time spent acquiring readers.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -5588,13 +5553,6 @@ fn remove_callgraph_pointer_before_inline_reopen_for_test(
 ) {
     let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
     remove_armed_callgraph_pointer_for_test(&pointer);
-}
-
-#[cfg(not(test))]
-fn remove_callgraph_pointer_before_inline_reopen_for_test(
-    _callgraph_dir: &Path,
-    _store: &CallGraphStore,
-) {
 }
 
 /// Inline wait window for a callgraph-store cold build before returning
@@ -10424,30 +10382,6 @@ impl AppContext {
         }
     }
 
-    /// Install the checkout's manifest snapshot and its durable query pin.
-    pub(crate) fn install_view_runtime(
-        &self,
-        snapshot: ViewRuntimeSnapshot,
-        pin: Option<crate::pins::QueryPin>,
-    ) {
-        self.deleted_view_root_retired
-            .store(false, Ordering::Release);
-        let next_view_dir = snapshot.view_dir.clone();
-        let next = ViewRuntimeState::new(snapshot, pin.map(Arc::new));
-        let retired = self
-            .view_runtime
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .replace(next);
-        if let Some(runtime) = retired
-            .as_ref()
-            .filter(|runtime| runtime.snapshot.view_dir != next_view_dir)
-        {
-            crate::views::assembly::release_manifest_cache(&runtime.snapshot.view_dir);
-        }
-        drop(retired);
-    }
-
     /// A deleted checkout has no publication consumer. Retire once rather than
     /// letting watcher quiet-window retries spawn git indefinitely.
     pub(crate) fn retire_deleted_view_root(&self) -> bool {
@@ -10491,18 +10425,6 @@ impl AppContext {
             .checkout_query_runtime
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let retired = self
-            .view_runtime
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        drop(retired);
-    }
-
-    /// Drops this root's content-addressed v1 view runtime and nothing else:
-    /// the checkout drivers and the semantic lane keep running.
-    pub(crate) fn drop_v1_view_runtime(&self) {
-        self.release_view_publication_cache();
         let retired = self
             .view_runtime
             .write()
@@ -10937,13 +10859,6 @@ impl AppContext {
             return Weak::new();
         }
         Arc::downgrade(memo.get_or_insert_with(Default::default))
-    }
-
-    /// Whether a refresh the store must apply before answering as current is
-    /// still outstanding.
-    #[cfg(test)]
-    pub(crate) fn callgraph_catch_up_outstanding(&self) -> bool {
-        self.callgraph_catch_up.outstanding()
     }
 
     /// Record the workspace manifests' resolution fields read by this
@@ -11524,35 +11439,6 @@ impl AppContext {
         })
     }
 
-    fn wait_checkout_query(
-        &self,
-        runtime: &crate::views::query_wait::CheckoutQueryRuntime,
-        wait: Duration,
-    ) -> crate::views::contracts::WaitOutcome {
-        if !wait.is_zero() {
-            if let Some(outcome) = self.checkout_query_outcome() {
-                return outcome;
-            }
-        }
-        let outcome = runtime.waiter.wait_for(
-            &runtime.access,
-            crate::blob_store::v2::FamilyPlane::Callgraph,
-            wait,
-        );
-        if !wait.is_zero() {
-            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
-                if let Some((_, slot)) = outcomes
-                    .borrow_mut()
-                    .iter_mut()
-                    .find(|(key, _)| *key == self.config_pin_key())
-                {
-                    *slot = Some(outcome.clone());
-                }
-            });
-        }
-        outcome
-    }
-
     #[cfg(test)]
     pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
         self.callgraph_cold_build_spawn_count.load(Ordering::SeqCst)
@@ -11594,28 +11480,6 @@ impl AppContext {
             wait.min(deadline.saturating_duration_since(Instant::now()))
         });
         self.callgraph_store_for_ops_with_wait(wait, true, None)
-    }
-
-    /// Warm the callgraph store from the transport loop without the query-op wait.
-    ///
-    /// Query operations can wait up to `AFT_CALLGRAPH_BUILD_WAIT_MS` for a cold
-    /// build to become ready. Configure maintenance and work resumed after semantic
-    /// index initialization run on the loop that reads stdin; waiting there would
-    /// delay EOF handling until the build or wait window finishes, leaving the
-    /// process alive after the client closes the pipe.
-    ///
-    /// Warming the store is not a use of the graph: it never starts a linked
-    /// worktree's on-demand build (see `LazyCallgraph`).
-    /// The second return value identifies a full cold-build limiter rather than
-    /// another building/unavailable state, so configure can retain upgrade work.
-    pub(crate) fn schedule_callgraph_store_warm(&self) -> (CallgraphStoreAccess, bool) {
-        let mut capacity_deferred = false;
-        let access = self.callgraph_store_for_ops_with_wait(
-            Duration::ZERO,
-            false,
-            Some(&mut capacity_deferred),
-        );
-        (access, capacity_deferred)
     }
 
     /// The store for a reader that needs the graph now but must not wait for
@@ -11669,13 +11533,6 @@ impl AppContext {
         view.generation
             .as_deref()
             .is_none_or(|generation| !crate::views::read::derived_built(&view.view_dir, generation))
-    }
-
-    /// Record that a query needs this worktree's own graph and start the
-    /// publication that builds it. Later publications build it too.
-    fn request_callgraph_build(&self) {
-        self.lazy_callgraph.demanded.store(true, Ordering::Release);
-        self.schedule_lazy_callgraph_build();
     }
 
     /// Start one view publication to build an outstanding on-demand graph,
@@ -11744,79 +11601,6 @@ impl AppContext {
             .store(true, Ordering::Release);
     }
 
-    /// Log which source answers this root's call-graph queries: the main
-    /// checkout's graph, the worktree's own graph, or a build in progress.
-    /// Logged when the source changes, not on every query.
-    fn note_callgraph_source(&self, source: &'static str) {
-        let mut last = self.lazy_callgraph.source.lock();
-        if *last != Some(source) {
-            *last = Some(source);
-            crate::slog_info!(
-                "callgraph queries answered by source={} root={}",
-                source,
-                self.canonical_cache_root_opt()
-                    .unwrap_or_default()
-                    .display()
-            );
-        }
-    }
-
-    /// An on-demand root whose view generation has no derived graph: answer
-    /// from the main checkout's graph while the published files match it,
-    /// otherwise report `Building` and (for a real query) start the build.
-    fn on_demand_callgraph_access(
-        &self,
-        view: &ViewRuntimeSnapshot,
-        project_root: &Path,
-        generation: &str,
-        demand: bool,
-    ) -> CallgraphStoreAccess {
-        let manifest = view.manifest.as_ref().expect("pinned manifest");
-        if crate::views::assembly::manifest_lacks_callgraph(manifest) {
-            return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
-                crate::views::read::CALLGRAPH_DISABLED.to_string(),
-            ));
-        }
-        // Once a query has needed the worktree's own graph, answer from it
-        // alone: main's graph never stands in for a build already under way.
-        if !self.lazy_callgraph.demanded.load(Ordering::Acquire) {
-            match crate::views::read::main_checkout_callgraph(
-                &view.storage,
-                project_root,
-                &view.family,
-                generation,
-                manifest,
-            ) {
-                crate::views::read::MainCheckoutGraph::Answer(store, _) => {
-                    self.note_callgraph_source("main_checkout_graph");
-                    return CallgraphStoreAccess::Ready(Arc::new(store));
-                }
-                // Main's database is locked for now: ask again on the next
-                // query instead of failing or starting a build.
-                crate::views::read::MainCheckoutGraph::Busy => {
-                    return CallgraphStoreAccess::Building;
-                }
-                crate::views::read::MainCheckoutGraph::Unavailable => {}
-            }
-        }
-        if demand {
-            self.request_callgraph_build();
-            self.note_callgraph_source("building");
-            // Outside any publication scope the build ran inline just now
-            // (tests and one-shot tools); answer from it.
-            if !self.lazy_callgraph_build_outstanding()
-                && self.view_runtime_snapshot().is_some_and(|view| {
-                    view.generation.as_deref().is_some_and(|generation| {
-                        crate::views::read::derived_built(&view.view_dir, generation)
-                    })
-                })
-            {
-                return self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None);
-            }
-        }
-        CallgraphStoreAccess::Building
-    }
-
     fn callgraph_store_for_ops_with_wait(
         &self,
         wait: Duration,
@@ -11840,58 +11624,6 @@ impl AppContext {
         // today's store is never opened or built.
         let _ = (wait, demand, capacity_deferred);
         CallgraphStoreAccess::Unavailable
-    }
-
-    /// Make a store opened through the published pointer the resident store
-    /// and answer `Ready` with it, unless the root was rebound since
-    /// `operation_generation`.
-    fn install_readonly_callgraph_store(
-        &self,
-        store: ReadonlyCallGraphStore,
-        operation_generation: u64,
-        project_root: &Path,
-        callgraph_dir: &Path,
-        reconcile_reused: bool,
-    ) -> CallgraphStoreAccess {
-        let store = Arc::new(store);
-        let installed = self.run_if_subc_bound_generation(operation_generation, || {
-            let mut guard = self
-                .callgraph_store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if reconcile_reused && operation_generation > 0 {
-                // Register the comparison before publishing the reused reader:
-                // a concurrent query must not see the old graph without its
-                // pending check, even if installation pauses after this guard.
-                self.request_callgraph_reconcile("startup");
-            }
-            *guard = Some(Arc::clone(&store));
-            Arc::clone(&store)
-        });
-        let Some(store) = installed else {
-            return CallgraphStoreAccess::Unavailable;
-        };
-        #[cfg(test)]
-        if reconcile_reused {
-            let gate = self.callgraph_reused_install_gate.lock().unwrap().take();
-            if let Some((entered, release)) = gate {
-                let _ = entered.send(());
-                let _ = release.recv();
-            }
-        }
-        if reconcile_reused && operation_generation > 0 {
-            // A reused generation predates this engine's watcher. Compare it
-            // off-thread so offline edits are refreshed without a cold build
-            // or delaying configure's bind reply.
-            self.start_pending_callgraph_reconcile();
-        }
-        self.clear_callgraph_store_build_denied();
-        self.schedule_legacy_callgraph_migration_if_needed(
-            store.as_ref(),
-            project_root.to_path_buf(),
-            callgraph_dir.to_path_buf(),
-        );
-        CallgraphStoreAccess::Ready(store)
     }
 
     fn schedule_legacy_callgraph_migration_if_needed(
@@ -12441,13 +12173,6 @@ impl AppContext {
             && self.cache_unavailable_reason().is_none()
     }
 
-    pub(crate) fn lexical_view_is_ready(&self) -> bool {
-        self.lexical_view
-            .lock()
-            .as_ref()
-            .is_some_and(|view| view.is_ready())
-    }
-
     #[cfg(test)]
     pub(crate) fn lexical_source_for_test(
         &self,
@@ -12702,15 +12427,6 @@ impl AppContext {
         )
     }
 
-    /// The checkout whose call graph this one reads, and the open reader,
-    /// while this checkout is over `views.callgraph_copies` or the live-base cap.
-    pub(crate) fn borrowed_callgraph_view(&self) -> Option<(PathBuf, Arc<ReadonlyCallGraphStore>)> {
-        let borrow = self.callgraph_borrow.lock();
-        let borrow = borrow.as_ref()?;
-        let (_, store) = borrow.reader.as_ref()?;
-        Some((borrow.target_root.clone(), store.clone()))
-    }
-
     /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
     pub fn lexical_view_route_counts(&self) -> [u64; 3] {
         std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
@@ -12827,17 +12543,6 @@ impl AppContext {
         self.callgraph_view_read_diagnostics.lock().clone()
     }
 
-    fn note_callgraph_view_read(&self, elapsed: Duration, error: Option<String>) {
-        let mut diagnostics = self.callgraph_view_read_diagnostics.lock();
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        diagnostics.attempts = diagnostics.attempts.saturating_add(1);
-        diagnostics.last_attempt_ms = elapsed_ms;
-        diagnostics.total_attempt_ms = diagnostics.total_attempt_ms.saturating_add(elapsed_ms);
-        if error.is_some() {
-            diagnostics.last_error = error;
-        }
-    }
-
     /// Test-only fixture adapter: block until the view's acquisition completes,
     /// then pin its reader for the read-only test request (up to 120 seconds).
     /// Production callers must handle Building through the normal read APIs,
@@ -12865,30 +12570,6 @@ impl AppContext {
             )
         });
         read()
-    }
-
-    /// The call-graph reader of this checkout's view, acquired once per
-    /// pinned request. `None` means views do not route call-graph reads; a
-    /// genuine acquisition error is final. Capacity borrows the same published
-    /// graph as copy saturation, retaining the note naming the borrowed checkout
-    /// and differing files, and the readmission timer.
-    pub(crate) fn callgraph_view_reader(
-        &self,
-    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
-    {
-        self.callgraph_view_reader_inner().map(|result| {
-            result.map_err(|mut error| {
-                error.reason = self.view_storage_refusal_message(error.reason);
-                error
-            })
-        })
-    }
-
-    fn callgraph_view_reader_inner(
-        &self,
-    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
-    {
-        self.callgraph_view_reader_with(|view| view.reader())
     }
 
     fn callgraph_view_reader_with(
@@ -13068,10 +12749,6 @@ impl AppContext {
     /// v3 symbol plane.
     pub fn symbol_view_route_count(&self) -> u64 {
         self.symbol_view_routes.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn symbol_view_route_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.symbol_view_routes)
     }
 
     pub(crate) fn search_exact_memo(
@@ -17787,70 +17464,6 @@ mod core_regressions {
         );
     }
 
-    /// The health rollup reads every views-on root's path-status summary
-    /// every few seconds. Reading it opens the view's database, so it is read
-    /// again only after that database changed; otherwise the last summary is
-    /// reused. The pass count and time are printed as the measurement.
-    #[test]
-    fn view_health_rereads_path_status_only_after_its_database_changes() {
-        const PASSES: usize = 50;
-        let ctx = context();
-        let storage = tempfile::tempdir().unwrap();
-        let scope = "0123456789abcdef";
-        let view_dir = storage.path().join("views").join(scope);
-        std::fs::create_dir_all(&view_dir).unwrap();
-        // An open writer keeps the write-ahead log in place, so each later
-        // write visibly grows it.
-        let mut writer = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
-        writer.mark_pending(b"a.rs", "test", 1).unwrap();
-        ctx.update_config(|config| config.views.enabled = true);
-        ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.path().to_path_buf(),
-                family: "path-status-fixture".to_owned(),
-                scope: scope.to_owned(),
-                view_dir: view_dir.clone(),
-                generation: Some("1-fixture".to_owned()),
-                manifest: None,
-                head_fingerprint: String::new(),
-                head_metadata: crate::git_head::GitHeadMetadata {
-                    head_path: PathBuf::new(),
-                    head_mtime: None,
-                    resolved_ref_path: None,
-                    resolved_ref_mtime: None,
-                },
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
-        let reads = || crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
-
-        let before = reads();
-        let started = Instant::now();
-        for _ in 0..PASSES {
-            let health = ctx.view_health_snapshot().expect("view health");
-            assert_eq!(health.pending_paths, 1);
-        }
-        let elapsed = started.elapsed();
-        let database_reads = reads() - before;
-        eprintln!(
-            "view health: {PASSES} snapshots in {elapsed:?}, {database_reads} path-status database reads"
-        );
-
-        assert_eq!(database_reads, 1, "an unchanged database was read again");
-        writer.mark_pending(b"b.rs", "test", 1).unwrap();
-        assert_eq!(
-            ctx.view_health_snapshot()
-                .expect("view health")
-                .pending_paths,
-            2,
-            "a change to the database is read"
-        );
-        drop(writer);
-    }
-
     #[test]
     fn lazy_filter_load_recovers_poison_once() {
         let ctx = context();
@@ -20711,59 +20324,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn query_wait_joins_callgraph_build_scheduled_without_wait() {
-        let project = TempDir::new().expect("project tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
-        let project_root = std::fs::canonicalize(project.path()).expect("canonical project root");
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
-        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project_root.clone()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
-                ..Config::default()
-            },
-        ));
-        let _wait_guard = callgraph_build_wait_ms(&ctx, 10_000);
-        let (reached, release) = install_callgraph_build_start_gate(project_root);
-
-        assert!(matches!(
-            ctx.schedule_callgraph_store_warm().0,
-            CallgraphStoreAccess::Building
-        ));
-        reached
-            .recv_timeout(Duration::from_secs(2))
-            .expect("scheduled callgraph worker did not reach start barrier");
-
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let query_ctx = Arc::clone(&ctx);
-        let query = std::thread::spawn(move || {
-            result_tx
-                .send(query_ctx.callgraph_store_for_ops())
-                .expect("send query result");
-        });
-        assert!(
-            matches!(
-                result_rx.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "query returned while the scheduled callgraph build was still in flight"
-        );
-
-        release.send(()).expect("release callgraph worker");
-        assert!(matches!(
-            result_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("query did not settle after the callgraph build completed"),
-            CallgraphStoreAccess::Ready(_)
-        ));
-        query.join().expect("callgraph query thread");
-    }
-
-    #[test]
     fn callgraph_corpus_retry_restarts_inventory_changes_but_not_lookup_bugs() {
         let mut attempts = 0;
         let result = retry_changed_callgraph_corpus(|| {
@@ -20820,128 +20380,6 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
-    #[test]
-    fn scheduled_callgraph_retries_an_edit_with_a_fresh_corpus_without_breaker_deaths() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&attempts);
-        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
-            if let Some(path) = paths
-                .iter()
-                .find(|path| path.file_name().unwrap() == "a.rs")
-            {
-                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                    std::fs::write(path, "pub fn after_edit_marker() {}\n").unwrap();
-                }
-            }
-        })));
-        let (ctx, _project, _storage, _root, release, events) =
-            gated_callgraph_cold_build(Duration::from_secs(60));
-        crate::callgraph_store::set_cold_build_extract_observer(None);
-        release.send(()).unwrap();
-        let event = events.recv_timeout(Duration::from_secs(30)).unwrap();
-        let store = match event {
-            CallGraphStoreBuildEvent::Ready { store, .. } => store,
-            _ => panic!("the scheduled worker settled without publishing the edited corpus"),
-        };
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(store.nodes_matching("after_edit_marker").unwrap().len(), 1);
-        assert!(store.nodes_matching("a_marker").unwrap().is_empty());
-        assert_callgraph_churn_was_not_charged(&ctx, 1);
-        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
-        drop(store);
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Ready(_)
-        ));
-    }
-
-    #[test]
-    fn scheduled_callgraph_churn_budget_settles_as_building_without_breaker_deaths() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&attempts);
-        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
-            if let Some(path) = paths
-                .iter()
-                .find(|path| path.file_name().unwrap() == "a.rs")
-            {
-                let version = observed.fetch_add(1, Ordering::SeqCst);
-                std::fs::write(path, format!("pub fn changing_{version}() {{}}\n")).unwrap();
-            }
-        })));
-        let (ctx, _project, _storage, _root, release, events) =
-            gated_callgraph_cold_build(Duration::from_secs(60));
-        crate::callgraph_store::set_cold_build_extract_observer(None);
-        release.send(()).unwrap();
-        assert!(matches!(
-            events.recv_timeout(Duration::from_secs(30)).unwrap(),
-            CallGraphStoreBuildEvent::Settled
-        ));
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        assert_callgraph_churn_was_not_charged(&ctx, 0);
-        let _wait = callgraph_build_wait_ms(&ctx, 10_000);
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Building
-        ));
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Ready(_)
-        ));
-        assert_callgraph_churn_was_not_charged(&ctx, 1);
-    }
-
-    /// Schedules a callgraph cold build held at its start gate, with the
-    /// given abandon grace, and returns the context, project root, the gate
-    /// release, and a clone of the build's event receiver.
-    fn gated_callgraph_cold_build(
-        grace: Duration,
-    ) -> (
-        Arc<AppContext>,
-        TempDir,
-        TempDir,
-        PathBuf,
-        crossbeam_channel::Sender<()>,
-        crossbeam_channel::Receiver<CallGraphStoreBuildEvent>,
-    ) {
-        let project = TempDir::new().expect("project tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        for name in ["a", "b", "c", "d"] {
-            std::fs::write(
-                project.path().join(format!("{name}.rs")),
-                format!("pub fn {name}_marker() {{}}\n"),
-            )
-            .expect("source file");
-        }
-        let project_root = std::fs::canonicalize(project.path()).expect("canonical project root");
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
-        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project_root.clone()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
-                ..Config::default()
-            },
-        ));
-        ctx.isolate_cold_build_limiter_for_test(2);
-        ctx.set_unbound_build_abandon_grace_for_test(grace);
-        let (reached, release) = install_callgraph_build_start_gate(project_root.clone());
-        assert!(matches!(
-            ctx.schedule_callgraph_store_warm().0,
-            CallgraphStoreAccess::Building
-        ));
-        reached
-            .recv_timeout(Duration::from_secs(10))
-            .expect("scheduled callgraph worker did not reach start barrier");
-        let events = ctx
-            .callgraph_store_rx()
-            .lock()
-            .clone()
-            .expect("callgraph build receiver");
-        (ctx, project, storage, project_root, release, events)
-    }
-
     fn wait_for_no_cold_build_holders(ctx: &AppContext) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ctx.cold_build_limiter().census().holders.is_empty() {
@@ -20952,48 +20390,6 @@ mod callgraph_store_for_ops_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    #[test]
-    fn callgraph_cold_build_stops_at_next_fence_when_root_is_abandoned_past_grace() {
-        let (ctx, _project, _storage, project_root, release, events) =
-            gated_callgraph_cold_build(Duration::ZERO);
-        let census = ctx.cold_build_limiter().census();
-        assert_eq!(census.holders.len(), 1, "{census:?}");
-        assert_eq!(
-            census.holders[0].root,
-            project_root.display().to_string(),
-            "the callgraph holder must name its root"
-        );
-
-        ctx.mark_subc_unbound();
-        release.send(()).expect("release callgraph worker");
-        let event = events
-            .recv_timeout(Duration::from_secs(30))
-            .expect("callgraph worker did not settle");
-        assert!(
-            matches!(event, CallGraphStoreBuildEvent::Settled),
-            "an abandoned root's callgraph build must stop without publishing a store"
-        );
-        wait_for_no_cold_build_holders(&ctx);
-    }
-
-    #[test]
-    fn callgraph_cold_build_continues_through_unbind_inside_grace() {
-        let (ctx, _project, _storage, _project_root, release, events) =
-            gated_callgraph_cold_build(Duration::from_secs(600));
-
-        // A transient unbind (host restart) must leave the build running.
-        ctx.mark_subc_unbound();
-        release.send(()).expect("release callgraph worker");
-        let event = events
-            .recv_timeout(Duration::from_secs(30))
-            .expect("callgraph worker did not settle");
-        assert!(
-            matches!(event, CallGraphStoreBuildEvent::Ready { .. }),
-            "a root unbound for less than the grace window must finish its callgraph build"
-        );
-        wait_for_no_cold_build_holders(&ctx);
     }
 
     #[test]
@@ -21061,574 +20457,6 @@ mod callgraph_store_for_ops_tests {
         assert!(
             unrelated.exists(),
             "unrelated pointer must remain published"
-        );
-    }
-
-    #[test]
-    fn inline_ready_without_published_pointer_settles_and_preserves_pending_paths() {
-        let project = TempDir::new().expect("project tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
-                ..Config::default()
-            },
-        );
-        let project_key = crate::search_index::artifact_cache_key(project.path());
-        crate::root_cache::configure_artifact_access(project.path(), &project_key, false);
-        let pending = project.path().join("pending.rs");
-        ctx.add_pending_callgraph_store_paths([pending.clone()]);
-        let pointer = ctx
-            .callgraph_store_dir()
-            .join(format!("{project_key}.current"));
-        ctx.isolate_cold_build_limiter_for_test(1);
-        let delayed_start = std::env::var("AFT_TEST_INLINE_READY_BUILD_DELAY_MS")
-            .ok()
-            .map(|value| {
-                let delay = Duration::from_millis(value.parse().expect("build delay milliseconds"));
-                let (reached, release) =
-                    install_callgraph_build_start_gate(ctx.callgraph_project_root().unwrap());
-                (delay, reached, release)
-            });
-        assert!(matches!(
-            ctx.schedule_callgraph_store_warm().0,
-            CallgraphStoreAccess::Building
-        ));
-        if let Some((delay, reached, release)) = delayed_start {
-            reached
-                .recv_timeout(Duration::from_secs(60))
-                .expect("worker did not reach delayed build start");
-            std::thread::sleep(delay);
-            release.send(()).expect("release delayed build");
-        }
-        let events = ctx
-            .callgraph_store_rx()
-            .lock()
-            .take()
-            .expect("build receiver");
-        let ready = events
-            .recv_timeout(Duration::from_secs(60))
-            .expect("callgraph build did not publish its completion");
-        assert!(matches!(&ready, CallGraphStoreBuildEvent::Ready { .. }));
-
-        // A query receiving Ready must clear its build receiver even if reopening
-        // the published store fails, without discarding pending watcher paths. Wait
-        // for the build event first so extraction and disk I/O cannot use up the
-        // query's wait window. Remove the pointer before the query so it cannot
-        // return a disk reader without consuming Ready; the event retains the
-        // built store's writer lease until the query drops it.
-        std::fs::remove_file(pointer).expect("remove published pointer");
-        let (tx, rx) = crossbeam_channel::unbounded();
-        tx.send(ready).expect("queue Ready event");
-        *ctx.callgraph_store_rx().lock() = Some(rx);
-        assert!(matches!(
-            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60), true, None),
-            CallgraphStoreAccess::Building
-        ));
-        assert!(
-            ctx.callgraph_store_rx().lock().is_none(),
-            "inline Ready must settle after the published pointer disappears"
-        );
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![pending],
-            "inline reopen failure must preserve pending watcher paths"
-        );
-    }
-
-    struct ViewsCallgraphFixture {
-        _project: TempDir,
-        _storage: TempDir,
-        root: PathBuf,
-        source: PathBuf,
-        ctx: AppContext,
-        watcher_tx: crossbeam_channel::Sender<crate::watcher_filter::WatcherDispatchEvent>,
-        legacy: Arc<ReadonlyCallGraphStore>,
-    }
-
-    impl ViewsCallgraphFixture {
-        fn new() -> Self {
-            let project = TempDir::new().expect("project tempdir");
-            let storage = TempDir::new().expect("storage tempdir");
-            let source = project.path().join("lib.rs");
-            std::fs::write(
-                &source,
-                "pub fn caller() { target(); }\npub fn target() {}\n",
-            )
-            .expect("initial source");
-            Self::git(project.path(), &["init", "--quiet"]);
-            Self::git(project.path(), &["add", "lib.rs"]);
-            Self::git(
-                project.path(),
-                &[
-                    "-c",
-                    "user.name=AFT Tests",
-                    "-c",
-                    "user.email=aft-tests@example.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "initial",
-                ],
-            );
-            let root = std::fs::canonicalize(project.path()).expect("canonical project root");
-            let family = crate::search_index::artifact_cache_key(&root);
-            let scope = crate::path_identity::project_scope_key(&root);
-            crate::root_cache::configure_artifact_access(&root, &family, false);
-            let ctx = AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                Config {
-                    project_root: Some(root.clone()),
-                    storage_dir: Some(storage.path().to_path_buf()),
-                    indexes: crate::config::IndexesConfig {
-                        trigram: false,
-                        semantic: false,
-                        callgraph: true,
-                    },
-                    callgraph_chunk_size: 1,
-                    views: crate::config::ViewsConfig {
-                        enabled: true,
-                        ..Default::default()
-                    },
-                    ..Config::default()
-                },
-            );
-            ctx.set_canonical_cache_root(root.clone());
-            let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
-            *ctx.watcher_rx().lock() = Some(watcher_rx);
-            let view = crate::views::ViewStore::open(storage.path(), &scope).expect("view store");
-            ctx.install_view_runtime(
-                ViewRuntimeSnapshot {
-                    query_pin: None,
-                    storage: storage.path().to_path_buf(),
-                    family,
-                    scope,
-                    view_dir: view.view_dir().to_path_buf(),
-                    generation: None,
-                    manifest: None,
-                    head_fingerprint: String::new(),
-                    head_metadata: crate::git_head::capture_git_head_metadata(&root, None).unwrap(),
-                    pending_paths: BTreeSet::from([b"lib.rs".to_vec()]),
-                    pending_inputs: BTreeMap::new(),
-                },
-                None,
-            );
-            let legacy = ctx
-                .ensure_callgraph_store()
-                .expect("legacy callgraph build")
-                .expect("legacy callgraph reader");
-            assert_eq!(legacy.reader_kind(), "legacy");
-            Self {
-                _project: project,
-                _storage: storage,
-                root,
-                source,
-                ctx,
-                watcher_tx,
-                legacy,
-            }
-        }
-
-        fn git(root: &Path, args: &[&str]) {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(status.success(), "git {args:?} failed with {status}");
-        }
-
-        fn callers(&self) -> crate::protocol::Response {
-            crate::commands::callers::handle_callers(
-                &RawRequest {
-                    id: "views-callers".to_owned(),
-                    command: "callers".to_owned(),
-                    lsp_hints: None,
-                    session_id: None,
-                    params: json!({
-                        "file": self.source,
-                        "symbol": "target",
-                    }),
-                },
-                &self.ctx,
-            )
-        }
-
-        fn commit_source(&self, source: &str, message: &str) {
-            std::fs::write(&self.source, source).expect("updated source");
-            Self::git(&self.root, &["add", "lib.rs"]);
-            Self::git(
-                &self.root,
-                &[
-                    "-c",
-                    "user.name=AFT Tests",
-                    "-c",
-                    "user.email=aft-tests@example.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    message,
-                ],
-            );
-            let metadata = self
-                .ctx
-                .view_runtime_snapshot()
-                .expect("view runtime")
-                .head_metadata;
-            let paths = metadata
-                .watch_paths()
-                .map(Path::to_path_buf)
-                .collect::<Vec<_>>();
-            self.watcher_tx
-                .send(crate::watcher_filter::WatcherDispatchEvent::Paths(
-                    paths.clone(),
-                ))
-                .expect("watcher HEAD event");
-            let outcome =
-                crate::runtime_drain::drain_watcher_events_bounded(&self.ctx, paths.len());
-            assert_eq!(outcome.processed, paths.len());
-            assert!(
-                self.ctx
-                    .watcher_drain_slice()
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|state| state.view_publication_due.is_some()),
-                "watcher HEAD metadata event must schedule publication"
-            );
-        }
-    }
-
-    #[test]
-    fn readonly_assembly_building_names_missing_callgraph_blob() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.ctx.set_cache_role(true, None);
-        fixture.commit_source(
-            "pub fn local_caller() { target(); }\npub fn target() {}\n",
-            "local source",
-        );
-        let snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
-        let source = std::fs::read(&fixture.source).unwrap();
-        let key = crate::blob_store::CallgraphKey::from_bytes(
-            &source,
-            "rust",
-            crate::callgraph_extractor::PRODUCER,
-        )
-        .full_key();
-        // Normal checkout publication may put its own immutable blobs. Keep
-        // refusal diagnostics covered with an explicitly read-only assembly.
-        let report =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: snapshot.storage.clone(),
-                project_root: fixture.root.clone(),
-                family: snapshot.family.clone(),
-                scope: snapshot.scope.clone(),
-                desired_head: snapshot.head_fingerprint.clone(),
-                changed_paths: BTreeSet::new(),
-                semantic_keys: BTreeMap::new(),
-                require_semantic: false,
-                allow_blob_put: false,
-                callgraph: true,
-            })
-            .unwrap();
-        assert!(!report.published);
-        fixture.ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                generation: report.generation,
-                manifest: report.manifest,
-                pending_paths: report.pending_paths,
-                pending_inputs: report.pending_inputs,
-                ..snapshot
-            },
-            None,
-        );
-        let response = crate::commands::callgraph_store_adapter::index_refusal_response(
-            "building",
-            "callers",
-            &fixture.ctx,
-            &CallgraphStoreAccess::Building,
-        );
-        assert_eq!(response.data["progress"]["pending_paths"], 1);
-        assert_eq!(
-            response.data["progress"]["waiting_on"],
-            json!([{
-                "path": "lib.rs", "plane": "callgraph", "reason": "shared callgraph blob unavailable", "blob_key": key.to_hex(),
-            }])
-        );
-        let message = response.data["message"].as_str().unwrap();
-        assert!(message.contains("lib.rs [callgraph:"), "{message}");
-        assert!(message.contains("artifact writer"), "{message}");
-        assert!(!message.contains("retry shortly"), "{message}");
-    }
-
-    /// With views on, a commit that changes the graph is answered from the
-    /// checkout as it now is: the stale legacy store, which still holds the
-    /// removed call, never answers.
-    #[test]
-    fn views_changed_head_callers_answer_the_current_tree_not_the_stale_legacy_store() {
-        let fixture = ViewsCallgraphFixture::new();
-        let before = fixture
-            .ctx
-            .with_ready_callgraph_for_test(|| fixture.callers());
-        assert!(before.success, "{:#}", before.data);
-        assert_eq!(before.data["total_callers"], 1, "{:#}", before.data);
-        fixture.commit_source(
-            "pub fn caller() {}\npub fn target() {}\n",
-            "remove stale call",
-        );
-        let stale = crate::commands::callgraph_store_adapter::callers_result(
-            fixture.legacy.as_ref(),
-            &fixture.source,
-            "target",
-            1,
-            false,
-        )
-        .expect("stale legacy callers");
-        assert_eq!(stale.total_callers, 1, "legacy fixture must remain stale");
-
-        let response = fixture
-            .ctx
-            .with_ready_callgraph_for_test(|| fixture.callers());
-
-        assert!(response.success, "{:#}", response.data);
-        assert_eq!(
-            response.data["total_callers"], 0,
-            "the changed HEAD must not serve stale rows: {:#}",
-            response.data
-        );
-    }
-
-    impl ViewsCallgraphFixture {
-        /// Hold this checkout's v3 call-graph view database busy the way a
-        /// writer does mid-maintenance: an exclusive lock that a reader cannot
-        /// get past. Binds the view first (one answered query), then drops
-        /// this context's view (turning views off and on again) so the next
-        /// query must open the database, and waits for the deferred checkpoint
-        /// so only the returned connection holds the file.
-        fn hold_checkout_view_derived_busy(&self) -> rusqlite::Connection {
-            let bound = self.ctx.with_ready_callgraph_for_test(|| self.callers());
-            assert!(bound.success, "{:#}", bound.data);
-            self.ctx
-                .update_config(|config| config.views.enabled = false);
-            self.ctx.update_config(|config| config.views.enabled = true);
-            let storage = self.ctx.storage_paths().artifacts;
-            let family = self.ctx.memoized_artifact_cache_key(&self.root);
-            let member = crate::blob_store::v3::view_dir(
-                &storage,
-                &family,
-                &crate::views::callgraph::view_scope(&self.root),
-            )
-            .expect("v3 member directory");
-            crate::views::wait_for_derived_checkpoint_for_test(&member);
-            let generation = crate::views::ViewStore::open_dir(member.clone())
-                .expect("v3 member view")
-                .current_generation()
-                .expect("v3 pointer")
-                .expect("published v3 generation");
-            let path =
-                crate::views::resolve_derived_path(&member, &generation).expect("derived path");
-            assert!(
-                path.is_file(),
-                "derived database {} missing",
-                path.display()
-            );
-            let holder = rusqlite::Connection::open(&path).expect("derived writer");
-            holder
-                .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
-                .expect("exclusive derived lock");
-            holder
-        }
-    }
-
-    /// A call graph turned off is never built and never answered: with views
-    /// on and `indexes.callgraph=false` the call-graph tools report the index
-    /// off without binding a checkout view.
-    #[test]
-    fn views_callgraph_index_off_answers_off_without_binding_a_view() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture
-            .ctx
-            .update_config(|config| config.indexes.callgraph = false);
-
-        let response = fixture.callers();
-
-        assert!(!response.success, "{:#}", response.data);
-        assert_eq!(
-            response.data["code"], "callgraph_off",
-            "{:#}",
-            response.data
-        );
-        assert!(matches!(
-            fixture.ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Off
-        ));
-        assert_eq!(fixture.ctx.callgraph_view_route_count(), 0);
-        let member = crate::blob_store::v3::view_dir(
-            &fixture.ctx.storage_paths().artifacts,
-            &fixture.ctx.memoized_artifact_cache_key(&fixture.root),
-            &crate::views::callgraph::view_scope(&fixture.root),
-        )
-        .unwrap();
-        assert!(!member.exists());
-    }
-
-    /// A generation that does carry a call graph, read while
-    /// its derived database is busy, is temporarily unreadable and says so as
-    /// a retryable `callgraph_building`. This also proves the busy hold above
-    /// really blocks a reader that opens the store.
-    #[test]
-    fn views_keyed_generation_answers_building_while_derived_store_is_busy() {
-        let fixture = ViewsCallgraphFixture::new();
-        let busy = fixture.hold_checkout_view_derived_busy();
-
-        let response = fixture.callers();
-
-        assert!(!response.success, "{:#}", response.data);
-        assert_eq!(
-            response.data["code"], "callgraph_building",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(
-            response.data["message"],
-            "callers: persisted callgraph store is busy; retry shortly"
-        );
-        drop(busy);
-        fixture.ctx.view_load_retry_due_for_test();
-        let response = fixture
-            .ctx
-            .with_ready_callgraph_for_test(|| fixture.callers());
-        assert!(response.success, "{:#}", response.data);
-    }
-
-    #[test]
-    fn views_keyed_generation_inspect_reports_pending_while_derived_store_is_busy() {
-        let fixture = ViewsCallgraphFixture::new();
-        fixture.ctx.set_harness(crate::harness::Harness::Runner);
-        let inspect = || {
-            crate::commands::inspect::handle_inspect(
-                &RawRequest {
-                    id: "views-inspect".to_owned(),
-                    command: "inspect".to_owned(),
-                    lsp_hints: None,
-                    session_id: None,
-                    params: json!({
-                        "scope": ["lib.rs"],
-                        "sections": ["dead_code", "unused_exports"],
-                    }),
-                },
-                &fixture.ctx,
-            )
-        };
-        let busy = fixture.hold_checkout_view_derived_busy();
-
-        let response = inspect();
-
-        assert!(response.success, "{:#}", response.data);
-        assert_eq!(
-            response.data["summary"]["dead_code"]["status"], "pending",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(
-            response.data["summary"]["dead_code"]["code"], "callgraph_building",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(
-            response.data["summary"]["dead_code"]["index"]["status"], "building",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(
-            response.data["summary"]["unused_exports"]["status"], "pending",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(response.data["complete"], false, "{:#}", response.data);
-        assert!(
-            response.data["text"].as_str().is_some_and(|text| {
-                text.starts_with("PARTIAL — dead code, unused exports still building")
-                    && text.contains(
-                        "Dead code: pending (waiting for or projecting the checkout call graph)",
-                    )
-            }),
-            "{:#}",
-            response.data
-        );
-
-        drop(busy);
-        fixture.ctx.view_load_retry_due_for_test();
-        let response = fixture.ctx.with_ready_callgraph_for_test(inspect);
-        assert!(response.success, "{:#}", response.data);
-        assert!(
-            response.data["summary"]["dead_code"]["count"]
-                .as_u64()
-                .is_some(),
-            "dead-code analysis should resolve after the database lock is released: {:#}",
-            response.data
-        );
-        assert!(
-            response.data["summary"]["unused_exports"]["count"]
-                .as_u64()
-                .is_some(),
-            "unused-export analysis should resolve after the database lock is released: {:#}",
-            response.data
-        );
-    }
-
-    /// Zoom's call graph field reads the same store as `callers` and must give
-    /// the same verdict for a busy database: building, retry shortly. A busy
-    /// open says nothing about whether the graph exists, so reporting it as
-    /// `callgraph_unavailable` would present a moment of contention as a fact
-    /// about the index.
-    #[test]
-    fn views_keyed_generation_zoom_reports_building_while_derived_store_is_busy() {
-        let fixture = ViewsCallgraphFixture::new();
-        let zoom = || {
-            crate::commands::zoom::handle_zoom(
-                &RawRequest {
-                    id: "views-zoom".to_owned(),
-                    command: "zoom".to_owned(),
-                    lsp_hints: None,
-                    session_id: None,
-                    params: json!({
-                        "file": fixture.source,
-                        "symbol": "target",
-                        "callgraph": true,
-                    }),
-                },
-                &fixture.ctx,
-            )
-        };
-        let busy = fixture.hold_checkout_view_derived_busy();
-
-        let response = zoom();
-
-        assert!(response.success, "{:#}", response.data);
-        assert_eq!(
-            response.data["callgraph"]["code"], "callgraph_building",
-            "{:#}",
-            response.data
-        );
-        assert_eq!(
-            response.data["callgraph"]["index"]["status"], "building",
-            "{:#}",
-            response.data
-        );
-        // Once the database is free again the same zoom reads the graph.
-        drop(busy);
-        fixture.ctx.view_load_retry_due_for_test();
-        let response = fixture.ctx.with_ready_callgraph_for_test(zoom);
-        assert!(response.success, "{:#}", response.data);
-        assert!(
-            response.data.get("callgraph").is_none(),
-            "{:#}",
-            response.data
         );
     }
 

@@ -2190,37 +2190,6 @@ fn install_search_rebuild_publish_gate(
     (reached_rx, shutdown_waiting_rx, release_tx)
 }
 
-pub(crate) fn note_search_rebuild_shutdown_wait_for_test() {
-    let signal = SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("search rebuild shutdown wait signal mutex poisoned")
-        .take();
-    if let Some(signal) = signal {
-        let _ = signal.send(());
-    }
-}
-
-fn wait_on_search_rebuild_publish_gate_for_test(root: &Path) {
-    let mut slot = SEARCH_REBUILD_PUBLISH_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("search rebuild publish gate mutex poisoned");
-    let gate = if slot
-        .as_ref()
-        .is_some_and(|gate| gate.root.as_deref().is_none_or(|expected| expected == root))
-    {
-        slot.take()
-    } else {
-        None
-    };
-    drop(slot);
-    if let Some(gate) = gate {
-        let _ = gate.reached_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
-    }
-}
-
 pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
@@ -2305,10 +2274,6 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
         status_changed
     })
     .unwrap_or(false)
-}
-
-fn search_refresh_started_log(reason: &str) -> String {
-    format!("started search index refresh after {reason}")
 }
 
 pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
@@ -4616,27 +4581,6 @@ mod tests {
         let state = state.as_ref().expect("replayed watcher state");
         assert!(state.ignore_refresh_due.is_none());
         assert!(state.ignore_changed_paths.is_empty());
-    }
-
-    #[test]
-    fn ignore_rule_refresh_log_caps_paths_and_counts_the_rest() {
-        let root = Path::new("/workspace");
-        let paths = [
-            "a/.gitignore",
-            "b/.aftignore",
-            "c/.gitignore",
-            "d/.aftignore",
-            "e/.gitignore",
-        ]
-        .into_iter()
-        .map(|path| root.join(path))
-        .collect::<Vec<_>>();
-        let reason = ignore_rule_change_reason(Some(root), &paths, paths.len());
-
-        assert_eq!(
-            search_refresh_started_log(&reason),
-            "started search index refresh after ignore-rule change: paths=[a/.gitignore, b/.aftignore, c/.gitignore] (+2)"
-        );
     }
 
     #[test]

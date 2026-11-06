@@ -1497,34 +1497,6 @@ thread_local! {
     static SYMBOL_CACHE_DECODE_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Loads the disk symbol cache into a shared cache for `generation`.
-///
-/// Decoding and checking each entry against its file (a stat, sometimes a
-/// content hash) happens with no lock held; only the final swap takes the
-/// write lock. Holding the write lock for the whole load blocked every outline,
-/// zoom and symbol lookup for as long as the startup load took. If the cache
-/// moved to another generation while decoding (a reconfigure reset it), the
-/// decoded entries belong to the old project state and are discarded, not
-/// merged.
-pub(crate) fn load_shared_symbol_cache_for_generation(
-    symbol_cache: &SharedSymbolCache,
-    generation: u64,
-    storage_dir: &Path,
-    project_key: &str,
-    current_root: &Path,
-) -> SymbolCacheLoadOutcome {
-    let Some(decoded) = DecodedSymbolCache::read(storage_dir, project_key, current_root) else {
-        return SymbolCacheLoadOutcome::default();
-    };
-    let Ok(mut cache) = symbol_cache.write() else {
-        return SymbolCacheLoadOutcome::default();
-    };
-    if cache.generation != generation {
-        return SymbolCacheLoadOutcome::default();
-    }
-    cache.install_decoded(decoded)
-}
-
 impl SymbolCache {
     pub fn new() -> Self {
         Self {
@@ -1798,26 +1770,6 @@ impl SymbolCache {
     /// Current generation token.
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub(crate) fn needs_persistence(&self) -> bool {
-        self.mutation_revision != self.persisted_revision
-    }
-
-    pub(crate) fn persistence_revision(&self) -> u64 {
-        self.mutation_revision
-    }
-
-    pub(crate) fn mark_persisted_for_generation(
-        &mut self,
-        generation: u64,
-        persisted_revision: u64,
-    ) -> bool {
-        if self.generation != generation || self.mutation_revision != persisted_revision {
-            return false;
-        }
-        self.persisted_revision = persisted_revision;
-        true
     }
 
     /// Whether the cache has an entry for a file.
@@ -10998,97 +10950,6 @@ pub(crate) mod outer {
         symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), key)
             .expect("write symbol cache");
         (project, storage, sources)
-    }
-
-    /// Starts a shared-cache load on another thread and parks it after the
-    /// disk cache has been read and decoded, before its entries are checked
-    /// against their files.
-    fn park_shared_load_mid_decode(
-        shared: &SharedSymbolCache,
-        generation: u64,
-        storage: &Path,
-        key: &str,
-        root: &Path,
-    ) -> (
-        std::sync::Arc<std::sync::Barrier>,
-        std::thread::JoinHandle<SymbolCacheLoadOutcome>,
-    ) {
-        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let released = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let hook = (arrived.clone(), released.clone());
-        let shared = Arc::clone(shared);
-        let storage = storage.to_path_buf();
-        let key = key.to_owned();
-        let root = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            SYMBOL_CACHE_DECODE_TEST_BARRIERS.with(|slot| *slot.borrow_mut() = Some(hook));
-            load_shared_symbol_cache_for_generation(&shared, generation, &storage, &key, &root)
-        });
-        arrived.wait();
-        (released, handle)
-    }
-
-    #[test]
-    fn startup_symbol_cache_load_decodes_without_holding_the_cache_lock() {
-        let (project, storage, sources) = disk_symbol_cache_fixture(3, "lock-free-load");
-        let shared = Arc::new(RwLock::new(SymbolCache::new()));
-        let generation = shared.read().unwrap().generation();
-        let (released, handle) = park_shared_load_mid_decode(
-            &shared,
-            generation,
-            storage.path(),
-            "lock-free-load",
-            project.path(),
-        );
-        // The load is parked mid-decode. Readers and writers must not wait on it.
-        let readable = shared.try_read().is_ok();
-        let writable = shared.try_write().is_ok();
-        released.wait();
-        let outcome = handle.join().unwrap();
-        assert!(readable, "a reader was blocked by the in-flight decode");
-        assert!(writable, "a writer was blocked by the in-flight decode");
-        assert_eq!(outcome.loaded, 3);
-        let cache = shared.read().unwrap();
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.project_root(), Some(project.path().to_path_buf()));
-        for source in &sources {
-            assert!(cache.contains_key(source));
-        }
-    }
-
-    #[test]
-    fn startup_symbol_cache_load_is_discarded_when_the_generation_moves_mid_decode() {
-        let (project, storage, sources) = disk_symbol_cache_fixture(3, "stale-load");
-        let shared = Arc::new(RwLock::new(SymbolCache::new()));
-        let generation = shared.read().unwrap().generation();
-        let (released, handle) = park_shared_load_mid_decode(
-            &shared,
-            generation,
-            storage.path(),
-            "stale-load",
-            project.path(),
-        );
-        // A reconfigure resets the cache while the decode is in flight, and a
-        // request of the new generation caches one file. `try_write` keeps a
-        // regression that holds the lock across the decode from deadlocking
-        // this test against the parked decode.
-        let active = shared
-            .try_write()
-            .expect("the cache lock is free while the decode is in flight")
-            .reset();
-        assert_ne!(active, generation);
-        let mut parser =
-            FileParser::with_symbol_cache_generation(Arc::clone(&shared), Some(active));
-        parser.extract_symbols(&sources[0]).unwrap();
-        released.wait();
-        let outcome = handle.join().unwrap();
-
-        assert_eq!(outcome, SymbolCacheLoadOutcome::default());
-        let cache = shared.read().unwrap();
-        assert_eq!(cache.generation(), active);
-        assert_eq!(cache.len(), 1, "the stale decode must not be merged in");
-        assert!(cache.contains_key(&sources[0]));
-        assert!(cache.project_root().is_none());
     }
 
     // --- Language detection ---

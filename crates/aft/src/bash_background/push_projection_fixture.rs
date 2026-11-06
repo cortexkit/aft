@@ -12,7 +12,6 @@ pub(crate) struct BusyRoot {
     pub storage: PathBuf,
     pub key: String,
     _dir: tempfile::TempDir,
-    _view: crate::views::registry::ViewRegistration,
 }
 
 pub(crate) fn busy_root() -> MutexGuard<'static, BusyRoot> {
@@ -70,38 +69,7 @@ fn build() -> BusyRoot {
         entries_done: Some(40_000),
         entries_total: Some(52_000),
     };
-    let family = crate::views::registry::FamilyRegistry::open(&storage, "push-fixture").unwrap();
-    let view = family
-        .register_view_with_storage(&storage, "prefrontal", &root)
-        .unwrap();
-    let mut paths = crate::path_status::PathStatusStore::open(view.view_dir()).unwrap();
-    for i in 0..20 {
-        paths
-            .mark_pending(format!("src/pending_{i}.rs").as_bytes(), "fixture", 1)
-            .unwrap();
-    }
-    paths.mark_failed(b"src/failed.rs", "fixture", 1).unwrap();
-    ctx.install_view_runtime(
-        crate::context::ViewRuntimeSnapshot {
-            query_pin: None,
-            storage: storage.clone(),
-            family: "push-fixture".into(),
-            scope: "prefrontal".into(),
-            view_dir: view.view_dir().to_path_buf(),
-            generation: Some("1-fixture".into()),
-            manifest: None,
-            head_fingerprint: String::new(),
-            head_metadata: crate::git_head::GitHeadMetadata {
-                head_path: PathBuf::new(),
-                head_mtime: None,
-                resolved_ref_path: None,
-                resolved_ref_mtime: None,
-            },
-            pending_paths: Default::default(),
-            pending_inputs: Default::default(),
-        },
-        None,
-    );
+    // Views are gone; the fixture carries no checkout view or path status.
     for kind in [
         crate::lsp::registry::ServerKind::TypeScript,
         crate::lsp::registry::ServerKind::Rust,
@@ -145,6 +113,5 @@ fn build() -> BusyRoot {
         storage,
         key,
         _dir: dir,
-        _view: view,
     }
 }

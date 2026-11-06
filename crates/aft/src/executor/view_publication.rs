@@ -662,25 +662,6 @@ pub(crate) fn cancel_for_context(ctx: &AppContext) {
     }
 }
 
-/// Scheduling succeeds once ownership has moved to the detached worker.
-/// Callers outside any actor scope (tests and one-shot tools that drain
-/// configure maintenance themselves) retain the synchronous API.
-pub(crate) fn schedule(
-    ctx: &AppContext,
-    paths: BTreeSet<Vec<u8>>,
-    allow_semantic_blob_put: bool,
-) -> Result<(), String> {
-    schedule_with_reason(
-        ctx,
-        paths,
-        allow_semantic_blob_put,
-        crate::views::publication_reason::Reason {
-            events: crate::views::publication_reason::Reason::CONFIGURE,
-            ..Default::default()
-        },
-    )
-}
-
 pub(crate) fn schedule_with_reason(
     ctx: &AppContext,
     paths: BTreeSet<Vec<u8>>,

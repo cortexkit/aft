@@ -404,10 +404,6 @@ impl LexicalView {
         self.source.record_cookie(path);
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Acquire)
-    }
-
     #[cfg(test)]
     pub(crate) fn source_for_test(&self) -> Arc<dyn LexicalSnapshotSource> {
         self.source.clone()
@@ -2167,51 +2163,6 @@ mod tests {
         crate::watcher_backend::subscription::gap(&root);
         assert_eq!(matches("third_needle"), 1);
         assert_eq!(view.acquisitions.load(Relaxed), 3, "a watcher gap binds");
-    }
-
-    /// A checkout with no steady watcher subscription (no watcher, an
-    /// unproved one, or an unsupported filesystem) is still served: every
-    /// query binds strictly against the disk and answers from that cut,
-    /// including edits no watcher reported.
-    #[test]
-    fn lexical_view_without_a_watcher_subscription_serves_each_strict_bind() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(temp.path()).unwrap();
-        let root = base.join("project");
-        let storage = base.join("storage");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("a.rs"), "fn first_needle() {}\n").unwrap();
-        assert!(crate::watcher_backend::subscription::status(&root).is_none());
-        let view = LexicalView::new(
-            root.clone(),
-            crate::root_cache::StoragePaths::same(&storage),
-            "lexical-unwatched".into(),
-            TrigramPolicy {
-                max_file_size: 1024 * 1024,
-            },
-        )
-        .unwrap();
-        let first = view.snapshot().unwrap().into_ready().unwrap();
-        assert_eq!(
-            first
-                .grep("first_needle", true, &[], &[], &root, 10)
-                .unwrap()
-                .matches
-                .len(),
-            1
-        );
-        assert!(view.is_ready());
-        // No event is recorded for this edit: only the strict bind sees it.
-        fs::write(root.join("b.rs"), "fn second_needle() {}\n").unwrap();
-        let second = view.snapshot().unwrap().into_ready().unwrap();
-        assert_eq!(
-            second
-                .grep("second_needle", true, &[], &[], &root, 10)
-                .unwrap()
-                .matches
-                .len(),
-            1
-        );
     }
 
     #[test]

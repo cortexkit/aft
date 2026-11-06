@@ -41,9 +41,6 @@ impl CallgraphCatchUp {
         Arc::new(CallgraphCatchUpGuard(Arc::clone(self)))
     }
 
-    pub(crate) fn outstanding(&self) -> bool {
-        self.outstanding.load(Ordering::SeqCst) > 0
-    }
 }
 
 /// Marks one catch-up outstanding until dropped.

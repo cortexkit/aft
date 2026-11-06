@@ -260,35 +260,6 @@ impl From<CallGraphStoreError> for MigrationError {
     }
 }
 
-/// Imports an eligible root's old `semantic.bin` without making embedding requests.
-///
-/// Compatibility is intentionally strict: V6–V8 snapshots must carry the exact
-/// configured model fingerprint and the current legacy chunking version. Earlier
-/// or unstamped snapshots are recorded as a rebuild request rather than treated as
-/// an import failure. The source snapshot is never deleted or rewritten here.
-pub(crate) fn configured_fingerprint_for_legacy(
-    path: &Path,
-    config: &crate::config::SemanticBackendConfig,
-) -> Result<String, MigrationError> {
-    let bytes = fs::read(path)?;
-    let mut reader = LegacyReader::new(&bytes);
-    let version = reader
-        .read_u8()
-        .map_err(MigrationError::InvalidLegacySnapshot)?;
-    if !(LEGACY_SEMANTIC_V6..=LEGACY_SEMANTIC_V8).contains(&version) {
-        return Err(MigrationError::InvalidLegacySnapshot(format!(
-            "semantic.bin version {version} has no established producer stamps"
-        )));
-    }
-    let dimension = reader
-        .read_u32()
-        .map_err(MigrationError::InvalidLegacySnapshot)? as usize;
-    Ok(
-        crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(config, dimension)
-            .as_string(),
-    )
-}
-
 pub(crate) struct LiveSemanticBlobs {
     pub keys: BTreeMap<Vec<u8>, String>,
     pub pin: AssemblyPin,

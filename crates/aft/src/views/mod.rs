@@ -54,8 +54,6 @@ pub mod callgraph;
 mod callgraph_acquisition;
 pub(crate) mod callgraph_copies;
 
-#[cfg(test)]
-mod cap_tests;
 pub mod first_load;
 pub mod intent;
 pub mod live_delta;

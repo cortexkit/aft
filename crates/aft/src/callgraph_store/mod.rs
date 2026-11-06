@@ -1049,43 +1049,6 @@ mod write_amplification_tests {
         );
     }
 
-    #[test]
-    fn callgraph_serving_reads_keep_outlasting_locks_busy() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("root");
-        fs::create_dir_all(&root).unwrap();
-        let source = root.join("main.rs");
-        fs::write(&source, "fn leaf() {}\npub fn entry() { leaf(); }\n").unwrap();
-        let dir = temp.path().join("store");
-        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
-        store.cold_build(&[source]).unwrap();
-        let blocker = store.lock_readiness_for_test();
-        blocker.execute_batch("ROLLBACK").unwrap();
-        let reader = CallGraphStore::open_readonly(dir, root).unwrap().unwrap();
-        let snapshot = reader.read_snapshot().unwrap();
-        for conn in [&reader.inner.conn, &snapshot.conn] {
-            let timeout: u64 = conn
-                .lock()
-                .unwrap()
-                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(timeout, 100, "serving reads need a short, bounded wait");
-        }
-
-        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        for reader in [&reader.inner, &snapshot] {
-            let error = reader
-                .call_tree(Path::new("main.rs"), "entry", 1)
-                .unwrap_err();
-            assert!(error.is_transient_lock_contention(), "{error}");
-        }
-        blocker.execute_batch("ROLLBACK").unwrap();
-        for reader in [&reader.inner, &snapshot] {
-            let tree = reader.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
-            assert_eq!(tree.children[0].name, "leaf");
-        }
-    }
-
     /// A store whose pointer is published and whose `meta` says ready must be
     /// readable from that moment on. Here another process holds a read open on
     /// the just-published generation (a readiness probe, or a second AFT reading
@@ -1274,61 +1237,6 @@ mod write_amplification_tests {
             .unwrap();
         assert_eq!(shifted_stats.unchanged_extract_files, 0);
         assert_eq!(shifted_stats.refreshed_own_files, 1);
-    }
-
-    #[test]
-    fn revision_bumps_always_have_journal_entries_and_graph_neutral_saves_have_neither() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("root");
-        fs::create_dir_all(&root).unwrap();
-        let source = root.join("main.ts");
-        fs::write(&source, "export function before() { return 1; }\n").unwrap();
-        let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
-        store.cold_build(std::slice::from_ref(&source)).unwrap();
-        let (baseline_revision, mut snapshot) =
-            dead_code_projection::project_dead_code_snapshot_with_revision(store.sqlite_path())
-                .unwrap();
-        let mut revision = baseline_revision.unwrap();
-        take_projection_mutation_counts_for_test();
-
-        for contents in [
-            "export function middle() { return 2; }\n",
-            "export function after() { return 3; }\n",
-        ] {
-            fs::write(&source, contents).unwrap();
-            store
-                .mark_files_stale(std::slice::from_ref(&source))
-                .unwrap();
-            store.refresh_files(std::slice::from_ref(&source)).unwrap();
-
-            let counts = take_projection_mutation_counts_for_test();
-            assert_eq!(
-                counts.revision_bumps, counts.journal_appends,
-                "every revision advance in an edit-save sequence must append its caller delta"
-            );
-            assert_eq!(counts.revision_bumps, 1);
-            let (next_revision, next_snapshot, verdict) =
-                dead_code_projection::project_dead_code_snapshot_incremental(
-                    store.sqlite_path(),
-                    Some((revision, &snapshot)),
-                )
-                .unwrap();
-            assert_eq!(verdict.kind, dead_code_projection::ProjectionKind::Spliced);
-            revision = next_revision.unwrap();
-            snapshot = next_snapshot;
-        }
-
-        fs::write(&source, "export function after() { return 3; }\n").unwrap();
-        store
-            .mark_files_stale(std::slice::from_ref(&source))
-            .unwrap();
-        store.refresh_files(std::slice::from_ref(&source)).unwrap();
-        assert_eq!(
-            take_projection_mutation_counts_for_test(),
-            ProjectionMutationCounts::default(),
-            "a graph-neutral save must neither advance the revision nor append a delta"
-        );
-        assert_eq!(store.projection_write_revision().unwrap(), Some(revision));
     }
 
     #[test]
@@ -1764,12 +1672,6 @@ thread_local! {
 pub(crate) mod dead_code_projection;
 
 #[cfg(test)]
-mod dispatch_narrowing_tests;
-#[cfg(test)]
-mod incremental_parity;
-#[cfg(test)]
-mod manifest_refresh_tests;
-#[cfg(test)]
 #[path = "../../tests/store_diet/harness.rs"]
 mod store_diet;
 
@@ -2034,25 +1936,6 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
 
 #[cfg(test)]
 mod keepalive_tests {
-    #[test]
-    fn call_keepalive_build_slice_checkpoints_publish_completed_work() {
-        use crate::cold_build_limiter::progress;
-        let root = tempfile::tempdir().unwrap();
-        let _build = progress::start(
-            root.path(),
-            "callgraph build",
-            Some(10),
-            progress::StartLog::Quiet,
-        );
-        super::ensure_cold_build_current("resolution", 4, 10).unwrap();
-        let first = progress::work_for_root(root.path());
-        assert_eq!(first.len(), 1);
-        assert_eq!((first[0].1, first[0].2), ("resolution", 4));
-        super::ensure_cold_build_current("resolution", 4, 10).unwrap();
-        assert_eq!(progress::work_for_root(root.path()), first);
-        super::ensure_cold_build_current("resolution", 8, 10).unwrap();
-        assert_eq!(progress::work_for_root(root.path())[0].2, 8);
-    }
 }
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
@@ -2144,14 +2027,6 @@ pub enum CallGraphStoreError {
 impl CallGraphStoreError {
     pub(crate) fn is_corpus_change(&self) -> bool {
         matches!(self, Self::CorpusInventoryChanged(_) | Self::StaleFiles(_))
-    }
-
-    pub(crate) fn is_unreadable_database(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
-                if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
-        )
     }
 
     /// SQLite reported the database busy or locked. A view reader opens
@@ -7160,50 +7035,6 @@ impl CallGraphStore {
         }
     }
 
-    /// Explain a cold-build decision without filtering away stale metadata or
-    /// changing the published store. Only the cold path pays for this probe.
-    pub(crate) fn cold_build_reason(callgraph_dir: &Path, project_root: &Path) -> Result<String> {
-        let key = project_key_for_store(callgraph_dir, project_root)?;
-        let target = if let Some(generation) = read_pointer(callgraph_dir, &key) {
-            let path = callgraph_dir.join(&generation);
-            if !path.is_file() {
-                return Ok(format!(
-                    "published generation missing; generation={generation}"
-                ));
-            }
-            path
-        } else {
-            let path = legacy_sqlite_path(callgraph_dir, &key);
-            if !path.is_file() {
-                return Ok("pointer missing".into());
-            }
-            path
-        };
-        let conn = open_readonly_connection(&target)?;
-        let (schema, fingerprint, ready): (Option<String>, Option<String>, Option<String>) = conn
-            .query_row(
-            "SELECT (SELECT v FROM meta WHERE k = 'schema_version'),
-                    (SELECT v FROM meta WHERE k = 'fingerprint'),
-                    (SELECT v FROM meta WHERE k = 'ready')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let current_schema = SCHEMA_VERSION.to_string();
-        let current_fingerprint = schema_fingerprint();
-        if schema.as_deref() != Some(current_schema.as_str())
-            || fingerprint.as_deref() != Some(current_fingerprint.as_str())
-        {
-            return Ok(format!(
-                "fingerprint or schema stale; stored_schema={}; current_schema={current_schema}; stored_fingerprint={}; current_fingerprint={current_fingerprint}; current_build_output={BUILD_OUTPUT_VERSION}",
-                schema.as_deref().unwrap_or("missing"), fingerprint.as_deref().unwrap_or("missing"),
-            ));
-        }
-        Ok(format!(
-            "generation not ready; ready={}",
-            ready.as_deref().unwrap_or("missing")
-        ))
-    }
-
     pub fn open_readonly(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
@@ -8125,19 +7956,6 @@ impl CallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         &self.sqlite_path
-    }
-
-    /// The generation file named by the publication pointer when this store opened.
-    pub(crate) fn projection_generation(&self) -> Option<&str> {
-        self.generation.as_deref()
-    }
-
-    /// Read the durable revision that changes in the same transaction as graph writes.
-    pub(crate) fn projection_write_revision(&self) -> Result<Option<u64>> {
-        self.refresh_read_marker()?;
-        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        self.ensure_ready(&conn)?;
-        projection_write_revision(&conn)
     }
 
     /// Whether this store is reading from a legacy harness partition because
@@ -9762,32 +9580,6 @@ impl CallGraphStore {
         nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
     }
 
-    /// Read one committed state throughout a multi-query answer without
-    /// nesting transactions on the shared connection. The caller must retain
-    /// this store for the snapshot's lifetime to keep its generation pinned.
-    pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
-        let conn = open_readonly_connection(&self.sqlite_path)?;
-        configure_serving_reader(&conn)?;
-        conn.execute_batch("BEGIN DEFERRED")?;
-        let mut snapshot = CallGraphStore::from_connection(
-            self.project_root.clone(),
-            self.project_key.clone(),
-            self.sqlite_path.clone(),
-            self.publication_dir.clone(),
-            self.legacy_fallback,
-            self.generation.clone(),
-            None,
-            None,
-            conn,
-        );
-        snapshot.manifest_view = self.manifest_view;
-        snapshot.database_ready.store(
-            self.database_ready.load(AtomicOrdering::Acquire),
-            AtomicOrdering::Release,
-        );
-        Ok(snapshot)
-    }
-
     /// The indexed content hash for `file`, or `None` when no row exists.
     /// See [`CallGraphRead::stored_content_hash`].
     pub fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
@@ -10372,11 +10164,6 @@ impl ReadonlyCallGraphStore {
         (result, observed)
     }
 
-    /// Read one answer snapshot while this reader retains the generation pins.
-    pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
-        self.inner.read_snapshot()
-    }
-
     /// Open only the selected derived database, without legacy fallback. The
     /// caller must retain the pinned generation for the lifetime of this reader.
     pub(crate) fn open_pinned_derived(
@@ -10614,14 +10401,6 @@ impl ReadonlyCallGraphStore {
             census,
             measured_age_ms: 0,
         }))
-    }
-
-    pub(crate) fn projection_generation(&self) -> Option<&str> {
-        self.inner.projection_generation()
-    }
-
-    pub(crate) fn projection_write_revision(&self) -> Result<Option<u64>> {
-        self.inner.projection_write_revision()
     }
 
     /// Report the open generation handle. SQLite-owned allocations are measured
@@ -27290,32 +27069,6 @@ mod refresh_worker_tests {
     }
 
     #[test]
-    fn read_snapshot_answers_from_one_committed_state() {
-        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
-        let writer = CallGraphStore::open_ready(callgraph_dir.clone(), root.clone())
-            .unwrap()
-            .unwrap();
-        let reader = CallGraphStore::open_readonly(callgraph_dir, root)
-            .unwrap()
-            .unwrap();
-        let snapshot = reader.read_snapshot().unwrap();
-        let main = Path::new("main.rs");
-        // The first query fixes the deferred transaction's snapshot.
-        assert_eq!(snapshot.nodes_for(main, "old_leaf").unwrap().len(), 1);
-        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
-        writer.refresh_files(std::slice::from_ref(&source)).unwrap();
-        assert_eq!(reader.nodes_for(main, "new_leaf").unwrap().len(), 1);
-        assert!(snapshot.nodes_for(main, "new_leaf").unwrap().is_empty());
-        assert_eq!(snapshot.nodes_for(main, "old_leaf").unwrap().len(), 1);
-        let tree = crate::commands::callgraph_store_adapter::call_tree_result(
-            &snapshot, &source, "entry", 1, true,
-        )
-        .unwrap();
-        assert_eq!(tree.children.len(), 1);
-        assert_eq!(tree.children[0].name, "old_leaf");
-    }
-
-    #[test]
     fn store_callers_count_each_boundary_caller_once() {
         let (_temp, root, callgraph_dir, source) = ready_store_fixture();
         fs::write(
@@ -31492,97 +31245,6 @@ export function leaf() {}
             "backend freshness rows must match apart from updated_at"
         );
         assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
-    }
-
-    #[test]
-    fn cold_build_reads_each_source_once_for_fingerprinting_and_preserves_rows() {
-        let dir = tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        let src = root.join("src");
-        fs::create_dir(&src).unwrap();
-        for index in 0..256 {
-            fs::write(
-                src.join(format!("file{index}.ts")),
-                format!(
-                    "import {{ target as next }} from './file{}';\nexport function target() {{ next(); }}\n",
-                    (index + 1) % 256
-                ),
-            )
-            .unwrap();
-        }
-        let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        assert_eq!(files.len(), 256);
-        let reference = CallGraphStore::open(root.join(".reference"), root.clone()).unwrap();
-        reference.cold_build(&files).unwrap();
-        work_counts::reset_under(&root);
-        let opens = crate::project_content::Probe::new(&root);
-        let memo = Arc::new(CorpusMemo::default());
-        let (published, _) = with_corpus_memo(Arc::downgrade(&memo), || {
-            CallGraphStore::cold_build_with_lease_chunked(
-                root.join(".published"),
-                root.clone(),
-                &[],
-                32,
-            )
-            .unwrap()
-        });
-        let reads = files
-            .iter()
-            .map(|path| work_counts::fingerprint_reads(path))
-            .collect::<Vec<_>>();
-        let parses = work_counts::parses_under(&root);
-        let source_opens = opens
-            .paths()
-            .into_iter()
-            .filter(|path| files.contains(path))
-            .count();
-        let mut rows = 0;
-        for (table, excluded) in [
-            ("files", &["indexed_at"][..]),
-            ("nodes", &[][..]),
-            ("refs", &[][..]),
-            ("edges", &[][..]),
-            ("file_dependencies", &[][..]),
-            ("dispatch_hints", &[][..]),
-            ("backend_file_state", &["updated_at"][..]),
-        ] {
-            let expected = graph_table_rows_without(&reference, table, excluded);
-            rows += expected.len();
-            assert_eq!(
-                expected,
-                graph_table_rows_without(&published, table, excluded),
-                "stored rows for {table}"
-            );
-        }
-        incremental_parity::compare(&reference, &published).unwrap();
-        eprintln!(
-            "256-source fixture: fingerprint reads={} (per-file {}..={}), extraction parses={parses}, source opens={source_opens}, identical stored rows={rows}",
-            reads.iter().sum::<usize>(),
-            reads.iter().min().unwrap(),
-            reads.iter().max().unwrap(),
-        );
-        assert_eq!(parses, files.len());
-        assert_eq!(work_counts::max_parses_of_one_file_under(&root), 1);
-        assert_eq!(source_opens, 2 * files.len());
-        assert!(
-            reads.iter().all(|count| *count == 1),
-            "one fingerprint read per source"
-        );
-        #[cfg(any(unix, windows))]
-        {
-            work_counts::reset_under(&root);
-            let probe = crate::project_content::Probe::new(&root);
-            assert!(with_corpus_memo(Arc::downgrade(&memo), || {
-                CallGraphStore::cold_build_suspension(&root.join(".published"), &root)
-                    .unwrap()
-                    .is_none()
-            }));
-            assert!(files
-                .iter()
-                .all(|path| work_counts::fingerprint_reads(path) == 0));
-            assert!(!probe.paths().iter().any(|path| files.contains(path)));
-            eprintln!("256-source suspension probe after build: 0 source opens");
-        }
     }
 
     #[test]

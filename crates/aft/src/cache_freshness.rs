@@ -371,20 +371,6 @@ pub(crate) fn verify_files_bounded<K: Send>(
     })
 }
 
-/// Collect metadata without hashing so admission can precede all content reads.
-pub(crate) fn stat_files_bounded<K: Send>(
-    files: Vec<(K, PathBuf, FileFreshness)>,
-) -> Vec<(K, PathBuf, FileFreshness, Option<fs::Metadata>)> {
-    map_files_bounded(files, |(key, path, cached)| {
-        #[cfg(test)]
-        record_metadata_call(&path);
-        let metadata = fs::metadata(&path)
-            .ok()
-            .filter(|metadata| metadata.is_file());
-        (key, path, cached, metadata)
-    })
-}
-
 fn map_files_bounded<K: Send, V: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
     map: impl Fn((K, PathBuf, FileFreshness)) -> V + Send + Sync,
@@ -423,20 +409,6 @@ fn map_files_bounded<K: Send, V: Send>(
         }),
         None => files.into_iter().map(map).collect(),
     }
-}
-
-/// Reuse admission metadata while running content verification in the same bounded pool.
-pub(crate) fn verify_statted_files_bounded<K: Send, V: Send>(
-    files: Vec<(K, PathBuf, FileFreshness, Option<fs::Metadata>)>,
-    verify: impl Fn(K, PathBuf, FileFreshness, Option<fs::Metadata>) -> V + Send + Sync,
-) -> Vec<V> {
-    let files = files
-        .into_iter()
-        .map(|(key, path, cached, metadata)| ((key, metadata), path, cached))
-        .collect();
-    map_files_bounded(files, |((key, metadata), path, cached)| {
-        verify(key, path, cached, metadata)
-    })
 }
 
 fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
