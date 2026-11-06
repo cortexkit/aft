@@ -49,6 +49,10 @@ struct Scenario {
     root: tempfile::TempDir,
     _search_tx: Option<crossbeam_channel::Sender<crate::search_index::SearchIndex>>,
     _callgraph_tx: Option<crossbeam_channel::Sender<crate::context::CallGraphStoreBuildEvent>>,
+    /// Keeps the index store's build from starting, so its text index stays
+    /// building for the whole call.
+    _build_hold: Option<crate::data_layer::runtime::BuildHold>,
+    _call_graph_hold: Option<crate::data_layer::checkout::CallGraphHold>,
 }
 
 impl Scenario {
@@ -81,6 +85,8 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
     );
     let search_tx = None;
     let mut callgraph_tx = None;
+    let mut build_hold = None;
+    let mut call_graph_hold = None;
     match name {
         "off" => ctx.update_config(|config| {
             config.indexes.trigram = false;
@@ -97,10 +103,17 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             let (tx, rx) = crossbeam_channel::unbounded();
             *ctx.callgraph_store_rx().lock() = Some(rx);
             callgraph_tx = Some(tx);
+            // The index store binds and starts its first build, which waits.
+            build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(&project_root));
+            crate::data_layer::surfaces::bind_for_test(&ctx);
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),
         "partially_ready" => {
-            crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+            // Text serves; the call graph's build waits until the call ends.
+            call_graph_hold = Some(crate::data_layer::checkout::hold_call_graph_for_test(
+                &project_root,
+            ));
+            crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
             ctx.trip_semantic_refresh_circuit(1, "embedding backend refused the connection");
             let (tx, rx) = crossbeam_channel::unbounded();
             *ctx.callgraph_store_rx().lock() = Some(rx);
@@ -113,6 +126,8 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         root,
         _search_tx: search_tx,
         _callgraph_tx: callgraph_tx,
+        _build_hold: build_hold,
+        _call_graph_hold: call_graph_hold,
     }
 }
 

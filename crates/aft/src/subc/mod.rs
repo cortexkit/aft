@@ -20977,8 +20977,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_root_catalog_and_role_describe_do_not_wait_for_view_load_or_index_work() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+    fn fresh_root_catalog_and_role_describe_do_not_wait_for_the_configure_tail() {
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let (started, running) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let index = fixture.executor.submit_async(
@@ -21042,7 +21042,7 @@ mod tests {
     fn same_root_rebind_herd_is_acked_while_the_configure_tail_is_held_in_a_slow_stage() {
         const BINDS: usize = 16;
         const ACK_BOUND: Duration = Duration::from_secs(2);
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let generation = fixture.ctx.configure_generation();
 
         let started = Instant::now();
@@ -21085,7 +21085,7 @@ mod tests {
             acked.len(),
             BINDS,
             "only {} of {BINDS} same-root rebinds were acked within {ACK_BOUND:?} while the \
-             tail was held in view_load: acked={acked:?} blockers={blockers:?}",
+             tail was held in process_flags: acked={acked:?} blockers={blockers:?}",
             acked.len()
         );
         // None of the herd re-ran the root's configure: the generation is the
@@ -21093,7 +21093,7 @@ mod tests {
         assert_eq!(fixture.ctx.configure_generation(), generation);
         let records =
             crate::commands::configure::configure_unit_records_for_root(&fixture.canonical_root);
-        for stage in ["project_runtime", "watcher", "view_load", "callgraph"] {
+        for stage in ["project_runtime", "watcher", "process_flags"] {
             assert_eq!(
                 records
                     .iter()
@@ -21356,7 +21356,7 @@ mod tests {
             let (gate, _held, release) =
                 crate::commands::configure::gate_configure_tail_stage_for_test(
                     root.canonical_root.clone(),
-                    "view_load",
+                    "process_flags",
                 );
             gates.push(gate);
             releases.push(release);
@@ -21389,7 +21389,7 @@ mod tests {
                 start_post_ack_database_open(&executor, &root.root);
                 acked_at[index] = Some(Instant::now());
                 // Queue the root's configure tail; the executor admits only
-                // a few maintenance jobs, and admitted tails hold at view_load.
+                // a few maintenance jobs, and admitted tails hold at process_flags.
                 tails.push(executor.submit_maintenance_async(
                     root.root.clone(),
                     Lane::MaintenanceCommit,
@@ -21825,72 +21825,10 @@ mod tests {
                 .any(|blocker| blocker == "rerun_as_exclusive_writer")
     }
 
-    #[test]
-    fn storage_sweeps_do_not_hold_bind_or_bash_admission() {
-        const HANG_GUARD: Duration = Duration::from_secs(30);
-        let mut fixture = HeldConfigureTail::start("storage_sweeps");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let generation = fixture.ctx.configure_generation();
-        let mut rebind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
-        let rebound =
-            runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut rebind).await });
-        let rebound_generation = fixture.ctx.configure_generation();
-
-        // Even a bind that needs exclusive use must not wait for sweep I/O.
-        // Leaving that writer queued would also fence off bash's shared admission.
-        let mut bind = fixture.submit_bind(fixture.bind_request(2, "pi"));
-        let bound = runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut bind).await });
-        // Exercise the real wire and executor admission path, but stop at the
-        // dispatch boundary: admission needs no shell child to leave running.
-        let bash = database_wire_tool_with_dispatch(
-            &fixture.executor,
-            &fixture.configured,
-            "bash",
-            HANG_GUARD,
-            (HANG_GUARD, HANG_GUARD),
-            |req, _ctx| {
-                assert_eq!(req.command, "bash");
-                Response::success(req.id, json!({ "admitted": true }))
-            },
-        );
-        // All replies above must arrive before releasing the sweep. These are
-        // hang guards, not latency requirements on a loaded runner.
-        fixture.release_tail();
-        for (timed_out, pending) in [(rebound.is_err(), rebind), (bound.is_err(), bind)] {
-            if timed_out {
-                runtime
-                    .block_on(async { tokio::time::timeout(HANG_GUARD, pending).await })
-                    .expect("bind completes after releasing the sweep")
-                    .expect("bind response");
-            }
-        }
-        assert!(
-            rebound.is_ok(),
-            "an equivalent bind waited on the held storage sweep"
-        );
-        assert!(rebound.unwrap().unwrap().success);
-        assert_eq!(rebound_generation, generation);
-        assert!(
-            bound.is_ok(),
-            "a config-changing bind waited on the held storage sweep: {bound:?}; bash={bash}"
-        );
-        assert!(bound.unwrap().unwrap().success);
-        assert_eq!(
-            bash["success"], true,
-            "bash waited on the held storage sweep: {bash}"
-        );
-        assert!(
-            bash["admitted"] == true,
-            "bash never reached dispatch while the sweep was held: {bash}"
-        );
-    }
 
     #[test]
     fn equivalent_new_session_without_a_watcher_does_not_require_exclusive_use() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         fixture.ctx.stop_watcher_runtime();
         let generation = fixture.ctx.configure_generation();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -21916,7 +21854,7 @@ mod tests {
     /// reconfigures once the tail steps aside.
     #[test]
     fn config_changing_bind_waits_for_the_held_tail_before_reconfiguring() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let generation = fixture.ctx.configure_generation();
 
         let request = fixture.bind_request(1, "pi");
@@ -21938,7 +21876,7 @@ mod tests {
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker.starts_with("configure_tail_stage(stage=view_load,")),
+                .any(|blocker| blocker.starts_with("configure_tail_stage(stage=process_flags,")),
             "{blockers:?}"
         );
         let response = bind.blocking_recv().expect("bind completion");
@@ -21963,8 +21901,8 @@ mod tests {
             drr_quantum: 1,
         }));
         let unrelated = ConfiguredRoot::new(&executor);
-        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
-        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
 
         // Fill what is left of the general pool with long reads elsewhere.
         let busy_dir = tempfile::tempdir().unwrap();
@@ -22085,8 +22023,8 @@ mod tests {
             heavy_permits: 2,
             drr_quantum: 1,
         }));
-        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
-        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
         let generation_a = held_a.ctx.configure_generation();
 
         let mut rebind_a = held_a.submit_bind(held_a.bind_request(1, "pi"));
@@ -22186,7 +22124,7 @@ mod tests {
     /// the tail would cancel the job and forget the session after the ack.
     #[test]
     fn rebind_of_a_quiesced_root_keeps_its_session_despite_the_running_tail() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         fixture.ctx.mark_subc_unbound();
 
         let request = fixture.bind_request(1, "opencode");

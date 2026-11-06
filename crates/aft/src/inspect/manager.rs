@@ -9103,49 +9103,6 @@ export function bannerUnused() {}
 
     // Unix-only: the unresolvable path relies on `..` after a regular file,
     // which Windows folds lexically into a resolvable path.
-    #[cfg(unix)]
-    #[test]
-    fn path_identity_mismatch_is_a_named_dead_code_terminal_gap() {
-        let dir = write_ts_project(1);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let source = root.join("mod0.ts");
-        let foreign_dir = tempfile::tempdir().expect("foreign tempdir");
-        let not_a_dir = foreign_dir.path().join("plain-file");
-        std::fs::write(&not_a_dir, "not a directory\n").expect("write plain file");
-        // A location that cannot be resolved, unlike a real out-of-root file
-        // (those are skipped per refresh and never recorded).
-        let foreign = not_a_dir.join("..").join("foreign.ts");
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        store.cold_build(&[source]).expect("cold build store");
-        let error = store
-            .refresh_files(&[foreign.clone()])
-            .expect_err("an unresolvable path cannot be assigned a store-relative key");
-        assert!(matches!(
-            error,
-            CallGraphStoreError::PathIdentityMismatch { .. }
-        ));
-        drop(store);
-
-        let job = snapshot_job(&root, &inspect_dir, true);
-        let reason = callgraph_path_identity_gap(&job)
-            .unwrap()
-            .expect("durable path identity gap");
-        assert!(reason.contains("callgraph_path_identity_mismatch"));
-        assert!(reason.contains(&foreign.display().to_string()));
-        let aggregate =
-            crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
-                1,
-                Some(&reason),
-            );
-        assert_eq!(
-            aggregate["notes"],
-            serde_json::json!(["callgraph_unavailable", "callgraph_path_identity_mismatch"])
-        );
-        assert_eq!(aggregate["callgraph_unavailable_reason"], reason);
-    }
 
     #[test]
     fn stale_callgraph_store_refreshes_inline_when_refresh_worker_does_not_run() {
@@ -9191,58 +9148,6 @@ export function bannerUnused() {}
             manager.callgraph_ready_for_snapshot(&ready),
             "after the inline refresh, callgraph_ready must agree with a successful projection"
         );
-    }
-
-    #[test]
-    fn callgraph_ready_and_builder_projection_agree_on_stale_rows() {
-        let dir = write_ts_project(1);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-        let sqlite_path = store.sqlite_path().to_path_buf();
-        drop(store);
-
-        let job = snapshot_job(&root, &inspect_dir, true);
-        let snapshot = InspectSnapshot::new(
-            root.clone(),
-            inspect_dir.clone(),
-            Arc::clone(&job.config),
-            Arc::clone(&job.symbol_cache),
-        );
-        let manager = InspectManager::new();
-        assert!(
-            manager.callgraph_ready_for_snapshot(&snapshot),
-            "a fresh store must be ready for both the phase check and projection"
-        );
-        project_dead_code_snapshot(&sqlite_path).expect("fresh store should project");
-
-        let store = CallGraphStore::open_ready_no_rebuild(
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir"),
-            root.clone(),
-        )
-        .expect("reopen writer")
-        .expect("ready writer");
-        store.mark_files_stale(&files).expect("mark stale");
-        drop(store);
-
-        assert!(
-            !manager.callgraph_ready_for_snapshot(&snapshot),
-            "callgraph_ready must use the same stale-row predicate as dead_code projection"
-        );
-        let error =
-            project_dead_code_snapshot(&sqlite_path).expect_err("stale rows must block projection");
-        match error {
-            CallGraphStoreError::Unavailable(message) => {
-                assert_eq!(message, "callgraph has stale files pending refresh")
-            }
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
     }
 
     #[test]

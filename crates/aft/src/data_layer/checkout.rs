@@ -1049,6 +1049,14 @@ impl Checkout {
             }
             report.text_ready_ms = Some(elapsed_ms(build_started));
         }
+        #[cfg(test)]
+        while call_graph_holds_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&self.root)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         checkpoint()?;
         // A change recorded before the scan starts is in what the scan
         // reads; one recorded later may not be.
@@ -3763,6 +3771,40 @@ impl CheckoutView {
             }));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+fn call_graph_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static HOLDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    HOLDS.get_or_init(Default::default)
+}
+
+/// Holds every build of the checkout at `root` after its text index
+/// publishes and before its call graph is built, until the returned guard
+/// drops, so a test can look at a checkout whose text serves while its call
+/// graph is building.
+#[cfg(test)]
+pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
+    call_graph_holds_for_test()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf());
+    CallGraphHold(root.to_path_buf())
+}
+
+/// See [`hold_call_graph_for_test`].
+#[cfg(test)]
+pub(crate) struct CallGraphHold(PathBuf);
+
+#[cfg(test)]
+impl Drop for CallGraphHold {
+    fn drop(&mut self) {
+        call_graph_holds_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
     }
 }
 

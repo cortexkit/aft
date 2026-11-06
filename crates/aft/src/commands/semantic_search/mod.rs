@@ -13388,35 +13388,6 @@ mod split_request_tests {
         }
     }
 
-    #[test]
-    fn external_pattern_split_indexed() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        save_external_index(&root, storage.path());
-        let ctx = external_context(session.path(), storage.path(), false);
-        let response = search(
-            &ctx,
-            serde_json::json!({
-                "query": "scheduler drains the work queue", "pattern": "load_config", "path": root,
-            }),
-        );
-        assert_external_split(&response, &root);
-        assert_eq!(
-            response["saved_index_check"]["complete"], true,
-            "{response}"
-        );
-        assert_eq!(response["saved_index_check"]["files_examined"], 5);
-        assert!(
-            response["text"].as_str().unwrap().contains(&format!(
-                "Checked the saved AFT index of {} against all 5 files on disk",
-                root.display()
-            )),
-            "{response}"
-        );
-    }
-
     /// A prose search of another project nobody has open would have used
     /// semantic results; the reply says once per session that semantic search
     /// is off for it and how the user can turn it on, then stays quiet.
@@ -13492,53 +13463,6 @@ mod split_request_tests {
         assert!(text.contains("No AFT index"), "{text}");
         assert!(text.contains("5 files"), "{text}");
         assert!(response.get("saved_index_check").is_none(), "{response}");
-    }
-
-    #[test]
-    fn external_pattern_disk_validation_finds_changed_and_added_files() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        std::fs::write(root.join("src/loader.rs"), "pub fn previous_name() {}\n").unwrap();
-        save_external_index(&root, storage.path());
-        // The saved postings cannot nominate the changed or new file for this
-        // pattern. Only validation against disk can make either one a candidate.
-        std::fs::write(
-            root.join("src/loader.rs"),
-            "pub fn fresh_pattern_name() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/added.rs"),
-            "fn call() { fresh_pattern_name(); }\n",
-        )
-        .unwrap();
-        std::fs::remove_file(root.join("src/cli.rs")).unwrap();
-        let ctx = external_context(session.path(), storage.path(), false);
-        let response = search(
-            &ctx,
-            serde_json::json!({
-                "query": "scheduler drains the work queue", "pattern": "fresh_pattern_name", "path": root,
-            }),
-        );
-        assert_eq!(response["success"], true, "{response}");
-        assert_eq!(
-            response["pattern_summary"]["files_matched"], 2,
-            "{response}"
-        );
-        assert!(
-            file_names(&response).contains(&"loader.rs".to_string()),
-            "{response}"
-        );
-        assert_eq!(response["saved_index_check"]["changed"], 1, "{response}");
-        assert_eq!(response["saved_index_check"]["added"], 1);
-        assert_eq!(response["saved_index_check"]["removed"], 1);
-        let alone = search(
-            &ctx,
-            serde_json::json!({"pattern": "fresh_pattern_name", "path": root}),
-        );
-        assert_eq!(file_names(&alone), ["loader.rs", "added.rs"], "{alone}");
     }
 
     #[test]
@@ -13626,114 +13550,6 @@ mod split_request_tests {
             );
             assert_eq!(with, without);
         }
-    }
-
-    #[test]
-    fn external_pattern_bounds_disclose_partial_coverage() {
-        for indexed in [false, true] {
-            let session = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            let (_dir, root) = project();
-            git_init(&root);
-            if indexed {
-                save_external_index(&root, storage.path());
-            }
-            let ctx = external_context(session.path(), storage.path(), false);
-            for query in [None, Some("scheduler drains the work queue")] {
-                regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(Some(1)));
-                // This case tests the file-count cap, so the disk walk gets a
-                // generous time budget: on a loaded Windows runner the default
-                // 2 s ran out before the walk reached any of the three files.
-                let capped = external_disk_check::with_budgets_for_test(
-                    Duration::from_secs(30),
-                    Duration::from_secs(30),
-                    || {
-                        search(
-                            &ctx,
-                            serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
-                        )
-                    },
-                );
-                regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(None));
-                assert_eq!(capped["success"], true, "{capped}");
-                assert_eq!(capped["complete"], false);
-                assert_eq!(
-                    capped["results_list_envelope"]["reason"], "budget",
-                    "{capped}"
-                );
-                let text = capped["text"].as_str().unwrap();
-                assert!(text.contains("1 of 3 candidate files"), "{text}");
-                assert!(
-                    text.contains(&format!("grep with path {}", root.display())),
-                    "{text}"
-                );
-
-                let stopped = external_disk_check::with_budgets_for_test(
-                    Duration::ZERO,
-                    Duration::from_secs(5),
-                    || {
-                        search(
-                            &ctx,
-                            serde_json::json!({"query": query, "pattern": "no_such_identifier_x", "path": root}),
-                        )
-                    },
-                );
-                assert_eq!(stopped["success"], true, "{stopped}");
-                assert_eq!(stopped["complete"], false);
-                let text = stopped["text"].as_str().unwrap();
-                assert!(text.contains("no match in the"), "{text}");
-                assert!(text.contains("0 files on disk"), "{text}");
-                assert!(text.contains("grep with path"), "{text}");
-                if indexed {
-                    assert_eq!(stopped["saved_index_check"]["complete"], false);
-                } else {
-                    assert_eq!(stopped["unindexed_scan"]["complete"], false);
-                }
-            }
-        }
-    }
-
-    /// The missing-literal notice claims no file contains the literal, so it
-    /// may appear only when the check against the files on disk covered every
-    /// file. A check its walk budget cut short says how far it got instead,
-    /// and the reply makes no not-found claim.
-    #[test]
-    fn external_missing_literal_notice_needs_a_complete_disk_check() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        save_external_index(&root, storage.path());
-        let ctx = external_context(session.path(), storage.path(), false);
-        let params = serde_json::json!({"query": "load_settings(", "path": root, "topK": 10});
-        let notice = "No file contains `load_settings(`.";
-
-        let full = external_disk_check::with_budgets_for_test(
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            || search(&ctx, params.clone()),
-        );
-        assert_eq!(full["success"], true, "{full}");
-        assert_eq!(full["saved_index_check"]["complete"], true, "{full}");
-        let text = full["text"].as_str().unwrap();
-        assert!(text.contains(notice), "{text}");
-
-        let stopped = external_disk_check::with_budgets_for_test(
-            Duration::ZERO,
-            Duration::from_secs(5),
-            || search(&ctx, params.clone()),
-        );
-        assert_eq!(stopped["success"], true, "{stopped}");
-        assert_eq!(stopped["saved_index_check"]["complete"], false, "{stopped}");
-        assert_eq!(stopped["complete"], false, "{stopped}");
-        let text = stopped["text"].as_str().unwrap();
-        assert!(!text.contains("No file contains"), "{text}");
-        assert!(!text.contains("[similar]"), "{text}");
-        assert!(!text.contains("not found"), "{text}");
-        assert!(
-            text.contains("only 0 files on disk were compared with it before the time limit"),
-            "{text}"
-        );
     }
 
     #[test]

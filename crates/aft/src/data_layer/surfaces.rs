@@ -276,6 +276,43 @@ thread_local! {
 /// gets a throwaway one, so a test never writes into the real storage.
 #[cfg(test)]
 pub(crate) fn serve_text_index_for_test(ctx: &AppContext) {
+    serve_text_for_test(ctx, true);
+}
+
+/// Binds the index store's checkout of `ctx`'s root and waits until its text
+/// index serves, without waiting for the call graph: for a test that holds
+/// the call graph's build to look at a checkout whose text alone is ready.
+#[cfg(test)]
+pub(crate) fn serve_text_only_for_test(ctx: &AppContext) {
+    serve_text_for_test(ctx, false);
+}
+
+#[cfg(test)]
+fn serve_text_for_test(ctx: &AppContext, whole_build: bool) {
+    bind_for_test(ctx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // The text index publishes before the call graph; the build's last
+    // publication changes the text generation answers are cached by, so a
+    // test that compares answers across calls waits for the build to end.
+    while text_plane_ready(ctx) != Some(true)
+        || (whole_build
+            && ctx
+                .data_checkout()
+                .is_some_and(|checkout| checkout.checkout().status().building))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the text index never served: {:?}",
+            report(ctx).map(|report| report.text.status)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Binds the index store's checkout of `ctx`'s root, giving the context a
+/// throwaway storage folder when it has none, without waiting for a build.
+#[cfg(test)]
+pub(crate) fn bind_for_test(ctx: &AppContext) {
     if ctx.config().storage_dir.is_none() {
         let dir = tempfile::tempdir().expect("test storage folder");
         let path = dir.path().to_path_buf();
@@ -288,15 +325,6 @@ pub(crate) fn serve_text_index_for_test(ctx: &AppContext) {
         }
     }
     ctx.data_checkout().expect("the index store binds the root");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while text_plane_ready(ctx) != Some(true) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the text index never served: {:?}",
-            report(ctx).map(|report| report.text.status)
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
 }
 
 /// Whether this root's text index serves: `Some(true)` ready, `Some(false)`

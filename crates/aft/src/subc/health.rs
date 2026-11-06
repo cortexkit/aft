@@ -7016,7 +7016,7 @@ mod tests {
         assert!(snapshot.metrics.get("health_rollup_tick").is_none());
         assert_eq!(tick["steps"]["per-root memory census"]["calls"], 110);
         assert_eq!(tick["steps"]["lifecycle OS probes"]["calls"], 1);
-        assert_eq!(tick["steps"].as_object().unwrap().len(), 14);
+        assert_eq!(tick["steps"].as_object().unwrap().len(), 13);
         assert!(tick["elapsed_ms"].as_f64().unwrap() >= 0.0);
         let census = cache.memory_census();
         assert_eq!(census["health_rollup_tick"]["age_ms"], 0);

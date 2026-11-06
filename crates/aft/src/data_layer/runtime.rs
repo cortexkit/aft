@@ -323,6 +323,37 @@ struct Work {
     fill_retry: std::sync::Mutex<BuildRetry>,
 }
 
+#[cfg(test)]
+fn build_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static HOLDS: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    HOLDS.get_or_init(Default::default)
+}
+
+/// Holds every build of the checkout at `root` before it starts, until the
+/// returned guard drops, so a test can look at a checkout that is building.
+#[cfg(test)]
+pub(crate) fn hold_builds_for_test(root: &Path) -> BuildHold {
+    build_holds_for_test()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf());
+    BuildHold(root.to_path_buf())
+}
+
+/// See [`hold_builds_for_test`].
+#[cfg(test)]
+pub(crate) struct BuildHold(PathBuf);
+
+#[cfg(test)]
+impl Drop for BuildHold {
+    fn drop(&mut self) {
+        build_holds_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 impl Work {
     /// Starts a build unless one is queued or running, or a failed one is
     /// waiting to be tried again. A build that fails is tried again after a
@@ -344,6 +375,14 @@ impl Work {
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
+            #[cfg(test)]
+            while build_holds_for_test()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(work.checkout.root())
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let result = work.checkout.build();
             drop(flag);
             if !matches!(result, Err(DataError::Cancelled)) {

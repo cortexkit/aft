@@ -1987,7 +1987,7 @@ mod tests {
                 "views.idle_checkout_hours"
             ]
         );
-        assert_eq!(out.removed_keys, vec!["false"]);
+        assert_eq!(out.removed_keys, vec!["harnesses.pi.views.enabled"]);
 
         for (raw, hours) in [
             (json!(9000), 8760),

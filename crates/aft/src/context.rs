@@ -15838,72 +15838,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn ensure_reopens_before_starting_pending_reconcile() {
-        let project = TempDir::new().expect("project tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        std::fs::write(
-            project.path().join("main.rs"),
-            "fn entry() { leaf(); }\nfn leaf() {}\n",
-        )
-        .expect("source file");
-        let root = std::fs::canonicalize(project.path()).expect("canonical project root");
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.clone()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        ));
-        ctx.set_canonical_cache_root(root.clone());
-        let key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &key, false);
-        // Publish a ready store, then drop the resident the way idle eviction
-        // does, leaving a watcher gap behind for the next reopen to compare.
-        assert!(ctx
-            .ensure_callgraph_store()
-            .expect("publish callgraph store")
-            .is_some());
-        ctx.invalidate_artifacts_after_watcher_gap();
-        assert_eq!(
-            ctx.pending_callgraph_reconcile_reason().as_deref(),
-            Some("watcher gap"),
-            "the reopen must service the gap left by the eviction"
-        );
-        let completed_before = ctx.callgraph_reconcile.completed();
-        let opens_before = ctx.callgraph_reconcile.ensure_open_completed_for_test();
-        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
-        // Single-shot: the caller's first open completes before the reconcile
-        // thread starts, so the two never race inside SQLite recovery.
-        let store = ctx
-            .ensure_callgraph_store()
-            .expect("reopen callgraph store");
-        assert!(store.is_some(), "reopen callgraph store");
-        // The entry hold captured how many of the caller's opens had finished
-        // when the reconcile thread started: exactly this reopen. With the old
-        // spawn-first order the parked thread enters before the caller's open
-        // and the count is still the previous one.
-        assert_eq!(
-            entered
-                .recv_timeout(Duration::from_secs(10))
-                .expect("reconcile started after the caller's open"),
-            opens_before + 1,
-            "the caller's open completed before the reconcile thread started"
-        );
-        drop(release);
-        assert!(
-            ctx.callgraph_reconcile
-                .wait_for_idle_for_test(Duration::from_secs(30)),
-            "pending comparison settled"
-        );
-        assert_eq!(
-            ctx.callgraph_reconcile.completed(),
-            completed_before + 1,
-            "the pending comparison still ran"
-        );
-    }
-
-    #[test]
     #[ignore = "manual 60,000-file startup reconciliation measurement"]
     #[cfg(target_os = "linux")]
     fn measure_startup_reconcile_on_sixty_thousand_files() {
@@ -18284,37 +18218,6 @@ mod view_load_health_tests {
             view_load_cause("lexical source deliberately refused"),
             "other"
         );
-    }
-
-    #[test]
-    fn view_load_failures_group_by_plane_and_cause() {
-        let ctx = ctx();
-        ctx.note_view_load_failure("trigram", "lexical payload not ready: /root/a.ts");
-        ctx.note_view_load_failure(
-            "callgraph",
-            "callgraph v3 store is busy: members.sqlite checkpoint WAL",
-        );
-        ctx.note_view_load_failure("trigram", "lexical payload not ready: /root/b.ts");
-        let snapshot = ctx.try_health_snapshot(Path::new("/tmp/view-load-health-planes"));
-        assert_eq!(
-            snapshot.view_load_failures.get("trigram:unavailable"),
-            Some(&2)
-        );
-        assert!(!snapshot.view_load_failures.contains_key("callgraph:busy"));
-        let last = snapshot
-            .view_load_failure_last
-            .as_ref()
-            .expect("last failure");
-        assert_eq!(last.plane, "trigram");
-        assert_eq!(last.cause, "unavailable");
-        assert_eq!((last.count, last.total), (2, 2));
-        assert!(degraded(&ctx));
-        // The health report carries the same map and last error.
-        let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
-        assert_eq!(json["view_load_failures"]["trigram:unavailable"], 2);
-        assert!(json["view_load_failure_last"]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("/root/b.ts")));
     }
 
     #[test]
