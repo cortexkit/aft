@@ -8,8 +8,20 @@ use crate::le::{array, u16_at, u32_at, u64_at};
 
 pub(crate) const MAGIC: [u8; 8] = *b"AFTSEG\0\0";
 
-/// Version of the container layout. Sections and the producers that fill them
-/// carry their own versions, so a change to one plane never touches this one.
+/// Version of the segment format: the container layout and the required
+/// sections it may hold.
+///
+/// It is the one number that tells an older build a segment is newer than
+/// it reads, so a build that adds a required section kind, or changes the
+/// version of a required section, must raise it along with the container
+/// layout. An older build then refuses the segment by this version
+/// ([`crate::family::FamilyError::NewerFormat`]) and leaves it as it is. A
+/// required section it did not understand would instead make the segment
+/// unusable, and an unusable segment is built over and reclaimed. The test
+/// `the_segment_format_version_moves_with_the_required_sections` pins the
+/// required section kinds and versions together with this number, and fails
+/// when one changes without the other. Optional sections, which an older
+/// build skips, need no bump.
 pub const FORMAT_VERSION: u16 = 1;
 
 pub(crate) const HEADER_LEN: usize = 128;

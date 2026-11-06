@@ -35,7 +35,8 @@ const TERM_LOOKUP: SectionKind = SectionKind::new(0x0303);
 const TERM_POSTINGS: SectionKind = SectionKind::new(0x0304);
 /// Version 2 added the recorded-input terms; version 3 the method terms;
 /// version 4 files folder reads under a folder's existence or its listing
-/// separately.
+/// separately. These sections are required, so raising this raises
+/// [`crate::segment::FORMAT_VERSION`] too.
 const VERSION: u16 = 4;
 const UNIT_KEY_SPACE: KeySpace = KeySpace::new(0);
 

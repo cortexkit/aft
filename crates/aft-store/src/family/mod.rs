@@ -110,6 +110,13 @@ impl FamilyError {
     /// failure is not one: the file may read fine next time. Neither is a
     /// file in a newer format version ([`Self::newer_format`]): it is
     /// refused, and nothing is built in its place.
+    ///
+    /// A segment with a required section this build does not know, at the
+    /// segment format version it reads, counts as unusable like a damaged
+    /// one. No build of ours writes such a segment: one that adds or changes
+    /// a required section raises the segment format version too (see
+    /// [`crate::segment::FORMAT_VERSION`]), so an older build refuses it by
+    /// that version instead.
     #[must_use]
     pub fn is_unusable_file(&self) -> bool {
         match self {

@@ -364,3 +364,77 @@ fn damaged_files_fail_cleanly_or_read_the_written_bytes() {
         "opened {opened}, refused reads {refused_reads}"
     );
 }
+
+/// The segment format version and the required sections it was pinned with
+/// last; see [`FORMAT_VERSION`]. Each entry is a section kind and its
+/// version, from the text, content, call-graph and vector planes.
+const PINNED_FORMAT_VERSION: u16 = 1;
+const PINNED_REQUIRED_SECTIONS: [(u16, u16); 22] = [
+    // Text.
+    (0x0100, 1),
+    (0x0101, 1),
+    (0x0102, 1),
+    (0x0103, 1),
+    // Content.
+    (0x0200, 1),
+    (0x0201, 1),
+    (0x0202, 1),
+    (0x0203, 1),
+    // Call graph.
+    (0x0300, 4),
+    (0x0301, 4),
+    (0x0302, 4),
+    (0x0303, 4),
+    (0x0304, 4),
+    // Vectors.
+    (0x0400, 1),
+    (0x0401, 1),
+    (0x0402, 1),
+    (0x0403, 1),
+    (0x0404, 1),
+    (0x0405, 1),
+    (0x0406, 1),
+    (0x0407, 1),
+    (0x0408, 1),
+];
+
+/// Every section kind the planes read, with its version. Each plane writes
+/// all of its sections as required, so a build that does not know one of
+/// them cannot open a segment holding it.
+fn required_sections() -> std::collections::BTreeSet<(u16, u16)> {
+    crate::text::KNOWN
+        .iter()
+        .chain(&crate::content::KNOWN)
+        .chain(&crate::graph::KNOWN)
+        .chain(&crate::vector::KNOWN)
+        .map(|known| (known.kind.get(), known.version))
+        .collect()
+}
+
+/// An older build must meet a newer segment format version, which it
+/// refuses, rather than a required section it does not know, which makes
+/// the segment unusable, so it is built over and reclaimed. So the
+/// required sections may only change together with [`FORMAT_VERSION`].
+#[test]
+fn the_segment_format_version_moves_with_the_required_sections() {
+    let sections = required_sections();
+    let pinned = PINNED_REQUIRED_SECTIONS
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        FORMAT_VERSION != PINNED_FORMAT_VERSION || sections == pinned,
+        "the required sections changed (added {:?}, removed {:?}) while the segment format \
+         version stayed {FORMAT_VERSION}: bump FORMAT_VERSION in segment/format.rs, so an older \
+         build refuses these segments by their version instead of meeting a required section \
+         it does not know and rebuilding over them. Then pin the new version and sections \
+         here. Only an optional section, which an older build skips, needs no bump.",
+        sections.difference(&pinned).collect::<Vec<_>>(),
+        pinned.difference(&sections).collect::<Vec<_>>()
+    );
+    assert!(
+        FORMAT_VERSION == PINNED_FORMAT_VERSION && sections == pinned,
+        "the segment format version is {FORMAT_VERSION} but this guard pins version \
+         {PINNED_FORMAT_VERSION}: pin the new version here together with the required sections \
+         it holds, {sections:?}"
+    );
+}

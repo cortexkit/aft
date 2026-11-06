@@ -25,7 +25,10 @@
 //!
 //! Sections are opaque to the container. Each plane gives its sections a kind
 //! and a version; a reader passes the kinds and versions it understands, and a
-//! segment with a required section outside that list cannot be opened.
+//! segment with a required section outside that list cannot be opened. A
+//! build that adds or changes a required section raises [`FORMAT_VERSION`]
+//! as well, so an older build refuses such a segment by its version rather
+//! than finding it unusable.
 
 mod error;
 mod format;
