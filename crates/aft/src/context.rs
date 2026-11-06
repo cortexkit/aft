@@ -13,9 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::alert_state::{
     AcceptedObservationBatch, AcceptedObservationResult, AlertDeltaState, ObservationError,
 };
-use crate::artifact_owner::{
-    ArtifactOwnerLease, ArtifactOwnerLeaseRegistration, ArtifactOwnerMode, ArtifactOwnerStatus,
-};
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
 
@@ -312,14 +309,6 @@ thread_local! {
 }
 
 thread_local! {
-    static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::views::trigram::LexicalViewSnapshot, String>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// The call-graph reader each pinned request acquired from its checkout
-    /// view, so every graph read in one request answers from one generation.
-    static CALLGRAPH_QUERY_READERS: std::cell::RefCell<Vec<(usize, Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -410,15 +399,6 @@ pub struct ConfigPinGuard {
 impl Drop for ConfigPinGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key {
-            LEXICAL_QUERY_SNAPSHOTS
-                .with(|snapshots| snapshots.borrow_mut().retain(|(id, _)| *id != key));
-            CALLGRAPH_QUERY_READERS
-                .with(|readers| readers.borrow_mut().retain(|(id, _)| *id != key));
-            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
-                outcomes
-                    .borrow_mut()
-                    .retain(|(pinned_key, _)| *pinned_key != key)
-            });
             CONFIG_PINS.with(|pins| {
                 pins.borrow_mut()
                     .retain(|(pinned_key, _)| *pinned_key != key)
@@ -1054,36 +1034,6 @@ pub struct SemanticFillHealth {
     pub last_progress_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ViewHealthSnapshot {
-    pub generation: u64,
-    pub pinned: bool,
-    pub pending_paths: usize,
-    pub failed_paths: usize,
-    /// Paths that ended without one of their derived planes, or outside the
-    /// generation, for a reason no retry changes, by reason (for example a
-    /// source the call graph cannot decode, or a HEAD entry with an
-    /// unsupported Git mode). They count as neither pending nor failed: the
-    /// view is complete, and status names them so the omission is visible.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub skipped_paths: BTreeMap<String, usize>,
-    /// Up to `path_status::SKIPPED_PATH_SAMPLE_CAP` skipped paths, bytewise
-    /// ordered.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skipped_path_sample: Vec<ViewSkippedPath>,
-    /// Graph-changing publications that built `derived.sqlite` cold instead of
-    /// patching the current generation, by reason, since this process started.
-    pub cold_builds: crate::views::assembly::ColdBuildCounts,
-    /// The current streak of failed publications, when the latest attempt
-    /// failed for a reason other than waiting for the semantic index. While
-    /// it is set, the served generation is not following checkout changes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub publication_failure: Option<ViewPublicationFailure>,
-    /// A readiness probe could not determine whether the call graph is usable.
-    /// Publication must revalidate it; this is not evidence of a missing graph.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub callgraph_readiness_deferred: Option<&'static str>,
-}
 
 /// Degraded reason recorded while a project's checkout view fails to load.
 /// Cleared by the next successful load; the history counts are kept.
@@ -1095,27 +1045,16 @@ pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 /// not internal errors that need a bug report.
 pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String {
     let error = error.to_string();
-    if crate::views::trigram::bind_is_busy(&error)
-        || crate::view_storage_reserve::is_message(&error)
-    {
+    if crate::view_storage_reserve::is_message(&error) {
         return error;
     }
     format!("{error}\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.")
 }
 
-/// Render a prepared lexical load diagnostic without treating contention as
-/// an internal failure. No other index or filesystem walk answers in its place.
+/// Render an index read failure as the call's error. No other index or
+/// filesystem walk answers in its place.
 pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::protocol::Response {
-    if crate::views::trigram::bind_is_busy(&message) {
-        crate::protocol::Response::error_with_data(
-            id,
-            "busy",
-            message,
-            serde_json::json!({"retryable": true}),
-        )
-    } else {
-        crate::protocol::Response::error(id, "internal_error", message)
-    }
+    crate::protocol::Response::error(id, "internal_error", message)
 }
 
 /// Error-level log throttle: one line per project and plane per minute.
@@ -1276,8 +1215,6 @@ pub struct RootHealthSnapshot {
     pub callgraph_commits_60s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_pages_or_bytes_written_60s: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub views: Option<ViewHealthSnapshot>,
     /// Checkout view loads that failed for this project since this process
     /// started, keyed `"plane:cause"` (for example `"trigram:unavailable"`
     /// or `"callgraph:io"`). Busy loads are retried, not counted. A failed load
@@ -1312,7 +1249,6 @@ pub(crate) struct RootHealthSummary {
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
     callgraph_store_status: Option<&'static str>,
-    views: Option<ViewHealthSnapshot>,
     view_load_failures: BTreeMap<String, u64>,
     view_load_failure_last: Option<ViewLoadFailure>,
     view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
@@ -1335,7 +1271,6 @@ impl RootHealthSummary {
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
-            views: None,
             view_load_failures: BTreeMap::new(),
             view_load_failure_last: None,
             view_storage_reserve: BTreeMap::new(),
@@ -1413,7 +1348,6 @@ impl RootHealthSummary {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s,
             callgraph_pages_or_bytes_written_60s,
-            views: self.views,
             view_load_failures: self.view_load_failures,
             view_load_failure_last: self.view_load_failure_last,
             view_storage_reserve: self.view_storage_reserve,
@@ -1445,7 +1379,6 @@ impl RootHealthSnapshot {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s: None,
             callgraph_pages_or_bytes_written_60s: None,
-            views: None,
             view_load_failures: BTreeMap::new(),
             view_load_failure_last: None,
             view_storage_reserve: BTreeMap::new(),
@@ -1551,13 +1484,6 @@ struct HealthMemoryWalks {
     semantic: Option<IndexMemoryWalk<Option<[u64; 9]>>>,
     trigram: Option<IndexMemoryWalk<Option<[u64; 11]>>>,
     symbols: Option<IndexMemoryWalk<[u64; 5]>>,
-}
-
-/// The immutable health projection of one installed runtime and ledger version.
-#[derive(Debug)]
-struct ViewHealthCache {
-    revision: u64,
-    snapshot: ViewHealthSnapshot,
 }
 
 /// Progress of the background walks that record which language servers apply
@@ -2392,12 +2318,6 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) status_changed: bool,
     pub(crate) scheduler_changed_path_count: usize,
     pub(crate) semantic_refresh_paths: Vec<PathBuf>,
-    pub(crate) view_publication_paths: BTreeSet<PathBuf>,
-    /// Lost events require a whole-checkout read until a full request is handed
-    /// to the publisher. Later path batches must not dilute that obligation.
-    pub(crate) view_publication_full: bool,
-    pub(crate) view_publication_reason: crate::views::publication_reason::Reason,
-    pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
 }
 
@@ -2840,61 +2760,6 @@ impl Drop for CallGraphStoreBuildSettlement {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ViewRuntimeSnapshot {
-    pub(crate) query_pin: Option<Arc<crate::pins::QueryPin>>,
-    pub(crate) storage: PathBuf,
-    pub(crate) family: String,
-    pub(crate) scope: String,
-    pub(crate) view_dir: PathBuf,
-    pub(crate) generation: Option<String>,
-    pub(crate) manifest: Option<Manifest>,
-    pub(crate) head_fingerprint: String,
-    pub(crate) head_metadata: crate::git_head::GitHeadMetadata,
-    pub(crate) pending_paths: BTreeSet<Vec<u8>>,
-    pub(crate) pending_inputs: BTreeMap<Vec<u8>, crate::views::assembly::PendingInput>,
-}
-
-#[derive(Debug)]
-struct ViewRuntimeState {
-    snapshot: ViewRuntimeSnapshot,
-    pin: Option<Arc<crate::pins::QueryPin>>,
-    health: Arc<crate::path_status::health::Health>,
-    health_cache: parking_lot::Mutex<Option<ViewHealthCache>>,
-    _manifest_cache: crate::views::assembly::CacheLease,
-}
-
-impl ViewRuntimeState {
-    fn new(snapshot: ViewRuntimeSnapshot, pin: Option<Arc<crate::pins::QueryPin>>) -> Self {
-        Self {
-            _manifest_cache: crate::views::assembly::CacheLease::new(&snapshot.view_dir),
-            health: crate::path_status::health::Health::for_view(&snapshot.view_dir),
-            snapshot,
-            pin,
-            // Readiness evidence belongs to this runtime, so even a
-            // same-generation replacement must discard its health projection.
-            health_cache: parking_lot::Mutex::new(None),
-        }
-    }
-}
-
-pub(crate) struct PreparedViewUpdate {
-    snapshot: Option<ViewRuntimeSnapshot>,
-    pin: Option<Arc<crate::pins::QueryPin>>,
-    retired: Option<ViewRuntimeState>,
-    callgraph_install_test_gate: Option<CallgraphViewInstallTestGate>,
-    assembly: crate::views::assembly::PreparedAssembly,
-    _semantic_pin: Option<crate::pins::AssemblyPin>,
-    pub(crate) content_generation: u64,
-}
-
-impl PreparedViewUpdate {
-    /// Writes the path status a committed publication accepted. Call it after
-    /// releasing the commit barrier: it opens the view's status ledger.
-    pub(crate) fn settle_status(&mut self) -> crate::views::assembly::SettleOutcome {
-        self.assembly.settle_status()
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
@@ -4477,144 +4342,9 @@ struct WorktreeBridgeCacheEntry {
     git_common_dir: Option<PathBuf>,
 }
 
-pub(crate) const BORROWED_INDEX_CACHE_CAPACITY: usize = 4;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct BorrowedIndexCacheKey {
-    canonical_root: PathBuf,
-    artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
-}
-
 struct ReadonlyArtifactCacheKey {
     record: Option<crate::root_identity::RecordStamp>,
     key: String,
-}
-
-type BorrowedSearchResult = crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>;
-
-#[derive(Debug, Default)]
-struct BorrowedSearchFlight {
-    result: Option<BorrowedSearchResult>,
-    previous: Option<BorrowedSearchResult>,
-}
-
-impl BorrowedSearchFlight {
-    fn serving(&self) -> BorrowedSearchResult {
-        match &self.result {
-            Some(
-                result @ (crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
-                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)),
-            ) => result.clone(),
-            _ => self
-                .previous
-                .clone()
-                .or_else(|| self.result.clone())
-                .unwrap_or(crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
-                    crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
-                )),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum BorrowedIndexCacheValue {
-    SearchLoading(Arc<parking_lot::Mutex<BorrowedSearchFlight>>),
-    Semantic(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>),
-}
-
-#[derive(Debug, Default)]
-struct BorrowedIndexCache {
-    entries: VecDeque<(BorrowedIndexCacheKey, BorrowedIndexCacheValue)>,
-    resolved_roots: VecDeque<(PathBuf, GitEntrySignature)>,
-    /// Copies of borrowed search indexes recently compared with their
-    /// project's files on disk. Each lives only as long as its project's
-    /// entries here: replacing or dropping them drops the copy too.
-    checked_overlays: crate::commands::semantic_search::external_disk_check::CheckedOverlays,
-}
-
-impl BorrowedIndexCache {
-    fn search(
-        &mut self,
-        key: &BorrowedIndexCacheKey,
-    ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>> {
-        let position = self.entries.iter().position(|(candidate, value)| {
-            candidate == key && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
-        })?;
-        let entry = self.entries.remove(position)?;
-        let BorrowedIndexCacheValue::SearchLoading(slot) = &entry.1 else {
-            return None;
-        };
-        let index = slot.lock().serving();
-        self.entries.push_back(entry);
-        Some(index)
-    }
-
-    fn semantic(
-        &mut self,
-        key: &BorrowedIndexCacheKey,
-    ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>> {
-        let position = self.entries.iter().position(|(candidate, value)| {
-            candidate == key && matches!(value, BorrowedIndexCacheValue::Semantic(_))
-        })?;
-        let entry = self.entries.remove(position)?;
-        let BorrowedIndexCacheValue::Semantic(index) = &entry.1 else {
-            return None;
-        };
-        let index = (*index).clone();
-        self.entries.push_back(entry);
-        Some(index)
-    }
-
-    fn insert(&mut self, key: BorrowedIndexCacheKey, value: BorrowedIndexCacheValue) {
-        self.entries.retain(|(candidate, _)| {
-            candidate.canonical_root != key.canonical_root
-                || candidate.artifact.path != key.artifact.path
-        });
-        // A new search or semantic generation for this project makes its
-        // checked copy describe indexes no longer served.
-        self.checked_overlays.forget_root(&key.canonical_root);
-        self.entries.push_back((key, value));
-        while self.entries.len() > BORROWED_INDEX_CACHE_CAPACITY {
-            self.entries.pop_front();
-        }
-        let entries = &self.entries;
-        self.checked_overlays.retain_roots(|root| {
-            entries.iter().any(|(candidate, value)| {
-                candidate.canonical_root == root
-                    && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
-            })
-        });
-    }
-
-    fn resolved_root(&mut self, requested_root: &Path) -> Option<PathBuf> {
-        let position = self
-            .resolved_roots
-            .iter()
-            .position(|(candidate, _)| candidate == requested_root)?;
-        let entry = self.resolved_roots.remove(position)?;
-        if entry.1 != git_entry_signature(requested_root) {
-            return None;
-        }
-        let root = entry.0.clone();
-        self.resolved_roots.push_back(entry);
-        Some(root)
-    }
-
-    fn remember_resolved_root(&mut self, root: PathBuf) {
-        self.resolved_roots
-            .retain(|(candidate, _)| candidate != &root);
-        let signature = git_entry_signature(&root);
-        self.resolved_roots.push_back((root, signature));
-        while self.resolved_roots.len() > BORROWED_INDEX_CACHE_CAPACITY {
-            self.resolved_roots.pop_front();
-        }
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.resolved_roots.clear();
-        self.checked_overlays.clear();
-    }
 }
 
 fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
@@ -4746,8 +4476,6 @@ pub struct AppContext {
     rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
-    artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
-    artifact_owner_lease: parking_lot::Mutex<Option<ArtifactOwnerLeaseRegistration>>,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
     /// current project root. Populated by `handle_configure` based on the
     /// canonical project root. Each reason is a stable machine-readable string
@@ -4764,16 +4492,7 @@ pub struct AppContext {
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
-    view_runtime: RwLock<Option<ViewRuntimeState>>,
-    view_publication_retry: parking_lot::Mutex<crate::executor::view_publication::PublicationRetry>,
-    deleted_view_root_retired: AtomicBool,
     lazy_callgraph: LazyCallgraph,
-    #[cfg(test)]
-    view_publication_attempts: AtomicUsize,
-    #[cfg(test)]
-    view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
-    checkout_driver: crate::views::first_load::InstalledDriver,
-    lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
     /// This root's checkout in the data layer that replaces the views and
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
     /// `data_layer::runtime`).
@@ -4800,33 +4519,11 @@ pub struct AppContext {
     data_external: parking_lot::Mutex<
         std::collections::HashMap<PathBuf, Arc<crate::data_layer::tools::search::ExternalSearch>>,
     >,
-    lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
-    lexical_routes: [AtomicU64; 3],
-    callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
     callgraph_executor: parking_lot::Mutex<Option<crate::executor::RootMaintenanceExecutor>>,
-    /// Set while this checkout is over `views.callgraph_copies` and reads
-    /// another checkout's published call graph instead of building its own.
-    callgraph_borrow: parking_lot::Mutex<Option<CallgraphBorrow>>,
-    callgraph_construction_retry: parking_lot::Mutex<
-        crate::views::contracts::LoadRetry<crate::views::callgraph::CallgraphViewError>,
-    >,
     callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
     /// Read by the health snapshot; written by every query that loads a view.
     view_load_health: parking_lot::Mutex<ViewLoadHealth>,
-    callgraph_view_routes: AtomicU64,
-    /// Files whose symbols a views-routed root's prewarm reused from, or
-    /// stored into, the family's v3 symbol plane.
-    symbol_view_routes: Arc<AtomicU64>,
-    /// The views-on semantic lane of this root (see `views::semantic_runtime`).
-    checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
-    /// Wall-clock milliseconds at which the completion drain should next
-    /// check this root's view disk limits; [`VIEW_DISK_LIMITS_OFF`] while
-    /// views are disabled. An atomic so the scheduler's work probe can read
-    /// it without a lock; only the drain and configuration publication
-    /// write it.
-    view_disk_limits_next_ms: AtomicU64,
-    checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
@@ -5015,7 +4712,6 @@ pub struct AppContext {
     readonly_artifact_cache_keys:
         parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,
     artifact_cache_key_derivations: AtomicU64,
-    borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
     /// Successful git worktree probes, keyed by canonical root and guarded by
     /// the root's `.git` entry shape and modification time.
     worktree_bridge_cache: parking_lot::Mutex<BTreeMap<PathBuf, WorktreeBridgeCacheEntry>>,
@@ -5147,39 +4843,6 @@ struct CallgraphPublicationFence {
     expected: u64,
 }
 
-impl crate::views::first_load::PublishFence for CallgraphPublicationFence {
-    fn publish(
-        &self,
-        commit: &mut dyn FnMut() -> Result<(), crate::views::contracts::PlaneError>,
-    ) -> Result<(), crate::views::contracts::PlaneError> {
-        let refused = || crate::views::contracts::PlaneError {
-            plane: Some(crate::blob_store::v2::FamilyPlane::Callgraph),
-            reason: crate::callgraph_store::join::SUPERSEDED_PUBLISH.into(),
-        };
-        loop {
-            if crate::executor::current_job_cancelled() {
-                return Err(refused());
-            }
-            // A root's bound/unbound lock may be held while retiring its view.
-            // A cancelled worker must leave this wait so retirement can join it.
-            let Some(unbound) = self
-                .lifecycle
-                .unbound
-                .try_lock_for(Duration::from_millis(10))
-            else {
-                continue;
-            };
-            if *unbound
-                || self.generation.load(Ordering::Acquire) != self.expected
-                || crate::executor::current_job_cancelled()
-            {
-                return Err(refused());
-            }
-            return commit();
-        }
-    }
-}
-
 /// Result of requesting the persisted callgraph store for a store-backed op.
 ///
 /// Cold builds run in the background. Checkout-view acquisitions also run
@@ -5289,31 +4952,6 @@ pub fn install_callgraph_view_install_test_gate(
     (reached_rx, release_tx, installed_rx)
 }
 
-fn take_callgraph_view_install_test_gate(
-    root: &Path,
-    snapshot: &ViewRuntimeSnapshot,
-    pinned: bool,
-) -> Option<CallgraphViewInstallTestGate> {
-    let gates = CALLGRAPH_VIEW_INSTALL_TEST_GATES.get()?;
-    // No filesystem readiness probe runs at the publication barrier unless
-    // this exact root has explicitly installed a test observer.
-    if !gates.lock().contains_key(root) {
-        return None;
-    }
-    let generation = snapshot.generation.as_deref()?;
-    if pinned
-        && crate::views::generation_matches_head(generation, &snapshot.head_fingerprint)
-        && !snapshot
-            .pending_inputs
-            .values()
-            .any(|input| input.plane == "checkout")
-        && crate::views::read::derived_built(&snapshot.view_dir, generation)
-    {
-        gates.lock().remove(root)
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 struct CallgraphBuildStartGate {
@@ -5394,42 +5032,9 @@ fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGua
     }
 }
 
-/// The locks the subc idle reaper reads for one candidate root (the eviction
-/// gate, the pending reconciliation sets and the resident handles it drops).
-/// Tests hold each in turn to prove the reaper does not wait for it.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IdleReapLock {
-    SemanticIndexStatus,
-    CallgraphStoreReceiver,
-    SemanticIndexReceiver,
-    InspectInFlight,
-    BashWatchdogTasks,
-    PendingCallgraphPaths,
-    PendingTier2Paths,
-    PendingSemanticPaths,
-    PendingCorpusRefresh,
-    CallgraphStore,
-    SemanticIndex,
-    BorrowedIndexCache,
-}
 
 #[cfg(test)]
 impl IdleReapLock {
-    pub(crate) const ALL: [Self; 12] = [
-        Self::SemanticIndexStatus,
-        Self::CallgraphStoreReceiver,
-        Self::SemanticIndexReceiver,
-        Self::InspectInFlight,
-        Self::BashWatchdogTasks,
-        Self::PendingCallgraphPaths,
-        Self::PendingTier2Paths,
-        Self::PendingSemanticPaths,
-        Self::PendingCorpusRefresh,
-        Self::CallgraphStore,
-        Self::SemanticIndex,
-        Self::BorrowedIndexCache,
-    ];
 }
 
 /// The locks behind the subc maintenance probes (see
@@ -5696,43 +5301,22 @@ impl AppContext {
             rerank_slot: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
-            artifact_owner_status: parking_lot::Mutex::new(None),
-            artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
-            view_runtime: RwLock::new(None),
-            view_publication_retry: parking_lot::Mutex::new(Default::default()),
-            deleted_view_root_retired: AtomicBool::new(false),
             lazy_callgraph: LazyCallgraph::default(),
-            #[cfg(test)]
-            view_publication_attempts: AtomicUsize::new(0),
-            #[cfg(test)]
-            view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
-            checkout_driver: crate::views::first_load::InstalledDriver::default(),
-            lexical_view: parking_lot::Mutex::new(None),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
             data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
             data_external: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            lexical_load_retry: parking_lot::Mutex::new(Default::default()),
-            lexical_routes: Default::default(),
-            callgraph_view: parking_lot::Mutex::new(None),
             callgraph_executor: parking_lot::Mutex::new(None),
-            callgraph_borrow: parking_lot::Mutex::new(None),
-            callgraph_construction_retry: parking_lot::Mutex::new(Default::default()),
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
                 CallgraphViewReadDiagnostics::default(),
             ),
             view_load_health: parking_lot::Mutex::new(ViewLoadHealth::default()),
-            callgraph_view_routes: AtomicU64::new(0),
-            symbol_view_routes: Arc::default(),
-            checkout_semantic: Arc::default(),
-            view_disk_limits_next_ms,
-            checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_corpus_memo: parking_lot::Mutex::new(None),
             callgraph_force_demand: Arc::default(),
@@ -5836,7 +5420,6 @@ impl AppContext {
             configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
-            borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
             worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             worktree_bridge_probe_spawns: AtomicU64::new(0),
@@ -6388,7 +5971,6 @@ impl AppContext {
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
-            views,
             view_load_failures,
             view_load_failure_last,
             view_storage_reserve,
@@ -7484,57 +7066,9 @@ impl AppContext {
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
     }
 
-    /// The family registry behind this project root's per-checkout view,
-    /// when views are enabled and the root's checkout semantic runtime is
-    /// loaded. `None` with views off, so the disk-limit checks below never
-    /// run for users who did not enable views. Takes locks; the drain calls
-    /// it, never the work probe.
-    pub(crate) fn checkout_view_registry(&self) -> Option<crate::views::registry::FamilyRegistry> {
-        {
-            return None;
-        }
-        match self.checkout_semantic.runtime()?.access() {
-            crate::views::contracts::ViewAccess::Owner(owner) => Some(owner.registry().clone()),
-            _ => None,
-        }
-    }
 
-    /// True when this root's view disk limits are due a check, which the
-    /// completion drain then starts (`runtime_drain::drain_view_disk_limits`).
-    /// Lock-free and free of I/O: one atomic load and a clock read, because
-    /// the module loop calls this probe for every root on every tick.
-    pub fn view_disk_limits_due(&self) -> bool {
-        let next = self.view_disk_limits_next_ms.load(Ordering::Acquire);
-        next != VIEW_DISK_LIMITS_OFF && now_epoch_ms() >= next
-    }
 
-    /// Sets when the drain should look at the view disk limits again.
-    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
-    pub(crate) fn schedule_view_disk_limits(&self, after: Duration) {
-        let next = now_epoch_ms().saturating_add(after.as_millis() as u64);
-        // Never re-arms a root whose views were turned off meanwhile.
-        let _ = self.view_disk_limits_next_ms.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| (current != VIEW_DISK_LIMITS_OFF).then_some(next),
-        );
-    }
 
-    /// Follows a configuration publication: views turned on make a check due
-    /// now unless one is already scheduled; views off disarm it entirely.
-    fn arm_view_disk_limits(&self, views_enabled: bool) {
-        if views_enabled {
-            let _ = self.view_disk_limits_next_ms.compare_exchange(
-                VIEW_DISK_LIMITS_OFF,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        } else {
-            self.view_disk_limits_next_ms
-                .store(VIEW_DISK_LIMITS_OFF, Ordering::Release);
-        }
-    }
 
     pub fn configure_tail_has_work(&self) -> bool {
         self.configure_maintenance_jobs
@@ -7617,68 +7151,6 @@ impl AppContext {
         }
     }
 
-    /// Hold one lock the idle reaper reads for the duration of `while_held`.
-    #[cfg(test)]
-    pub(crate) fn hold_idle_reap_lock_for_test(
-        &self,
-        lock: IdleReapLock,
-        while_held: impl FnOnce(),
-    ) {
-        fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-            lock.write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-        match lock {
-            IdleReapLock::SemanticIndexStatus => {
-                let _held = write(&self.semantic_index_status);
-                while_held();
-            }
-            IdleReapLock::CallgraphStoreReceiver => {
-                let _held = self.callgraph_store_rx.lock();
-                while_held();
-            }
-            IdleReapLock::SemanticIndexReceiver => {
-                let _held = self.semantic_index_rx.lock();
-                while_held();
-            }
-            IdleReapLock::InspectInFlight => {
-                self.inspect_manager
-                    .hold_in_flight_lock_for_test(while_held);
-            }
-            IdleReapLock::BashWatchdogTasks => {
-                self.bash_background
-                    .hold_watchdog_tasks_lock_for_test(while_held);
-            }
-            IdleReapLock::PendingCallgraphPaths => {
-                let _held = self.pending_callgraph_store_paths.lock();
-                while_held();
-            }
-            IdleReapLock::PendingTier2Paths => {
-                let _held = self.pending_tier2_paths.lock();
-                while_held();
-            }
-            IdleReapLock::PendingSemanticPaths => {
-                let _held = self.pending_semantic_index_paths.lock();
-                while_held();
-            }
-            IdleReapLock::PendingCorpusRefresh => {
-                let _held = self.pending_semantic_corpus_refresh.lock();
-                while_held();
-            }
-            IdleReapLock::CallgraphStore => {
-                let _held = write(&self.callgraph_store);
-                while_held();
-            }
-            IdleReapLock::SemanticIndex => {
-                let _held = write(&self.semantic_index);
-                while_held();
-            }
-            IdleReapLock::BorrowedIndexCache => {
-                let _held = self.borrowed_index_cache.lock();
-                while_held();
-            }
-        }
-    }
 
     pub(crate) fn park_configure_tail(
         &self,
@@ -8017,218 +7489,10 @@ impl AppContext {
         self.artifact_cache_key_derivations.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn resolve_external_git_root(
-        &self,
-        project_root: &Path,
-        requested_path: &str,
-        scan_root_is_protected: impl Fn(&Path) -> bool,
-    ) -> Result<PathBuf, crate::git_root_resolution::GitRootResolutionError> {
-        let raw_path = Path::new(requested_path);
-        let canonical_requested = if raw_path.is_absolute() {
-            std::fs::canonicalize(raw_path).ok()
-        } else {
-            None
-        };
-        if let Some(root) = canonical_requested
-            .as_deref()
-            .and_then(|root| self.borrowed_index_cache.lock().resolved_root(root))
-            // A cached plain root may now be protected by the effective policy.
-            // Re-probe it so Git roots retain their existing authorization path.
-            .filter(|root| !scan_root_is_protected(root))
-        {
-            return Ok(root);
-        }
 
-        let root = crate::git_root_resolution::resolve_git_root_from_user_path(
-            project_root,
-            requested_path,
-            scan_root_is_protected,
-        )?;
-        if canonical_requested.as_deref() == Some(root.as_path()) {
-            self.borrowed_index_cache
-                .lock()
-                .remember_resolved_root(root.clone());
-        }
-        Ok(root)
-    }
 
-    pub(crate) fn open_borrowed_search_index(
-        &self,
-        external_root: &Path,
-        storage_dir: Option<&Path>,
-    ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>> {
-        if self.cache_unavailable_reason().is_some() {
-            return crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
-                crate::readonly_artifacts::ReadOnlyDegradation {
-                    reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
-                },
-            );
-        }
-        let canonical_root =
-            std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let storage = crate::bash_background::storage_dir(storage_dir);
-        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
-        {
-            Ok(key) => key,
-            Err(error) => {
-                crate::slog_warn!("borrowed search index unavailable: {}", error);
-                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
-            }
-        };
-        let Some(artifact) = crate::readonly_artifacts::search_index_artifact_generation_with_key(
-            &project_key,
-            storage_dir,
-        ) else {
-            return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
-        };
-        let key = BorrowedIndexCacheKey {
-            canonical_root: canonical_root.clone(),
-            artifact,
-        };
-        let slot = Arc::new(parking_lot::Mutex::new(BorrowedSearchFlight::default()));
-        {
-            let mut cache = self.borrowed_index_cache.lock();
-            if let Some(index) = cache.search(&key) {
-                return index;
-            }
-            slot.lock().previous = cache.entries.iter().find_map(|(candidate, value)| {
-                if candidate.canonical_root == key.canonical_root
-                    && candidate.artifact.path == key.artifact.path
-                {
-                    if let BorrowedIndexCacheValue::SearchLoading(previous) = value {
-                        let serving = previous.lock().serving();
-                        if matches!(
-                            serving,
-                            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
-                                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
-                        ) {
-                            return Some(serving);
-                        }
-                    }
-                }
-                None
-            });
-            // Publish the flight before spawning: concurrent requests share one
-            // parse, and eviction drops its only long-lived strong reference.
-            cache.insert(
-                key,
-                BorrowedIndexCacheValue::SearchLoading(Arc::clone(&slot)),
-            );
-        }
-        let weak = Arc::downgrade(&slot);
-        let (max_records, wait_budget) =
-            crate::readonly_artifacts::borrowed_search_background_limits();
-        let cache_dir = crate::search_index::resolve_cache_dir_with_key(&project_key, storage_dir);
-        std::thread::spawn(move || {
-            let opened = crate::readonly_artifacts::open_search_index_background_with_limit(
-                &canonical_root,
-                cache_dir,
-                max_records,
-                &|| weak.strong_count() > 0,
-            )
-            .map(Arc::new);
-            if let Some(slot) = weak.upgrade() {
-                let mut flight = slot.lock();
-                if matches!(
-                    opened,
-                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
-                        | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
-                ) {
-                    flight.previous = None;
-                }
-                flight.result = Some(opened);
-            }
-        });
-        let started = Instant::now();
-        loop {
-            {
-                let flight = slot.lock();
-                if flight.result.is_some() {
-                    return flight.serving();
-                }
-            }
-            if started.elapsed() >= wait_budget || crate::executor::current_job_cancelled() {
-                return slot.lock().serving();
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
 
-    pub(crate) fn open_borrowed_semantic_index(
-        &self,
-        external_root: &Path,
-        storage_dir: Option<&Path>,
-    ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>> {
-        if self.cache_unavailable_reason().is_some() {
-            return crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
-                crate::readonly_artifacts::ReadOnlyDegradation {
-                    reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
-                },
-            );
-        }
-        let canonical_root =
-            std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let storage = crate::bash_background::storage_dir(storage_dir);
-        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
-        {
-            Ok(key) => key,
-            Err(error) => {
-                crate::slog_warn!("borrowed semantic index unavailable: {}", error);
-                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
-            }
-        };
-        let Some(artifact) = crate::readonly_artifacts::semantic_index_artifact_generation_with_key(
-            &project_key,
-            storage_dir,
-        ) else {
-            return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
-        };
-        let key = BorrowedIndexCacheKey {
-            canonical_root: canonical_root.clone(),
-            artifact,
-        };
-        {
-            let mut cache = self.borrowed_index_cache.lock();
-            if let Some(index) = cache.semantic(&key) {
-                return index;
-            }
-        }
 
-        // Semantic snapshot parsing follows the same rule: bounded work runs
-        // without holding the cache's process-wide coordination mutex.
-        let opened = crate::readonly_artifacts::open_semantic_index_read_only_with_key(
-            &canonical_root,
-            storage_dir,
-            &project_key,
-        )
-        .map(Arc::new);
-        if !matches!(
-            opened,
-            crate::readonly_artifacts::ReadOnlyArtifact::Absent
-                | crate::readonly_artifacts::ReadOnlyArtifact::Cancelled
-        ) {
-            self.borrowed_index_cache
-                .lock()
-                .insert(key, BorrowedIndexCacheValue::Semantic(opened.clone()));
-        }
-        opened
-    }
-
-    #[cfg(test)]
-    pub(crate) fn borrowed_index_cache_len_for_test(&self) -> usize {
-        self.borrowed_index_cache.lock().entries.len()
-    }
-
-    /// Run `use_overlays` on the recently checked copies of borrowed search
-    /// indexes, under the borrowed-index cache lock.
-    pub(crate) fn with_checked_overlays<R>(
-        &self,
-        use_overlays: impl FnOnce(
-            &mut crate::commands::semantic_search::external_disk_check::CheckedOverlays,
-        ) -> R,
-    ) -> R {
-        use_overlays(&mut self.borrowed_index_cache.lock().checked_overlays)
-    }
 
     pub fn configure_generation(&self) -> u64 {
         self.configure_generation.load(Ordering::SeqCst)
@@ -9364,9 +8628,6 @@ impl AppContext {
             pins.push((key, snapshot));
             true
         });
-        if pushed {
-            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| outcomes.borrow_mut().push((key, None)));
-        }
         ConfigPinGuard {
             key: pushed.then_some(key),
             _not_send: std::marker::PhantomData,
@@ -9948,22 +9209,6 @@ impl AppContext {
             .store(!is_worktree_bridge && !artifact_read_only, Ordering::SeqCst);
     }
 
-    pub fn set_artifact_owner(
-        &self,
-        status: Option<ArtifactOwnerStatus>,
-        lease: Option<ArtifactOwnerLease>,
-    ) {
-        let read_only = status
-            .as_ref()
-            .is_some_and(|status| status.mode == ArtifactOwnerMode::ReadOnly);
-        self.shared_artifacts_read_only
-            .store(read_only, Ordering::SeqCst);
-        self.callgraph_writer
-            .store(!self.is_worktree_bridge() && !read_only, Ordering::SeqCst);
-        self.inspect_writer.store(true, Ordering::SeqCst);
-        *self.artifact_owner_status.lock() = status;
-        *self.artifact_owner_lease.lock() = lease.map(crate::artifact_owner::register_heartbeat);
-    }
 
     pub fn set_cache_writer_capabilities(&self, callgraph_writer: bool, inspect_writer: bool) {
         self.callgraph_writer
@@ -10025,9 +9270,6 @@ impl AppContext {
         self.shared_artifacts_read_only() && self.config().worktree.ram_overlay
     }
 
-    pub fn artifact_owner_status(&self) -> Option<ArtifactOwnerStatus> {
-        self.artifact_owner_status.lock().clone()
-    }
 
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.lock()
@@ -10094,11 +9336,7 @@ impl AppContext {
     /// A measured disk-reserve refusal is recorded separately, without adding
     /// to the bug count or replacing the most recent genuine failure.
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
-        self.note_classified_view_load_failure(
-            plane,
-            error,
-            crate::views::trigram::bind_is_busy(error),
-        );
+        self.note_classified_view_load_failure(plane, error, false);
     }
 
     fn note_classified_view_load_failure(&self, plane: &'static str, error: &str, planned: bool) {
@@ -10248,383 +9486,15 @@ impl AppContext {
         }
     }
 
-    /// A deleted checkout has no publication consumer. Retire once rather than
-    /// letting watcher quiet-window retries spawn git indefinitely.
-    pub(crate) fn retire_deleted_view_root(&self) -> bool {
-        let missing = self
-            .canonical_cache_root_opt()
-            .is_some_and(|root| !root.is_dir());
-        if !missing && !self.deleted_view_root_retired.load(Ordering::Acquire) {
-            return false;
-        }
-        if !self.deleted_view_root_retired.swap(true, Ordering::AcqRel) {
-            if let Some(root) = self.canonical_cache_root_opt() {
-                crate::cold_build_limiter::progress::cancel_root(&root);
-            }
-            crate::executor::view_publication::cancel_for_context(self);
-            self.clear_view_runtime();
-            log::info!(
-                "content-addressed view publication retired deleted root={}",
-                self.canonical_cache_root_opt()
-                    .unwrap_or_default()
-                    .display()
-            );
-        }
-        true
-    }
 
-    #[cfg(test)]
-    pub(crate) fn view_publication_attempts_for_test(&self) -> usize {
-        self.view_publication_attempts.load(Ordering::Acquire)
-    }
 
-    pub(crate) fn clear_view_runtime(&self) {
-        self.cancel_callgraph_acquisition();
-        self.release_view_publication_cache();
-        if let Some(root) = self.canonical_cache_root_opt() {
-            crate::cold_build_limiter::progress::cancel_root(&root);
-        }
-        self.reset_view_publication_retry();
-        self.checkout_driver.clear();
-        self.checkout_semantic.clear();
-        *self
-            .checkout_query_runtime
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let retired = self
-            .view_runtime
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        drop(retired);
-    }
 
-    fn release_view_publication_cache(&self) {
-        let view_dir = self
-            .view_runtime
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|runtime| runtime.snapshot.view_dir.clone());
-        if let Some(view_dir) = view_dir {
-            crate::views::assembly::release_manifest_cache(&view_dir);
-        }
-    }
 
-    pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
-        {
-            return None;
-        }
-        // Read before taking the view runtime lock, so this never holds one
-        // lock while waiting for the other.
-        let publication_failure = self.view_publication_retry.lock().failure_snapshot();
-        let state = self
-            .view_runtime
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
-        let state = state.as_ref()?;
-        let (revision, status) = state.health.snapshot();
-        let mut cache = state.health_cache.lock();
-        let mut snapshot = if let Some(cached) = cache.as_ref().filter(|c| c.revision == revision) {
-            cached.snapshot.clone()
-        } else {
-            let snapshot = ViewHealthSnapshot {
-                generation: state
-                    .snapshot
-                    .generation
-                    .as_deref()
-                    .and_then(|generation| generation.split('-').next())
-                    .and_then(|generation| generation.parse().ok())
-                    .unwrap_or(0),
-                pinned: state.pin.is_some(),
-                pending_paths: status
-                    .as_ref()
-                    .map_or(state.snapshot.pending_paths.len(), |status| {
-                        status.pending_count
-                    }),
-                failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
-                skipped_paths: status
-                    .as_ref()
-                    .map(|status| status.skipped_by_reason.clone())
-                    .unwrap_or_default(),
-                skipped_path_sample: status
-                    .as_ref()
-                    .map(|status| {
-                        status
-                            .skipped_sample
-                            .iter()
-                            .map(|skip| ViewSkippedPath {
-                                path: String::from_utf8_lossy(&skip.rel_path).into_owned(),
-                                reason: skip.reason.clone(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                cold_builds: Default::default(),
-                publication_failure: None,
-                callgraph_readiness_deferred: state
-                    .snapshot
-                    .pending_inputs
-                    .values()
-                    .map(|input| input.reason)
-                    .find(|reason| {
-                        matches!(
-                            *reason,
-                            crate::views::read::CALLGRAPH_READINESS_BUSY
-                                | crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED
-                        )
-                    }),
-            };
-            *cache = Some(ViewHealthCache {
-                revision,
-                snapshot: snapshot.clone(),
-            });
-            snapshot
-        };
-        // Retry delay counts down without a write, and cold-build counters
-        // advance during preparation, before a runtime is published.
-        snapshot.publication_failure = publication_failure;
-        snapshot.cold_builds = crate::views::assembly::cold_build_counts(&state.snapshot.view_dir);
-        Some(snapshot)
-    }
 
-    pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
-        None
-    }
 
-    pub(crate) fn publish_view_paths(
-        &self,
-        changed_paths: BTreeSet<Vec<u8>>,
-        allow_semantic_blob_put: bool,
-    ) -> Result<
-        crate::views::assembly::AssemblyReport,
-        crate::executor::view_publication::PublicationFailure,
-    > {
-        let mut prepared =
-            self.prepare_view_paths(changed_paths, allow_semantic_blob_put, &mut |_| Ok(()))?;
-        let report = self.commit_view_update(&mut prepared)?;
-        prepared.settle_status();
-        Ok(report)
-    }
 
-    pub(crate) fn can_skip_irrelevant_view_paths(&self, paths: &BTreeSet<Vec<u8>>) -> bool {
-        let Some(snapshot) = self.view_runtime_snapshot() else {
-            return false;
-        };
-        let config = self.config();
-        if paths.is_empty()
-            || !snapshot.pending_paths.is_empty()
-            || !snapshot.pending_inputs.is_empty()
-            || self.lazy_callgraph_build_outstanding()
-            || (config.indexes.semantic && !self.checkout_semantic.active())
-        {
-            return false;
-        }
-        crate::views::assembly::can_skip_irrelevant_paths(
-            &crate::views::assembly::AssemblyRequest {
-                storage: snapshot.storage,
-                project_root: self.canonical_cache_root(),
-                family: snapshot.family,
-                scope: snapshot.scope,
-                desired_head: snapshot.head_fingerprint,
-                changed_paths: paths.clone(),
-                semantic_keys: BTreeMap::new(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: config.indexes.callgraph,
-            },
-            self.defer_callgraph_build(),
-        )
-    }
 
-    pub(crate) fn prepare_view_paths(
-        &self,
-        changed_paths: BTreeSet<Vec<u8>>,
-        allow_semantic_blob_put: bool,
-        phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
-    ) -> Result<PreparedViewUpdate, String> {
-        // store_live_semantic_blobs copies semantic-index payloads into databases
-        // shared by this repository's worktrees before checkout assembly starts.
-        let store_writes = crate::db::write_accounting::Publication::default();
-        let _store_writes = store_writes.enter();
-        #[cfg(test)]
-        {
-            let mut starts = self.view_publication_attempt_starts.lock();
-            // Capture the producer clock before observers can see the new attempt.
-            starts.push(Instant::now());
-            self.view_publication_attempts
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        let content_generation = self.configure_content_generation();
-        phase("manifest").map_err(|error| error.to_string())?;
 
-        if self.retire_deleted_view_root() {
-            return Err("view publication root was deleted".to_owned());
-        }
-        let snapshot = self
-            .view_runtime_snapshot()
-            .ok_or_else(|| "view runtime is not configured".to_string())?;
-        let root = self
-            .canonical_cache_root_opt()
-            .ok_or_else(|| "view root is not configured".to_string())?;
-        let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
-        let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
-        crate::views::cache_head_fingerprint(root.clone(), desired_head.clone());
-        // Worded as an alias error, like the head-tree read above.
-        let head_metadata =
-            crate::git_head::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
-                .map_err(|error| crate::alias::AliasError::from(error).to_string())?;
-        // With a per-checkout semantic view, the content-addressed view this
-        // function publishes (used for views-on callgraph reads) carries no
-        // semantic plane: its vectors came from the legacy semantic index,
-        // which such a root no longer builds.
-        let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
-        let (semantic_keys, semantic_pin) =
-            if semantic_search && allow_semantic_blob_put && !self.shared_artifacts_read_only() {
-                let index = self
-                    .semantic_index
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone()
-                    .ok_or_else(|| VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX.to_owned())?;
-                let fingerprint = index
-                    .fingerprint()
-                    .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
-                    .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
-                let mut request = crate::migration::SemanticMigrationRequest::for_root_with_key(
-                    snapshot.storage.clone(),
-                    root.clone(),
-                    snapshot.family.clone(),
-                    fingerprint,
-                );
-                request.view.clone_from(&snapshot.scope);
-                let handoff = crate::migration::store_live_semantic_blobs(&request, &index)
-                    .map_err(|error| error.to_string())?;
-                (handoff.keys, Some(handoff.pin))
-            } else {
-                (BTreeMap::new(), None)
-            };
-        let assembly = crate::views::assembly::prepare_checkout_deferring(
-            &crate::views::assembly::AssemblyRequest {
-                storage: snapshot.storage.clone(),
-                project_root: root,
-                family: snapshot.family.clone(),
-                scope: snapshot.scope.clone(),
-                desired_head: desired_head.clone(),
-                changed_paths,
-                semantic_keys,
-                require_semantic: semantic_search,
-                // Each checkout must contribute blobs for source only it has.
-                // These content-addressed inserts cannot overwrite another
-                // checkout's blobs, and the generation is checkout-scoped.
-                // This does not grant legacy-store or shared search-cache ownership.
-                allow_blob_put: true,
-                // Nothing reads a view's call graph while the index is off.
-                callgraph: self.config().indexes.callgraph,
-            },
-            // A linked worktree leaves its derived call graph unbuilt until a
-            // query needs it; see `LazyCallgraph`.
-            self.defer_callgraph_build(),
-            phase,
-        )
-        .map_err(|error| error.to_string())?;
-        // Missing members are valid deletions, but an absent checkout is not
-        // a valid empty view. It may have disappeared during the source walk.
-        if self.retire_deleted_view_root() {
-            return Err("view publication root was deleted".to_owned());
-        }
-        let report = assembly.report();
-        let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
-            .map_err(|error| error.to_string())?;
-        let generation = report.generation.clone();
-        let manifest = match (&report.manifest, generation.as_deref()) {
-            (Some(manifest), _) => Some(manifest.clone()),
-            (None, Some(generation)) => view.load_manifest(generation).ok(),
-            (None, None) => None,
-        };
-        // Taking the query pin can wait on a filesystem lock. A detached
-        // publication gives up its cold-build slot when this phase starts.
-        phase(VIEW_PUBLICATION_PIN_PHASE).map_err(|error| error.to_string())?;
-        let pin = generation
-            .as_deref()
-            .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        let snapshot = ViewRuntimeSnapshot {
-            generation,
-            manifest,
-            head_fingerprint: desired_head,
-            head_metadata,
-            pending_paths: report.pending_paths.clone(),
-            pending_inputs: report.pending_inputs.clone(),
-            ..snapshot
-        };
-        let callgraph_install_test_gate = take_callgraph_view_install_test_gate(
-            &self.canonical_cache_root(),
-            &snapshot,
-            pin.is_some(),
-        );
-        if let Some(gate) = &callgraph_install_test_gate {
-            let _ = gate.reached.send(snapshot.generation.clone().unwrap());
-            gate.release
-                .recv_timeout(Duration::from_secs(30))
-                .expect("callgraph view install test gate was not released");
-        }
-        Ok(PreparedViewUpdate {
-            snapshot: Some(snapshot),
-            callgraph_install_test_gate,
-            pin: pin.map(Arc::new),
-            retired: None,
-            assembly,
-            // Reused semantic rows can already exceed the GC age floor. Keep
-            // their pin through publication, not merely through blob insertion.
-            _semantic_pin: semantic_pin,
-            content_generation,
-        })
-    }
-
-    /// Called only at the actor's short publication barrier. All filesystem
-    /// construction and query-pin acquisition have already completed.
-    pub(crate) fn commit_view_update(
-        &self,
-        prepared: &mut PreparedViewUpdate,
-    ) -> Result<
-        crate::views::assembly::AssemblyReport,
-        crate::executor::view_publication::PublicationFailure,
-    > {
-        if self.configure_content_generation() != prepared.content_generation || true {
-            return Err("view publication configuration was superseded"
-                .to_owned()
-                .into());
-        }
-        let report = prepared.assembly.commit()?;
-        if let Some(snapshot) = prepared
-            .snapshot
-            .take()
-            .filter(|snapshot| report.generation == snapshot.generation)
-        {
-            prepared.retired = self
-                .view_runtime
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .replace(ViewRuntimeState::new(snapshot, prepared.pin.take()));
-            if let Some(gate) = prepared.callgraph_install_test_gate.take() {
-                let _ = gate.installed.send(report.generation.clone().unwrap());
-            }
-        }
-        if report.published
-            && self.config().indexes.callgraph
-            && self
-                .inspect_manager
-                .note_view_publication(&self.canonical_cache_root())
-        {
-            // Only analysis that deferred for this view needs another pass.
-            // Retain its pull demand even while that scan is still in flight;
-            // ordinary publications must not start unsolicited analysis.
-            let _ = self.request_tier2_refresh_pull();
-        }
-        Ok(report)
-    }
 
     /// Access the persisted call graph store.
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
@@ -11104,30 +9974,9 @@ impl AppContext {
         false
     }
 
-    /// Binds watcher invalidation and synchronous write intent to the same driver.
-    /// Called explicitly alongside query activation, never by legacy configure.
-    pub fn install_checkout_driver(&self, driver: Arc<crate::views::first_load::CheckoutDriver>) {
-        self.checkout_driver.install(driver);
-    }
 
-    /// The shared handle a worker thread uses to install this root's driver
-    /// with the same wiring as `install_checkout_driver`.
-    pub(crate) fn installed_checkout_driver(&self) -> crate::views::first_load::InstalledDriver {
-        self.checkout_driver.clone()
-    }
 
-    /// This root's views-on semantic lane.
-    pub fn checkout_semantic(&self) -> &Arc<crate::views::semantic_runtime::CheckoutSemanticSlot> {
-        &self.checkout_semantic
-    }
 
-    /// The loaded views-on semantic view, when this root serves semantic
-    /// search from one.
-    pub fn checkout_semantic_runtime(
-        &self,
-    ) -> Option<Arc<crate::views::semantic_runtime::CheckoutSemantic>> {
-        None
-    }
 
     pub(crate) fn record_checkout_pending_watcher_gap(&self) {
         if self
@@ -11137,39 +9986,9 @@ impl AppContext {
         {}
     }
 
-    pub(crate) fn view_publication_retry(
-        &self,
-    ) -> &parking_lot::Mutex<crate::executor::view_publication::PublicationRetry> {
-        &self.view_publication_retry
-    }
 
-    pub(crate) fn reset_view_publication_retry(&self) {
-        let root = self.canonical_cache_root_opt().unwrap_or_default();
-        self.view_publication_retry.lock().reset(&root);
-    }
 
-    /// Activates a supplied, already loaded checkout runtime for this root.
-    /// Nothing calls this from legacy configure; defaults remain unchanged.
-    pub fn install_checkout_query_runtime(
-        &self,
-        runtime: Arc<crate::views::query_wait::CheckoutQueryRuntime>,
-    ) {
-        *self
-            .checkout_query_runtime
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(runtime);
-    }
 
-    /// The one final post-wait outcome pinned by this request, including gaps.
-    pub fn checkout_query_outcome(&self) -> Option<crate::views::contracts::WaitOutcome> {
-        CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
-            outcomes
-                .borrow()
-                .iter()
-                .find(|(key, _)| *key == self.config_pin_key())
-                .and_then(|(_, outcome)| outcome.clone())
-        })
-    }
 
     #[cfg(test)]
     pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
@@ -11197,22 +10016,6 @@ impl AppContext {
         self.callgraph_store_for_ops_capped(Some(deadline))
     }
 
-    fn callgraph_store_for_ops_capped(&self, deadline: Option<Instant>) -> CallgraphStoreAccess {
-        let active = self
-            .checkout_query_runtime
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        let wait = if active {
-            crate::views::contracts::CALLGRAPH_QUERY_WAIT
-        } else {
-            self.callgraph_build_wait_window()
-        };
-        let wait = deadline.map_or(wait, |deadline| {
-            wait.min(deadline.saturating_duration_since(Instant::now()))
-        });
-        self.callgraph_store_for_ops_with_wait(wait, true, None)
-    }
 
     /// The store for a reader that needs the graph now but must not wait for
     /// it, such as zoom's call-graph annotations or inspect's dead-code and
@@ -11239,80 +10042,7 @@ impl AppContext {
         self.callgraph_build_on_demand() && !self.lazy_callgraph.demanded.load(Ordering::Acquire)
     }
 
-    /// A query needed this worktree's own graph and the current view
-    /// generation has none: a publication must still build it.
-    pub(crate) fn lazy_callgraph_build_outstanding(&self) -> bool {
-        if !self.callgraph_build_on_demand()
-            || !self.lazy_callgraph.demanded.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        let Some(view) = self.view_runtime_snapshot() else {
-            return false;
-        };
-        view.generation
-            .as_deref()
-            .is_none_or(|generation| !crate::views::read::derived_built(&view.view_dir, generation))
-    }
 
-    /// Start one view publication to build an outstanding on-demand graph,
-    /// through the ordinary publication scheduler and its cold-build limiter.
-    /// Does nothing while a publication for this root is queued or running:
-    /// one that started before the demand was recorded rebuilds when it
-    /// finishes.
-    ///
-    /// Under a root actor or the standalone scope, the publication detaches.
-    /// With no scope on this thread, `schedule` publishes inline on it; tests
-    /// and one-shot tools that never install a scope rely on that, so they
-    /// build here. If a scope was ever installed for this context on another
-    /// thread (a daemon root, the standalone loop), or this is a standalone CLI
-    /// query, this call skips the inline build and leaves it to the next
-    /// scoped query or maintenance drain, so this thread is not held for the
-    /// whole build.
-    pub(crate) fn schedule_lazy_callgraph_build(&self) {
-        if !self.lazy_callgraph_build_outstanding() {
-            return;
-        }
-        if !crate::executor::view_publication::detaches_for(self)
-            && (self
-                .lazy_callgraph
-                .publication_scoped
-                .load(Ordering::Acquire)
-                || self.daemonless_query_mode())
-        {
-            return;
-        }
-        let _serial = self.lazy_callgraph.schedule.lock();
-        if !self.lazy_callgraph_build_outstanding()
-            || crate::executor::view_publication::running_for(self)
-        {
-            return;
-        }
-        #[cfg(test)]
-        self.lazy_callgraph
-            .builds_scheduled
-            .fetch_add(1, Ordering::AcqRel);
-        let root = self.canonical_cache_root_opt().unwrap_or_default();
-        crate::slog_info!(
-            "callgraph on-demand build scheduled root={}",
-            root.display()
-        );
-        if let Err(error) = crate::executor::view_publication::schedule_with_reason(
-            self,
-            BTreeSet::new(),
-            !self.shared_artifacts_read_only(),
-            crate::views::publication_reason::Reason {
-                query: true,
-                ..Default::default()
-            },
-        ) {
-            crate::slog_warn!(
-                "callgraph on-demand build failed to schedule root={}: {}",
-                root.display(),
-                error
-            );
-        }
-    }
 
     /// A root actor or the standalone scope now publishes for this context.
     pub(crate) fn note_publication_scope(&self) {
@@ -11884,55 +10614,10 @@ impl AppContext {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn lexical_source_for_test(
-        &self,
-    ) -> Arc<dyn crate::views::trigram::LexicalSnapshotSource> {
-        self.lexical_view.lock().as_ref().unwrap().source_for_test()
-    }
 
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn lexical_view_acquisitions_for_test(&self) -> usize {
-        self.lexical_view
-            .lock()
-            .as_ref()
-            .map_or(0, |view| view.acquisitions_for_test())
-    }
 
-    #[cfg(test)]
-    pub(crate) fn install_lexical_source_for_test(
-        &self,
-        source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
-    ) {
-        *self.lexical_load_retry.lock() = Default::default();
-        let root = self.canonical_cache_root();
-        let family = self.memoized_artifact_cache_key(&root);
-        *self.lexical_view.lock() =
-            Some(Arc::new(crate::views::trigram::LexicalView::with_source(
-                root,
-                self.storage_paths(),
-                family,
-                crate::blob_store::v2::TrigramPolicy {
-                    max_file_size: self.config().search_index_max_file_size,
-                },
-                source,
-            )));
-    }
 
-    /// With views enabled, lexical queries use the checkout-local view rather
-    /// than the legacy SearchIndex cache. The separate lexical driver keeps
-    /// lexical service independent of semantic models.
-    pub(crate) fn lexical_view_snapshot(
-        &self,
-        tool: &str,
-    ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
-        None
-    }
 
-    /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
-    pub fn lexical_view_route_counts(&self) -> [u64; 3] {
-        std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
-    }
 
     pub(crate) fn install_callgraph_executor(
         &self,
@@ -11956,14 +10641,71 @@ impl AppContext {
         self.callgraph_executor.lock().clone()
     }
 
-    fn cancel_callgraph_acquisition(&self) {
-        if let Some(view) = self.callgraph_view.lock().as_ref() {
-            view.cancel();
-        }
-    }
 
     /// Fence and drain standalone call-graph acquisition before process teardown.
     /// Daemon acquisitions are also cancelled, and their executor owns the drain.
+    /// Gate every watcher-maintained artifact after the last route detaches. Files
+    /// may change before the watcher is restored, so a later bind must reconcile
+    /// from disk instead of serving retained snapshots that missed those edits.
+    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
+        self.next_semantic_persist_epoch();
+        self.next_callgraph_persist_epoch();
+
+        self.semantic_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.callgraph_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Keep semantic status reloadable when the feature is enabled: the
+        // query path's self-healing reload only fires from Ready (or Failed on
+        // read-only roots), so Disabled would strand an already-bound root
+        // with no way back short of a reconfigure. The advanced persist epoch
+        // and strict verify memo force the reload to re-verify from disk.
+        *self
+            .semantic_index_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().indexes.semantic
+        {
+            SemanticIndexStatus::ready()
+        } else {
+            SemanticIndexStatus::Disabled
+        };
+        // Files may change before the watcher is restored. The store is still
+        // the right store and only missed edits, so the next use compares it
+        // with the disk and refreshes what differs instead of rebuilding it.
+        // `request_callgraph_reconcile` ignores read-only roots, which follow
+        // the owner's published store.
+        self.request_callgraph_reconcile("watcher gap");
+
+        if let Some(root) = self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+        {
+            crate::cache_freshness::invalidate_verify_memo_strict(&root);
+        }
+        self.inspect_manager.evict_idle_caches();
+        self.reset_symbol_cache();
+        self.clear_tsconfig_membership_cache();
+    }
+
+    /// The Git checkout holding `requested_path`, resolved from the session's
+    /// project root. A plain root the policy protects is refused.
+    pub(crate) fn resolve_external_git_root(
+        &self,
+        project_root: &Path,
+        requested_path: &str,
+        scan_root_is_protected: impl Fn(&Path) -> bool,
+    ) -> Result<PathBuf, crate::git_root_resolution::GitRootResolutionError> {
+        crate::git_root_resolution::resolve_git_root_from_user_path(
+            project_root,
+            requested_path,
+            scan_root_is_protected,
+        )
+    }
+
     pub fn shutdown_callgraph_acquisition(&self) {
         self.mark_subc_unbound();
         let view = self.callgraph_view.lock().take();
@@ -11972,26 +10714,6 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_callgraph_source_for_test(
-        &self,
-        source: Arc<dyn crate::views::callgraph::CallgraphReaderSource>,
-    ) {
-        *self.callgraph_construction_retry.lock() = Default::default();
-        let root = self.canonical_cache_root();
-        let family = self.memoized_artifact_cache_key(&root);
-        *self.callgraph_view.lock() = Some(Arc::new(
-            crate::views::callgraph::CallgraphView::with_source(
-                root,
-                self.storage_paths(),
-                family,
-                crate::blob_store::v2::TrigramPolicy {
-                    max_file_size: self.config().search_index_max_file_size,
-                },
-                source,
-            ),
-        ));
-    }
 
     /// Passive diagnostic state, including the last acquisition error. A
     /// successful retry does not erase that error.
@@ -11999,71 +10721,10 @@ impl AppContext {
         self.callgraph_view_read_diagnostics.lock().clone()
     }
 
-    /// Test-only fixture adapter: block until the view's acquisition completes,
-    /// then pin its reader for the read-only test request (up to 120 seconds).
-    /// Production callers must handle Building through the normal read APIs,
-    /// whose interactive acquisition wait remains three seconds.
-    #[doc(hidden)]
-    pub fn with_ready_callgraph_for_test<T>(&self, read: impl FnOnce() -> T) -> T {
-        {
-            return read();
-        }
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let _pin = self.pin_config();
-        CALLGRAPH_QUERY_READERS.with(|readers| {
-            readers
-                .borrow_mut()
-                .retain(|(key, _)| *key != self.config_pin_key());
-        });
-        self.callgraph_view_reader_with(|view| {
-            Ok(view.ready_reader_before_for_test(Instant::now, deadline))
-        })
-        .expect("fixture must route through callgraph views")
-        .unwrap_or_else(|error| {
-            panic!(
-                "fixture callgraph root={} failed before acquisition: {error}",
-                self.canonical_cache_root().display()
-            )
-        });
-        read()
-    }
 
-    fn callgraph_view_reader_with(
-        &self,
-        acquire: impl FnOnce(
-            &crate::views::callgraph::CallgraphView,
-        ) -> Result<
-            Arc<ReadonlyCallGraphStore>,
-            crate::views::callgraph::CallgraphViewError,
-        >,
-    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
-    {
-        None
-    }
 
-    /// Executed v3 call-graph acquisitions (one per pinned request).
-    pub fn callgraph_view_route_count(&self) -> u64 {
-        self.callgraph_view_routes.load(Ordering::Relaxed)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn view_load_retry_due_for_test(&self) {
-        if let Some((deadline, _)) = &mut self.lexical_load_retry.lock().pending {
-            *deadline = Instant::now();
-        }
-        if let Some((deadline, _)) = &mut self.callgraph_construction_retry.lock().pending {
-            *deadline = Instant::now();
-        }
-        if let Some(view) = self.callgraph_view.lock().as_ref() {
-            view.retry_due_for_test();
-        }
-    }
 
-    /// Files a views-routed symbol prewarm served from or stored into the
-    /// v3 symbol plane.
-    pub fn symbol_view_route_count(&self) -> u64 {
-        self.symbol_view_routes.load(Ordering::Relaxed)
-    }
 
     pub(crate) fn search_exact_memo(
         &self,
@@ -12211,53 +10872,6 @@ impl AppContext {
         }
     }
 
-    /// Gate every watcher-maintained artifact after the last route detaches. Files
-    /// may change before the watcher is restored, so a later bind must reconcile
-    /// from disk instead of serving retained snapshots that missed those edits.
-    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
-        self.next_semantic_persist_epoch();
-        self.next_callgraph_persist_epoch();
-
-        self.semantic_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.callgraph_store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Keep semantic status reloadable when the feature is enabled: the
-        // query path's self-healing reload only fires from Ready (or Failed on
-        // read-only roots), so Disabled would strand an already-bound root
-        // with no way back short of a reconfigure. The advanced persist epoch
-        // and strict verify memo force the reload to re-verify from disk.
-        *self
-            .semantic_index_status
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().indexes.semantic
-        {
-            SemanticIndexStatus::ready()
-        } else {
-            SemanticIndexStatus::Disabled
-        };
-        // Files may change before the watcher is restored. The store is still
-        // the right store and only missed edits, so the next use compares it
-        // with the disk and refreshes what differs instead of rebuilding it.
-        // `request_callgraph_reconcile` ignores read-only roots, which follow
-        // the owner's published store.
-        self.request_callgraph_reconcile("watcher gap");
-
-        if let Some(root) = self
-            .canonical_cache_root_opt()
-            .or_else(|| self.config().project_root.clone())
-        {
-            crate::cache_freshness::invalidate_verify_memo_strict(&root);
-        }
-        self.borrowed_index_cache.lock().clear();
-        self.inspect_manager.evict_idle_caches();
-        self.reset_symbol_cache();
-        self.clear_tsconfig_membership_cache();
-    }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
@@ -14006,9 +12620,6 @@ impl AppContext {
             refresh_events,
             refresh_requests,
             refresh_worker,
-            lexical_view,
-            callgraph_view,
-            callgraph_borrow,
             lexical_retry,
             callgraph_retry,
             data_checkout,
@@ -14022,7 +12633,6 @@ impl AppContext {
         drop((
             callgraph_store,
             semantic_index,
-            borrowed_index_cache,
             backup,
         ));
         self.inspect_manager.evict_idle_caches();
@@ -14031,62 +12641,7 @@ impl AppContext {
         true
     }
 
-    /// Count requests for a family-arena measurement on this thread. The idle
-    /// reaper test uses this hook to guard against adding an arena walk back to
-    /// the frame loop, even when its fixture has no semantic lane loaded.
-    #[cfg(test)]
-    pub(crate) fn semantic_family_arena_bytes_for_test(&self) -> Option<u64> {
-        SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(|count| count.set(count.get() + 1));
-        self.checkout_semantic
-            .runtime()
-            .map(|runtime| runtime.family_arena_bytes())
-    }
 
-    /// Let go of this root's views-on semantic lane, loaded or still loading,
-    /// when its artifacts are evicted for idleness. Without this an idle root
-    /// keeps its overlay and pins every arena run its view names until the
-    /// daemon exits, and a lane that never finished loading keeps its worker
-    /// thread.
-    ///
-    /// The checkout runtime drops once its worker notices the closed lane and
-    /// exits; the view then unbinds and the family arena drops every run no
-    /// other view still holds. Runs shared with a live view stay. The next
-    /// semantic query on this root finds no lane, reports that semantic
-    /// search is reloading, and starts a new lane through the same reload
-    /// path that reopens an evicted legacy index.
-    ///
-    /// Returns false, releasing nothing, when the lane's locks are contended.
-    fn try_release_idle_semantic_lane(&self) -> bool {
-        let Some(released) = self.checkout_semantic.try_release_idle() else {
-            return false;
-        };
-        let Some(runtime) = released else {
-            return true;
-        };
-        // The watcher drain routes changes to the installed driver; a dropped
-        // lane's driver must not keep receiving them (or stay resident). The
-        // driver lock and the runtime's drop (its view unbind and arena trim)
-        // can wait, so neither runs on the caller's thread, which may be the
-        // subc frame loop.
-        let driver = Arc::downgrade(runtime.driver());
-        let drivers = self.checkout_driver.clone();
-        let spawned = std::thread::Builder::new()
-            .name("aft-semantic-release".to_owned())
-            .spawn({
-                let drivers = drivers.clone();
-                move || {
-                    drivers.clear_if(runtime.driver());
-                    drop(runtime);
-                }
-            });
-        if spawned.is_err() {
-            // The runtime was dropped with the closure; only the driver is left.
-            if let Some(driver) = driver.upgrade() {
-                drivers.clear_if(&driver);
-            }
-        }
-        true
-    }
 
     /// Test seam for the serialized real-watcher integration suite. Production
     /// callers cannot trigger it without the explicit test-only environment flag.
@@ -17074,26 +15629,6 @@ mod readonly_artifact_cache_key_tests {
 mod git_entry_signature_tests {
     use super::*;
 
-    /// The borrowed-index cache trusts a remembered external root while its
-    /// `.git` entry is unchanged. A `gitdir:` pointer file rewritten by atomic
-    /// replacement within one clock tick keeps its size and times, so only
-    /// the file identity shows that it is a different file.
-    #[test]
-    fn same_length_git_file_replacement_forgets_the_resolved_root() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().to_path_buf();
-        let marker = root.join(".git");
-        std::fs::write(&marker, b"gitdir: ../first\n").unwrap();
-        let mut cache = BorrowedIndexCache::default();
-        cache.remember_resolved_root(root.clone());
-        assert_eq!(cache.resolved_root(&root), Some(root.clone()));
-        crate::file_identity::replace_keeping_times(&marker, b"gitdir: ../other\n");
-        assert_eq!(
-            cache.resolved_root(&root),
-            None,
-            "a replaced .git entry must make the root resolve again"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -18060,7 +16595,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn callgraph_view_diagnostics_preserve_busy_cause_and_retry_on_the_same_context() {
-        use crate::blob_store::v3;
         use crate::db::file_identity::IdentityConnection;
 
         let _serial = v3::serial_for_test();

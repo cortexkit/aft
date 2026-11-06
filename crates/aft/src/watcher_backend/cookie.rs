@@ -1,9 +1,18 @@
 //! In-band views delivery acknowledgments, distinct from command-report flushes.
-use crate::views::snapshot::WatcherState;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicU64, atomic::Ordering, mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Whether the watcher can vouch for disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatcherState {
+    Healthy,
+    Overflowed,
+    Stopped,
+    /// A strict reconcile is running; the index must not prune.
+    Reconciling,
+}
 
 const PREFIX: &str = ".aft-cookie-";
 static NEXT: AtomicU64 = AtomicU64::new(0);

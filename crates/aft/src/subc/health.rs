@@ -3192,8 +3192,6 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
             "rss_bytes": Value::Null,
             "phys_footprint_bytes": Value::Null,
             "total_attributed_bytes": Value::Null,
-            "semantic_arena_bytes": Value::Null,
-            "semantic_resident_chunks": Value::Null,
             "sqlite_bytes": Value::Null,
             "allocator_slack_bytes": Value::Null,
             "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
@@ -3243,10 +3241,6 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
-        // Views-on semantic arenas, counted once per family and included in
-        // `total_attributed_bytes`; the chunk count is one vector per chunk.
-        "semantic_arena_bytes": snapshot.process.semantic_arena_bytes,
-        "semantic_resident_chunks": snapshot.process.semantic_resident_chunks,
         "sqlite_bytes": snapshot.process.sqlite.memory_used_bytes,
     })
 }

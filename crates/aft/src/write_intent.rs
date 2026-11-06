@@ -75,12 +75,10 @@ pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuar
         registered.retain(|listener| listener.strong_count() != 0);
         registered.clone()
     };
-    let has_roots = crate::views::intent::has_roots();
-    if listener_snapshot.is_empty() && !has_roots {
+    if listener_snapshot.is_empty() {
         return IntentGuard {
             listeners: Vec::new(),
             changes: Vec::new(),
-            _checkouts: Default::default(),
         };
     }
     let paths = paths
@@ -101,11 +99,9 @@ pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuar
         changes.push(WriteIntent::Paths(files));
     }
     notify(&listener_snapshot, &changes, WritePhase::Before);
-    let checkouts = crate::views::intent::begin(&paths);
     IntentGuard {
         listeners: listener_snapshot,
         changes,
-        _checkouts: checkouts,
     }
 }
 
@@ -115,9 +111,6 @@ pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuar
 pub struct IntentGuard {
     listeners: Vec<Weak<dyn WriteIntentListener>>,
     changes: Vec<WriteIntent>,
-    /// Dropped after this guard's `drop` has sent the After notification, so
-    /// the checkout views settle their intents after every listener has seen it.
-    _checkouts: crate::views::intent::CheckoutIntents,
 }
 
 impl Drop for IntentGuard {

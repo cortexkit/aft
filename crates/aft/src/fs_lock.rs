@@ -2693,7 +2693,7 @@ pub(crate) fn speech_process_identity(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     let boot = identity.boot_id?;
     #[cfg(target_os = "macos")]
-    let boot = crate::storage_retention::boot_id()?;
+    let boot = crate::volume::boot_id()?;
     #[cfg(windows)]
     let boot = speech_windows_boot_id()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

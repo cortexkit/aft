@@ -273,7 +273,7 @@ fn validate_saved_parent(
             || saved.configured.as_deref() == Some(configured))
             && saved.identity != actual)
             || saved.identity == actual
-                && saved.volume_uuid != crate::storage_retention::cache_volume_uuid(parent)
+                && saved.volume_uuid != crate::volume::cache_volume_uuid(parent)
     }) {
         return Err(io::Error::other("cache_dir is not the volume it was"));
     }
@@ -301,7 +301,7 @@ fn remember_parent(
             path: parent.to_path_buf(),
             identity: actual,
             configured,
-            volume_uuid: crate::storage_retention::cache_volume_uuid(parent),
+            volume_uuid: crate::volume::cache_volume_uuid(parent),
         });
         crate::durability::atomic_write(
             &parent_state_path(storage),

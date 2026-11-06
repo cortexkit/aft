@@ -85,11 +85,6 @@ pub(crate) fn render_memory_census_with_roots(
             // Shared semantic bases are attributed once for the whole process,
             // not on any root row; show them so the total adds up.
             "shared_semantic_base_bytes": snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0),
-            // Views-on semantic arenas, also attributed once for the whole
-            // process: each family's runs are shared by all of its views.
-            "semantic_arena_bytes": process.semantic_arena_bytes,
-            "semantic_resident_chunks": process.semantic_resident_chunks,
-            "semantic_arenas": snapshot.semantic_arenas.families,
             "total_attributed_bytes": process.total_attributed_bytes,
             "unattributed_bytes": unattributed_bytes,
             "last_relief_at_ms": crate::memory::last_allocator_relief_at_ms(),

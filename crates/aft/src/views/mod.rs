@@ -10,24 +10,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
-pub mod assembly;
-pub mod base_builder;
-pub mod base_refs;
-pub mod base_sweep;
-pub(crate) mod donor;
-mod generation;
-#[cfg(test)]
-pub(crate) use generation::wait_for_derived_checkpoint_for_test;
-pub(crate) mod io;
-#[cfg(aft_views_lazy_benchmark)]
-pub mod lazy_read_benchmark;
-pub mod materialization;
-mod profile;
-pub(crate) mod publication_reason;
-#[cfg(test)]
-pub(crate) use profile::observe_publication_phases_for_test;
-pub(crate) mod read;
-pub(crate) mod reference_sidecar;
 
 /// Make every manifest reference sidecar be fully re-verified on its next use.
 /// Benchmarks use this to measure the cost the verification memo saves.
@@ -38,42 +20,13 @@ pub fn forget_verified_reference_sidecars() {
 
 // Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
 // trigram segments, the plane contracts and the parity harness.
-pub mod contracts;
-pub mod eviction;
-pub mod manifest_v2;
-pub mod parity_harness;
-pub mod readiness;
-pub mod registry;
-pub mod segment_store;
-pub mod snapshot;
-pub mod symbol_store;
 
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.
-pub mod callgraph;
-mod callgraph_acquisition;
-pub(crate) mod callgraph_copies;
 
-pub mod first_load;
-pub mod intent;
-pub mod live_delta;
 /// Multi-repo parent folders served from their children's views.
 pub mod parent;
-pub mod query_wait;
-pub mod semantic;
-pub mod semantic_arena;
-pub(crate) mod semantic_batch_lease;
-pub mod semantic_runtime;
-mod tree_base;
-pub mod trigram;
-pub(crate) mod verification;
 
-#[cfg(test)]
-mod dispatch_parity_probe;
-#[cfg(test)]
-mod per_checkout_core_tests;
-#[cfg(test)]
-mod v3_plane_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;

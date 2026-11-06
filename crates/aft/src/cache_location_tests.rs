@@ -2871,7 +2871,7 @@ fn cache_location_remembered_parent_identity_mismatch_disables_caches() {
                 path: parent.to_path_buf(),
                 identity: identity(parent).unwrap(),
                 configured: None,
-                volume_uuid: crate::storage_retention::cache_volume_uuid(parent),
+                volume_uuid: crate::volume::cache_volume_uuid(parent),
             }],
         })
         .unwrap(),

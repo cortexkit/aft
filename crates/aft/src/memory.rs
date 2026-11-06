@@ -417,17 +417,11 @@ pub struct ProcessMemorySnapshot {
     /// a request-path read is null until the first process-wide observation exists.
     pub allocator_observation_age_ms: Option<u64>,
     pub total_attributed_bytes: u64,
-    /// Resident views-on semantic arena bytes, every family counted once
-    /// (see [`SemanticArenaCensus`]). Included in `total_attributed_bytes`.
-    pub semantic_arena_bytes: u64,
     /// Live local ONNX embedding sessions, shared across roots and query/build workers.
     pub embedding_sessions: u64,
     /// Serialized weight bytes for those sessions, counted once per session.
     /// This estimates model storage, not ORT's transient tensors or allocator slack.
     pub embedding_model_bytes: u64,
-    /// Embedded chunks resident in those arenas. Each holds one embedding
-    /// vector, so it can be checked against an allocator's block counts.
-    pub semantic_resident_chunks: u64,
     /// Bytes resident in the data layer's block cache, shared by every
     /// checkout and counted once here. Included in `total_attributed_bytes`.
     /// Present only once a checkout of this process has bound.
@@ -556,63 +550,6 @@ impl AllocatorPressureRelief {
     }
 }
 
-/// One family's resident views-on semantic arena.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SemanticArenaRow {
-    pub storage: String,
-    pub family: String,
-    pub runs: usize,
-    pub chunks: usize,
-    pub bytes: u64,
-}
-
-/// The views-on semantic arenas alive in this process. A family's arena is
-/// shared by every view of that family and appears once in the process
-/// registry, so its runs are counted here exactly once and never on a root
-/// row. A root row counts only its own overlay (see `CheckoutSemantic`).
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct SemanticArenaCensus {
-    pub bytes: u64,
-    pub resident_chunks: u64,
-    /// Largest family first.
-    pub families: Vec<SemanticArenaRow>,
-}
-
-impl SemanticArenaCensus {
-    pub fn measure() -> Self {
-        let mut families: Vec<SemanticArenaRow> = crate::views::semantic_arena::live_arenas()
-            .iter()
-            .map(|arena| {
-                let memory = arena.memory();
-                SemanticArenaRow {
-                    storage: arena.storage().display().to_string(),
-                    family: arena.family().to_owned(),
-                    runs: memory.runs,
-                    chunks: memory.chunks,
-                    bytes: memory.bytes,
-                }
-            })
-            .collect();
-        families.sort_by(|a, b| {
-            b.bytes
-                .cmp(&a.bytes)
-                .then_with(|| a.family.cmp(&b.family))
-                .then_with(|| a.storage.cmp(&b.storage))
-        });
-        Self {
-            bytes: families
-                .iter()
-                .map(|row| row.bytes)
-                .fold(0u64, u64::saturating_add),
-            resident_chunks: families
-                .iter()
-                .map(|row| usize_to_u64(row.chunks))
-                .fold(0u64, u64::saturating_add),
-            families,
-        }
-    }
-}
-
 impl ProcessMemorySnapshot {
     pub fn from_roots(
         roots: &BTreeMap<String, RootMemorySnapshot>,
@@ -623,7 +560,6 @@ impl ProcessMemorySnapshot {
             rollups.iter(),
             roots.len(),
             shared_semantic_bases,
-            &SemanticArenaCensus::measure(),
             crate::data_layer::surfaces::block_cache_estimate().as_ref(),
             AllocatorObservation::measure(),
         )
@@ -633,7 +569,6 @@ impl ProcessMemorySnapshot {
         roots: impl Iterator<Item = &'a RootMemoryRollup>,
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
-        semantic_arenas: &SemanticArenaCensus,
         data_layer_block_cache: Option<&MemoryEstimate>,
         allocator_observation: AllocatorObservation,
     ) -> Self {
@@ -656,7 +591,6 @@ impl ProcessMemorySnapshot {
             data_layer_block_cache.and_then(|cache| cache.estimated_bytes);
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
-            .saturating_add(semantic_arenas.bytes)
             .saturating_add(data_layer_block_cache_bytes.unwrap_or(0))
             .saturating_add(embedding.model_bytes)
             .saturating_add(sqlite.memory_used_bytes);
@@ -684,10 +618,8 @@ impl ProcessMemorySnapshot {
             allocator,
             allocator_observation_age_ms,
             total_attributed_bytes,
-            semantic_arena_bytes: semantic_arenas.bytes,
             embedding_sessions: embedding.sessions,
             embedding_model_bytes: embedding.model_bytes,
-            semantic_resident_chunks: semantic_arenas.resident_chunks,
             data_layer_block_cache_bytes,
             unattributed_bytes,
             root_count,
@@ -723,9 +655,6 @@ pub struct MemorySnapshot {
     /// snapshots borrowed loads share and the indexes owner roots froze when
     /// they installed them. Root rows count zero for a view of such a base.
     pub shared_semantic_bases: MemoryEstimate,
-    /// Views-on semantic arenas, one row per family, attributed once
-    /// process-wide (`process.semantic_arena_bytes`).
-    pub semantic_arenas: SemanticArenaCensus,
     /// The data layer's block cache, shared by every checkout and attributed
     /// once process-wide (`process.data_layer_block_cache_bytes`). Present
     /// only once a checkout of this process has bound.
@@ -735,11 +664,10 @@ pub struct MemorySnapshot {
 }
 
 /// Memory attributed once for the whole process rather than to any root:
-/// shared semantic bases and views-on semantic arenas.
+/// shared semantic bases and the data layer's block cache.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedProcessMemory {
     pub(crate) shared_semantic_bases: MemoryEstimate,
-    pub(crate) semantic_arenas: SemanticArenaCensus,
     pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
 }
 
@@ -747,7 +675,6 @@ impl SharedProcessMemory {
     pub(crate) fn measure() -> Self {
         Self {
             shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
-            semantic_arenas: SemanticArenaCensus::measure(),
             data_layer_block_cache: crate::data_layer::surfaces::block_cache_estimate(),
         }
     }
@@ -790,7 +717,6 @@ impl MemoryRollupSnapshot {
             roots.values(),
             roots.len(),
             &shared.shared_semantic_bases,
-            &shared.semantic_arenas,
             shared.data_layer_block_cache.as_ref(),
             allocator,
         );
@@ -861,7 +787,6 @@ impl MemorySnapshot {
     ) -> Self {
         let SharedProcessMemory {
             shared_semantic_bases,
-            semantic_arenas,
             data_layer_block_cache,
         } = shared;
         // Totals cover EVERY root before the detail map is capped.
@@ -870,7 +795,6 @@ impl MemorySnapshot {
             rollups.iter(),
             roots.len(),
             &shared_semantic_bases,
-            &semantic_arenas,
             data_layer_block_cache.as_ref(),
             allocator,
         );
@@ -887,7 +811,6 @@ impl MemorySnapshot {
             roots_omitted,
             roots_omitted_bytes,
             shared_semantic_bases,
-            semantic_arenas,
             data_layer_block_cache,
             process,
         }
