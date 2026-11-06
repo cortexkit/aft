@@ -2975,6 +2975,47 @@ impl CheckoutView {
     pub fn callgraph_failures(&self) -> Vec<String> {
         self.published.graph.failures()
     }
+
+    /// Runs one call-graph command on this view for a measurement probe:
+    /// `callers` at depth 1, `impact` at depth 3 or `trace_to`, for `symbol`
+    /// in `file` (relative to the root). Returns how many result rows it
+    /// produced, or the error text.
+    #[doc(hidden)]
+    pub fn probe_query(&self, command: &str, file: &str, symbol: &str) -> Result<usize, String> {
+        use crate::commands::callgraph_store_adapter as adapter;
+        let graph = self.callgraph();
+        let path = self.published.root.join(file);
+        match command {
+            "callers" => adapter::callers_result(&graph, &path, symbol, 1, true)
+                .map(|result| result.total_callers)
+                .map_err(|error| format!("{error:?}")),
+            "impact" => adapter::impact_result(&graph, &path, symbol, 3, true)
+                .map(|result| format!("{result:?}").len())
+                .map_err(|error| format!("{error:?}")),
+            "trace_to" => adapter::trace_to_result(&graph, &path, symbol, 10, true)
+                .map(|result| format!("{result:?}").len())
+                .map_err(|error| format!("{error:?}")),
+            other => Err(format!("unknown probe command {other}")),
+        }
+    }
+
+    /// Decodes every file of the call graph, as a whole-graph command does,
+    /// for a measurement probe. Returns the files decoded and each decode's
+    /// time in microseconds.
+    #[doc(hidden)]
+    pub fn probe_decode_all(&self) -> Vec<u64> {
+        self.published
+            .state
+            .paths()
+            .iter()
+            .filter_map(|record| std::str::from_utf8(&record.path).ok())
+            .filter_map(|path| {
+                let started = std::time::Instant::now();
+                self.graph.slice(path)?;
+                Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+            })
+            .collect()
+    }
 }
 
 /// The resolver's inputs for the checkout's current `state`: `previous`'s
