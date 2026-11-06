@@ -980,6 +980,43 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         Ok(calls.into_iter().map(|(_, call)| call).collect())
     }
 
+    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        let Some(slice) = self.source.slice(&node.file) else {
+            return Ok(Vec::new());
+        };
+        let mut calls = slice
+            .refs
+            .values()
+            .filter(|reference| {
+                reference.caller_node.as_deref() == Some(node.node_id())
+                    && reference.kind == crate::callgraph_store::MACRO_BODY_CALL_REF_KIND
+            })
+            .map(|reference| {
+                (
+                    (
+                        reference.byte_start,
+                        reference.line,
+                        reference.ref_id.clone(),
+                    ),
+                    StoreUnresolvedCall {
+                        caller: node.clone(),
+                        symbol: reference
+                            .short_name
+                            .clone()
+                            .or_else(|| reference.full_ref.clone())
+                            .unwrap_or_default(),
+                        full_ref: reference.full_ref.clone(),
+                        line: reference.line,
+                        byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
+                        byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(calls.into_iter().map(|(_, call)| call).collect())
+    }
+
     fn ref_sites_named(
         &self,
         kind: &str,

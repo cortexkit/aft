@@ -5012,6 +5012,14 @@ pub trait CallGraphRead {
         let _ = (kind, short_name, limit);
         Ok(Vec::new())
     }
+    /// The calls written inside the `macro_rules!` template that `node`, a
+    /// macro owner (`name!`), defines, resolved or not, in source order.
+    /// `call_tree` and `trace_to_symbol` follow them by name, as `callers`
+    /// lists them. Stores that keep no such rows answer with none.
+    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        let _ = node;
+        Ok(Vec::new())
+    }
     /// Unbound receiver calls of the written member name, excluding sites that
     /// already have a supplemental edge. An empty reverse graph cannot prove
     /// these calls do not reach the queried method.
@@ -10980,6 +10988,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     ) -> Result<Vec<StoreRefSite>> {
         (**self).ref_sites_named(kind, short_name, limit)
     }
+    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        (**self).macro_template_calls_of(node)
+    }
     fn unresolved_method_sites_named(
         &self,
         name: &str,
@@ -11180,6 +11191,12 @@ impl<A: CallGraphRead, B: CallGraphRead> CallGraphRead for EitherGraph<A, B> {
         match self {
             Self::Store(store) => store.ref_sites_named(kind, short_name, limit),
             Self::Data(data) => data.ref_sites_named(kind, short_name, limit),
+        }
+    }
+    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        match self {
+            Self::Store(store) => store.macro_template_calls_of(node),
+            Self::Data(data) => data.macro_template_calls_of(node),
         }
     }
     fn unresolved_method_sites_named(

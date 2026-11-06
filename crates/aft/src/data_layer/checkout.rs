@@ -3594,6 +3594,90 @@ mod tests {
         format!("{callers:?}")
     }
 
+    /// `call_tree` and `trace_to_symbol` follow a call written inside a
+    /// `macro_rules!` template from each use of the macro, matched by name
+    /// and marked approximate, as `callers` lists it. A name two symbols
+    /// share stays unresolved.
+    #[test]
+    fn forward_queries_follow_macro_template_calls_by_name() {
+        use crate::commands::callgraph_store_adapter as adapter;
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "Cargo.toml",
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            root.path(),
+            "src/lib.rs",
+            "pub mod other;\npub fn template_target() {}\npub fn shared() {}\n\
+             macro_rules! run_template { () => { template_target(); shared() }; }\n\
+             pub fn template_caller() { run_template!(); }\n",
+        );
+        write(root.path(), "src/other.rs", "pub fn shared() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let graph = view.callgraph();
+        let lib = view.root().join("src/lib.rs");
+
+        let tree = adapter::call_tree_result(&graph, &lib, "template_caller", 3, true).unwrap();
+        let [invocation] = tree.children.as_slice() else {
+            panic!("{tree:?}");
+        };
+        assert_eq!(
+            (invocation.name.as_str(), invocation.resolved),
+            ("run_template!", true)
+        );
+        let template_calls = invocation
+            .children
+            .iter()
+            .map(|call| {
+                (
+                    call.name.as_str(),
+                    call.resolved,
+                    call.approximate,
+                    call.resolved_by.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            template_calls,
+            [
+                ("template_target", true, Some(true), Some("name_match")),
+                ("shared", false, None, None),
+            ],
+            "{tree:?}"
+        );
+
+        let traced = adapter::trace_to_symbol_result(
+            &graph,
+            &lib,
+            "template_caller",
+            "template_target",
+            None,
+            5,
+            true,
+        )
+        .unwrap();
+        let hops = traced
+            .path
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hop| (hop.symbol, hop.approximate))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hops,
+            [
+                ("template_caller".to_string(), None),
+                ("run_template!".to_string(), None),
+                ("template_target".to_string(), Some(true)),
+            ]
+        );
+    }
+
     /// Rust calls to free functions through module paths: a full `crate::`
     /// path into a `pub(crate) mod`, a module declared with `#[path]`, and a
     /// module imported with `{self, ...}`. Today's legacy store resolves all
@@ -4436,7 +4520,7 @@ pub fn other() { callee(); }
         // 1 GiB free on a 1 TiB disk: below the 32 GiB floor.
         let low = crate::disk_floor::set_free_space_for_test(store.path(), 1 << 30, 1 << 40);
         let paused = "Index storage is paused: 1.0 GiB is free on this disk and AFT keeps \
-                      32.0 GiB free. Unused view data is being cleaned up; retry later.";
+                      32.0 GiB free. Unused index data is being cleaned up; retry later.";
         let error = checkout.build().unwrap_err();
         assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
         assert_eq!(error.to_string(), paused);

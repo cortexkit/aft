@@ -1489,9 +1489,14 @@ pub fn trace_to_symbol_result(
             let Some((current_file, current_symbol, path, depth)) = queue.pop_front() else {
                 break;
             };
-            let calls = calls_by_symbol
-                .remove(&(current_file, current_symbol))
+            let mut calls = calls_by_symbol
+                .remove(&(current_file.clone(), current_symbol.clone()))
                 .unwrap_or_default();
+            if current_symbol.ends_with('!') {
+                for node in store.nodes_for_stored(&current_file, &current_symbol)? {
+                    calls.extend(macro_template_calls(store, &node)?.0);
+                }
+            }
             let callees = forward_resolved_callees(calls);
 
             if depth >= effective_max {
@@ -3164,6 +3169,9 @@ fn forward_calls_for_nodes(
                 .into_iter()
                 .map(ForwardCall::Unresolved),
         );
+        let (resolved, unresolved) = macro_template_calls(store, node)?;
+        calls.extend(resolved.into_iter().map(ForwardCall::Resolved));
+        calls.extend(unresolved.into_iter().map(ForwardCall::Unresolved));
     }
     calls.sort_by(|left, right| {
         left.byte_start()
@@ -3173,6 +3181,51 @@ fn forward_calls_for_nodes(
     let mut seen = BTreeSet::new();
     calls.retain(|call| seen.insert(call.call_site_key()));
     Ok(calls)
+}
+
+/// The calls written inside the `macro_rules!` template of `node`, when it
+/// is a macro owner (`name!`), split into those matched to a symbol and those
+/// left unresolved. They are matched by name only, as `callers` lists them
+/// (see [`macro_via_entries`]), so each match is marked name-resolved. A name
+/// that several symbols share stays unresolved, because nothing tells which
+/// of them the template calls.
+fn macro_template_calls(
+    store: &impl CallGraphRead,
+    node: &StoreNode,
+) -> StoreAdapterResult<(Vec<StoreCallSite>, Vec<StoreUnresolvedCall>)> {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    if !node.symbol.ends_with('!') {
+        return Ok((resolved, unresolved));
+    }
+    for call in store.macro_template_calls_of(node)? {
+        let mut candidates = store
+            .nodes_matching(&call.symbol)?
+            .into_iter()
+            .filter(|candidate| candidate.name == call.symbol)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| (&a.file, &a.symbol).cmp(&(&b.file, &b.symbol)));
+        candidates.dedup_by(|a, b| a.file == b.file && a.symbol == b.symbol);
+        if candidates.len() != 1 {
+            unresolved.push(call);
+            continue;
+        }
+        let target = candidates.remove(0);
+        resolved.push(StoreCallSite {
+            kind: MACRO_BODY_CALL_REF_KIND.to_string(),
+            caller_is_test: None,
+            caller: node.clone(),
+            target_file: target.file.clone(),
+            target_symbol: target.symbol.clone(),
+            target: Some(target),
+            line: call.line,
+            byte_start: call.byte_start,
+            byte_end: call.byte_end,
+            resolved: true,
+            provenance: crate::callgraph_store::PROVENANCE_NAME_MATCH.to_string(),
+        });
+    }
+    Ok((resolved, unresolved))
 }
 
 fn forward_resolved_callees(calls: Vec<StoreCallSite>) -> Vec<(StoreNode, EdgeMarker)> {

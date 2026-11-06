@@ -1,6 +1,6 @@
 use super::*;
 
-const MESSAGE: &str = "Index storage is paused: 21.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused view data is being cleaned up; retry later.";
+const MESSAGE: &str = "Index storage is paused: 21.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused index data is being cleaned up; retry later.";
 
 struct Refused(String);
 
