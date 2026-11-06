@@ -212,42 +212,88 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     encoded: Option<ContentSectionsBuilder>,
     memory: Option<&mut Vec<(String, usize)>>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
-    let prebuilt = encoded.is_some();
-    let mut content = encoded.unwrap_or_default();
-    // Configuration files' records too, so a reader of the segment can give
-    // the resolver the same configuration bytes the build read.
-    for record in inputs.state.paths() {
-        if prebuilt || record.language != "config" {
-            continue;
+    let mut sections = SectionsWriter::new(inputs, records, all_records, encoded);
+    for (file, resolution) in resolved {
+        sections.add(file, std::borrow::Borrow::borrow(resolution))?;
+    }
+    sections.finish(writer, memory)
+}
+
+/// [`write_sections`] one file at a time: each file's fragment is built as
+/// its resolution arrives, so the caller can let the resolution go at once
+/// rather than hold every file's until the segment is written.
+pub(crate) struct SectionsWriter<'i> {
+    inputs: &'i CheckoutInputs,
+    records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+    all_records: bool,
+    /// Whether `content` came with every record already in it.
+    prebuilt: bool,
+    content: ContentSectionsBuilder,
+    graph: GraphSectionsBuilder,
+    keys: BTreeMap<String, FragmentKey>,
+    facts: super::callgraph::CheckoutFacts<'i>,
+    subjects: HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
+}
+
+impl<'i> SectionsWriter<'i> {
+    /// A writer for the files of `inputs`, taking their content records
+    /// from `records`, or from `encoded` when given (see
+    /// [`write_sections`]).
+    pub(crate) fn new(
+        inputs: &'i CheckoutInputs,
+        records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+        all_records: bool,
+        encoded: Option<ContentSectionsBuilder>,
+    ) -> Self {
+        let prebuilt = encoded.is_some();
+        let mut content = encoded.unwrap_or_default();
+        // Configuration files' records too, so a reader of the segment can
+        // give the resolver the same configuration bytes the build read.
+        for record in inputs.state.paths() {
+            if prebuilt || record.language != "config" {
+                continue;
+            }
+            let key = RecordKey::new(
+                record.content,
+                &record.language,
+                super::content::EXTRACTOR_VERSION,
+            );
+            if let Some((record_key, stored)) = records.get(&key.digest().to_string()) {
+                content.add(*record_key, stored);
+            }
         }
-        let key = RecordKey::new(
-            record.content,
-            &record.language,
-            super::content::EXTRACTOR_VERSION,
-        );
-        if let Some((record_key, stored)) = records.get(&key.digest().to_string()) {
-            content.add(*record_key, stored);
+        Self {
+            inputs,
+            records,
+            all_records,
+            prebuilt,
+            content,
+            graph: GraphSectionsBuilder::new(),
+            keys: BTreeMap::new(),
+            facts: super::callgraph::CheckoutFacts { inputs },
+            subjects: HashMap::new(),
         }
     }
-    let mut graph = GraphSectionsBuilder::new();
-    let mut keys = BTreeMap::new();
-    let facts = super::callgraph::CheckoutFacts { inputs };
-    let mut subjects = HashMap::new();
-    for (file, resolution) in resolved {
-        let resolution: &FileResolution = std::borrow::Borrow::borrow(resolution);
-        let (key, parse) = &inputs.parses[file];
+
+    /// Adds `file`'s record and fragment.
+    ///
+    /// # Errors
+    ///
+    /// When the file has no content record and the writer needs one.
+    pub(crate) fn add(&mut self, file: &String, resolution: &FileResolution) -> Result<(), String> {
+        let (key, parse) = &self.inputs.parses[file];
         // A segment holding only what changed since a publication writes
         // the records of changed contents; an unchanged one stays where the
         // publication stored it.
-        match records.get(key) {
-            _ if prebuilt => {}
-            Some((record_key, record)) => content.add(*record_key, record),
-            None if all_records => return Err(format!("no content record for {file}")),
+        match self.records.get(key) {
+            _ if self.prebuilt => {}
+            Some((record_key, record)) => self.content.add(*record_key, record),
+            None if self.all_records => return Err(format!("no content record for {file}")),
             None => {}
         }
         let slice = FileSlice::build(file, key, parse, resolution);
         let mut terms = slice_terms(&slice);
-        terms.extend(input_terms(resolution, &facts, &mut subjects));
+        terms.extend(input_terms(resolution, &self.facts, &mut self.subjects));
         terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
         // A test stores a fragment that does not decode, as a damaged one
@@ -266,28 +312,47 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
         subjects.sort_unstable();
         subjects.dedup();
         let fragment = fragment_key(key, file, &bytes, &subjects);
-        keys.insert(file.clone(), fragment);
-        graph.add(
+        self.keys.insert(file.clone(), fragment);
+        self.graph.add(
             fragment,
             bytes,
             terms.iter().map(|(kind, term)| (*kind, term.as_slice())),
         );
+        Ok(())
     }
-    if let Some(memory) = memory {
-        use aft_store::heap::HeapBytes as _;
-        let mut seen = aft_store::heap::Seen::new();
-        memory.push((
-            "write.content_builder".to_string(),
-            content.heap_bytes(&mut seen),
-        ));
-        memory.push((
-            "write.graph_builder".to_string(),
-            graph.heap_bytes(&mut seen),
-        ));
+
+    /// Writes the content and graph sections into `writer`, adding to
+    /// `memory`, when given, what the two held. Returns each file's fragment
+    /// key.
+    ///
+    /// # Errors
+    ///
+    /// When the sections cannot be written.
+    pub(crate) fn finish(
+        self,
+        writer: &mut SegmentWriter,
+        memory: Option<&mut Vec<(String, usize)>>,
+    ) -> Result<BTreeMap<String, FragmentKey>, String> {
+        if let Some(memory) = memory {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            memory.push((
+                "write.content_builder".to_string(),
+                self.content.heap_bytes(&mut seen),
+            ));
+            memory.push((
+                "write.graph_builder".to_string(),
+                self.graph.heap_bytes(&mut seen),
+            ));
+        }
+        self.content
+            .write(writer)
+            .map_err(|error| error.to_string())?;
+        self.graph
+            .write(writer)
+            .map_err(|error| error.to_string())?;
+        Ok(self.keys)
     }
-    content.write(writer).map_err(|error| error.to_string())?;
-    graph.write(writer).map_err(|error| error.to_string())?;
-    Ok(keys)
 }
 
 #[cfg(test)]

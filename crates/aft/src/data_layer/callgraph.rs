@@ -654,33 +654,64 @@ pub(crate) fn resolve_checkout(
     inputs: &CheckoutInputs,
     threads: usize,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
-    resolve_checkout_measuring(inputs, threads, None)
+    let mut resolved = BTreeMap::new();
+    resolve_checkout_into(inputs, threads, None, &mut |path, resolution| {
+        resolved.insert(path.clone(), resolution);
+        Ok(())
+    })?;
+    Ok(resolved)
 }
 
-/// [`resolve_checkout`], also adding to `memory`, when given, the heap bytes
-/// its bound files and method-call inputs held. For measurement.
-pub(crate) fn resolve_checkout_measuring(
+/// How many files pass 4 resolves before their resolutions go to the sink.
+/// Each batch's method-call sites are held until the batch is done.
+const SINK_BATCH: usize = 1024;
+
+/// [`resolve_checkout`], handing each file's finished resolution to `sink`
+/// in path order instead of keeping them all, and adding to `memory`, when
+/// given, the heap bytes its stages held.
+///
+/// Pass 4 reads every file's method-call inputs, built from that file's
+/// pass-2 and pass-3 results, so it can start only once every file has
+/// those. Until then each file's resolution is kept encoded, a small
+/// fraction of its decoded size, and decoded again only to add its sites
+/// and go to the sink.
+///
+/// # Errors
+///
+/// When the resolver fails on a file, or the sink does.
+pub(crate) fn resolve_checkout_into(
     inputs: &CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
-) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    sink: &mut dyn FnMut(&String, FileResolution) -> Result<(), ManifestJoinError>,
+) -> Result<(), ManifestJoinError> {
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let bound = BindCache::default();
         bound.bind_missing(inputs, &paths)?;
-        let mut resolved = resolve_files(inputs, &bound, &paths)?;
+        let resolved = resolve_files_with(inputs, &bound, &paths, &|path, resolution| {
+            let (_, parse) = &inputs.parses[path];
+            let site = Arc::new(SiteFile::new(path, parse, &resolution));
+            (site, super::fragment::encode(&resolution))
+        })?;
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
             // The parses are counted by the caller; mark them seen so the
-            // part below counts only what it holds besides.
+            // parts below count only what they hold besides.
             let _ = inputs.parses.heap_bytes(&mut seen);
             memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
         }
-        // Pass 4 reads each file's own inputs, built below from its parse
+        // Pass 4 reads each file's own inputs, built above from its parse
         // and resolution, and never the bound surfaces.
         drop(bound);
-        let mut calls = MethodCallInputs::build(inputs, &resolved);
+        let mut encoded = BTreeMap::new();
+        let mut sites = Vec::with_capacity(resolved.len());
+        for (path, (site, bytes)) in resolved {
+            sites.push((path.clone(), site));
+            encoded.insert(path, bytes);
+        }
+        let mut calls = MethodCallInputs::from_site_files(sites);
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -689,16 +720,36 @@ pub(crate) fn resolve_checkout_measuring(
                 "resolve.method_call_inputs".to_string(),
                 calls.heap_bytes(&mut seen),
             ));
+            memory.push((
+                "resolve.encoded_resolutions".to_string(),
+                encoded.heap_bytes(&mut seen),
+            ));
         }
-        for (path, sites, dependencies) in calls.resolve_sites(inputs, &resolved, &paths) {
-            let file = resolved
-                .get_mut(&path)
-                .expect("every parsed file was resolved");
-            file.sites = sites;
-            file.site_dependencies = dependencies;
+        for batch in paths.chunks(SINK_BATCH) {
+            for (path, sites, dependencies) in calls.resolve_sites(inputs, &NoResolutions, batch) {
+                let bytes = encoded
+                    .remove(&path)
+                    .expect("every parsed file was resolved");
+                let (key, _) = &inputs.parses[&path];
+                let mut file = super::fragment::decode(key, &path, &bytes)
+                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                file.sites = sites;
+                file.site_dependencies = dependencies;
+                sink(&path, file)?;
+            }
         }
-        Ok(resolved)
+        Ok(())
     })
+}
+
+/// A [`ResolutionLookup`] with nothing in it, for pass 4 when every file's
+/// method-call inputs are already built.
+struct NoResolutions;
+
+impl ResolutionLookup for NoResolutions {
+    fn resolution(&self, _path: &str) -> Option<&FileResolution> {
+        None
+    }
 }
 
 pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinError> {
@@ -757,6 +808,26 @@ pub(crate) fn resolve_files(
     bound: &BindCache,
     paths: &[&String],
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    Ok(
+        resolve_files_with(inputs, bound, paths, &|_, resolution| resolution)?
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// [`resolve_files`], passing each file's resolution through `keep` on the
+/// thread that resolved it, so a caller can keep less than the whole
+/// resolution. Returns the kept values in path order.
+///
+/// # Errors
+///
+/// As [`resolve_files`].
+pub(crate) fn resolve_files_with<T: Send>(
+    inputs: &CheckoutInputs,
+    bound: &BindCache,
+    paths: &[&String],
+    keep: &(dyn Fn(&str, FileResolution) -> T + Sync),
+) -> Result<Vec<(String, T)>, ManifestJoinError> {
     paths
         .par_iter()
         .map_init(
@@ -789,15 +860,13 @@ pub(crate) fn resolve_files(
                 if let Some(error) = files.take_error() {
                     return Err(error);
                 }
-                Ok((
-                    (*path).clone(),
-                    FileResolution {
-                        rows: rows.into_iter().collect(),
-                        binding,
-                        dispatch,
-                        ..FileResolution::default()
-                    },
-                ))
+                let resolution = FileResolution {
+                    rows: rows.into_iter().collect(),
+                    binding,
+                    dispatch,
+                    ..FileResolution::default()
+                };
+                Ok(((*path).clone(), keep(path, resolution)))
             },
         )
         .collect()
@@ -938,7 +1007,6 @@ const SMALL_SITE_RUN: usize = 64;
 impl MethodCallInputs {
     /// Every file's inputs, from `resolved`.
     pub(crate) fn build(inputs: &CheckoutInputs, resolved: &(dyn ResolutionLookup + Sync)) -> Self {
-        let mut calls = Self::default();
         let built = inputs
             .parses
             .par_iter()
@@ -950,7 +1018,13 @@ impl MethodCallInputs {
                 ))
             })
             .collect::<Vec<_>>();
-        for (path, file) in built {
+        Self::from_site_files(built)
+    }
+
+    /// Every file's inputs, from inputs already built for every file.
+    fn from_site_files(files: Vec<(String, Arc<SiteFile>)>) -> Self {
+        let mut calls = Self::default();
+        for (path, file) in files {
             calls.file(&path, &file);
             calls.files.insert(path, file);
         }

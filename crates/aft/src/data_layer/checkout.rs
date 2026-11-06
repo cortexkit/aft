@@ -29,7 +29,7 @@ use aft_store::text::{
     TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
-use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
+use super::callgraph::{CheckoutInputs, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use super::graph_store::{write_sections, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
@@ -1144,22 +1144,28 @@ impl Checkout {
         }
         checkpoint()?;
 
+        // Each file's fragment is built as soon as its resolution is done, so
+        // no more than a batch of resolutions is held decoded at once;
+        // `resolve_ms` covers building the fragments too.
         let started = Instant::now();
-        let resolved = super::callgraph::resolve_checkout_measuring(
+        let mut sections = super::graph_store::SectionsWriter::new(
+            &inputs,
+            &collected.records,
+            true,
+            Some(encoded),
+        );
+        super::callgraph::resolve_checkout_into(
             &inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
+            &mut |path, resolution| {
+                sections
+                    .add(path, &resolution)
+                    .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
+            },
         )
         .map_err(|error| DataError::Resolve(error.to_string()))?;
         report.resolve_ms = elapsed_ms(started);
-        if measure {
-            use aft_store::heap::HeapBytes as _;
-            let mut seen = aft_store::heap::Seen::new();
-            report.memory.push((
-                "resolve.resolutions".to_string(),
-                resolved.heap_bytes(&mut seen),
-            ));
-        }
         checkpoint()?;
 
         let started = Instant::now();
@@ -1179,16 +1185,9 @@ impl Checkout {
             .text
             .write(pending.writer())
             .map_err(DataError::store)?;
-        let fragments = write_sections(
-            pending.writer(),
-            &inputs,
-            &resolved,
-            &collected.records,
-            true,
-            Some(encoded),
-            measure.then_some(&mut report.memory),
-        )
-        .map_err(DataError::Store)?;
+        let fragments = sections
+            .finish(pending.writer(), measure.then_some(&mut report.memory))
+            .map_err(DataError::Store)?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
