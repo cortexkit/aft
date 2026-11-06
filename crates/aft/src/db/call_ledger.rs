@@ -726,18 +726,88 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
 /// Drops one custodian's oldest late entries beyond [`UNACKED_RESULTS_MAX`]
 /// unacked results and [`EXPIRED_ENTRIES_MAX`] expired entries (the
 /// tool-provider contract's retention bounds), deleting their rows as an ack
-/// would.
+/// would, and clears held-update payloads beyond [`UNACKED_RESULTS_MAX`].
+/// Every settle and held update runs this in its own transaction, so the
+/// bounds hold after each of them; `late_results` runs it again before
+/// reading, because expiry ([`reduce_expired`]) can push the expired count
+/// over its bound between settles.
+///
+/// Its cost must not follow the size of the stored results, since a late
+/// entry can carry a whole tool result. A custodian with no more rows than
+/// either bound is skipped after reading only its index. Otherwise one pass
+/// visits each late entry, newest first, and reads its frame type from the
+/// row's first page. Only a row with an `Error` frame can hold an `expired`
+/// entry, because [`reduce_expired`] writes that frame and that kind in one
+/// update; every other late entry counts as unexpired without being read.
+/// The entries of `Error` rows are small (a not-started, not-retained or
+/// protocol error body) and are classified by their `kind`, with the same
+/// SQL comparison as before, so an entry whose kind is missing still counts
+/// against neither bound.
 fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
-    for (expired, max) in [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)] {
-        conn.execute(
-            "DELETE FROM call_ledger WHERE rowid IN (SELECT rowid FROM call_ledger
-                WHERE custodian=?1 AND late_entry IS NOT NULL
-                AND (json_extract(late_entry,'$.kind')='expired')=?2
-                ORDER BY seq DESC LIMIT -1 OFFSET ?3)",
-            params![custodian, expired, max as i64],
-        )?;
+    let fewest_kept = UNACKED_RESULTS_MAX.min(EXPIRED_ENTRIES_MAX) as i64;
+    let over_either_bound = conn
+        .query_row(
+            "SELECT 1 FROM call_ledger WHERE custodian=?1 LIMIT 1 OFFSET ?2",
+            params![custodian, fewest_kept],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if over_either_bound {
+        drop_late_entries_over_bounds(conn, custodian)?;
     }
-    conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
+    let over_update_bound = conn
+        .query_row(
+            "SELECT 1 FROM call_ledger_updates WHERE custodian=?1 LIMIT 1 OFFSET ?2",
+            params![custodian, UNACKED_RESULTS_MAX as i64],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if over_update_bound {
+        conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
+    }
+    Ok(())
+}
+
+/// The row deletions of [`enforce_retention_bounds`]: newest first, the
+/// unexpired entries past the first [`UNACKED_RESULTS_MAX`] and the expired
+/// entries past the first [`EXPIRED_ENTRIES_MAX`].
+fn drop_late_entries_over_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
+    let over_bounds = {
+        // `late_entry IS NOT NULL` reads only the row header, and the CASE
+        // reads the entry itself only for `Error` rows.
+        let mut stmt = conn.prepare(
+            "SELECT rowid, CASE WHEN frame_type='Error'
+                 THEN json_extract(late_entry,'$.kind')='expired' ELSE 0 END
+             FROM call_ledger WHERE custodian=?1 AND late_entry IS NOT NULL
+             ORDER BY seq DESC",
+        )?;
+        let mut rows = stmt.query([custodian])?;
+        let (mut unexpired, mut expired) = (0, 0);
+        let mut over_bounds = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kept = match row.get::<_, Option<bool>>(1)? {
+                Some(false) => {
+                    unexpired += 1;
+                    unexpired <= UNACKED_RESULTS_MAX
+                }
+                Some(true) => {
+                    expired += 1;
+                    expired <= EXPIRED_ENTRIES_MAX
+                }
+                None => true,
+            };
+            if !kept {
+                over_bounds.push(row.get::<_, i64>(0)?);
+            }
+        }
+        over_bounds
+    };
+    let mut delete = conn.prepare("DELETE FROM call_ledger WHERE rowid=?1")?;
+    for rowid in over_bounds {
+        delete.execute([rowid])?;
+    }
     Ok(())
 }
 
@@ -2971,51 +3041,67 @@ mod tests {
     #[test]
     #[ignore = "manual settle-time measurement"]
     fn settle_time_on_large_ledgers() {
-        // Source-like text, so the stored JSON has escapes as tool output does.
+        // Plain padding, and source-like text whose stored JSON has escapes
+        // as tool output does.
         let line = "    let value = map.get(\"key\").unwrap_or(&default);\t// \u{2192} cached\n";
-        let mut text = String::new();
-        while serde_json::to_string(&text).unwrap().len() < 20_000 {
-            text.push_str(line);
+        let mut escaped = String::new();
+        while serde_json::to_string(&escaped).unwrap().len() < 20_000 {
+            escaped.push_str(line);
         }
         let dir = tempfile::tempdir().unwrap();
-        for (results, expired) in [(1_000, 0), (1_000, 1_000), (2_000, 0)] {
-            let path = dir.path().join(format!("bench-{results}-{expired}.db"));
-            build_ledger_file(&path, results, expired, &text);
-            let conn = crate::db::open(&path).unwrap();
-            let entry_bytes: i64 = conn
-                .query_row(
-                    "SELECT max(octet_length(late_entry)) FROM call_ledger WHERE custodian='owner'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let mut times = Vec::new();
-            for i in 0..21 {
-                let next = Key {
-                    carrier: "carrier".into(),
-                    call_key: format!("next-{i}"),
-                };
-                admit(
-                    &conn,
-                    &next,
-                    "digest",
-                    Some(&scope("owner")),
-                    State::DispatchStarted,
-                )
-                .unwrap();
-                let started = std::time::Instant::now();
-                settle(&conn, &next, &text_result(&text), "ok", None, 100).unwrap();
-                times.push(started.elapsed());
+        for (kind, text) in [("padded", "x".repeat(20_000)), ("escaped", escaped)] {
+            for (results, expired) in [(1_000, 0), (1_000, 1_000), (2_000, 0)] {
+                settle_timing(dir.path(), kind, &text, results, expired);
             }
-            let first = times.remove(0);
-            times.sort();
-            eprintln!(
-                "settle on {results} results ({entry_bytes}-byte late entries) + {expired} expired: \
+        }
+    }
+
+    /// Times 20 settles after a first one on a ledger of `results` results
+    /// carrying `text` and `expired` expired entries, and prints the result.
+    fn settle_timing(
+        dir: &std::path::Path,
+        kind: &str,
+        text: &str,
+        results: usize,
+        expired: usize,
+    ) {
+        let path = dir.join(format!("bench-{kind}-{results}-{expired}.db"));
+        eprintln!("building {}", path.display());
+        build_ledger_file(&path, results, expired, text);
+        let conn = crate::db::open(&path).unwrap();
+        let entry_bytes: i64 = conn
+            .query_row(
+                "SELECT max(octet_length(late_entry)) FROM call_ledger WHERE custodian='owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut times = Vec::new();
+        for i in 0..21 {
+            let next = Key {
+                carrier: "carrier".into(),
+                call_key: format!("next-{i}"),
+            };
+            admit(
+                &conn,
+                &next,
+                "digest",
+                Some(&scope("owner")),
+                State::DispatchStarted,
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            settle(&conn, &next, &text_result(text), "ok", None, 100).unwrap();
+            times.push(started.elapsed());
+        }
+        let first = times.remove(0);
+        times.sort();
+        eprintln!(
+                "{kind}: settle on {results} results ({entry_bytes}-byte late entries) + {expired} expired: \
                  first {first:?}, then median {:?}, max {:?} over {} settles",
                 times[times.len() / 2],
                 times[times.len() - 1],
                 times.len()
             );
-        }
     }
 }
