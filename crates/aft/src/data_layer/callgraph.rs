@@ -778,9 +778,12 @@ pub(crate) fn resolve_checkout(
 }
 
 /// How many files each stage of [`resolve_checkout_into`] takes before it
-/// lets the parses they decoded go, and how many decoded resolutions it
-/// hands to the sink at once.
+/// lets the parses they decoded go.
 const BATCH: usize = 1024;
+
+/// How many decoded resolutions [`resolve_checkout_into`] hands to its sink
+/// at once: enough to keep every thread busy building their fragments.
+const SINK_CHUNK: usize = 128;
 
 /// [`resolve_checkout`], handing finished resolutions to `sink` a batch at a
 /// time, in path order, instead of keeping them all, and adding to `memory`,
@@ -893,35 +896,44 @@ pub(crate) fn resolve_checkout_into(
         }
         // Pass 4 runs a batch at a time: run over every file at once, its
         // sites and their dependencies held about 1 GB on aft's checkout.
-        // Each batch's resolutions are decoded in parallel and handed to the
-        // sink, which builds their fragments in parallel too.
+        // Each batch's resolutions go to the sink in smaller chunks, decoded
+        // in parallel, and the sink builds their fragments in parallel too;
+        // a whole batch decoded and built at once held about 750 MB more.
         let mut sites_ms = 0u128;
         for batch in paths.chunks(BATCH) {
             let started = std::time::Instant::now();
-            let reached = calls.resolve_sites(inputs, &NoResolutions, &refs(batch));
+            let mut reached = calls
+                .resolve_sites(inputs, &NoResolutions, &refs(batch))
+                .into_iter();
             sites_ms += started.elapsed().as_millis();
             let parses = &inputs.parses;
-            let files = reached
-                .into_iter()
-                .map(|(path, sites, dependencies)| {
-                    let bytes = encoded
-                        .remove(&path)
-                        .expect("every parsed file was resolved");
-                    (path, bytes, sites, dependencies)
-                })
-                .collect::<Vec<_>>();
-            let files = files
-                .into_par_iter()
-                .map(|(path, bytes, sites, dependencies)| {
-                    let key = parses.key(&path).expect("every resolved file is parsed");
-                    let mut file = super::fragment::decode(&key, &path, &bytes)
-                        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                    file.sites = sites;
-                    file.site_dependencies = dependencies;
-                    Ok((path, file))
-                })
-                .collect::<Result<Vec<_>, ManifestJoinError>>()?;
-            sink(&*inputs, files)?;
+            loop {
+                let chunk = reached
+                    .by_ref()
+                    .take(SINK_CHUNK)
+                    .map(|(path, sites, dependencies)| {
+                        let bytes = encoded
+                            .remove(&path)
+                            .expect("every parsed file was resolved");
+                        (path, bytes, sites, dependencies)
+                    })
+                    .collect::<Vec<_>>();
+                if chunk.is_empty() {
+                    break;
+                }
+                let files = chunk
+                    .into_par_iter()
+                    .map(|(path, bytes, sites, dependencies)| {
+                        let key = parses.key(&path).expect("every resolved file is parsed");
+                        let mut file = super::fragment::decode(&key, &path, &bytes)
+                            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                        file.sites = sites;
+                        file.site_dependencies = dependencies;
+                        Ok((path, file))
+                    })
+                    .collect::<Result<Vec<_>, ManifestJoinError>>()?;
+                sink(&*inputs, files)?;
+            }
             inputs.parses.release_decoded();
         }
         drop(calls);
