@@ -213,6 +213,11 @@ pub struct Checkout {
     /// Orders recordings: each one brings the state the previous left up to
     /// date.
     recording: Mutex<()>,
+    /// Moves whenever what the checkout holds in memory may have changed: a
+    /// recorded change, a call-graph refresh, a new publication. A memory
+    /// figure walked at one value stays right until it moves (see
+    /// [`Self::memory_epoch`]).
+    memory_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -526,6 +531,7 @@ impl Checkout {
             live: RwLock::new(Live::default()),
             engine: Mutex::new(None),
             recording: Mutex::new(()),
+            memory_epoch: std::sync::atomic::AtomicU64::new(0),
         };
         handle.adopt_newest()?;
         Ok(handle)
@@ -830,6 +836,7 @@ impl Checkout {
                 for path in paths {
                     live.early.insert(path.clone(), sequence);
                 }
+                self.touch_memory();
                 return Ok(());
             };
             let sink = ChangeSink::default();
@@ -946,6 +953,7 @@ impl Checkout {
             return false;
         }
         live.sequence += 1;
+        self.touch_memory();
         let sequence = live.sequence;
         let mut text = (*live.text).clone();
         let mut pending = (*live.callgraph_pending).clone();
@@ -1408,6 +1416,7 @@ impl Checkout {
     /// change recorded before then. A change recorded while it ran may be
     /// newer than what it read, so it stays laid over the new publication.
     fn serve_new(&self, snapshot: Snapshot, covered: u64) -> Result<(), DataError> {
+        self.touch_memory();
         let published = self
             .open_published(snapshot)?
             .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
@@ -1724,8 +1733,21 @@ impl Checkout {
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
         checkpoint()?;
         let result = self.refresh_inner();
+        self.touch_memory();
         self.note_outcome("refresh", &result);
         result
+    }
+
+    /// See the `memory_epoch` field: equal values mean nothing the checkout
+    /// holds in memory has changed between two reads.
+    #[must_use]
+    pub fn memory_epoch(&self) -> u64 {
+        self.memory_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn touch_memory(&self) {
+        self.memory_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     fn refresh_inner(&self) -> Result<Option<UpdateStats>, DataError> {

@@ -712,6 +712,16 @@ pub(crate) struct DataLayerMemory {
 }
 
 impl DataLayerMemory {
+    /// A bound checkout another thread is measuring right now.
+    pub(crate) fn busy_checkout() -> Self {
+        Self {
+            shared: MemoryEstimate::busy()
+                .gap("checkout_memory_busy")
+                .count("bound_checkouts", 1),
+            ..Self::unbound()
+        }
+    }
+
     /// Nothing held: no checkout is bound.
     fn unbound() -> Self {
         Self {
@@ -769,7 +779,7 @@ pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
             shared: MemoryEstimate::busy().gap("checkout_binding"),
             ..DataLayerMemory::unbound()
         },
-        DataCheckoutProbe::Bound(checkout) => {
+        DataCheckoutProbe::Bound(checkout) => checkout.memory_figure(|| {
             let mut seen = aft_store::heap::Seen::new();
             // aft_inspect's dead-code scan may hold the same snapshot the
             // checkout's dead-code memo holds; the root's
@@ -780,7 +790,7 @@ pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
             let memory = checkout.checkout().memory(&mut seen);
             let meaning = checkout.meaning_memory(&mut seen);
             checkout_estimate(memory, meaning, seen.contended())
-        }
+        }),
     })
 }
 

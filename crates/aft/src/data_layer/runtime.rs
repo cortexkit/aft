@@ -649,12 +649,19 @@ impl Work {
 }
 
 /// One root's checkout in a running AFT.
+/// How old a checkout's memory figure may be before the census walks it
+/// again (see [`DataCheckout::memory_figure`]).
+const MEMORY_FIGURE_MAX_AGE: Duration = Duration::from_secs(30);
+
 pub(crate) struct DataCheckout {
     work: Arc<Work>,
     quiet: Arc<QuietTimer>,
     /// Set once a bind has used the scan that opening the checkout made;
     /// every later bind compares the files again (see [`root_bound`]).
     bound_once: AtomicBool,
+    /// The last memory figure the census walked for this checkout, and when
+    /// (see [`Self::memory_figure`]).
+    memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
@@ -769,6 +776,7 @@ impl DataCheckout {
             work,
             quiet,
             bound_once: AtomicBool::new(false),
+            memory_figure: std::sync::Mutex::new(None),
             _listener: listener,
         }))
     }
@@ -1212,6 +1220,34 @@ impl DataCheckout {
 
     /// What meaning search holds in memory for this checkout; see
     /// [`super::meaning::Meaning::memory`].
+    /// This checkout's memory as the census reports it, walked again only
+    /// when the checkout changed what it holds since the last walk, or the
+    /// last figure is older than [`MEMORY_FIGURE_MAX_AGE`]. The health
+    /// rollup asks for every bound root every few seconds, and the walk
+    /// visits each decoded parse and resolution an edited checkout's engine
+    /// holds: walked on every ask, it kept a core busy.
+    pub(crate) fn memory_figure(
+        &self,
+        walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
+    ) -> super::surfaces::DataLayerMemory {
+        // Another thread walking it now holds the slot: report it busy
+        // rather than wait.
+        let Ok(mut slot) = self.memory_figure.try_lock() else {
+            return super::surfaces::DataLayerMemory::busy_checkout();
+        };
+        // Read before the walk: a change during it moves the epoch, so the
+        // next ask walks again.
+        let epoch = self.checkout().memory_epoch();
+        if let Some((at, walked_at, figure)) = slot.as_ref() {
+            if *walked_at == epoch && at.elapsed() < MEMORY_FIGURE_MAX_AGE {
+                return figure.clone();
+            }
+        }
+        let figure = walk();
+        *slot = Some((Instant::now(), epoch, figure.clone()));
+        figure
+    }
+
     pub(crate) fn meaning_memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
         self.work.meaning.memory(seen)
     }
@@ -1226,6 +1262,32 @@ mod tests {
     /// A process published a checkout's text index and stopped before its
     /// call graph. The next process to bind it builds the call graph, and
     /// its refresh thread does not spin while it waits.
+    #[test]
+    fn the_memory_figure_is_walked_again_only_after_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() {}\n").unwrap();
+        let handle = DataCheckout::open(&root, storage.path(), None).unwrap();
+        let walks = std::cell::Cell::new(0);
+        let walk = || {
+            walks.set(walks.get() + 1);
+            super::super::surfaces::DataLayerMemory::busy_checkout()
+        };
+        handle.memory_figure(walk);
+        handle.memory_figure(walk);
+        assert_eq!(walks.get(), 1, "an unchanged checkout is not walked again");
+        std::fs::write(root.join("src/extra.rs"), "pub fn other() {}\n").unwrap();
+        handle
+            .checkout()
+            .record_paths(&[b"src/extra.rs".to_vec()])
+            .unwrap();
+        handle.memory_figure(walk);
+        assert_eq!(walks.get(), 2, "a recorded change is measured at once");
+    }
+
     #[test]
     fn a_text_only_publication_is_built_on_the_next_bind() {
         let dir = tempfile::tempdir().unwrap();
