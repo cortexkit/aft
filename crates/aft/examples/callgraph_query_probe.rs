@@ -34,9 +34,15 @@ fn ms(started: Instant) -> f64 {
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let split = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
     let root = std::fs::canonicalize(&args[0]).unwrap();
-    let threads = args.get(1).filter(|_| split > 1).map_or(8, |t| t.parse().unwrap());
+    let threads = args
+        .get(1)
+        .filter(|_| split > 1)
+        .map_or(8, |t| t.parse().unwrap());
     let queries = args.get(split + 1..).unwrap_or_default().to_vec();
     let store = std::env::temp_dir().join(format!("aft-query-probe-{}", std::process::id()));
     std::fs::create_dir_all(&store).unwrap();
@@ -99,6 +105,16 @@ fn main() {
         at(0.99),
         decodes.last().copied().unwrap_or(0),
         callgraph_mb(&checkout),
+    );
+    let [nodes, refs, edges, maps, node_count, ref_count, resolved, edge_count] =
+        view.probe_breakdown();
+    println!(
+        "decoded parts: nodes {:.0} MB ({node_count}), references {:.0} MB ({ref_count}, {resolved} resolved), \
+         edges {:.0} MB ({edge_count}), lookup maps {:.0} MB",
+        nodes as f64 / 1e6,
+        refs as f64 / 1e6,
+        edges as f64 / 1e6,
+        maps as f64 / 1e6,
     );
     drop(view);
     drop(checkout);

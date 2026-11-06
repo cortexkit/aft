@@ -121,6 +121,31 @@ pub(crate) struct FileSlice {
 }
 
 impl FileSlice {
+    /// Heap bytes by part, for a measurement probe: nodes, references,
+    /// edges, the four lookup maps, and counts of nodes, references,
+    /// resolved references and edges.
+    #[doc(hidden)]
+    pub(crate) fn probe_breakdown(&self) -> [usize; 8] {
+        use aft_store::heap::HeapBytes as _;
+        let mut seen = aft_store::heap::Seen::new();
+        [
+            self.nodes.heap_bytes(&mut seen),
+            self.refs.heap_bytes(&mut seen),
+            self.edges.heap_bytes(&mut seen),
+            self.ordinary.heap_bytes(&mut seen)
+                + self.scoped.heap_bytes(&mut seen)
+                + self.kinds.heap_bytes(&mut seen)
+                + self.node_index.heap_bytes(&mut seen),
+            self.nodes.len(),
+            self.refs.len(),
+            self.refs
+                .values()
+                .filter(|reference| reference.resolved)
+                .count(),
+            self.edges.len(),
+        ]
+    }
+
     /// A slice of `path` with no symbols, references or edges.
     #[cfg(test)]
     pub(crate) fn empty_for_test(path: &str) -> Self {

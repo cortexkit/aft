@@ -2999,6 +2999,24 @@ impl CheckoutView {
         }
     }
 
+    /// Sums [`FileSlice::probe_breakdown`] over every file of the call
+    /// graph, for a measurement probe.
+    #[doc(hidden)]
+    pub fn probe_breakdown(&self) -> [usize; 8] {
+        let mut total = [0usize; 8];
+        for record in self.published.state.paths() {
+            let Ok(path) = std::str::from_utf8(&record.path) else {
+                continue;
+            };
+            if let Some(slice) = self.graph.slice(path) {
+                for (sum, part) in total.iter_mut().zip(slice.probe_breakdown()) {
+                    *sum += part;
+                }
+            }
+        }
+        total
+    }
+
     /// Decodes every file of the call graph, as a whole-graph command does,
     /// for a measurement probe. Returns the files decoded and each decode's
     /// time in microseconds.
