@@ -648,34 +648,6 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                 evicted: false,
                 lock_contended: false,
             }
-        } else if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
-            match snapshot {
-                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Ready,
-                        snapshot: Some(Arc::new(snapshot)),
-                        evicted: false,
-                        lock_contended: false,
-                        data_view: false,
-                    }
-                }
-                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Building,
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: false,
-                        data_view: false,
-                    }
-                }
-                Err(_) => TrigramReadiness {
-                    status: IndexStatus::Fallback,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                    data_view: false,
-                },
-            }
         } else {
             // No text plane serves yet: building while the checkout's first
             // publication is on the way, otherwise a bounded scan answers.
@@ -4371,16 +4343,7 @@ fn regex_route_collection(
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
-    let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        match snapshot {
-            Ok(snapshot) => snapshot.into_ready()?,
-            Err(error) => {
-                return Some(Err(std::io::Error::other(
-                    crate::context::view_load_failure_message(error),
-                )))
-            }
-        }
-    } else {
+    let snapshot = {
         #[cfg(test)]
         regex_route_lock_hook(false);
         // The checkout's text index names the candidate files, when ready.
@@ -8184,9 +8147,7 @@ fn search_index_ready_with_budget(
     if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
         return Ok(true);
     }
-    if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
-    }
+    
     Ok(false)
 }
 

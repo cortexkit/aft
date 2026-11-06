@@ -1634,7 +1634,7 @@ mod checkout_transport_tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        assert!(!ctx.checkout_query_runtime_active());
+        assert!(!false);
         let _pin = ctx.pin_config();
         let _ = ctx.callgraph_store_for_ops();
         assert!(ctx.checkout_query_outcome().is_none());

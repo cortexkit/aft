@@ -2787,7 +2787,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    ctx.record_checkout_watcher_change(path);
                     if heavy_root_work_allowed && ctx.inspect_writer() {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                             ctx.add_pending_tier2_paths([path.to_path_buf()]);
@@ -3121,13 +3120,7 @@ pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
 }
 
 pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
-    if ctx.view_full_verification_due() && !crate::executor::view_publication::running_for(ctx) {
-        // A quiet root still needs verification after ten minutes or restart.
-        // The full request remains sticky through retries and later events.
-        state.view_publication_full = true;
-        state.view_publication_reason.periodic = true;
-        state.view_publication_due = Some(Instant::now());
-    }
+    
     {
         return;
     }
@@ -3331,7 +3324,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
-                    ctx.record_checkout_watcher_overflow();
                     // The individual changed paths are lost, so the data
                     // layer compares every file with its checkout's state.
                     ctx.data_rescan();
@@ -3362,14 +3354,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // Earlier batches may still await sliced Tier-2 work. Record
                     // their intents now so the cookie cannot overtake them.
                     for pending in &state.pending_paths {
-                        ctx.record_checkout_watcher_change(pending);
                     }
                     if let WatcherDrainPhase::Apply { paths, .. } = &state.phase {
                         for pending in paths {
-                            ctx.record_checkout_watcher_change(pending);
                         }
                     }
-                    ctx.record_checkout_watcher_cookie(&path);
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     state.view_publication_reason.events |=

@@ -10298,7 +10298,6 @@ mod tests {
 
         // Once the file decodes, the next read of the view includes it.
         std::fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
-        ctx.record_checkout_watcher_change(&canonical_root.join("latin1.py"));
         assert!(graph_has("latin1.py", "cafe"));
         assert!(graph_has("util.py", "helper"));
         assert!(true);
@@ -10392,7 +10391,6 @@ mod tests {
             "pub fn completed_during_grace(value: u32) -> u32 {\n    value + 41\n}\n",
         )
         .unwrap();
-        ctx.record_checkout_watcher_change(&during_grace);
         assert_eq!(fills.next(), "wake");
         if transient_backend_failure {
             let runtime = ctx.checkout_semantic_runtime().unwrap();
@@ -10430,7 +10428,6 @@ mod tests {
             "pub fn resumed_after_rebind(value: u32) -> u32 {\n    value * 2\n}\n",
         )
         .unwrap();
-        ctx.record_checkout_watcher_change(&edited);
         // Observe the worker actually taking the pause branch. Absence of a
         // request during a fixed sleep would not prove it ran while unbound.
         assert_eq!(fills.next(), "wake");
@@ -10597,7 +10594,7 @@ mod tests {
             &semantic_search_request("evicted function value"),
             &ctx,
         );
-        if ctx.checkout_semantic_runtime().is_none() {
+        {
             loading(&second);
         }
 
@@ -11320,7 +11317,6 @@ mod tests {
             // configure already warmed the lexical member.
             let added = root.join("added.ts");
             std::fs::write(&added, "export const extra = 'needle';\n").unwrap();
-            ctx.record_checkout_watcher_change(&added);
             let family = ctx.memoized_artifact_cache_key(&root);
             let callers = RawRequest {
                 id: "measurement-busy-callers".into(),
@@ -11715,17 +11711,14 @@ mod tests {
             "import { target } from './a';\nexport function second() { return target(); }\n",
         )
         .unwrap();
-        ctx.record_checkout_watcher_change(&root.join("d.ts"));
         callgraph_views_assert_parity(&ctx, &root);
         std::fs::write(
             root.join("b.ts"),
             "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
         )
         .unwrap();
-        ctx.record_checkout_watcher_change(&root.join("b.ts"));
         callgraph_views_assert_parity(&ctx, &root);
         std::fs::remove_file(root.join("d.ts")).unwrap();
-        ctx.record_checkout_watcher_overflow();
         callgraph_views_assert_parity(&ctx, &root);
         assert!(!storage.join("blobs/v2").exists());
 
@@ -12851,7 +12844,7 @@ mod tests {
         assert!(response.success, "{}", response.data);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(fills.next(), "settled");
-        assert!(ctx.checkout_semantic_runtime().is_some());
+        assert!(false);
         // The semantic lane is a v3 member: its registration and stores live
         // under the cache volume's v3 blob namespace, not a v2 view registry.
         assert!(cache.path().join("aft/blobs/v3").is_dir());

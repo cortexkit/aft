@@ -7295,7 +7295,6 @@ impl AppContext {
             .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
         cleanup_pending
             || receiver_pending
-            || self.view_full_verification_due()
             || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
                 slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
@@ -7316,26 +7315,7 @@ impl AppContext {
     /// Probe subsystem state without blocking the dispatch frame loop; only
     /// the verification registry's short map lookup may wait.
     pub(crate) fn view_full_verification_due(&self) -> bool {
-        {
-            return false;
-        }
-        let runtime = match self.view_runtime.try_read() {
-            Ok(runtime) => runtime,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return true,
-        };
-        let Some(state) = runtime
-            .as_ref()
-            .filter(|state| state.snapshot.generation.is_some())
-        else {
-            return false;
-        };
-        if !crate::views::assembly::full_verification_due(&state.snapshot.view_dir) {
-            return false;
-        }
-        self.view_publication_retry
-            .try_lock()
-            .is_none_or(|retry| retry.due().is_none_or(|due| Instant::now() >= due))
+        false
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
@@ -10373,15 +10353,7 @@ impl AppContext {
     }
 
     fn try_release_view_publication_cache(&self) -> bool {
-        let Some(runtime) = try_read_unpoisoned(&self.view_runtime) else {
-            return false;
-        };
-        let view_dir = runtime
-            .as_ref()
-            .map(|runtime| runtime.snapshot.view_dir.clone());
-        drop(runtime);
-        view_dir
-            .is_none_or(|view_dir| crate::views::assembly::try_release_manifest_cache(&view_dir))
+        false
     }
 
     pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
@@ -10462,11 +10434,7 @@ impl AppContext {
     }
 
     pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
-        self.view_runtime
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|state| state.snapshot.clone())
+        None
     }
 
     pub(crate) fn publish_view_paths(
@@ -11180,10 +11148,7 @@ impl AppContext {
 
     /// True only after explicit per-checkout activation, never from defaults.
     pub fn checkout_query_runtime_active(&self) -> bool {
-        self.checkout_query_runtime
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
+        false
     }
 
     /// Binds watcher invalidation and synchronous write intent to the same driver.
@@ -11208,50 +11173,16 @@ impl AppContext {
     pub fn checkout_semantic_runtime(
         &self,
     ) -> Option<Arc<crate::views::semantic_runtime::CheckoutSemantic>> {
-        self.checkout_semantic.runtime()
+        None
     }
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
-        self.reset_view_publication_retry();
-        if let Some(view) = self.lexical_view.lock().as_ref() {
-            view.record_change(path);
-        }
-        if let Some(view) = self.callgraph_view.lock().as_ref() {
-            view.record_change(path);
-        }
-        if let Some(driver) = self.checkout_driver.get() {
-            driver.record_absolute_change(path);
-        }
-        // The driver only records the change; the semantic view resolves it
-        // on its worker after the quiet window.
-        self.checkout_semantic.wake();
     }
 
     pub(crate) fn record_checkout_watcher_overflow(&self) {
-        self.reset_view_publication_retry();
-        if let Some(view) = self.lexical_view.lock().as_ref() {
-            view.record_overflow();
-        }
-        if let Some(view) = self.callgraph_view.lock().as_ref() {
-            view.record_overflow();
-        }
-        if let Some(driver) = self.checkout_driver.get() {
-            driver.record_watcher_overflow();
-        }
-        self.checkout_semantic.wake();
     }
 
     pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
-        self.record_checkout_pending_watcher_gap();
-        if let Some(view) = self.lexical_view.lock().as_ref() {
-            view.record_cookie(path);
-        }
-        if let Some(view) = self.callgraph_view.lock().as_ref() {
-            view.record_cookie(path);
-        }
-        if let Some(driver) = self.checkout_driver.get() {
-            driver.record_watcher_cookie(path);
-        }
     }
 
     pub(crate) fn record_checkout_pending_watcher_gap(&self) {
@@ -11260,7 +11191,6 @@ impl AppContext {
             .checkout_watcher_gap_pending
             .swap(false, Ordering::AcqRel)
         {
-            self.record_checkout_watcher_overflow();
         }
     }
 
@@ -12053,95 +11983,7 @@ impl AppContext {
         &self,
         tool: &str,
     ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
-        {
-            return None;
-        }
-        if let Some(snapshot) = LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
-            snapshots
-                .borrow()
-                .iter()
-                .find(|(id, _)| *id == self.config_pin_key())
-                .map(|(_, snapshot)| snapshot.clone())
-        }) {
-            return Some(snapshot);
-        }
-        let config = self.config();
-        let root = self.canonical_cache_root();
-        let storage = self.storage_paths();
-        let policy = crate::blob_store::v2::TrigramPolicy {
-            max_file_size: config.search_index_max_file_size,
-        };
-        let family = self.memoized_artifact_cache_key(&root);
-        // Building the view, recording a watcher gap and binding the checkout
-        // can take long on a cold or loaded machine, and other queries may
-        // wait behind them. None of it is this request's read, so it does not
-        // spend the request's filesystem deadline.
-        let result = crate::bounded_io::excluding_wait(|| {
-            self.lexical_load_retry.lock().run(
-                Instant::now,
-                |error| crate::views::trigram::bind_is_busy(error),
-                || {
-                    let (view, check_bind) = {
-                        let mut slot = self.lexical_view.lock();
-                        let replace = !slot
-                            .as_ref()
-                            .is_some_and(|view| view.matches(&root, &storage, &family, policy));
-                        if replace {
-                            let replacement = match slot.as_ref().filter(|view| {
-                                view.matches_checkout(&root, &storage, &family, policy)
-                            }) {
-                                Some(previous) => previous.with_binding(
-                                    self.views_import_control(),
-                                    self.cold_build_limiter(),
-                                ),
-                                None => crate::views::trigram::LexicalView::new_with_import(
-                                    root,
-                                    storage,
-                                    family,
-                                    policy,
-                                    self.views_import_control(),
-                                    self.cold_build_limiter(),
-                                ),
-                            };
-                            match replacement {
-                                Ok(view) => *slot = Some(Arc::new(view)),
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        (slot.as_ref().unwrap().clone(), replace || tool == "bind")
-                    };
-                    self.record_checkout_pending_watcher_gap();
-                    if check_bind {
-                        view.prepare_bind();
-                    }
-                    view.snapshot()
-                },
-            )
-        });
-        let result = result.map_err(|error| self.view_storage_refusal_message(error));
-        if pinned_config_for(self.config_pin_key()).is_some() {
-            LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
-                snapshots
-                    .borrow_mut()
-                    .push((self.config_pin_key(), result.clone()))
-            });
-        }
-        if result.as_ref().is_ok_and(|snapshot| snapshot.is_ready()) && tool != "bind" {
-            let index = match tool {
-                "grep" => 0,
-                "glob" => 1,
-                _ => 2,
-            };
-            self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
-        }
-        match &result {
-            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
-                self.note_view_load_success("trigram")
-            }
-            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
-            Err(error) => self.note_view_load_failure("trigram", error),
-        }
-        Some(result)
+        None
     }
 
     /// This checkout's current file identities (size and content hash by
@@ -12390,149 +12232,7 @@ impl AppContext {
         >,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
     {
-        {
-            return None;
-        }
-        if let Some(reader) = CALLGRAPH_QUERY_READERS.with(|readers| {
-            readers
-                .borrow()
-                .iter()
-                .find(|(id, _)| *id == self.config_pin_key())
-                .map(|(_, reader)| reader.clone())
-        }) {
-            return Some(reader);
-        }
-        let config = self.config();
-        let root = self.canonical_cache_root();
-        let storage = self.storage_paths();
-        let policy = crate::blob_store::v2::TrigramPolicy {
-            max_file_size: config.search_index_max_file_size,
-        };
-        let family = self.memoized_artifact_cache_key(&root);
-        let own_view_bound = self
-            .callgraph_view
-            .lock()
-            .as_ref()
-            .is_some_and(|view| view.matches(&root, &storage, &family, policy));
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-route-ready");
-        if !own_view_bound || self.callgraph_borrow.lock().is_some() {
-            if let Some(borrowed) =
-                self.borrowed_callgraph_view_reader(&root, &storage, &family, policy, false)
-            {
-                if pinned_config_for(self.config_pin_key()).is_some() {
-                    CALLGRAPH_QUERY_READERS.with(|readers| {
-                        readers
-                            .borrow_mut()
-                            .push((self.config_pin_key(), borrowed.clone()))
-                    });
-                }
-                match &borrowed {
-                    Ok(_) => self.note_view_load_success("callgraph"),
-                    Err(error) if !error.is_planned() => {
-                        self.note_classified_view_load_failure("callgraph", &error.reason, false)
-                    }
-                    Err(_) => {}
-                }
-                return Some(borrowed);
-            }
-        }
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-view-select-begin");
-        let view = {
-            let mut slot = self.callgraph_view.lock();
-            if !slot
-                .as_ref()
-                .is_some_and(|view| view.matches(&root, &storage, &family, policy))
-            {
-                match self.callgraph_construction_retry.lock().run(
-                    Instant::now,
-                    |error| error.busy,
-                    || {
-                        crate::views::callgraph::CallgraphView::new_with_import(
-                            root.clone(),
-                            storage.clone(),
-                            family.clone(),
-                            policy,
-                            self.callgraph_view_control(),
-                            self.cold_build_limiter(),
-                        )
-                    },
-                ) {
-                    Ok(mut view) => {
-                        view.set_executor(self.callgraph_executor.lock().clone());
-                        view.set_publish_fence(Arc::new(CallgraphPublicationFence {
-                            lifecycle: self.subc_lifecycle_admission(),
-                            generation: self.configure_generation_flag(),
-                            expected: self.configure_generation(),
-                        }));
-                        *slot = Some(Arc::new(view));
-                    }
-                    Err(error) => {
-                        drop(slot);
-                        if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) {
-                            if let Some(borrowed) = self.borrowed_callgraph_view_reader(
-                                &root, &storage, &family, policy, true,
-                            ) {
-                                match &borrowed {
-                                    Ok(_) => self.note_view_load_success("callgraph"),
-                                    Err(error) if !error.is_planned() => self
-                                        .note_classified_view_load_failure(
-                                            "callgraph",
-                                            &error.reason,
-                                            false,
-                                        ),
-                                    Err(_) => {}
-                                }
-                                return Some(borrowed);
-                            }
-                        }
-                        // Like the lexical view, a failed callgraph load fails
-                        // the query: no legacy store may answer for the view.
-                        if !error.is_planned() {
-                            self.note_classified_view_load_failure(
-                                "callgraph",
-                                &error.reason,
-                                false,
-                            );
-                        }
-                        return Some(Err(error));
-                    }
-                }
-            }
-            slot.as_ref().unwrap().clone()
-        };
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-view-selected");
-        self.record_checkout_pending_watcher_gap();
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-gap-recorded");
-        let result = match acquire(&view) {
-            Err(error) if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) => self
-                .borrowed_callgraph_view_reader(&root, &storage, &family, policy, true)
-                .unwrap_or(Err(error)),
-            result => result,
-        };
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-view-read-return");
-        if pinned_config_for(self.config_pin_key()).is_some() {
-            CALLGRAPH_QUERY_READERS.with(|readers| {
-                readers
-                    .borrow_mut()
-                    .push((self.config_pin_key(), result.clone()))
-            });
-        }
-        if result.is_ok() {
-            self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
-            self.note_view_load_success("callgraph");
-        } else if let Err(error) = &result {
-            if !error.is_planned() {
-                self.note_classified_view_load_failure("callgraph", &error.reason, false);
-            }
-        }
-        #[cfg(test)]
-        crate::storage_retention::test_hook(&root, "cg-timing:context-accounted");
-        Some(result)
+        None
     }
 
     /// Executed v3 call-graph acquisitions (one per pinned request).
@@ -14469,7 +14169,7 @@ impl AppContext {
         }
         // Publication memoization can be discarded independently of resident
         // artifact handles, including when the semantic lane remains busy.
-        if !self.try_release_view_publication_cache() {
+        {
             return false;
         }
         // Last, so a contended lane leaves every other handle in place too.

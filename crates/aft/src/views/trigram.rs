@@ -2080,7 +2080,6 @@ mod tests {
                 .len()
         };
         fs::write(&probe, "fn visible_recorded_edit() {}\n").unwrap();
-        ctx.record_checkout_watcher_change(&probe);
         assert_eq!(matches("visible_recorded_edit"), 1);
         assert_eq!(acquisitions(), 2);
         fs::write(&probe, "fn visible_unreported_edit() {}\n").unwrap();

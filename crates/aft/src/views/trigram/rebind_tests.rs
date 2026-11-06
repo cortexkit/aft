@@ -207,7 +207,6 @@ impl Fixture {
 fn lexical_rebind_recorded_change_reverifies_even_if_bytes_are_unchanged() {
     fixture(|f| {
         f.bind();
-        f.ctx.record_checkout_watcher_change(&f.root.join("a.rs"));
         let result = f.rebind();
         assert_eq!(f.matches(&result, "first_needle"), 1);
     });
@@ -347,7 +346,6 @@ fn lexical_rebind_reported_new_directory_discovers_its_policy() {
         fs::write(f.root.join("nested/.ignore"), "hidden.rs\n").unwrap();
         fs::write(f.root.join("nested/hidden.rs"), "fn hidden_needle() {}\n").unwrap();
         fs::write(f.root.join("nested/visible.rs"), "fn visible_needle() {}\n").unwrap();
-        f.ctx.record_checkout_watcher_change(&f.root.join("nested"));
         let result = f.rebind();
         assert_eq!(f.matches(&result, "hidden_needle"), 0);
         assert_eq!(f.matches(&result, "visible_needle"), 1);

@@ -330,7 +330,7 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
         Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    } || ctx.checkout_semantic_runtime().is_some();
+    };
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),
@@ -452,7 +452,7 @@ pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
 /// Observe a query access and indicate whether SQLite explicitly reported a
 /// transient busy or locked error while opening the published view database.
 pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
-    let served_by_view = ctx.checkout_query_runtime_active();
+    let served_by_view = false;
     if !served_by_view {
         return (observed_index_status(ctx, IndexPlane::Callgraph), false);
     }

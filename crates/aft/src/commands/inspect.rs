@@ -842,7 +842,7 @@ fn handle_inspect_payload(
     // pinned once for this request; an unavailable view is reported, never
     // replaced by the legacy scanner's store.
     let v3_routed = false;
-    let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
+    let routed_store = if tier2_enabled && (v3_routed) {
         request_deadline.map_or_else(
             || ctx.callgraph_store_for_query_without_wait(),
             |deadline| {
@@ -1642,13 +1642,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     return;
                 }
             };
-            if ctx.checkout_query_runtime_active() {
-                // Resolve call-graph availability before diagnostics can end the
-                // request. Response finalization must report the same outcome
-                // even if no background scan is submitted.
-                let _ = ctx
-                    .callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP));
-            }
+            
             // Queueing instead of sharing a response keeps request-specific scopes,
             // phase logs, and terminals independent while bounding expensive work to
             // one detached inspect body per root.
