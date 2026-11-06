@@ -980,16 +980,6 @@ fn main() {
             .clear_request_handles_progress(&resolved.response.id);
     });
     aft::slog_info!("shutdown phase=pending_responses_drained");
-    // Everything from here to exit fits in the exit budget measured from this
-    // point: the index flushes end by `flush_deadline`, then LSP shutdown
-    // takes at most its own budget.
-    let drained_at = Instant::now();
-    if graceful_stdin_shutdown {
-        // Only the natural stdin-EOF path flushes owner-side index deltas and
-        // queued callgraph refreshes. Signal, stdout-error, and panic teardown
-        // skip disk work so abrupt exits stay fast and avoid lock contention.
-        flush_indexes_on_graceful_shutdown(shutdown_started, drained_at);
-    }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();
     for runtime in registry.iter() {
@@ -1137,37 +1127,6 @@ fn collect_queued_lines(
         queued_lines.push_back(line);
     }
     queued_lines.len()
-}
-
-#[cfg(test)]
-fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Deadline-bounded EOF index flush, shared by the transport and its regression tests.
-fn flush_indexes_on_graceful_shutdown(shutdown_started: Instant, drained_at: Instant) {
-    // Tests share the callgraph refresh worker, so one test must not drain another's job.
-    #[cfg(test)]
-    let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
-    aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
-    let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
-    aft::slog_info!(
-        "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
-        outcome.as_str(),
-        outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
-        shutdown_started.elapsed().as_millis()
-    );
-    if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
-        aft::slog_warn!(
-            "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
-            aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
-        );
-    }
 }
 
 fn drain_runtime_events_and_write_pending_cooperatively(
