@@ -646,17 +646,41 @@ pub struct SymbolMeta {
 /// Whether the symbol `identity` of `kind` is where a program in `lang`
 /// starts, as the language defines it: `fn main` at the top of a Rust file,
 /// `func main` in a Go `package main` (`go_main_package`), and `main` in C,
-/// C++ and Objective-C. A Python program starts in the module code run as
-/// `__main__`, which [`python_runs_as_main`] finds. JavaScript and
-/// TypeScript define no starting function.
-fn starts_program(lang: LangId, identity: &str, kind: &SymbolKind, go_main_package: bool) -> bool {
-    *kind == SymbolKind::Function
-        && identity == "main"
-        && match lang {
-            LangId::Rust | LangId::C | LangId::Cpp | LangId::ObjC => true,
-            LangId::Go => go_main_package,
-            _ => false,
-        }
+/// C++ and Objective-C. Go also starts every package's top-level
+/// `func init()` (`go_init`: the file declares one with no parameters)
+/// before `main`; the runtime calls it and code never can. A Python program
+/// starts in the module code run as `__main__`, which
+/// [`python_runs_as_main`] finds. JavaScript and TypeScript define no
+/// starting function.
+fn starts_program(
+    lang: LangId,
+    identity: &str,
+    kind: &SymbolKind,
+    go_main_package: bool,
+    go_init: bool,
+) -> bool {
+    if *kind != SymbolKind::Function {
+        return false;
+    }
+    match lang {
+        LangId::Rust | LangId::C | LangId::Cpp | LangId::ObjC => identity == "main",
+        LangId::Go => (identity == "main" && go_main_package) || (identity == "init" && go_init),
+        _ => false,
+    }
+}
+
+/// Whether a Go file declares a top-level `func init()`: a function, so no
+/// receiver, with no parameters. Go runs each one when the program starts.
+fn go_declares_init(source: &str, root: tree_sitter::Node<'_>) -> bool {
+    root.named_children(&mut root.walk()).any(|node| {
+        node.kind() == "function_declaration"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| &source[name.byte_range()] == "init")
+            && node
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| parameters.named_child_count() == 0)
+    })
 }
 
 /// Whether a Python module has a top-level `if __name__ == "__main__":`
@@ -1977,6 +2001,7 @@ fn build_file_data_from_tree_observed<'tree>(
             n.kind() == "package_clause" && source[n.byte_range()].trim() == "package main"
         });
     let python_main = lang == LangId::Python && python_runs_as_main(source, root);
+    let go_init = lang == LangId::Go && go_declares_init(source, root);
     // Build per-symbol metadata for entry point detection
     let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
@@ -2007,7 +2032,13 @@ fn build_file_data_from_tree_observed<'tree>(
                             (go_main_package && s.kind == SymbolKind::Variable)
                                 .then(|| "go_package_initializer".to_string())
                         }),
-                    program_start: starts_program(lang, &identity, &s.kind, go_main_package),
+                    program_start: starts_program(
+                        lang,
+                        &identity,
+                        &s.kind,
+                        go_main_package,
+                        go_init,
+                    ),
                 },
             )
         })

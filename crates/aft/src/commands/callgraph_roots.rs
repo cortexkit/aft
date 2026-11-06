@@ -5,9 +5,11 @@
 //!
 //! - `main`: where the program starts, as its language defines it: `fn main`
 //!   at the root of a Rust binary target, `func main` in a Go `package
-//!   main`, `main` in C, C++ and Objective-C, and the top-level code of a
-//!   Python module that has an `if __name__ == "__main__":` block.
-//!   JavaScript and TypeScript define no starting function.
+//!   main` and a top-level `func init()` in any Go package (the runtime
+//!   runs it at start-up; code never calls it), `main` in C, C++ and
+//!   Objective-C, and the top-level code of a Python module that has an
+//!   `if __name__ == "__main__":` block. JavaScript and TypeScript define
+//!   no starting function.
 //! - `test`: test code, by test attribute or test file.
 //! - `attribute`: an entry attribute extraction recorded, such as
 //!   `#[no_mangle]` or `#[tauri::command]`.
@@ -590,6 +592,39 @@ mod tests {
         assert_eq!(
             paths(&trace(&reader, "util/util.go", "work", false)),
             ["no_caller_found: main > work"]
+        );
+    }
+
+    /// Go starts every top-level `func init()` at program start, in package
+    /// main and in a library package alike; a method named `init` is not
+    /// one.
+    #[test]
+    fn go_init_starts_the_program_in_any_package() {
+        let (_dir, reader) = graph(&[
+            ("go.mod", "module example.com/demo\n\ngo 1.21\n"),
+            (
+                "main.go",
+                "package main\n\nfunc setup() {}\n\nfunc init() {\n\tsetup()\n}\n\nfunc main() {}\n",
+            ),
+            (
+                "util/util.go",
+                "package util\n\nfunc prepare() {}\n\nfunc init() {\n\tprepare()\n}\n\nfunc tidy() {}\n\ntype worker struct{}\n\nfunc (w worker) init() {\n\ttidy()\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            paths(&trace(&reader, "main.go", "setup", false)),
+            ["main: init > setup"]
+        );
+        assert_eq!(
+            paths(&trace(&reader, "util/util.go", "prepare", false)),
+            ["main: init > prepare"]
+        );
+        let method = trace(&reader, "util/util.go", "tidy", false);
+        assert_eq!(method.paths.len(), 1, "{method:#?}");
+        assert_eq!(method.paths[0].root, RootKind::NoCallerFound, "{method:#?}");
+        assert!(
+            method.paths[0].hops[0].symbol.ends_with("init"),
+            "{method:#?}"
         );
     }
 

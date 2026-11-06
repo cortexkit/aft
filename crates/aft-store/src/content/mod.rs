@@ -76,7 +76,8 @@ pub struct Symbol {
     pub end_col: u32,
     pub signature: Option<String>,
     /// Whether the program starts at this symbol, as its language defines
-    /// it (`fn main`, `func main` in a Go `package main`, a C `main`).
+    /// it (`fn main`, `func main` in a Go `package main`, a Go
+    /// `func init()`, a C `main`).
     pub program_start: bool,
     /// The entry attribute or decorator extraction recorded on the symbol,
     /// such as `no_mangle` or `tauri::command`.
