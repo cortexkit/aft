@@ -1342,7 +1342,7 @@ Call graph and data-flow analysis across the workspace.
 |------|-------------|
 | `call_tree` | What does this function call? (forward, default depth 5) |
 | `callers` | Where is this function called from? (reverse, default depth 1) |
-| `trace_to` | How does execution reach this function from entry points? |
+| `trace_to` | How does execution reach this function? Each path of callers runs back to a root, labelled main, test, attribute, public API, or no caller found. |
 | `impact` | What callers are affected if this function changes? |
 | `trace_to_symbol` | Shortest call path from one symbol to another. Needs `toSymbol` (and `toPath` to disambiguate). |
 | `trace_data` | Follow a value through assignments and parameters. Needs `expression`. |

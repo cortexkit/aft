@@ -144,7 +144,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
-        "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",
+        "- `trace_to` — how execution reaches this code; each path runs back to a root labelled main, test, attribute, public API, or no caller found",
         "- `trace_to_symbol` — shortest call path from one symbol to another",
         "- `trace_data` — follow a value through assignments and parameters across files",
       ].join("\n"),
