@@ -166,6 +166,16 @@ impl Parses {
         }
     }
 
+    /// How many entries that can be decoded again are decoded now.
+    pub(crate) fn decoded_count(&self) -> usize {
+        self.map
+            .values()
+            .filter(|slot| {
+                (slot.encoded.is_some() || slot.stored.is_some()) && slot.value.get().is_some()
+            })
+            .count()
+    }
+
     /// Lets go of every decoded parse that can be decoded again, from its
     /// encoded record or the publication. An entry another copy of these
     /// parses shares stays decoded.
@@ -382,7 +392,29 @@ impl Resolutions {
     pub(crate) fn get_mut(&mut self, path: &str) -> Option<&mut FileResolution> {
         let slot = self.map.get_mut(path)?;
         slot.read(path);
+        // Changed here, the entry no longer matches what the publication
+        // stored, so it is never let go (see `release_unchanged`).
+        slot.stored = None;
         slot.value.get_mut()?.as_mut().map(Arc::make_mut)
+    }
+
+    /// How many entries still as the publication stored them are decoded.
+    pub(crate) fn decoded_unchanged_count(&self) -> usize {
+        self.map
+            .values()
+            .filter(|slot| slot.stored.is_some() && slot.value.get().is_some())
+            .count()
+    }
+
+    /// Lets go of every decoded resolution still as the publication stored
+    /// it; the next read decodes it again. A resolution changed since, or
+    /// built in memory, stays.
+    pub(crate) fn release_unchanged(&mut self) {
+        for slot in self.map.values_mut() {
+            if slot.stored.is_some() {
+                slot.value.take();
+            }
+        }
     }
 
     pub(crate) fn insert(&mut self, path: String, resolution: FileResolution) {
@@ -568,6 +600,12 @@ impl BindCache {
             .lock()
             .expect("no panics while holding it")
             .remove(path);
+    }
+
+    /// Sets the whole-checkout lists, built by a caller that read every
+    /// parse anyway, so resolution does not read them all again.
+    fn set_lists(&self, lists: FileLists) {
+        *self.lists.lock().expect("no panics while holding it") = Some(Arc::new(lists));
     }
 
     /// Updates the whole-checkout lists, once built, for `paths`, whose
@@ -761,11 +799,24 @@ pub(crate) fn resolve_checkout_into(
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
-        bound.bind_missing(inputs, &refs(&paths))?;
-        // The whole-checkout lists read every parse; build them while all
-        // are decoded.
-        bound.lists(inputs);
-        inputs.parses.release_decoded();
+        // The whole-checkout lists read every parse, so they are built here,
+        // a batch at a time while binding has each batch decoded.
+        let mut lists = FileLists::default();
+        for batch in paths.chunks(BATCH) {
+            bound.bind_missing(inputs, &refs(batch))?;
+            for path in batch {
+                let (rust, declaring) = FileLists::kinds(&inputs.parses[path].1);
+                if rust {
+                    lists.rust.push(path.clone());
+                }
+                if declaring {
+                    lists.module_declaring.push(path.clone());
+                }
+            }
+            inputs.parses.release_decoded();
+        }
+        bound.set_lists(lists);
+        relieve_allocator();
         let mut resolved = Vec::with_capacity(paths.len());
         for batch in paths.chunks(BATCH) {
             let parses = &inputs.parses;
@@ -792,6 +843,7 @@ pub(crate) fn resolve_checkout_into(
         // Pass 4 reads each file's own inputs, built above from its parse
         // and resolution, and never the bound surfaces.
         drop(bound);
+        relieve_allocator();
         let mut encoded = BTreeMap::new();
         let mut sites = Vec::with_capacity(resolved.len());
         for (path, (site, bytes)) in resolved {
@@ -827,8 +879,18 @@ pub(crate) fn resolve_checkout_into(
             }
             inputs.parses.release_decoded();
         }
+        drop(calls);
+        relieve_allocator();
         Ok(())
     })
+}
+
+/// Hands the allocator's free pages back to the system between a build's
+/// stages, so what a finished stage let go stops counting as the process's
+/// memory while the next stage runs.
+fn relieve_allocator() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = crate::memory::relieve_allocator_pressure();
 }
 
 /// A [`ResolutionLookup`] with nothing in it, for pass 4 when every file's

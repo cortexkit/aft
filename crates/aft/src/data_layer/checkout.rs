@@ -35,7 +35,6 @@ use super::graph_store::{write_sections, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
 use super::overlay::OverlaySlices;
 use super::query::{SliceReader, SliceSource};
-use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 /// The name status gives the data layer's family store when it refuses a
@@ -397,6 +396,10 @@ impl DeadCodeMemo {
 /// How long a build waits for another process to release the store's
 /// writer before it gives up and reports the store busy.
 const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many unchanged files' parses, and separately resolutions, the
+/// call-graph engine keeps decoded between updates (see `update_engine`).
+const ENGINE_DECODED_FILES: usize = 1024;
 
 /// One path changed since the publication.
 #[derive(Clone)]
@@ -1765,9 +1768,12 @@ impl Checkout {
                     engine.live.inputs.parses.get(file),
                 ) {
                     (Some(resolution), Some((key, parse))) => {
-                        engine
-                            .overlay
-                            .replace(FileSlice::build(file, key, parse, &resolution));
+                        engine.overlay.replace_lazy(
+                            file,
+                            key,
+                            Arc::clone(parse),
+                            Arc::clone(&resolution),
+                        );
                         engine.refreshed.removed.remove(file);
                         // Shared with the engine: a later update that changes
                         // this file copies it then, and only then.
@@ -1788,6 +1794,17 @@ impl Checkout {
                 engine.applied.insert(path.clone(), changes[path].sequence);
             }
             stats = Some(update);
+            // An update keeps every parse and resolution it decoded. A broad
+            // one reads thousands (every file declaring a method named `new`,
+            // say), so past a budget the unchanged ones go and a later update
+            // decodes again what it reads. The changed ones stay, since only
+            // the engine holds them until the next publication.
+            if engine.live.inputs.parses.decoded_count() > ENGINE_DECODED_FILES {
+                engine.live.inputs.parses.release_decoded();
+            }
+            if engine.live.resolved.decoded_unchanged_count() > ENGINE_DECODED_FILES {
+                engine.live.resolved.release_unchanged();
+            }
         }
         // A refresh that applied nothing keeps the served graph, and with it
         // any dead-code snapshot already built for it.
@@ -3711,7 +3728,9 @@ mod tests {
 
         let graph = Arc::clone(&view.published.graph);
         let slice = graph.slice("src/lib.rs").expect("a stored slice");
-        let (copy, allocated) = crate::test_allocations::count_bytes(|| FileSlice::clone(&slice));
+        let (copy, allocated) = crate::test_allocations::count_bytes(|| {
+            crate::data_layer::slice::FileSlice::clone(&slice)
+        });
         let walked = heap_bytes_of(&copy);
         assert!(
             walked <= allocated && 2 * walked > allocated,

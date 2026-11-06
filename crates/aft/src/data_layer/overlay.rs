@@ -38,6 +38,21 @@ impl<B: SliceSource> OverlaySlices<B> {
         self.replaced.insert(slice);
     }
 
+    /// Lays `path`'s new slice over the base, assembled from `parse` and
+    /// `resolution` when a query first reads it (see
+    /// [`MemorySlices::insert_lazy`]).
+    pub(crate) fn replace_lazy(
+        &mut self,
+        path: &str,
+        record_key: &str,
+        parse: Arc<crate::callgraph_store::join::ParseBlob>,
+        resolution: Arc<super::callgraph::FileResolution>,
+    ) {
+        self.removed.remove(path);
+        self.replaced
+            .insert_lazy(path, record_key, parse, resolution);
+    }
+
     /// Removes a file from the checkout.
     pub(crate) fn remove(&mut self, path: &str) {
         self.replaced.remove(path);

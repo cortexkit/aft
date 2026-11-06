@@ -64,74 +64,170 @@ impl<T: SliceSource + ?Sized> SliceSource for Arc<T> {
 /// Slices kept in memory, with their lookups.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MemorySlices {
-    slices: BTreeMap<String, Arc<FileSlice>>,
+    slices: BTreeMap<String, SliceEntry>,
     callers: HashMap<(String, String), BTreeSet<String>>,
     ref_names: HashMap<String, BTreeSet<String>>,
     symbol_names: HashMap<String, BTreeSet<String>>,
     languages: HashMap<String, BTreeSet<String>>,
 }
 
+/// One file's slice, or what assembles it on first read.
+#[derive(Clone, Debug)]
+enum SliceEntry {
+    Built(Arc<FileSlice>),
+    Lazy(Arc<LazySlice>),
+}
+
+/// A file's parse and resolution, which its slice is assembled from the
+/// first time a query reads it, and the lookup keys the slice files under.
+#[derive(Debug)]
+struct LazySlice {
+    record_key: String,
+    parse: Arc<crate::callgraph_store::join::ParseBlob>,
+    resolution: Arc<super::callgraph::FileResolution>,
+    keys: SliceKeys,
+    built: std::sync::OnceLock<Arc<FileSlice>>,
+}
+
+/// The lookup keys one slice is filed under.
+#[derive(Debug, Default)]
+struct SliceKeys {
+    callers: Vec<(String, String)>,
+    ref_names: Vec<String>,
+    symbol_names: BTreeSet<String>,
+    language: String,
+}
+
+impl SliceKeys {
+    fn of(slice: &FileSlice) -> Self {
+        Self {
+            callers: slice
+                .edges
+                .values()
+                .map(|edge| (edge.target_file.clone(), edge.target_symbol.clone()))
+                .collect(),
+            ref_names: slice
+                .refs
+                .values()
+                .filter_map(|reference| reference.short_name.clone())
+                .collect(),
+            symbol_names: symbol_keys(slice),
+            language: slice.language.clone(),
+        }
+    }
+}
+
+impl SliceEntry {
+    fn slice(&self, path: &str) -> Arc<FileSlice> {
+        match self {
+            Self::Built(slice) => Arc::clone(slice),
+            Self::Lazy(lazy) => Arc::clone(lazy.built.get_or_init(|| {
+                Arc::new(FileSlice::build(
+                    path,
+                    &lazy.record_key,
+                    &lazy.parse,
+                    &lazy.resolution,
+                ))
+            })),
+        }
+    }
+}
+
 impl MemorySlices {
     /// Adds or replaces the slice of its file.
     pub(crate) fn insert(&mut self, slice: FileSlice) {
-        self.remove(&slice.path.clone());
+        let keys = SliceKeys::of(&slice);
         let path = slice.path.clone();
-        for edge in slice.edges.values() {
+        self.file(&path, &keys);
+        self.slices.insert(path, SliceEntry::Built(Arc::new(slice)));
+    }
+
+    /// Adds or replaces `path`'s slice, assembled from `parse` and
+    /// `resolution` only when a query first reads it: an update can replace
+    /// thousands of files, and queries read few of them. The parse and
+    /// resolution are shared, not copied.
+    pub(crate) fn insert_lazy(
+        &mut self,
+        path: &str,
+        record_key: &str,
+        parse: Arc<crate::callgraph_store::join::ParseBlob>,
+        resolution: Arc<super::callgraph::FileResolution>,
+    ) {
+        // The lookup keys need the slice once; it goes again at once.
+        let keys = SliceKeys::of(&FileSlice::build(path, record_key, &parse, &resolution));
+        self.file(path, &keys);
+        self.slices.insert(
+            path.to_string(),
+            SliceEntry::Lazy(Arc::new(LazySlice {
+                record_key: record_key.to_string(),
+                parse,
+                resolution,
+                keys,
+                built: std::sync::OnceLock::new(),
+            })),
+        );
+    }
+
+    /// Files `path` under `keys`, removing it from the keys of the slice it
+    /// replaces first.
+    fn file(&mut self, path: &str, keys: &SliceKeys) {
+        self.remove(path);
+        for key in &keys.callers {
             self.callers
-                .entry((edge.target_file.clone(), edge.target_symbol.clone()))
+                .entry(key.clone())
                 .or_default()
-                .insert(path.clone());
+                .insert(path.to_string());
         }
-        for reference in slice.refs.values() {
-            if let Some(name) = &reference.short_name {
-                self.ref_names
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(path.clone());
-            }
+        for name in &keys.ref_names {
+            self.ref_names
+                .entry(name.clone())
+                .or_default()
+                .insert(path.to_string());
         }
-        for name in symbol_keys(&slice) {
+        for name in &keys.symbol_names {
             self.symbol_names
-                .entry(name)
+                .entry(name.clone())
                 .or_default()
-                .insert(path.clone());
+                .insert(path.to_string());
         }
         self.languages
-            .entry(slice.language.clone())
+            .entry(keys.language.clone())
             .or_default()
-            .insert(path.clone());
-        self.slices.insert(path, Arc::new(slice));
+            .insert(path.to_string());
     }
 
     /// Removes the slice of `path`.
     pub(crate) fn remove(&mut self, path: &str) {
-        let Some(slice) = self.slices.remove(path) else {
+        let Some(entry) = self.slices.remove(path) else {
             return;
         };
-        for edge in slice.edges.values() {
-            let key = (edge.target_file.clone(), edge.target_symbol.clone());
-            if let Some(files) = self.callers.get_mut(&key) {
+        let built;
+        let keys = match &entry {
+            SliceEntry::Built(slice) => {
+                built = SliceKeys::of(slice);
+                &built
+            }
+            SliceEntry::Lazy(lazy) => &lazy.keys,
+        };
+        for key in &keys.callers {
+            if let Some(files) = self.callers.get_mut(key) {
                 files.remove(path);
                 if files.is_empty() {
-                    self.callers.remove(&key);
+                    self.callers.remove(key);
                 }
             }
         }
-        for reference in slice.refs.values() {
-            if let Some(files) = reference
-                .short_name
-                .as_ref()
-                .and_then(|name| self.ref_names.get_mut(name))
-            {
+        for name in &keys.ref_names {
+            if let Some(files) = self.ref_names.get_mut(name) {
                 files.remove(path);
             }
         }
-        for name in symbol_keys(&slice) {
-            if let Some(files) = self.symbol_names.get_mut(&name) {
+        for name in &keys.symbol_names {
+            if let Some(files) = self.symbol_names.get_mut(name) {
                 files.remove(path);
             }
         }
-        if let Some(files) = self.languages.get_mut(&slice.language) {
+        if let Some(files) = self.languages.get_mut(&keys.language) {
             files.remove(path);
         }
     }
@@ -154,7 +250,7 @@ pub(crate) fn symbol_keys(slice: &FileSlice) -> BTreeSet<String> {
 
 impl SliceSource for MemorySlices {
     fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
-        self.slices.get(path).cloned()
+        self.slices.get(path).map(|entry| entry.slice(path))
     }
     fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
         self.callers
@@ -1036,4 +1132,27 @@ aft_store::heap_bytes_of_fields!(MemorySlices {
     ref_names,
     symbol_names,
     languages,
+});
+
+impl aft_store::heap::HeapBytes for SliceEntry {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Built(slice) => slice.heap_bytes(seen),
+            Self::Lazy(lazy) => lazy.heap_bytes(seen),
+        }
+    }
+}
+
+aft_store::heap_bytes_of_fields!(LazySlice {
+    record_key,
+    parse,
+    resolution,
+    keys,
+    built,
+});
+aft_store::heap_bytes_of_fields!(SliceKeys {
+    callers,
+    ref_names,
+    symbol_names,
+    language,
 });
