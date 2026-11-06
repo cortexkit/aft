@@ -602,6 +602,15 @@ impl LiveCheckout {
     /// # Errors
     ///
     /// When resolution fails on a file.
+    /// The files whose binding recorded `key`.
+    #[cfg(test)]
+    pub(crate) fn binding_readers_of(&self, key: &str) -> Vec<String> {
+        self.reverse
+            .binding_of(&BTreeSet::from([key.to_string()]))
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn update(
         &mut self,
         next: CheckoutInputs,

@@ -289,16 +289,22 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
     // is bound again; a single key for every config file added or removed
     // would bind `app` again as well.
     let base = [
+        ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n"),
         ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
         (
             "app/src/lib.rs",
-            "mod inner;\npub fn start() {\n    crate::inner::help();\n}\n",
+            "mod inner;\nuse crate::inner::help;\npub fn start() {\n    help();\n    crate::inner::help();\n}\n",
         ),
         ("app/src/inner.rs", "pub fn help() {}\n"),
         ("tools/src/lib.rs", "pub fn tool() {}\n"),
     ];
     let mut after = base.to_vec();
     after.push(("tools/Cargo.toml", "[package]\nname = \"tools\"\n"));
+    // Which files recorded the one key for config files added or removed:
+    // printed when the rebound count below fails, to name the reader.
+    let readers = LiveCheckout::cold(checkout(&base, &[]), 1)
+        .unwrap()
+        .binding_readers_of(crate::callgraph_store::join::VIEW_CONFIG_MEMBERSHIP_DOMAIN);
     let (stats, cold) = update_checked(
         checkout(&base, &[]),
         checkout(&after, &[]),
@@ -311,7 +317,10 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
             .is_some_and(|path| path == b"app/src/inner.rs")),
         "the fixture must resolve the crate path"
     );
-    assert!(stats.rebound <= 1, "{stats:?}");
+    assert!(
+        stats.rebound <= 1,
+        "config-membership readers {readers:?}; {stats:?}"
+    );
 }
 
 #[test]
