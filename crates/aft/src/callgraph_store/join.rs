@@ -2888,11 +2888,7 @@ pub(crate) fn resolve_file(
         .map(|s| s.ordinal)
         .collect::<BTreeSet<_>>();
     let caller_data = &extract.data;
-    let surface_index = ViewSurfaceIndex {
-        inner: index,
-        queries: Default::default(),
-        caller: Some((caller, caller_data)),
-    };
+    let surface_index = ViewSurfaceIndex::new(index, Some((caller, caller_data)));
     let mut resolutions = HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
     let mut caller_queries = BTreeMap::new();
     for (key, (kind, raw)) in caller_work {
@@ -2999,11 +2995,7 @@ pub(crate) fn dispatch_type_targets_for(
     facts.take();
     facts.take_config();
     facts.take_answers();
-    let recording = ViewSurfaceIndex {
-        inner: index,
-        queries: Default::default(),
-        caller: None,
-    };
+    let recording = ViewSurfaceIndex::new(index, None);
     let targets = resolve_dispatch_type_names(&recording, file, blob, &data);
     let probes = facts.take();
     facts.take_config();
@@ -3575,10 +3567,41 @@ impl ViewSurfaceQuery {
     }
 }
 
+/// A resolver index over one file's resolution that records each surface
+/// query it answers. Everything it records for the file ends up in one set
+/// (the binding's surface queries, and its facts), so an answer computed
+/// once for the file is kept and not computed, or recorded, again: a large
+/// file asks the same crate-root and module questions for every reference.
 struct ViewSurfaceIndex<'a, I> {
     inner: &'a I,
     queries: std::cell::RefCell<BTreeMap<ViewSurfaceQuery, String>>,
     caller: Option<(&'a str, &'a FileCallData)>,
+    crate_roots: std::cell::RefCell<HashMap<String, Option<String>>>,
+    caller_modules: std::cell::RefCell<HashMap<String, Vec<String>>>,
+    caller_aliases: std::cell::OnceCell<std::rc::Rc<[super::RustModuleAliases]>>,
+}
+
+impl<'a, I> ViewSurfaceIndex<'a, I> {
+    fn new(inner: &'a I, caller: Option<(&'a str, &'a FileCallData)>) -> Self {
+        Self {
+            inner,
+            queries: Default::default(),
+            caller,
+            crate_roots: Default::default(),
+            caller_modules: Default::default(),
+            caller_aliases: Default::default(),
+        }
+    }
+
+    /// Whether this index keeps answers. Tests that compare cached and
+    /// uncached module lookups turn it off.
+    fn keeps_answers() -> bool {
+        #[cfg(test)]
+        if super::rust_module_work::disabled() {
+            return false;
+        }
+        true
+    }
 }
 
 impl<I> ViewSurfaceIndex<'_, I> {
@@ -3680,9 +3703,43 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
         value
     }
     fn rust_crate_root_file(&self, file: &str) -> Option<String> {
+        if let Some(value) = self.crate_roots.borrow().get(file) {
+            return value.clone();
+        }
         let value = self.inner.rust_crate_root_file(file);
         self.record(ViewSurfaceQuery::CrateRoot(file.into()), &value);
+        if Self::keeps_answers() {
+            self.crate_roots
+                .borrow_mut()
+                .insert(file.to_string(), value.clone());
+        }
         value
+    }
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        if let Some(segments) = self.caller_modules.borrow().get(caller_file) {
+            return segments.clone();
+        }
+        // Computed through this index, so the queries it asks are recorded.
+        let segments = super::rust_caller_module_segments_uncached(self, caller_file);
+        if Self::keeps_answers() {
+            self.caller_modules
+                .borrow_mut()
+                .insert(caller_file.to_string(), segments.clone());
+        }
+        segments
+    }
+    fn rust_module_aliases(&self, data: &FileCallData) -> std::rc::Rc<[super::RustModuleAliases]> {
+        // Kept only for this index's own caller: it borrows that data for
+        // its whole life, so no other value can share its address.
+        match self.caller {
+            Some((_, caller)) if std::ptr::eq(caller, data) && Self::keeps_answers() => {
+                std::rc::Rc::clone(
+                    self.caller_aliases
+                        .get_or_init(|| super::rust_module_aliases_of(data)),
+                )
+            }
+            _ => super::rust_module_aliases_of(data),
+        }
     }
     fn inline_scoped_target(
         &self,

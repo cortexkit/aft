@@ -6065,6 +6065,12 @@ pub(crate) trait ResolverIndex {
     fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
         rust_caller_module_segments_uncached(self, caller_file)
     }
+    /// The module names each `use` in `data` binds, one entry per import in
+    /// order. Resolution asks for them once per qualified reference, so an
+    /// index that resolves one file's references can keep them.
+    fn rust_module_aliases(&self, data: &FileCallData) -> std::rc::Rc<[RustModuleAliases]> {
+        rust_module_aliases_of(data)
+    }
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
@@ -18648,7 +18654,7 @@ fn rust_target_for_qualified<I: ResolverIndex>(
     segments.pop();
     let requested_symbol = rust_target_symbol(full_ref, short_name);
 
-    for path in rust_module_path_candidates(&segments, caller_data, raw) {
+    for path in rust_module_path_candidates(index, &segments, caller_data, raw) {
         let path_refs = path.iter().map(String::as_str).collect::<Vec<_>>();
         if !matches!(path_refs.first().copied(), Some("crate" | "self" | "super")) {
             if let Some(target_file) = rust_workspace_file_for_segments(index, &path_refs) {
@@ -18711,19 +18717,22 @@ fn rust_resolve_reexport_if_symbol_missing<I: ResolverIndex>(
     }
 }
 
-fn rust_module_path_candidates(
+fn rust_module_path_candidates<I: ResolverIndex + ?Sized>(
+    index: &I,
     segments: &[&str],
     caller_data: &FileCallData,
     raw: &RawRef,
 ) -> Vec<Vec<String>> {
     let mut candidates = Vec::new();
     if let Some(first) = segments.first().copied() {
-        for import in &caller_data.import_block.imports {
+        let aliases = index.rust_module_aliases(caller_data);
+        for (import, aliases) in caller_data.import_block.imports.iter().zip(aliases.iter()) {
             if !rust_import_is_visible_to_call(import, raw) {
                 continue;
             }
-            for (local_name, mut path_segments) in rust_module_alias_segments(import) {
+            for (local_name, path_segments) in aliases {
                 if local_name == first {
+                    let mut path_segments = path_segments.clone();
                     path_segments
                         .extend(segments[1..].iter().map(|segment| (*segment).to_string()));
                     rust_push_unique_path_candidate(&mut candidates, path_segments);
@@ -18749,6 +18758,19 @@ fn rust_push_unique_path_candidate(candidates: &mut Vec<Vec<String>>, candidate:
 
 fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> bool {
     import.byte_range.start <= raw.byte_start
+}
+
+/// What [`rust_module_alias_segments`] returns for one import: each local
+/// module name it binds, with the path it names.
+pub(crate) type RustModuleAliases = Vec<(String, Vec<String>)>;
+
+/// [`rust_module_alias_segments`] for each import of `data`, in order.
+pub(crate) fn rust_module_aliases_of(data: &FileCallData) -> std::rc::Rc<[RustModuleAliases]> {
+    data.import_block
+        .imports
+        .iter()
+        .map(rust_module_alias_segments)
+        .collect()
 }
 
 /// Module names a `use` declaration binds: `use a::b;` / `use a::b as c;`
