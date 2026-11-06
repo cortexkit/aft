@@ -2775,10 +2775,10 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
+    // `views.enabled` is a removed key: the data layer replaces today's
+    // views, so a file that sets it gets the removed-key notice and the
+    // value reaches nothing.
     if let Some(views) = raw.views.as_ref() {
-        if let Some(value) = views.enabled {
-            config.views.enabled = value;
-        }
         config.views.callgraph_copies = resolve_clamped_views_setting(
             views.callgraph_copies.as_ref(),
             "views.callgraph_copies",
@@ -5363,21 +5363,23 @@ mod tests {
     }
 
     /// `views.callgraph_copies` and `views.enabled` are removed keys: a file
-    /// that sets them gets a notice, but until the views code is deleted
-    /// their values still reach `ViewsConfig`, merged per key.
+    /// that sets them gets a notice. `views.enabled` reaches nothing, since
+    /// the data layer replaces today's views; until the views code is
+    /// deleted, the copy setting still reaches `ViewsConfig`, merged per key.
     #[test]
     fn removed_views_settings_still_apply_and_merge_per_key_until_cutover() {
         let default = resolve_config(&[tier("user", r#"{}"#)]);
         assert_eq!(default.config.views.callgraph_copies, 4);
         assert!(!default.config.views.enabled);
 
-        // A project that only turns views on keeps the user's copy setting.
+        // A project that turns views on changes nothing, and keeps the
+        // user's copy setting.
         let merged = resolve_config(&[
             tier("user", r#"{"views":{"callgraph_copies":0}}"#),
             tier("project", r#"{"views":{"enabled":true}}"#),
         ]);
         assert!(merged.errors.is_empty(), "{:?}", merged.errors);
-        assert!(merged.config.views.enabled);
+        assert!(!merged.config.views.enabled);
         assert_eq!(merged.config.views.callgraph_copies, 0);
         assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
 

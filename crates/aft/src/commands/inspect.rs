@@ -905,16 +905,12 @@ fn handle_inspect_payload(
         None
     };
     let manager = ctx.inspect_manager();
-    // With the data layer on (`AFT_DATA_LAYER=1`) and views on, dead code
-    // reads its call graph from the root's checkout while that graph is
-    // ready, and from today's view otherwise (see `data_layer::tools::inspect`).
-    // The data layer follows the views store; with views off, dead code keeps
-    // today's legacy store and the checkout is not bound for it.
-    if snapshot.config.views.enabled
-        && snapshot
-            .config
-            .inspect
-            .category_enabled(InspectCategory::DeadCode)
+    // Dead code reads its call graph from the root's checkout (see
+    // `data_layer::tools::inspect`).
+    if snapshot
+        .config
+        .inspect
+        .category_enabled(InspectCategory::DeadCode)
     {
         if let Some(checkout) = ctx
             .data_checkout()

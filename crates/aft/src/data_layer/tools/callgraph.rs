@@ -29,7 +29,8 @@ pub(crate) type OpsGraph = EitherGraph<CallGraphStore, DataGraph>;
 
 /// What the data layer offers a call-graph command.
 pub(crate) enum Access {
-    /// The data layer is off for this root: answer from today's store.
+    /// No checkout answers for this root: the call graph is switched off,
+    /// or the root has none of its own.
     Off,
     /// Edits are still being resolved after the wait.
     Building,
@@ -44,8 +45,6 @@ pub(crate) enum Access {
 /// The data layer's call graph for `ctx`'s root, once no recorded edit
 /// waits for it, or [`Access::Building`] after [`READ_WAIT`].
 pub(crate) fn access(ctx: &AppContext) -> Access {
-    // With the call graph switched off, today's store answers, and it
-    // refuses as switched off.
     let Some(checkout) = ctx
         .data_checkout()
         .filter(|checkout| checkout.checkout().planes().callgraph)
@@ -93,9 +92,8 @@ fn relative(root: &Path, file: &Path) -> Option<String> {
     Some(relative.to_str()?.replace('\\', "/"))
 }
 
-/// The reader a call-graph command answers from: the data layer's when it is
-/// on for `ctx`'s root, otherwise a pinned snapshot of today's store. Each
-/// of `files` must be in the call graph. The view, when the data layer
+/// The reader a call-graph command answers from: the root's checkout in the
+/// data layer. Each of `files` must be in the call graph. The view, when the data layer
 /// answers, must stay alive until the answer is built; pass it to
 /// [`failed_reads`] afterwards.
 ///
@@ -140,23 +138,16 @@ pub(crate) fn ops_graph(
             }
             Ok((EitherGraph::Data(reader), Some(view)))
         }
+        // No checkout answers: the call graph is switched off, or the root
+        // has no checkout of its own (it could not be bound, or is a parent
+        // folder). No other store answers instead.
         Access::Off => {
-            let store = match ctx.callgraph_store_for_ops() {
-                CallgraphStoreAccess::Ready(store) => store,
-                CallgraphStoreAccess::Error(error) => {
-                    return Err(store_error_response(req_id, operation, error))
-                }
-                other => return Err(index_refusal_response(req_id, operation, ctx, &other)),
+            let access = if ctx.config().indexes.callgraph {
+                CallgraphStoreAccess::Unavailable
+            } else {
+                CallgraphStoreAccess::Off
             };
-            for file in files {
-                ensure_target_indexed(req_id, operation, ctx, &store, file)?;
-            }
-            // A pinned snapshot keeps the generation's files until the
-            // answer is built.
-            let snapshot = store
-                .read_snapshot()
-                .map_err(|error| store_error_response(req_id, operation, error))?;
-            Ok((EitherGraph::Store(snapshot), None))
+            Err(index_refusal_response(req_id, operation, ctx, &access))
         }
     }
 }
