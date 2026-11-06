@@ -513,31 +513,40 @@ pub(crate) fn work_for_root(root: &Path) -> Vec<(u64, &'static str, u64, Option<
 /// its cap, so a parallel test with many older jobs cannot hide a fixture's row.
 #[cfg(test)]
 pub(crate) fn snapshot_for_root(root: &Path, warming_roots: u64) -> Snapshot {
-    let root = root.to_string_lossy();
+    snapshot_for_roots(&[root], warming_roots)
+}
+
+/// Every running and queued job of the given roots, uncapped, and none of the
+/// jobs other tests in the process registered for their own roots.
+#[cfg(test)]
+pub(crate) fn snapshot_for_roots(roots: &[&Path], warming_roots: u64) -> Snapshot {
+    let roots = roots
+        .iter()
+        .map(|root| root.to_string_lossy())
+        .collect::<Vec<_>>();
+    let owned = |root: &str| roots.iter().any(|owned| owned == root);
     let now = Instant::now();
     let state = lock(&REGISTRY.0);
     Snapshot {
         running: state
             .running
             .values()
-            .find_map(|entry| {
+            .filter_map(|entry| {
                 let entry = lock(entry);
-                (entry.root == root && !entry.shadowed).then(|| entry.render(now))
+                (owned(&entry.root) && !entry.shadowed).then(|| entry.render(now))
             })
-            .into_iter()
             .collect(),
         queued: state
             .queued
             .values()
-            .find_map(|entry| {
+            .filter_map(|entry| {
                 let entry = lock(entry);
-                (entry.root == root).then(|| Queued {
+                owned(&entry.root).then(|| Queued {
                     root: entry.root.clone(),
                     kind: entry.kind.clone(),
                     waited_seconds: now.saturating_duration_since(entry.started).as_secs_f64(),
                 })
             })
-            .into_iter()
             .collect(),
         warming_roots,
         omitted: Omitted {

@@ -4155,6 +4155,33 @@ fn build_health_report_with_snapshots(
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
     sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
 ) -> HealthReport {
+    let mut report = assemble_health_report(
+        cache,
+        executor,
+        pending_binds,
+        dispatch_path_metrics,
+        shared_app,
+        indexing_snapshot,
+        sweep_snapshot,
+    );
+    if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+        budget_health_metrics(metrics);
+    }
+    report
+}
+
+/// The health reply before its metrics are fitted to the byte budget. The
+/// status and detail never read the metrics, so budgeting afterwards gives
+/// the same reply as budgeting first.
+fn assemble_health_report(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
+    indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
+) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
     let (rollup, snapshot_age_ms) = cache.snapshot();
@@ -4319,7 +4346,6 @@ fn build_health_report_with_snapshots(
         .map(|key| json!(key))
         .collect::<Vec<_>>();
     metrics.insert("headline".to_string(), json!(headline));
-    budget_health_metrics(&mut metrics);
 
     let gap_health = dispatch_path_metrics.watch_delivery.health();
     let watch_gap_unresolved = gap_health["status"] != "ok";
@@ -4720,13 +4746,15 @@ mod tests {
         cache.publish(Some(rollup));
         let executor = Executor::new();
         let app = App::default_shared();
-        let report = super::build_health_report_with_snapshots(
+        let report = fixture_health_report(
             &cache,
             &executor,
             &HashMap::new(),
             &DispatchPathMetrics::new(),
             &app,
-            crate::cold_build_limiter::progress::snapshot,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(&[], warming_roots)
+            },
             sweeps,
         );
         let metrics = report.metrics.unwrap();
@@ -5572,8 +5600,14 @@ mod tests {
     }
     use serde_json::json;
 
-    // Health fixtures own their roots, not sweep observations made by other
-    // tests in the process. Production still supplies the live store snapshot.
+    // Health fixtures own their roots, not the work other tests in this
+    // process do for theirs. The reply lists rows from process-wide registries
+    // (indexing jobs, cold-build slots, view publications, write-ledger
+    // writers, stopped fleet routes) next to the root detail, and a fixture's
+    // reply sits close to its byte budget: other tests' rows can push the
+    // fixture's root detail out of it. Fixture replies keep only the rows of
+    // the executor's own roots, and no store sweep observations. Production
+    // supplies the live registries and the live sweep snapshot.
     fn build_health_report(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -5581,16 +5615,24 @@ mod tests {
         metrics: &DispatchPathMetrics,
         app: &App,
     ) -> HealthReport {
+        let roots = fixture_roots(executor);
+        let roots = roots
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<_>>();
         build_health_report_with_indexing(
             cache,
             executor,
             pending_binds,
             metrics,
             app,
-            crate::cold_build_limiter::progress::snapshot,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(&roots, warming_roots)
+            },
         )
     }
 
+    /// A fixture reply whose indexing jobs the caller chooses.
     fn build_health_report_with_indexing(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -5599,7 +5641,7 @@ mod tests {
         app: &App,
         indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
     ) -> HealthReport {
-        super::build_health_report_with_snapshots(
+        fixture_health_report(
             cache,
             executor,
             pending_binds,
@@ -5608,6 +5650,73 @@ mod tests {
             indexing_snapshot,
             crate::gc::family::SweepStatsSnapshot::default(),
         )
+    }
+
+    /// A fixture reply whose indexing jobs and store sweeps the caller chooses.
+    fn fixture_health_report(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+        indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+        sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
+    ) -> HealthReport {
+        let roots = fixture_roots(executor);
+        let mut report = super::assemble_health_report(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            indexing_snapshot,
+            sweep_snapshot,
+        );
+        // Drop other tests' rows before the budget decides what fits.
+        if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+            retain_fixture_process_rows(metrics, &roots);
+            budget_health_metrics(metrics);
+        }
+        report
+    }
+
+    /// The roots registered with a fixture's executor. A read that finds the
+    /// scheduler busy owns none, so it keeps no process-wide rows.
+    fn fixture_roots(executor: &Executor) -> Vec<std::path::PathBuf> {
+        executor
+            .try_actor_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(root, _)| root.as_path().to_path_buf())
+            .collect()
+    }
+
+    /// Keeps the rows of the process-wide work lists that name a fixture root
+    /// or a path under one, and drops the rows other tests added.
+    fn retain_fixture_process_rows(
+        metrics: &mut serde_json::Map<String, Value>,
+        roots: &[std::path::PathBuf],
+    ) {
+        let owned = |row: &Value, field: &str| {
+            row[field]
+                .as_str()
+                .is_some_and(|path| roots.iter().any(|root| Path::new(path).starts_with(root)))
+        };
+        for (section, list, field) in [
+            ("cold_build_limiter", Some("holders"), "root"),
+            ("cold_build_limiter", Some("queued"), "root"),
+            ("dispatch_path", Some("off_lane_jobs"), "root"),
+            ("write_ledger_top_10m", None, "root_id"),
+            ("stopped_routes", None, "project_root"),
+        ] {
+            let rows = metrics.get_mut(section).and_then(|value| match list {
+                Some(list) => value.get_mut(list),
+                None => Some(value),
+            });
+            if let Some(Value::Array(rows)) = rows {
+                rows.retain(|row| owned(row, field));
+            }
+        }
     }
 
     fn test_health_report(
@@ -5761,6 +5870,67 @@ mod tests {
         }
         eprintln!("SAMPLE detail: {}", report.detail.unwrap());
         eprintln!("SAMPLE indexing: {}", indexing);
+    }
+
+    #[test]
+    fn fixture_reply_lists_only_the_process_wide_work_of_its_own_roots() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("fixture-owned-process-rows");
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        // Another test's job, registered in the same process-wide registry.
+        let foreign = tempfile::tempdir().unwrap();
+        let _foreign = crate::cold_build_limiter::progress::start(
+            foreign.path(),
+            "foreign build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let _own = crate::cold_build_limiter::progress::start(
+            root.as_path(),
+            "own build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
+        let metrics = report.metrics.expect("health metrics");
+        let running = metrics["indexing"]["running"]
+            .as_array()
+            .expect("indexing rows")
+            .iter()
+            .map(|row| row["kind"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(running, vec![json!("own build")], "{metrics:#}");
+
+        // The registries without a root-scoped snapshot are scoped by their
+        // rows' root, keeping paths under a fixture root too.
+        let own = root.as_path().display().to_string();
+        let nested = root.as_path().join("checkpoints").display().to_string();
+        let other = foreign.path().display().to_string();
+        let mut synthetic = json!({
+            "cold_build_limiter": {
+                "holders": [{ "root": own }, { "root": other }],
+                "queued": [{ "root": other }],
+            },
+            "dispatch_path": { "off_lane_jobs": [{ "root": other }, { "root": own }] },
+            "write_ledger_top_10m": [{ "root_id": nested }, { "root_id": other }],
+            "stopped_routes": [{ "project_root": other }],
+        })
+        .as_object()
+        .expect("synthetic metrics")
+        .clone();
+        retain_fixture_process_rows(&mut synthetic, &[root.as_path().to_path_buf()]);
+        assert_eq!(
+            Value::Object(synthetic),
+            json!({
+                "cold_build_limiter": { "holders": [{ "root": own }], "queued": [] },
+                "dispatch_path": { "off_lane_jobs": [{ "root": own }] },
+                "write_ledger_top_10m": [{ "root_id": nested }],
+                "stopped_routes": [],
+            })
+        );
     }
 
     #[test]
