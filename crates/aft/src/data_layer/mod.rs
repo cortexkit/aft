@@ -17,6 +17,7 @@ pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
 pub(crate) mod meaning;
+pub mod old_index;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::checkout::{Checkout, CheckoutView, DataError};
+use super::old_index::OldIndex;
 use super::vectors::{Coverage, FillBudget, FillProgress, MeaningSnapshot, Producer, VectorPlane};
 use crate::config::SemanticBackendConfig;
 use crate::semantic_index::SemanticEmbeddingModel;
@@ -148,6 +149,8 @@ pub(crate) struct Meaning {
     /// When the fill under way started and when a fill last stored what
     /// it filled, for health (see [`FillTimes`]).
     times: Mutex<FillTimes>,
+    /// What the fill under way, or the last one, did over its rounds.
+    totals: Mutex<FillTotals>,
     /// Set for a checkout a parent folder's session holds for one of its
     /// child repositories ([`Self::read_only`]): its plane only reads the
     /// vectors the repository's store already holds, and no fill runs for
@@ -174,6 +177,18 @@ pub(crate) struct FillTimes {
     /// When a round last stored vectors and chunk maps
     /// ([`FillProgress::stored_at_ms`]), in this fill or an earlier one.
     pub(crate) stored_at_ms: Option<u64>,
+}
+
+/// What one fill did over all its rounds, for the line the log gets when
+/// it finishes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FillTotals {
+    /// Files whose chunk maps it stored.
+    pub(crate) files: usize,
+    /// Chunks whose vectors it took from the old meaning index.
+    pub(crate) chunks_imported: usize,
+    /// Chunks it sent to the embedding model.
+    pub(crate) chunks_embedded: usize,
 }
 
 impl Meaning {
@@ -206,6 +221,7 @@ impl Meaning {
         *lock(&self.failure) = None;
         *lock(&self.progress) = None;
         *lock(&self.times) = FillTimes::default();
+        *lock(&self.totals) = FillTotals::default();
         *lock(&self.refreshed_at) = None;
         true
     }
@@ -317,12 +333,18 @@ impl Meaning {
         *lock(&self.times)
     }
 
+    /// What the fill under way, or the last one, did over its rounds.
+    pub(crate) fn totals(&self) -> FillTotals {
+        *lock(&self.totals)
+    }
+
     /// Records that a round starts: the fill's start, unless a fill is
     /// already under way.
     pub(crate) fn note_round_started(&self) {
         let mut times = lock(&self.times);
         if times.started_at_ms.is_none() {
             times.started_at_ms = Some(super::vectors::unix_ms());
+            *lock(&self.totals) = FillTotals::default();
         }
     }
 
@@ -474,6 +496,12 @@ impl Meaning {
         let filled = plane.fill_rounds(&mut |texts| model.embed(texts), budget, 1, &mut |step| {
             self.note_progress(step);
         });
+        if let Ok(report) = &filled {
+            let mut totals = lock(&self.totals);
+            totals.files += report.files_filled;
+            totals.chunks_imported += report.chunks_imported;
+            totals.chunks_embedded += report.chunks_embedded;
+        }
         match filled {
             Err(DataError::Cancelled) => Round::Idle,
             Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
@@ -501,11 +529,16 @@ impl Meaning {
             return Ok(Arc::clone(&configured.plane));
         }
         let fingerprint = fingerprint()?;
-        let plane = Arc::new(VectorPlane::new(
-            Arc::clone(checkout),
-            Producer::from_fingerprint(&fingerprint),
-            config.max_files,
-        ));
+        // A read-only plane never fills, so it never opens the old index.
+        let old = OldIndex::of_checkout(&self.storage, checkout.root(), fingerprint.clone());
+        let plane = Arc::new(
+            VectorPlane::new(
+                Arc::clone(checkout),
+                Producer::from_fingerprint(&fingerprint),
+                config.max_files,
+            )
+            .reusing_old_index(old),
+        );
         *slot = Some(Configured {
             config: config.clone(),
             plane: Arc::clone(&plane),

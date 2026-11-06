@@ -42,6 +42,7 @@ use aft_store::vector::{
 };
 
 use super::checkout::{Checkout, CheckoutView, DataError};
+use super::old_index::OldIndex;
 use crate::semantic_index::{
     chunk_view_file, execute_build_embedding_batch, is_semantic_indexed_extension,
     BuildEmbeddingRow, EmbedTextCaps, SemanticIndexFingerprint, SemanticResult,
@@ -152,7 +153,7 @@ fn kind_code(kind: &SymbolKind) -> u8 {
 }
 
 /// The kind stored as `code`.
-fn kind_of(code: u8) -> Option<SymbolKind> {
+pub(super) fn kind_of(code: u8) -> Option<SymbolKind> {
     Some(match code {
         0 => SymbolKind::Function,
         1 => SymbolKind::Kernel,
@@ -878,6 +879,9 @@ pub struct FillProgress {
     pub files_total: usize,
     /// Texts embedded so far.
     pub chunks_embedded: usize,
+    /// Vectors taken from the old meaning index so far (see
+    /// [`super::old_index`]).
+    pub chunks_imported: usize,
     /// The round is waiting for another fill of the same repository, in
     /// this process or another, to publish what it is embedding.
     pub waiting: bool,
@@ -918,9 +922,11 @@ pub struct FillReport {
     /// Files not finished when the fill stopped early.
     pub files_left: usize,
     /// Chunks of the files this fill cut, how many of their texts already
-    /// had vectors, how many it embedded, and how many the embedder refused.
+    /// had vectors, how many it took from the old meaning index, how many
+    /// it embedded, and how many the embedder refused.
     pub chunks: usize,
     pub chunks_reused: usize,
+    pub chunks_imported: usize,
     pub chunks_embedded: usize,
     pub chunks_refused: usize,
     pub embed_calls: usize,
@@ -928,6 +934,8 @@ pub struct FillReport {
     pub segment_bytes: u64,
     pub read_ms: f64,
     pub chunk_ms: f64,
+    /// Time spent reading the old meaning index and matching its rows.
+    pub import_ms: f64,
     pub embed_ms: f64,
     pub publish_ms: f64,
     /// Files another fill of the repository published while this one
@@ -946,6 +954,8 @@ pub struct VectorPlane {
     max_files: usize,
     loaded: Mutex<Arc<Loaded>>,
     members: Mutex<Option<Arc<Members>>>,
+    /// The old meaning index whose vectors fills take where they match.
+    old: Option<OldIndex>,
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -963,7 +973,52 @@ impl VectorPlane {
             max_files,
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
+            old: None,
         }
+    }
+
+    /// Makes this plane's fills take a chunk's vector from `old`, the old
+    /// meaning index, where it holds one for exactly that chunk (see
+    /// [`super::old_index`]), instead of embedding it. An index made for
+    /// another model than the plane's is not used.
+    #[must_use]
+    pub fn reusing_old_index(mut self, old: OldIndex) -> Self {
+        if Producer::from_fingerprint(old.configured()).model == self.producer.model {
+            self.old = Some(old);
+        } else {
+            crate::slog_warn!(
+                "data layer meaning fill: the old meaning index was offered for another model than {}",
+                self.producer.model.name
+            );
+        }
+        self
+    }
+
+    /// The old meaning index's vectors for `chunks` of the file at `path`
+    /// with content `bytes`, one slot per chunk; empty without an old
+    /// index.
+    fn old_vectors(&self, path: &[u8], bytes: &[u8], chunks: &[CutChunk]) -> Vec<Option<Vec<f32>>> {
+        self.old
+            .as_ref()
+            .and_then(OldIndex::snapshot)
+            .map_or_else(Vec::new, |snapshot| snapshot.vectors(path, bytes, chunks))
+    }
+
+    /// The vector the family's newest generation holds for `text` under
+    /// this plane's model, if any: for gates that compare stores.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read.
+    pub fn stored_vector(&self, text: &str) -> Result<Option<Vec<f32>>, DataError> {
+        let loaded = self.load()?;
+        let Some(index) = loaded.shared.as_ref().map(SharedVectorIndex::index) else {
+            return Ok(None);
+        };
+        let Some(unit) = index.locate(TextDigest::of(text.as_bytes())) else {
+            return Ok(None);
+        };
+        index.vector(unit).map(Some).map_err(store_error)
     }
 
     /// The family's newest generation, read again only when a newer one
@@ -1186,9 +1241,12 @@ impl VectorPlane {
             }
             rounds_run += 1;
 
-            // Cut the round's files, and collect the texts no segment holds.
+            // Cut the round's files, and collect the texts no segment holds:
+            // those the old meaning index has vectors for, and the rest,
+            // which are embedded.
             let mut round = Vec::new();
             let mut wanted: Vec<(TextDigest, String)> = Vec::new();
+            let mut imported: HashMap<TextDigest, Vec<f32>> = HashMap::new();
             {
                 let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
                 let stored = |digest: &TextDigest| {
@@ -1198,7 +1256,7 @@ impl VectorPlane {
                 };
                 let mut seen = HashSet::new();
                 while round.len() < budget.files_per_round.max(1)
-                    && wanted.len().saturating_mul(per_vector) < ROUND_BYTES
+                    && (wanted.len() + imported.len()).saturating_mul(per_vector) < ROUND_BYTES
                 {
                     let Some((path, content)) = queue.next() else {
                         break;
@@ -1220,19 +1278,41 @@ impl VectorPlane {
                     report.chunk_ms += elapsed_ms(started);
                     let chunks = match cut {
                         Cut::Failed(reason) => Err(reason),
-                        Cut::Chunks(chunks) => Ok(chunks
-                            .into_iter()
-                            .map(|chunk| {
-                                let digest = TextDigest::of(chunk.text.as_bytes());
-                                report.chunks += 1;
-                                if stored(&digest) {
-                                    report.chunks_reused += 1;
-                                } else if seen.insert(digest) {
-                                    wanted.push((digest, chunk.text.clone()));
-                                }
-                                (digest, chunk)
-                            })
-                            .collect()),
+                        Cut::Chunks(chunks) => {
+                            let digests: Vec<TextDigest> = chunks
+                                .iter()
+                                .map(|chunk| TextDigest::of(chunk.text.as_bytes()))
+                                .collect();
+                            let mut old = Vec::new();
+                            if digests.iter().any(|digest| !stored(digest)) {
+                                let started = Instant::now();
+                                old = self.old_vectors(&path, &bytes, &chunks);
+                                report.import_ms += elapsed_ms(started);
+                            }
+                            Ok(chunks
+                                .into_iter()
+                                .zip(digests)
+                                .enumerate()
+                                .map(|(at, (chunk, digest))| {
+                                    report.chunks += 1;
+                                    if stored(&digest) {
+                                        report.chunks_reused += 1;
+                                    } else if seen.insert(digest) {
+                                        match old
+                                            .get_mut(at)
+                                            .and_then(Option::take)
+                                            .filter(|vector| vector.len() == dimensions)
+                                        {
+                                            Some(vector) => {
+                                                imported.insert(digest, vector);
+                                            }
+                                            None => wanted.push((digest, chunk.text.clone())),
+                                        }
+                                    }
+                                    (digest, chunk)
+                                })
+                                .collect())
+                        }
                     };
                     round.push(RoundFile {
                         path,
@@ -1245,7 +1325,7 @@ impl VectorPlane {
             // Wait for any other fill of the repository to publish, then
             // leave out what it published: its texts' vectors, and the files
             // whose chunk maps it finished.
-            let _lock = if wanted.is_empty() {
+            let _lock = if wanted.is_empty() && imported.is_empty() {
                 None
             } else {
                 let started = Instant::now();
@@ -1253,6 +1333,7 @@ impl VectorPlane {
                     files_done,
                     files_total: report.files_queued,
                     chunks_embedded: report.chunks_embedded,
+                    chunks_imported: report.chunks_imported,
                     waiting: true,
                     stored_at_ms: None,
                 };
@@ -1272,10 +1353,12 @@ impl VectorPlane {
                     .as_ref()
                     .is_some_and(|index| index.locate(*digest).is_some())
             };
-            let asked = wanted.len();
+            let asked = wanted.len() + imported.len();
             wanted.retain(|(digest, _)| !stored(digest));
-            report.chunks_reused += asked - wanted.len();
-            if asked > wanted.len() {
+            imported.retain(|digest, _| !stored(digest));
+            let left = wanted.len() + imported.len();
+            report.chunks_reused += asked - left;
+            if asked > left {
                 if let Some(index) = &index {
                     let mut kept = Vec::with_capacity(round.len());
                     for file in round {
@@ -1297,8 +1380,9 @@ impl VectorPlane {
                 }
             }
 
-            // Embed them, each distinct text once.
-            let mut vectors: HashMap<TextDigest, Vec<f32>> = HashMap::new();
+            // Embed the rest, each distinct text once.
+            report.chunks_imported += imported.len();
+            let mut vectors: HashMap<TextDigest, Vec<f32>> = imported;
             let mut refused: HashMap<TextDigest, String> = HashMap::new();
             let started = Instant::now();
             for batch in wanted.chunks(budget.max_batch.max(1)) {
@@ -1409,6 +1493,7 @@ impl VectorPlane {
                 files_done,
                 files_total: report.files_queued,
                 chunks_embedded: report.chunks_embedded,
+                chunks_imported: report.chunks_imported,
                 waiting: false,
                 stored_at_ms,
             });
@@ -1556,7 +1641,9 @@ impl VectorPlane {
     /// holder and the segments it opened) and the members it built for the
     /// view searched last. The vectors themselves are read through the
     /// shared block cache, which the process counts once. The checkout the
-    /// plane belongs to is counted with the checkout, not here.
+    /// plane belongs to is counted with the checkout, not here. The old
+    /// meaning index, once a fill opened it, adds its index of files and
+    /// rows.
     pub(crate) fn memory(&self, seen: &mut aft_store::heap::Seen) -> usize {
         use aft_store::heap::HeapBytes as _;
         let Self {
@@ -1565,8 +1652,9 @@ impl VectorPlane {
             max_files: _,
             loaded,
             members,
+            old,
         } = self;
-        model.heap_bytes(seen) + loaded.heap_bytes(seen) + members.heap_bytes(seen)
+        model.heap_bytes(seen) + loaded.heap_bytes(seen) + members.heap_bytes(seen) + old.heap_bytes(seen)
     }
 }
 

@@ -633,12 +633,13 @@ impl Work {
                         .fill_retry
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = BuildRetry::default();
-                    let progress = work.meaning.progress().unwrap_or_default();
+                    let totals = work.meaning.totals();
                     crate::slog_info!(
-                        "data layer meaning fill finished for {}: {} files, {} chunks embedded",
+                        "data layer meaning fill finished for {}: {} files, {} chunks taken from the old meaning index, {} chunks embedded",
                         work.checkout.root().display(),
-                        progress.files_done,
-                        progress.chunks_embedded
+                        totals.files,
+                        totals.chunks_imported,
+                        totals.chunks_embedded
                     );
                 }
                 Round::Idle => {}
