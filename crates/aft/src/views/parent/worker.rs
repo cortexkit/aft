@@ -7,7 +7,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use super::{read, write, Child, Discovery, ParentSemantic, ParentSession, Plane, DEFAULT_MAX_CHILD_REPOS};
+use super::{
+    read, write, Child, Discovery, ParentSemantic, ParentSession, Plane, DEFAULT_MAX_CHILD_REPOS,
+};
 
 /// Longest the worker sleeps between two checks of its stop flag and
 /// holders when no watcher event wakes it.

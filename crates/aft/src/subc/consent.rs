@@ -2156,8 +2156,7 @@ fn probe_directory_scope_with(
     {
         return Err("directory does not exist");
     }
-    let (volume, _) =
-        crate::volume::volume_anchor(parent).ok_or("volume identity unknown")?;
+    let (volume, _) = crate::volume::volume_anchor(parent).ok_or("volume identity unknown")?;
     let volume = crate::access_policy::policy_path(&volume);
     let root = parent.ancestors().last().unwrap_or(parent);
     if !directory_scope_is_narrow(parent, &home, &volume) {

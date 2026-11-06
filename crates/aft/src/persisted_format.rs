@@ -1029,7 +1029,6 @@ pub fn gate(
     }
 }
 
-
 /// Highest format version of every store this build reads, as printed by
 /// `aft --formats`. Placement compares this map with the storage root's
 /// reader floor without starting the candidate against any data.

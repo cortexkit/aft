@@ -247,7 +247,6 @@ struct BorrowedIndexLoadBudget<'a> {
 }
 
 impl<'a> BorrowedIndexLoadBudget<'a> {
-
     fn preflight(&self, records: usize) -> bool {
         if records > self.max_records {
             self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
@@ -2124,7 +2123,6 @@ impl SearchIndex {
         );
         Some(index)
     }
-
 
     fn ingest_paths_parallel_cancellable(
         &mut self,
@@ -6458,7 +6456,6 @@ mod project_walk_lists_tests {
             }
         }
     }
-
 }
 
 #[cfg(all(test, unix))]
@@ -6489,7 +6486,6 @@ mod membership_admission_tests {
             .sum();
         (paths, stats)
     }
-
 }
 
 fn walk_project_files_from_inner_matching<F>(
@@ -12197,7 +12193,6 @@ mod tests {
         (result, work)
     }
 
-
     #[cfg(unix)]
     fn cached_path_before_reload_memo(root: &Path, relative_path: &Path) -> Option<PathBuf> {
         // Resolve each parent afresh, as before reload-wide memo sharing, so this
@@ -16151,7 +16146,6 @@ mod project_ignore_rule_tests {
         fixture::relative_set(root, &index.glob("**/*", root))
     }
 
-
     /// The project walker as it was built before every walker shared
     /// `apply_project_ignore_rules`, reproduced independently with the
     /// crate's default `require_git`, so the comparison below is not two
@@ -16191,5 +16185,4 @@ mod project_ignore_rule_tests {
             .collect::<Vec<_>>();
         fixture::relative_set(root, &files)
     }
-
 }

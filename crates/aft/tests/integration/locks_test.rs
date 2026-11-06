@@ -204,9 +204,6 @@ fn search_lock_blocks_cross_host() {
     assert!(lock_path.exists());
 }
 
-
-
-
 #[test]
 fn semantic_lock_acquires_when_uncontended() {
     let storage = tempfile::tempdir().expect("create temp dir");

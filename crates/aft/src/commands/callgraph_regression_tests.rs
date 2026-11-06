@@ -28,7 +28,6 @@ fn impact(store: &CallGraphStore, file: &str, symbol: &str, tests: bool) -> Stri
     crate::subc_format::format_callgraph("impact", &serde_json::to_value(result).unwrap(), false)
 }
 
-
 #[test]
 fn callgraph_empty_receiver_note_exact_counts_and_test_filtering() {
     let (_temp, store) = fixture(&[("lib.rs", "fn target() {}\n")]);

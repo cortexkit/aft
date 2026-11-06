@@ -18190,8 +18190,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn post_bind_configure_and_completion_jobs_are_queued_in_order() {
         let (_dir, root) = test_root("maintenance-post-bind");
@@ -21824,7 +21822,6 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker == "rerun_as_exclusive_writer")
     }
-
 
     #[test]
     fn equivalent_new_session_without_a_watcher_does_not_require_exclusive_use() {

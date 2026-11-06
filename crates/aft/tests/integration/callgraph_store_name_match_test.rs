@@ -849,7 +849,6 @@ fn canonical_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-
 #[test]
 fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
     let dir = tempdir().unwrap();
@@ -885,14 +884,12 @@ fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
     }
 }
 
-
 fn build_store(root: &Path, name: &str, files: &[PathBuf]) -> CallGraphStore {
     let store =
         CallGraphStore::open(root.join(format!(".{name}-store")), root.to_path_buf()).unwrap();
     store.cold_build(files).unwrap();
     store
 }
-
 
 fn json<T: serde::Serialize>(value: Result<T, aft::callgraph_store::CallGraphStoreError>) -> Value {
     serde_json::to_value(value.unwrap()).unwrap()

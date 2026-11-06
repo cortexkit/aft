@@ -2034,7 +2034,6 @@ pub(crate) struct ViewBindingDependencies {
 }
 
 impl ViewBindingDependencies {
-
     /// This binding without its bound file surface, which is not stored:
     /// binding computes it again from the file's own parse.
     pub(crate) fn without_surface(&self) -> Self {
@@ -2233,7 +2232,6 @@ impl ViewFileSurface {
                 .collect(),
         }
     }
-
 }
 
 /// Configuration files read by the manifest resolver's workspace/package and

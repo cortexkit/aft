@@ -1400,7 +1400,6 @@ fn cached_symbols_estimated_bytes(path: &Path, cached: &CachedSymbols) -> u64 {
         )
 }
 
-
 #[cfg(test)]
 thread_local! {
     /// Parks a disk-cache decode before its next entry, so a test can act on
@@ -1580,10 +1579,6 @@ impl SymbolCache {
             .is_some_and(|cached| cached.mtime == mtime)
     }
 
-
-
-
-
     /// Invalidate cached symbols for a specific file.
     pub fn invalidate(&mut self, path: &Path) {
         if let Some((stored_path, previous)) = self.entries.remove_entry(path) {
@@ -1706,7 +1701,6 @@ impl SymbolCache {
             .count("entries", self.entries.len())
             .count("symbols", symbol_count)
     }
-
 }
 
 pub(crate) fn cached_symbol_count_shared(
@@ -10293,7 +10287,6 @@ pub(crate) mod outer {
         );
     }
 
-
     #[test]
     fn symbol_memory_running_totals_include_outline_facts() {
         let root = tempfile::tempdir().unwrap();
@@ -10445,11 +10438,6 @@ pub(crate) mod outer {
         assert_eq!(get("$brand-color").kind, SymbolKind::Variable);
         assert_eq!(get(".card, .panel").kind, SymbolKind::Class);
     }
-
-
-
-
-
 
     // --- Language detection ---
 
@@ -13018,5 +13006,4 @@ mod audit11_regressions {
             "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
         );
     }
-
 }

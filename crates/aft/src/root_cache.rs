@@ -61,9 +61,10 @@ pub(crate) use location::{
     acquire_speech_serving_lease, release_quiescent_speech_serving_lease, SpeechServingLease,
 };
 pub(crate) use location::{
-    cache_status_code, check_cache_access, durable_route,
-    ensure_config_storage_lease, identity_storage_root, pin_cache_path, prepare_process_cache_root, prepare_third_party_cache_dir, refuse_durable_cache_write,
-    refuse_new_durable_cache_entry, unavailable_code, unavailable_warning,
+    cache_status_code, check_cache_access, durable_route, ensure_config_storage_lease,
+    identity_storage_root, pin_cache_path, prepare_process_cache_root,
+    prepare_third_party_cache_dir, refuse_durable_cache_write, refuse_new_durable_cache_entry,
+    unavailable_code, unavailable_warning,
 };
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1094,9 +1095,7 @@ pub(crate) struct ReadMarkerSweepContext {
     started: HashMap<u32, Option<u64>>,
 }
 
-impl ReadMarkerSweepContext {
-
-}
+impl ReadMarkerSweepContext {}
 
 // Test hook counting hostname resolutions on this thread. Reset before a
 // marker pass and read after it to prove the pass resolved the hostname

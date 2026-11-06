@@ -38,7 +38,6 @@ fn legacy_bytes(blob: &CallgraphBlob) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
-
 fn query_answers(root: &Path, database: &Path) -> String {
     let connection = super::super::open_readonly_connection(database).unwrap();
     let symbols = {
@@ -239,4 +238,3 @@ fn dead_code_answers(root: &Path, files: &[PathBuf], snapshot: CallgraphSnapshot
         contributions.join("\n")
     )
 }
-

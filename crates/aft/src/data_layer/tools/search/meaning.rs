@@ -914,5 +914,4 @@ pub(crate) mod tests {
         let value = work();
         (value, started.elapsed())
     }
-
 }

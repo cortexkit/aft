@@ -330,7 +330,6 @@ struct SqliteAliases {
 }
 
 impl SqliteAliases {
-
     fn assert_refused(&self, path: &Path, call: impl FnOnce() -> Response) {
         let before = crate::file_identity::metadata(path).unwrap();
         let response = call();

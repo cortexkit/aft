@@ -1219,7 +1219,6 @@ async fn drive_egress_measurement_daemon(input: FakeDaemonInput, config: EgressM
     drop(stream);
 }
 
-
 async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let delay_ms = std::env::var("AFT_STORM_EMBED_DELAY_MS")
         .ok()

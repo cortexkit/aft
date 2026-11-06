@@ -1759,7 +1759,6 @@ mod tests {
         RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| assert_eq!(count.get(), 1));
     }
 
-
     fn parse_source(lang: LangId, source: &str) -> tree_sitter::Tree {
         let grammar = grammar_for(lang);
         let mut parser = tree_sitter::Parser::new();

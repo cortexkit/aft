@@ -1158,7 +1158,6 @@ impl Drop for SubmissionExecutor {
 }
 
 impl RootMaintenanceExecutor {
-
     /// Submits `job` as this root's maintenance on `lane`. The executor
     /// refuses it, and drops it unrun, while the root is unbound, and a
     /// root unbinding cancels it at its checkpoints through `cancellation`.

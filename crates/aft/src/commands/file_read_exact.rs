@@ -589,7 +589,6 @@ mod tests {
         }
     }
 
-
     #[cfg(unix)]
     fn still_alive(connection: &crate::db::file_identity::IdentityConnection) {
         assert_eq!(

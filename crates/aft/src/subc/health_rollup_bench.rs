@@ -28,4 +28,3 @@ fn seed_inspect_findings(ctx: &AppContext, root: &Path, count: usize, tick: usiz
 }
 use crate::test_allocations::profile::{cpu_ns, STEPS};
 use std::collections::BTreeMap;
-

@@ -43,4 +43,3 @@ fn build_symbol_cache(project: &tempfile::TempDir, source: &std::path::Path) -> 
     cache.set_project_root(project.path().to_path_buf());
     cache
 }
-

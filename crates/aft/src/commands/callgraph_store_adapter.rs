@@ -3283,7 +3283,6 @@ fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
         .collect()
 }
 
-
 fn file_matches_store(
     store: &impl CallGraphRead,
     file: &str,

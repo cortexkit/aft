@@ -104,7 +104,9 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             *ctx.callgraph_store_rx().lock() = Some(rx);
             callgraph_tx = Some(tx);
             // The index store binds and starts its first build, which waits.
-            build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(&project_root));
+            build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(
+                &project_root,
+            ));
             crate::data_layer::surfaces::bind_for_test(&ctx);
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),

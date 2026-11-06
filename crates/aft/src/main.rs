@@ -3781,10 +3781,7 @@ mod signal_handler_tests {
 
 #[cfg(test)]
 mod graceful_shutdown_search_index_tests {
-    use super::{
-        flush_indexes_on_graceful_shutdown, global_gitignore_env_test_lock, App, AppContext,
-        Config, RuntimeRegistry,
-    };
+    use super::{global_gitignore_env_test_lock, App, AppContext, Config, RuntimeRegistry};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -3852,9 +3849,9 @@ mod watcher_filter_tests {
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::finalize_response;
     use aft::runtime_drain::{
-        drain_watcher_events_bounded,
-        record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
-        semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
+        drain_watcher_events_bounded, record_semantic_refresh_transient_failure,
+        schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
+        semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
         BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_PATH_DRAIN_BATCH_CAP,
     };
@@ -4697,7 +4694,6 @@ mod watcher_filter_tests {
         };
         drop(tx);
 
-
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(matches!(
             &*ctx.semantic_index_status()
@@ -4726,7 +4722,6 @@ mod watcher_filter_tests {
             })
             .unwrap();
         drop(event_tx);
-
 
         assert!(ctx.semantic_refresh_event_rx().lock().is_none());
         assert_eq!(
@@ -4833,7 +4828,6 @@ mod watcher_filter_tests {
             "nothing changed on disk, so the reconcile refreshes nothing"
         );
     }
-
 
     #[test]
     fn watcher_error_clears_receiver_and_marks_degraded() {
@@ -4996,7 +4990,6 @@ mod watcher_filter_tests {
                 })
                 .unwrap();
 
-
             match request_rx
                 .recv_timeout(RECV_DISPATCH_TIMEOUT)
                 .expect("retry request")
@@ -5100,7 +5093,6 @@ mod watcher_filter_tests {
                     error: transient_embedding_error(),
                 })
                 .unwrap();
-
 
             assert!(semantic_refresh_circuit_is_open(&ctx));
             assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
@@ -5272,7 +5264,6 @@ mod watcher_filter_tests {
                 ),
             })
             .unwrap();
-
 
         let pending = ctx.take_pending_semantic_index_paths();
         assert_eq!(pending, vec![file]);

@@ -285,8 +285,6 @@ fn scoped_inspect_cold_checkout_phase_timings() {
     }
 }
 
-
-
 fn inspect_tool_call(ctx: &AppContext, payload: Value) -> Value {
     serde_json::to_value(handle_inspect_tool_call(&request(payload), ctx))
         .expect("inspect tool_call response serializes")
@@ -382,7 +380,6 @@ fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
     assert_eq!(value["success"], true, "tier2_run failed: {value:#}");
     value
 }
-
 
 fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
     let manager = ctx.inspect_manager();
@@ -2517,7 +2514,6 @@ fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
         .collect()
 }
 
-
 fn not_applicable_producers(response: &Value) -> Vec<String> {
     response["summary"]["diagnostics"]["not_applicable"]
         .as_array()
@@ -2777,7 +2773,6 @@ fn inspect_outside(ctx: &AppContext, payload: Value) -> Value {
 fn inspect_tool_call_outside(ctx: &AppContext, payload: Value) -> Value {
     inspect_as_opencode(ctx, payload, inspect_tool_call)
 }
-
 
 #[cfg(unix)]
 #[test]
@@ -3685,7 +3680,6 @@ fn scoped_python_progress_excluded_file_without_new_run_settles() {
     std::fs::write(dir.path().join("excluded.py"), "value: int = 'wrong'\n").unwrap();
     assert_short_run_complete(&ctx, "excluded.py");
 }
-
 
 #[test]
 fn scoped_python_progress_unchanged_reopen_without_new_run_settles() {

@@ -710,7 +710,6 @@ mod write_amplification_tests {
             .expect("WAL setup waits for the writer instead of failing locked");
     }
 
-
     #[test]
     fn callgraph_reader_setup_does_not_read_locked_schema() {
         let temp = tempdir().unwrap();
@@ -1213,9 +1212,7 @@ pub(crate) struct CallgraphBackgroundTestHooks {
     extract_observer: Option<Arc<ColdBuildExtractObserver>>,
 }
 
-impl CallgraphBackgroundTestHooks {
-
-}
+impl CallgraphBackgroundTestHooks {}
 
 pub(crate) struct CallgraphBackgroundTestHooksGuard(CallgraphBackgroundTestHooks);
 
@@ -3906,8 +3903,6 @@ const HEALTH_STALE_PATH_MAX_AGE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod health_stale_census_tests {
     use super::*;
-
-
 }
 
 /// Bound the work spent counting unresolved possible callers.
@@ -6341,7 +6336,6 @@ impl CallGraphStore {
         }
     }
 
-
     /// Open the currently-published ready store with write access so moved-root
     /// metadata can be repaired before projection readers consume it. Unlike
     /// [`open`], this preserves the read path's cold/mid-build behavior: if no
@@ -6507,8 +6501,6 @@ impl CallGraphStore {
         )?;
         Ok((store, stats))
     }
-
-
 
     /// Build a fresh DB and publish it as a new generation, then atomically flip
     /// the `<key>.current` pointer to it. NEVER replaces an open DB file, so it
@@ -9219,10 +9211,6 @@ impl ReadonlyCallGraphStore {
         (result, observed)
     }
 
-
-
-
-
     pub fn reader_kind(&self) -> &'static str {
         if self.inner.manifest_view {
             "view"
@@ -11333,10 +11321,6 @@ fn verify_writer_lease(lease: &crate::root_cache::WriterLease) -> Result<()> {
     }
 }
 
-
-
-
-
 fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
     let domain_dir = callgraph_dir.parent()?;
     if domain_dir.file_name().and_then(|name| name.to_str()) != Some("callgraph") {
@@ -11344,8 +11328,6 @@ fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
     }
     domain_dir.parent().map(Path::to_path_buf)
 }
-
-
 
 fn migration_manifest_path(callgraph_dir: &Path, generation: &str) -> PathBuf {
     callgraph_dir.join(format!("{generation}.migration.json"))
@@ -11381,10 +11363,6 @@ fn migration_manifest_valid(callgraph_dir: &Path, generation: &str) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|hash| hash.len() == 64)
 }
-
-
-
-
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     open_readonly_connection_before(path, Instant::now())
@@ -11542,7 +11520,6 @@ fn checkpoint_wal_truncate(conn: &TrackedConnection) -> bool {
         }
     }
 }
-
 
 pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -13123,9 +13100,6 @@ enum CallgraphRootCandidate {
     SkippedUnreadable,
     BudgetExceeded,
 }
-
-
-
 
 #[cfg(test)]
 fn callgraph_root_file_stats(
@@ -24272,7 +24246,6 @@ mod corpus_memo_lifecycle_tests {
             crate::config::Config::default(),
         )
     }
-
 }
 
 #[derive(Default)]
@@ -25248,8 +25221,6 @@ mod refresh_worker_tests {
         );
     }
 
-
-
     /// Stopping a readiness watch must never stall another thread's file
     /// I/O. The watch sits on the callgraph directory, which store writers
     /// change all the time, and it stops whenever the waiting batch settles.
@@ -25269,7 +25240,6 @@ mod refresh_worker_tests {
             drop(watcher);
         });
     }
-
 
     fn wait_for_refresh_calls(root: &Path, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(12);
@@ -29037,7 +29007,6 @@ mod rust_use_parser_tests {
     }
 }
 
-
 #[cfg(test)]
 mod rust_resolution_tests {
     use super::*;
@@ -29446,8 +29415,6 @@ edition = "2021"
         (store, snapshot)
     }
 
-
-
     #[test]
     fn callgraph_python_receiver_header_dispatch_keeps_defining_caller() {
         let blob = join::CallgraphBlob::extract(
@@ -29469,7 +29436,6 @@ edition = "2021"
             [(Some("outer"), 5), (Some("inner"), 6), (Some("outer"), 6)]
         );
     }
-
 
     #[test]
     fn callgraph_go_main_boot_register_and_function_values() {
@@ -29971,7 +29937,6 @@ impl Other { pub fn qualified(self) -> Self { self } }
             .unwrap();
         assert_eq!(wrong, 0);
     }
-
 
     #[test]
     fn rust_study_unit_struct_receiver_is_not_a_wildcard_imported_function() {

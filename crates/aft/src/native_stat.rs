@@ -110,7 +110,6 @@ impl NativeStat {
             && self.modified_ns >= 0
             && (self.modified_ns as u128) < observed_ns
     }
-
 }
 
 #[cfg(unix)]

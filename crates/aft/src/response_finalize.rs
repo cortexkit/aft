@@ -1314,7 +1314,6 @@ mod tests {
     }
 }
 
-
 pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or cached results may omit unapplied file changes. Retry after maintenance catches up; a missing result is not evidence of absence.";
 
 /// Capture before execution: finishing maintenance cannot make an already
@@ -1547,7 +1546,6 @@ pub(crate) fn append_watcher_query_notice(text: &mut String, response: &Response
         append_trailing_line(text, WATCHER_PENDING_NOTICE);
     }
 }
-
 
 #[cfg(test)]
 mod callgraph_pending_tests {

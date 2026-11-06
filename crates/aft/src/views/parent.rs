@@ -35,9 +35,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-
-
-
 /// Most child repositories one parent folder serves. The operator's own
 /// projects folder holds 39 repositories, so the cap leaves room above that.
 /// Children past the cap are reported as a named gap, never silently dropped.
@@ -74,7 +71,6 @@ const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
 /// Each check reads a few small files per child; file contents are followed
 /// through watcher events instead.
 const DEFAULT_POINTER_INTERVAL: Duration = Duration::from_secs(10);
-
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -451,10 +447,7 @@ pub fn activate(
     if let Some(existing) = registry.sessions.get(&root) {
         // A rebind with the same planes and storage joins the warm session
         // instead of loading every child again.
-        if !existing.stopped()
-            && existing.planes == planes
-            && existing.storage == storage
-        {
+        if !existing.stopped() && existing.planes == planes && existing.storage == storage {
             existing.hold(Holder::of(ctx));
             return true;
         }
@@ -774,7 +767,6 @@ impl Child {
     pub fn engine_ready(&self) -> bool {
         lock(&self.engine).is_some()
     }
-
 }
 
 /// The semantic model this session embeds queries with.

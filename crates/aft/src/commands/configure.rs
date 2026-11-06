@@ -28,8 +28,7 @@ use crate::lsp::registry::{
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, resolve_cache_dir_with_key,
-    CacheLock, SearchIndex,
+    build_path_filters, current_git_head, resolve_cache_dir_with_key, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
@@ -315,14 +314,6 @@ type ReadOnlyQueryWarmupHook =
 static READ_ONLY_QUERY_WARMUP_HOOKS: Mutex<Option<HashMap<PathBuf, ReadOnlyQueryWarmupHook>>> =
     Mutex::new(None);
 
-
-
-
-
-
-
-
-
 // Test seam between the worker's start gate and its lifecycle recheck. A
 // non-zero "delay" HOLDS the worker here until the test releases it (bounded so
 // a test that forgets cannot hang the suite) rather than sleeping a fixed time:
@@ -330,7 +321,6 @@ static READ_ONLY_QUERY_WARMUP_HOOKS: Mutex<Option<HashMap<PathBuf, ReadOnlyQuery
 // Windows runner a 500 ms sleep elapsed before the test thread got scheduled,
 // so the worker rechecked a still-bound lifecycle and the test read one load
 // attempt where it expected none (train 126).
-
 
 #[cfg(test)]
 fn reset_configure_deferred_delay_reached_for_test() {
@@ -406,7 +396,6 @@ static INDEX_ORDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone)]
 struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
-
 
 #[cfg(test)]
 static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -864,13 +853,10 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
     }
 }
 
-
-
 #[cfg(test)]
 static SEMANTIC_BLOB_OPEN_OBSERVERS: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<(PathBuf, bool)>>>,
 > = std::sync::OnceLock::new();
-
 
 /// Tracks one worker's private index without retaining the index in the census.
 /// Each worker owns its contribution: a retiring generation cannot erase a
@@ -882,16 +868,13 @@ struct SemanticWorkerMemory {
     bytes: u64,
 }
 
-impl SemanticWorkerMemory {
-
-}
+impl SemanticWorkerMemory {}
 
 impl Drop for SemanticWorkerMemory {
     fn drop(&mut self) {
         self.total.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
-
 
 #[cfg(any(test, feature = "test-timing-hooks"))]
 fn semantic_quiet_gate_path() -> Option<PathBuf> {
@@ -915,11 +898,7 @@ struct SemanticRefreshDebounce {
     batch_deadline: Instant,
 }
 
-impl SemanticRefreshDebounce {
-
-}
-
-
+impl SemanticRefreshDebounce {}
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -2094,7 +2073,6 @@ struct SymbolViewPrewarm {
 #[cfg(test)]
 mod nested_worktree_semantic_tests {
     use super::*;
-
 }
 
 #[cfg(not(debug_assertions))]
@@ -2283,8 +2261,6 @@ fn configure_cancelled(req_id: &str) -> Option<Response> {
         )
     })
 }
-
-
 
 fn configure_maintenance_backpressure(req_id: &str) -> Response {
     Response::error_with_data(
@@ -3452,10 +3428,8 @@ fn handle_configure_inner(
                 false
             }
         };
-    let callgraph_writer_capability = root_cache_storage_ok
-        && !is_worktree_bridge
-        && !root_too_broad
-        && !identity_provisional;
+    let callgraph_writer_capability =
+        root_cache_storage_ok && !is_worktree_bridge && !root_too_broad && !identity_provisional;
     // A parent folder, like HOME, runs no project-wide work over the folder
     // itself; its children are served from their own sessions' results.
     let inspect_writer_capability =
@@ -3794,7 +3768,6 @@ fn handle_configure_inner(
             ctx.clear_pending_index_updates();
         }
 
-
         // Reconfigure can point AFT at a different root; reset that root's
         // entries before warming the callgraph store for it.
         if let Some(root) = ctx.config().project_root.as_deref() {
@@ -3913,8 +3886,6 @@ struct ArtifactLoadNeeds {
     semantic: bool,
 }
 
-
-
 fn release_callgraph_start_waiters_for_generation_change(
     previous_root: Option<&Path>,
     configured_root: &Path,
@@ -3937,16 +3908,6 @@ fn release_callgraph_start_waiters_for_generation_change(
     }
 }
 
-
-
-
-
-
-
-
-
-
-
 // Fleet restarts can reopen dozens of owner caches at once. Four warm loads
 // bound disk parsing and verification without sharing slots with cold builds.
 
@@ -3954,10 +3915,6 @@ fn release_callgraph_start_waiters_for_generation_change(
 thread_local! {
     static WARM_SEARCH_RELOAD_LIMITER_FOR_TEST: std::cell::RefCell<Option<Arc<crate::cold_build_limiter::ColdBuildLimiter>>> = const { std::cell::RefCell::new(None) };
 }
-
-
-
-
 
 /// Open the root's database under the newest open epoch (the configure that
 /// committed last). Used by the per-call retry after a busy open; the deferred
@@ -4614,7 +4571,6 @@ fn drop_superseded_parked_continuations(ctx: &AppContext, state: &mut ConfigureM
     });
 }
 
-
 fn run_configure_maintenance_unit(
     ctx: &AppContext,
     continuation: &mut ConfigureMaintenanceContinuation,
@@ -5072,8 +5028,6 @@ thread_local! {
     static VIEW_WORKING_TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-
-
 struct ConfigureViewInput {
     family: String,
     git_common_dir: Option<PathBuf>,
@@ -5086,12 +5040,8 @@ struct ConfigureViewInput {
     limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
 }
 
-
-
 #[cfg(test)]
 mod tests {
-
-
 
     #[test]
     fn watcher_spawn_failure_leaves_runtime_uninstalled() {
@@ -5153,9 +5103,10 @@ mod tests {
         only_lsp_process_state_changed, parse_lsp_paths_extra, project_root_is_too_broad,
         release_callgraph_start_waiters_for_generation_change,
         release_configure_artifact_post_gate_for_test,
-        reset_configure_deferred_delay_reached_for_test, set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
-        slow_configure_prefix_line, validate_storage_dir, ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK,
-        INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
+        reset_configure_deferred_delay_reached_for_test,
+        set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
+        slow_configure_prefix_line, validate_storage_dir, ConfigureMaintenanceStage,
+        INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
@@ -5733,7 +5684,6 @@ mod tests {
         );
     }
 
-
     fn assert_admitted_replay_finishes_after_unbind(stage: ConfigureMaintenanceStage) {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, ctx, mut state, _task_ids) = bash_background_replay_fixture(40, Some(8));
@@ -5835,7 +5785,6 @@ mod tests {
         std::fs::write(&path, content).expect("write source");
         path
     }
-
 
     fn symbol_file(path: &std::path::Path) -> crate::search_index::FileEntry {
         let modified = std::fs::metadata(path)
@@ -6456,8 +6405,6 @@ mod tests {
         ctx
     }
 
-
-
     /// Write `lib.rs` in `root` and commit it.
     fn lazy_commit(root: &Path, contents: &str, message: &str) {
         fs::write(root.join("lib.rs"), contents).unwrap();
@@ -6482,15 +6429,11 @@ mod tests {
             .success());
     }
 
-
     fn lazy_view_dir(storage: &Path, root: &Path) -> PathBuf {
         storage
             .join("views")
             .join(crate::path_identity::project_scope_key(root))
     }
-
-
-
 
     /// Edit `lib.rs` in the worktree and deliver the change through the
     /// watcher drain, without publishing it yet.
@@ -6506,8 +6449,6 @@ mod tests {
         let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
         assert_eq!(outcome.processed, 1);
     }
-
-
 
     #[test]
     fn build_key_memo_does_not_bypass_first_configure_identity_bind() {
@@ -6538,10 +6479,6 @@ mod tests {
             Some(crate::root_identity::Identity::Git { .. })
         ));
     }
-
-
-
-
 
     #[test]
     fn configure_without_storage_dir_defaults_to_shared_storage_root() {
@@ -7225,7 +7162,6 @@ mod tests {
         }))
     }
 
-
     fn configure_callgraph_views(root: &Path, storage: &Path, views: bool) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root, "harness": "opencode", "storage_dir": storage,
@@ -7265,12 +7201,6 @@ mod tests {
             })
             .collect()
     }
-
-
-
-
-
-
 
     /// What a root's storage holds outside the v3 namespace: content-addressed
     /// v1 views and v1/v2 blob stores, plus the legacy symbol cache file.
@@ -7390,11 +7320,6 @@ mod tests {
         }))
     }
 
-
-
-
-
-
     fn semantic_cache_file(
         storage: &std::path::Path,
         root: &std::path::Path,
@@ -7406,11 +7331,6 @@ mod tests {
             .join("semantic.bin")
     }
 
-
-
-
-
-
     fn count_non_probe_inputs(requests: &[Vec<String>]) -> usize {
         requests
             .iter()
@@ -7418,8 +7338,6 @@ mod tests {
             .filter(|text| text.as_str() != "semantic index fingerprint probe")
             .count()
     }
-
-
 
     struct CountingEmbeddingServer {
         base_url: String,
@@ -7677,7 +7595,6 @@ mod tests {
             .expect("write embedding response");
     }
 
-
     /// Every non-probe embedding input the server has received so far.
     fn non_probe_inputs(server: &CountingEmbeddingServer) -> Vec<String> {
         server
@@ -7690,9 +7607,6 @@ mod tests {
             .cloned()
             .collect()
     }
-
-
-
 
     fn semantic_search_request(query: &str) -> RawRequest {
         serde_json::from_value(json!({
@@ -8450,7 +8364,6 @@ mod tests {
         lock
     }
 
-
     fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
@@ -8830,7 +8743,6 @@ mod tests {
         assert!(!ctx.config().indexes.trigram);
     }
 
-
     #[test]
     fn detect_worktree_bridge_returns_common_dir_for_main_and_linked_worktree() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -8932,11 +8844,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     /// A semantic configure as a route under `harness` and `session` would send
     /// it, with optional user-tier `index.roots`.
     fn configure_semantic_bind(
@@ -8985,7 +8892,6 @@ mod tests {
         project
     }
 
-
     fn total_embedding_requests(server: &CountingEmbeddingServer) -> usize {
         server
             .requests
@@ -8993,15 +8899,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
-
-
-
-
-
-
-
-
-
 
     /// Starts a semantic cold build over nine small files at one chunk per
     /// embed batch and returns once the first batch is parked in the embedding
@@ -9043,10 +8940,6 @@ mod tests {
         );
         (ctx, server, temp, project, storage)
     }
-
-
-
-
 
     fn git_commit_all(root: &Path, message: &str) {
         assert!(git_command(root)
@@ -9139,8 +9032,6 @@ mod tests {
     /// File that exists only at the live checkout's HEAD.
     const PHANTOM_REL_PATH: &str = "extra/phantom.ts";
 
-
-
     fn git_ok(root: &Path, args: &[&str]) {
         let status = git_command(root).args(args).status().unwrap();
         assert!(
@@ -9176,7 +9067,6 @@ mod tests {
             }))]
         }))
     }
-
 
     #[test]
     fn configure_defers_large_tree_file_walk_until_after_ack() {
@@ -9241,7 +9131,6 @@ mod tests {
         assert_eq!(frame.frame_type, "configure_warnings");
     }
 
-
     struct IndexOrderTestGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
     }
@@ -9301,8 +9190,6 @@ mod tests {
         (root, storage)
     }
 
-
-
     struct BusyObsoleteNonGitUpgrade {
         ctx: TestContext,
         _root: tempfile::TempDir,
@@ -9311,8 +9198,6 @@ mod tests {
         request: RawRequest,
         slots: Vec<crate::cold_build_limiter::ColdBuildPermit>,
     }
-
-
 
     #[test]
     fn non_equivalent_reconfigure_retires_superseded_callgraph_receiver() {
@@ -9365,7 +9250,6 @@ mod tests {
             "receiver retirement must also invalidate stale disk publication"
         );
     }
-
 
     #[test]
     fn workspace_manifest_fingerprint_is_lazy_and_reused_per_configure() {
@@ -9475,7 +9359,6 @@ mod tests {
         }))
     }
 
-
     #[test]
     fn equivalent_reconfigure_replays_new_sessions_but_not_same_session_rebinds() {
         let _env_guard = home_env_mutex();
@@ -9526,7 +9409,6 @@ mod tests {
             "a fresh-session bind must not inspect backup directories"
         );
     }
-
 
     #[test]
     fn configure_missing_tools_warns_for_explicit_oxfmt_formatter() {
@@ -9677,7 +9559,6 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-
     fn assert_broad_configure_root(root: &std::path::Path) {
         let ctx = test_context();
         let req = configure_request_with_params(json!({
@@ -9814,9 +9695,7 @@ mod tests {
             !project_root_is_too_broad(project.path(), false, None),
             "an unknown account home must not broaden protection beyond the volume root"
         );
-        let volume = crate::volume::volume_anchor(project.path())
-            .unwrap()
-            .0;
+        let volume = crate::volume::volume_anchor(project.path()).unwrap().0;
         assert!(project_root_is_too_broad(&volume, false, None));
     }
 
@@ -10784,7 +10663,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn lsp_paths_only_reconfigure_makes_new_binary_lazy_start_discoverable() {
         let _env_guard = home_env_mutex();
@@ -11224,7 +11102,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn new_session_attach_skips_root_probes_and_keeps_watcher_thread() {
         let _watcher_guard = watcher_test_mutex()
@@ -11368,7 +11245,6 @@ mod tests {
         assert_eq!(ctx.watcher_registry_count(), 1);
         ctx.stop_watcher_runtime();
     }
-
 
     /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.
     /// The legacy samples explicitly replay the manifest scans removed from the
@@ -11563,11 +11439,9 @@ mod inspect_orphan_sweep_tests {
         fs::write(&meta, serde_json::to_vec(&meta_json).unwrap()).unwrap();
         (content, meta)
     }
-
 }
 
 #[cfg(test)]
 mod startup_view_sweep_tests {
     use super::*;
-
 }

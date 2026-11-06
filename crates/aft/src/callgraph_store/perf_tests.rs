@@ -1836,5 +1836,3 @@ pub(crate) fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
         })
         .collect()
 }
-
-

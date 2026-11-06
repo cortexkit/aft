@@ -477,4 +477,3 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     attach_gaps(&mut body, gaps.into_values());
     Response::success(&req.id, body)
 }
-

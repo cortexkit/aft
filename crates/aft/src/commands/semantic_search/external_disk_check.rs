@@ -197,7 +197,6 @@ pub(crate) struct CheckedOverlays {
 }
 
 impl CheckedOverlays {
-
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -550,7 +549,6 @@ mod tests {
         (dir, root)
     }
 
-
     fn backdate(path: &Path) {
         // Equal sizes with different mtimes must still count as a change, so
         // give the original file an mtime the rewrite cannot share.
@@ -616,5 +614,4 @@ mod tests {
         .expect("request");
         serde_json::to_value(super::super::handle_semantic_search(&request, ctx)).expect("response")
     }
-
 }

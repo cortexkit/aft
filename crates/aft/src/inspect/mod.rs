@@ -31,9 +31,9 @@ pub use job::{
     InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, InspectTier, JobKey,
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
+pub(crate) use manager::CheckoutViewUnavailable;
 #[cfg(test)]
 pub(crate) use manager::{filter_payload_for_scope_for_test, InspectBuilderState};
-pub(crate) use manager::CheckoutViewUnavailable;
 pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
 pub use phase_log::{
     format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,

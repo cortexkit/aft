@@ -294,8 +294,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-thread_local! {
-}
+thread_local! {}
 
 #[cfg(test)]
 thread_local! {
@@ -1019,7 +1018,6 @@ pub struct SemanticFillHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_progress_at_ms: Option<u64>,
 }
-
 
 /// Degraded reason recorded while a project's checkout view fails to load.
 /// Cleared by the next successful load; the history counts are kept.
@@ -2687,9 +2685,7 @@ struct CallGraphStoreBuildSettlement {
     publication_epoch: u64,
 }
 
-impl CallGraphStoreBuildSettlement {
-
-}
+impl CallGraphStoreBuildSettlement {}
 
 impl Drop for CallGraphStoreBuildSettlement {
     fn drop(&mut self) {
@@ -2698,7 +2694,6 @@ impl Drop for CallGraphStoreBuildSettlement {
         }
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
@@ -3341,7 +3336,6 @@ pub(crate) struct PendingInstall {
 pub(crate) struct PendingInstallSlot(parking_lot::Mutex<Option<PendingInstall>>);
 
 impl PendingInstallSlot {
-
     fn get(&self) -> Option<PendingInstall> {
         *self.0.lock()
     }
@@ -4772,7 +4766,6 @@ pub fn install_callgraph_view_install_test_gate(
     (reached_rx, release_tx, installed_rx)
 }
 
-
 #[cfg(test)]
 struct CallgraphBuildStartGate {
     reached: crossbeam_channel::Sender<()>,
@@ -4851,8 +4844,6 @@ fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGua
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
-
-
 
 /// The locks behind the subc maintenance probes (see
 /// [`AppContext::watcher_drain_has_work`] and its siblings), one per field a
@@ -6849,10 +6840,6 @@ impl AppContext {
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
     }
 
-
-
-
-
     pub fn configure_tail_has_work(&self) -> bool {
         self.configure_maintenance_jobs
             .try_lock()
@@ -6933,7 +6920,6 @@ impl AppContext {
             }
         }
     }
-
 
     pub(crate) fn park_configure_tail(
         &self,
@@ -7271,11 +7257,6 @@ impl AppContext {
     pub fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
         self.artifact_cache_key_derivations.load(Ordering::SeqCst)
     }
-
-
-
-
-
 
     pub fn configure_generation(&self) -> u64 {
         self.configure_generation.load(Ordering::SeqCst)
@@ -8972,7 +8953,6 @@ impl AppContext {
             .store(!is_worktree_bridge && !artifact_read_only, Ordering::SeqCst);
     }
 
-
     pub fn set_cache_writer_capabilities(&self, callgraph_writer: bool, inspect_writer: bool) {
         self.callgraph_writer
             .store(callgraph_writer, Ordering::SeqCst);
@@ -9032,7 +9012,6 @@ impl AppContext {
     pub fn ram_overlay_active(&self) -> bool {
         self.shared_artifacts_read_only() && self.config().worktree.ram_overlay
     }
-
 
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.lock()
@@ -9248,16 +9227,6 @@ impl AppContext {
             "main"
         }
     }
-
-
-
-
-
-
-
-
-
-
 
     /// Access the persisted call graph store.
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
@@ -9576,10 +9545,6 @@ impl AppContext {
         false
     }
 
-
-
-
-
     pub(crate) fn record_checkout_pending_watcher_gap(&self) {
         if self
             .watcher_counters()
@@ -9587,10 +9552,6 @@ impl AppContext {
             .swap(false, Ordering::AcqRel)
         {}
     }
-
-
-
-
 
     #[cfg(test)]
     pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
@@ -9600,7 +9561,6 @@ impl AppContext {
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
         self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None)
     }
-
 
     /// The store for a reader that needs the graph now but must not wait for
     /// it, such as zoom's call-graph annotations or inspect's dead-code and
@@ -9620,8 +9580,6 @@ impl AppContext {
         let config = self.config();
         false
     }
-
-
 
     fn callgraph_store_for_ops_with_wait(
         &self,
@@ -9931,11 +9889,6 @@ impl AppContext {
             .collect()
     }
 
-
-
-
-
-
     pub(crate) fn install_callgraph_executor(
         &self,
         executor: crate::executor::RootMaintenanceExecutor,
@@ -9953,7 +9906,6 @@ impl AppContext {
     ) -> Option<crate::executor::RootMaintenanceExecutor> {
         self.callgraph_executor.lock().clone()
     }
-
 
     /// Fence and drain standalone call-graph acquisition before process teardown.
     /// Daemon acquisitions are also cancelled, and their executor owns the drain.
@@ -10023,17 +9975,11 @@ impl AppContext {
         self.mark_subc_unbound();
     }
 
-
     /// Passive diagnostic state, including the last acquisition error. A
     /// successful retry does not erase that error.
     pub fn callgraph_view_read_diagnostics(&self) -> CallgraphViewReadDiagnostics {
         self.callgraph_view_read_diagnostics.lock().clone()
     }
-
-
-
-
-
 
     pub(crate) fn search_exact_memo(
         &self,
@@ -10179,7 +10125,6 @@ impl AppContext {
             self.set_semantic_build_progress(None);
         }
     }
-
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
@@ -11732,18 +11677,12 @@ impl AppContext {
         let _ = std::thread::Builder::new()
             .name("aft-embedding-release".into())
             .spawn(move || drop(released));
-        drop((
-            callgraph_store,
-            semantic_index,
-            backup,
-        ));
+        drop((callgraph_store, semantic_index, backup));
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
         true
     }
-
-
 
     /// Test seam for the serialized real-watcher integration suite. Production
     /// callers cannot trigger it without the explicit test-only environment flag.
@@ -14680,7 +14619,6 @@ mod readonly_artifact_cache_key_tests {
 #[cfg(test)]
 mod git_entry_signature_tests {
     use super::*;
-
 }
 
 #[cfg(test)]

@@ -1134,9 +1134,6 @@ mod tests {
         );
     }
 
-
-
-
     /// A checkout and an owner directory holding the given files.
     fn trees(
         checkout_files: &[(&str, &str)],

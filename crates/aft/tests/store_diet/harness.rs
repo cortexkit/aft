@@ -218,17 +218,12 @@ fn store_diet_legacy_golden() {
     );
 }
 
-
-
 struct TestViewBuild {
     store: CallGraphStore,
     shapes: Value,
     entries: Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
     blobs: PathBuf,
 }
-
-
-
 
 fn plans(store: &CallGraphStore) -> Value {
     let rows: Vec<Value> =
@@ -839,7 +834,6 @@ fn json_fact_schema(value: &Value, path: &str, schema: &mut BTreeMap<String, BTr
         _ => {}
     }
 }
-
 
 #[test]
 fn store_diet_json_fact_schema_accepts_new_optional_fields() {

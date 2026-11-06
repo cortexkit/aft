@@ -39,8 +39,6 @@ fn request(payload: Value) -> RawRequest {
     serde_json::from_value(payload).expect("request parses")
 }
 
-
-
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -115,8 +113,6 @@ fn tier2_aggregate_bytes(ctx: &AppContext, root: &Path) -> BTreeMap<String, Vec<
     .collect()
 }
 
-
-
 fn inspect(ctx: &AppContext) -> Value {
     crate::helpers::inspect_reasking_tier1_deadline(
         ctx,
@@ -154,4 +150,3 @@ fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) -> Value {
     );
     response
 }
-

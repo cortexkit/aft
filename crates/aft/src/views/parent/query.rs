@@ -18,7 +18,6 @@ use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnaps
 
 use super::{display_relative, read, Child, ParentSession, Plane};
 
-
 /// Commands a parent session answers itself from its children.
 const ROUTED_COMMANDS: &[&str] = &[
     "semantic_search",
@@ -199,7 +198,6 @@ impl ChildText {
             Self::Data(scope) => Cow::Owned(scope.listing()),
         }
     }
-
 }
 
 /// Each child overlapping `search_root`, with its text index (the child's
@@ -723,5 +721,4 @@ fn inspect(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Respo
 #[cfg(test)]
 mod disk_reserve_tests {
     use super::*;
-
 }

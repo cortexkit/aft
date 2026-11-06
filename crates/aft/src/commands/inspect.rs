@@ -9467,4 +9467,3 @@ mod deferred_terminal_tests {
         assert_eq!(InspectBuilderState::Absent.as_str(), "absent");
     }
 }
-

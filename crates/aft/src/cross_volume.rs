@@ -1088,5 +1088,4 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"old");
         assert!(!source.exists());
     }
-
 }

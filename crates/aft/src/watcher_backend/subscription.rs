@@ -65,6 +65,4 @@ pub(crate) fn start(root: &Path, coverage: InitialCoverage) -> Subscription {
 }
 
 #[cfg(test)]
-mod tests {
-
-}
+mod tests {}

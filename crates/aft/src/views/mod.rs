@@ -14,7 +14,6 @@ pub mod parent;
 /// Increment it whenever that encoding changes.
 pub const PATH_IDENTITY_VERSION: u8 = 1;
 
-
 /// Errors raised while constructing, verifying, or publishing a view.
 #[derive(Debug)]
 pub enum ViewError {
@@ -431,7 +430,6 @@ impl Manifest {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(bytes)?)
     }
-
 }
 
 #[derive(Deserialize, Serialize)]
@@ -488,7 +486,6 @@ impl<'de> Deserialize<'de> for Manifest {
         .map_err(D::Error::custom)
     }
 }
-
 
 fn validate_filesystem_rel_path(bytes: &[u8]) -> Result<()> {
     if bytes.is_empty()

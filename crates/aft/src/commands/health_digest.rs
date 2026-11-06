@@ -133,8 +133,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        handle_health_digest, render_current_values, DigestCurrentValues,
-        FreshnessTicket, TicketedCurrent, HEALTH_DIGEST_OPERATION,
+        handle_health_digest, render_current_values, DigestCurrentValues, FreshnessTicket,
+        TicketedCurrent, HEALTH_DIGEST_OPERATION,
     };
     use crate::config::Config;
     use crate::context::AppContext;

@@ -3414,7 +3414,6 @@ impl TickStoragePaths {
         self.cache.insert(key, resolved.clone());
         resolved
     }
-
 }
 
 /// The unavailable code of each context whose cache location is unavailable,
@@ -6075,7 +6074,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn cold_build_holder_census_renders_one_row_per_root_with_sharers() {
         let limiter = crate::cold_build_limiter::isolated_limiter(2);
@@ -7110,7 +7108,6 @@ mod tests {
             "the census row must carry its age: {census}"
         );
     }
-
 
     /// The census row of one arena family, as `memory.census` reports it.
     fn census_family_row(census: &Value, family: &str) -> Value {

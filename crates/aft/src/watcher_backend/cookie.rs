@@ -31,9 +31,7 @@ pub struct CookieTicket {
     rx: mpsc::Receiver<CookieObservation>,
 }
 
-impl CookieTicket {
-
-}
+impl CookieTicket {}
 
 impl Drop for CookieTicket {
     fn drop(&mut self) {
@@ -50,9 +48,7 @@ pub(crate) struct CookieBarrier {
     pending: Pending,
 }
 
-impl CookieBarrier {
-
-}
+impl CookieBarrier {}
 
 pub(crate) fn is_cookie_path(path: &Path) -> bool {
     path.file_name()
@@ -72,5 +68,4 @@ pub(crate) fn is_cookie_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 }

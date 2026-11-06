@@ -1267,7 +1267,6 @@ fn worked_fixture(name: &str) -> (tempfile::TempDir, ProjectRootId) {
     (dir, root)
 }
 
-
 /// Give detached teardown work (LSP and watcher reapers, semantic lane
 /// release) time to free its memory: samples allocator usage every 100 ms
 /// and returns once two readings differ by less than 16 KiB, or after 50

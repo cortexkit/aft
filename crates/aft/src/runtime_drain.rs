@@ -899,7 +899,11 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         if let Some(project_root) = ctx.callgraph_project_root() {
             // Today's call-graph store is retired: no build publishes one.
             let _ = project_root;
-            match Ok::<Option<crate::callgraph_store::ReadonlyCallGraphStore>, crate::callgraph_store::CallGraphStoreError>(None) {
+            match Ok::<
+                Option<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::callgraph_store::CallGraphStoreError,
+            >(None)
+            {
                 Ok(Some(store)) => reopened = Some(Arc::new(store)),
                 Ok(None) => {
                     crate::slog_warn!(
@@ -2673,7 +2677,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         apply_watcher_slice(ctx, &mut state, started);
     }
 
-
     let receiver_has_more = ctx
         .watcher_rx()
         .lock()
@@ -4410,7 +4413,6 @@ mod tests {
         }
     }
 
-
     fn semantic_owner_context(root: &Path) -> Arc<AppContext> {
         let ctx = Arc::new(AppContext::new(
             default_language_provider_factory(),
@@ -4456,7 +4458,6 @@ mod tests {
         assert!(!semantic_refresh_circuit_is_open(&ctx));
     }
 
-
     fn installed_semantic_entries(ctx: &AppContext) -> Option<usize> {
         ctx.semantic_index()
             .read()
@@ -4464,7 +4465,6 @@ mod tests {
             .as_ref()
             .map(crate::semantic_index::SemanticIndex::entry_count)
     }
-
 
     #[test]
     fn delayed_semantic_retry_targets_same_generation_replacement_worker() {

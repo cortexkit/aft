@@ -3880,7 +3880,6 @@ pub(crate) struct RepairEntryStatus {
 }
 
 impl RepairEntryStatus {
-
     #[cfg(windows)]
     fn windows(metadata: &fs::Metadata) -> Self {
         let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;

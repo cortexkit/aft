@@ -833,4 +833,3 @@ fn trace_in_process_stores(verify_counts: bool) {
         std::fs::write(dir.join("report.txt"), &report).unwrap();
     }
 }
-

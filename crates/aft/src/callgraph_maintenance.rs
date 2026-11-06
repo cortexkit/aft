@@ -82,7 +82,6 @@ impl CallgraphForceDemand {
     pub(crate) fn fulfill(&self, token: u64) {
         self.fulfilled.fetch_max(token, Ordering::SeqCst);
     }
-
 }
 
 /// What one finished reconcile did.
@@ -443,7 +442,11 @@ impl CallgraphReconcileJob {
         // Today's call-graph store is retired, so there is never a published
         // store to compare with the disk.
         let _ = (&callgraph_dir, max_examined);
-        let report = match Ok::<Option<crate::callgraph_store::ReadonlyCallGraphStore>, crate::callgraph_store::CallGraphStoreError>(None) {
+        let report = match Ok::<
+            Option<crate::callgraph_store::ReadonlyCallGraphStore>,
+            crate::callgraph_store::CallGraphStoreError,
+        >(None)
+        {
             Ok(Some(store)) => store.reconcile_with_disk(max_examined),
             Ok(None) => {
                 let outcome = CallgraphReconcileOutcome {

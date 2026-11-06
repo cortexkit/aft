@@ -303,9 +303,6 @@ struct RuntimeReadinessSource<'a> {
     ctx: &'a AppContext,
 }
 
-
-
-
 impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     fn sample(&self) -> extensions::ReadinessObservation<'_> {
         use extensions::{
@@ -317,68 +314,67 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         // lane is the data layer's meaning plane, sampled as it stands now
         // and retained, so the ranking reads the generation admitted here.
         let data_semantic = crate::data_layer::tools::search::DataSemantic::current(self.ctx);
-        let semantic =
-            if let Some(data) = data_semantic {
-                SemanticReadiness {
-                    status: data.status(),
-                    snapshot: data
-                        .serving()
-                        .map(|meaning| SemanticSnapshot::from_data(Arc::clone(meaning))),
-                    evicted: false,
-                    lock_contended: false,
-                }
-            } else {
-                match try_read_with_budget(
-                    self.ctx.semantic_index_status(),
-                    INTERACTIVE_ARTIFACT_READ_BUDGET,
-                ) {
-                    Some(status) => {
-                        let status = status.clone();
-                        if matches!(status, SemanticIndexStatus::Ready { .. }) {
-                            match try_read_with_budget(
-                                self.ctx.semantic_index(),
-                                INTERACTIVE_ARTIFACT_READ_BUDGET,
-                            ) {
-                                Some(index) => {
-                                    let evicted = index.is_none();
-                                    let snapshot =
-                                        (!evicted).then(|| SemanticSnapshot::from_guard(index));
-                                    SemanticReadiness {
-                                        evicted,
-                                        status,
-                                        snapshot,
-                                        lock_contended: false,
-                                    }
-                                }
-                                None => SemanticReadiness {
+        let semantic = if let Some(data) = data_semantic {
+            SemanticReadiness {
+                status: data.status(),
+                snapshot: data
+                    .serving()
+                    .map(|meaning| SemanticSnapshot::from_data(Arc::clone(meaning))),
+                evicted: false,
+                lock_contended: false,
+            }
+        } else {
+            match try_read_with_budget(
+                self.ctx.semantic_index_status(),
+                INTERACTIVE_ARTIFACT_READ_BUDGET,
+            ) {
+                Some(status) => {
+                    let status = status.clone();
+                    if matches!(status, SemanticIndexStatus::Ready { .. }) {
+                        match try_read_with_budget(
+                            self.ctx.semantic_index(),
+                            INTERACTIVE_ARTIFACT_READ_BUDGET,
+                        ) {
+                            Some(index) => {
+                                let evicted = index.is_none();
+                                let snapshot =
+                                    (!evicted).then(|| SemanticSnapshot::from_guard(index));
+                                SemanticReadiness {
+                                    evicted,
                                     status,
-                                    snapshot: None,
-                                    evicted: false,
-                                    lock_contended: true,
-                                },
+                                    snapshot,
+                                    lock_contended: false,
+                                }
                             }
-                        } else {
-                            SemanticReadiness {
+                            None => SemanticReadiness {
                                 status,
                                 snapshot: None,
                                 evicted: false,
-                                lock_contended: false,
-                            }
+                                lock_contended: true,
+                            },
+                        }
+                    } else {
+                        SemanticReadiness {
+                            status,
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: false,
                         }
                     }
-                    None => SemanticReadiness {
-                        status: SemanticIndexStatus::Building {
-                            stage: "status_lock".to_string(),
-                            files: None,
-                            entries_done: None,
-                            entries_total: None,
-                        },
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: true,
-                    },
                 }
-            };
+                None => SemanticReadiness {
+                    status: SemanticIndexStatus::Building {
+                        stage: "status_lock".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    },
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: true,
+                },
+            }
+        };
 
         let trigram = if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
             TrigramReadiness {
@@ -1288,8 +1284,7 @@ fn split_semantic_results(
                 .unwrap_or_default(),
             None => return SplitSemantic::from_gap(semantic_artifacts_busy_gap()),
         }
-    
-                      };
+    };
     if ctx.shared_artifacts_read_only() {
         results.retain(|result| result.file.is_file());
     }
@@ -2210,14 +2205,7 @@ fn handle_semantic_search_inner(
     // A repository outside the project with no checkout in the index store
     // is answered by a bounded scan of its files, with a disclosure.
     if let Some(external_root) = external_root {
-        return handle_external_unindexed_fallback(
-            req,
-            ctx,
-            &params,
-            top_k,
-            &shape,
-            external_root,
-        );
+        return handle_external_unindexed_fallback(req, ctx, &params, top_k, &shape, external_root);
     }
     // An unsettled artifact identity keeps indexes off until the next bind;
     // answer through the bounded grep fallback and disclose the bind failure.
@@ -3272,7 +3260,6 @@ impl CheckoutSemanticGaps {
             "refreshing"
         }
     }
-
 
     /// What a data-layer meaning plane whose fill is under way does not
     /// cover yet: the files waiting for vectors. Files that cannot be cut
@@ -9527,7 +9514,6 @@ mod tests {
             assert!(result.exact);
         }
     }
-
 
     struct BlockingLocalProvider {
         calls: Arc<AtomicUsize>,

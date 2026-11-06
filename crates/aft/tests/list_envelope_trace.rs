@@ -566,5 +566,3 @@ fn copy_dir_all(src: &Path, dst: &Path) {
         }
     }
 }
-
-

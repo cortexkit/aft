@@ -350,9 +350,7 @@ pub(crate) struct IdentityConnection {
     _record: OpenRecord,
 }
 
-impl IdentityConnection {
-
-}
+impl IdentityConnection {}
 
 impl std::ops::Deref for IdentityConnection {
     type Target = rusqlite::Connection;

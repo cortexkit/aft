@@ -78,8 +78,6 @@ fn glob_all(root: &Path, use_index: bool) -> Vec<String> {
         .collect()
 }
 
-
-
 #[test]
 fn matches_exact_metadata_names_only() {
     for name in [

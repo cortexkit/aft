@@ -550,9 +550,7 @@ struct PauseRetryPolicy {
 
 pub(crate) struct PauseRetryScope(Option<PauseRetryPolicy>);
 
-impl PauseRetryScope {
-
-}
+impl PauseRetryScope {}
 
 impl Drop for PauseRetryScope {
     fn drop(&mut self) {
@@ -4684,7 +4682,6 @@ pub struct EmbeddingEntry {
 }
 
 impl EmbeddingEntry {
-
     fn new(chunk: SemanticChunk, vector: impl Into<Arc<[f32]>>) -> Self {
         let vector = vector.into();
         let norm = vector_norm(&vector);
@@ -4897,7 +4894,6 @@ impl SemanticVectors {
     pub fn vectors(&self) -> impl Iterator<Item = &Arc<[f32]>> {
         self.entries.iter().map(|entry| &entry.vector)
     }
-
 }
 
 /// Bytes of floats in one vector allocation.
@@ -5513,7 +5509,6 @@ fn semantic_changed_paths(previous: &SemanticIndex, current: &SemanticIndex) -> 
 }
 
 impl SemanticIndex {
-
     /// Absolute path of a root-relative base or view-run chunk path. Tests
     /// count the calls to prove refresh joins only the paths it needs.
     fn join_shared_path(&self, file: &Path) -> PathBuf {
@@ -10479,9 +10474,7 @@ fn push_view_field(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
-impl SemanticVectors {
-
-}
+impl SemanticVectors {}
 
 /// Chunks one checkout file for a view fill, from the very bytes whose hash
 /// names the work. It mirrors what a full build does for the same file, so a
@@ -10529,8 +10522,6 @@ fn chunk_view_file_uncached(
     Ok(Some(chunks))
 }
 
-
-
 /// The immutable semantic base of one view generation: the arena runs its
 /// manifest names, each holding chunk paths relative to the checkout. It is a
 /// `SharedSemanticBase` whose runs are shared with every other view naming
@@ -10541,7 +10532,6 @@ pub struct ViewSemanticBase {
 }
 
 impl ViewSemanticBase {
-
     /// Chunks in the base, before any tombstone.
     pub fn chunk_count(&self) -> usize {
         self.base.entry_count
@@ -10667,8 +10657,6 @@ pub(crate) mod tests {
         );
         assert!(!chunks.iter().any(|chunk| chunk.name == "old_c_symbol"));
     }
-
-
 
     #[test]
     fn lane_paused_direct_cold_builder_has_no_implicit_wait() {

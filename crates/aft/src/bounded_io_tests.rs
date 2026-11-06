@@ -1170,4 +1170,3 @@ fn probe_pool_workload() {
     let probes: usize = totals.iter().map(|row| row[3]).sum();
     println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
 }
-

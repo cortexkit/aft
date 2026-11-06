@@ -211,6 +211,7 @@ impl Pool {
                         // ends. Hand those pages back now, as dead code does
                         // after a run, rather than holding them until the
                         // daemon's periodic relief comes round.
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
                         let _ = crate::memory::relieve_allocator_pressure();
                     }
                     let mut state = self.state().lock();
