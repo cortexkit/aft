@@ -345,7 +345,12 @@ pub enum ToolCallOutcome {
 
 /// Server-owned settings for a single `tool_call` request.
 /// These fields cannot be supplied through the agent's arguments object.
-#[derive(Debug, Clone)]
+///
+/// `Default` gives every setting its off or empty value. Tests that pin a
+/// call's reply, such as the tool-call parity test, name only the settings
+/// they depend on and take the rest from it, so adding a setting does not
+/// change them.
+#[derive(Debug, Clone, Default)]
 pub struct ToolCallContext {
     pub project_root: PathBuf,
     pub session_id: Option<String>,
