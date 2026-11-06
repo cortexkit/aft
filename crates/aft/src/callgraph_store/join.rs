@@ -2888,7 +2888,7 @@ pub(crate) fn resolve_file(
         .map(|s| s.ordinal)
         .collect::<BTreeSet<_>>();
     let caller_data = &extract.data;
-    let surface_index = ViewSurfaceIndex::new(index, Some((caller, caller_data)));
+    let surface_index = ViewSurfaceIndex::for_caller(index, caller, caller_data);
     let mut resolutions = HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
     let mut caller_queries = BTreeMap::new();
     for (key, (kind, raw)) in caller_work {
@@ -2995,7 +2995,7 @@ pub(crate) fn dispatch_type_targets_for(
     facts.take();
     facts.take_config();
     facts.take_answers();
-    let recording = ViewSurfaceIndex::new(index, None);
+    let recording = ViewSurfaceIndex::reading_inner(index, &data);
     let targets = resolve_dispatch_type_names(&recording, file, blob, &data);
     let probes = facts.take();
     facts.take_config();
@@ -3578,17 +3578,38 @@ struct ViewSurfaceIndex<'a, I> {
     caller: Option<(&'a str, &'a FileCallData)>,
     crate_roots: std::cell::RefCell<HashMap<String, Option<String>>>,
     caller_modules: std::cell::RefCell<HashMap<String, Vec<String>>>,
+    /// The file data whose `use` answers this index keeps: the data of the
+    /// file being resolved, borrowed for this index's whole life, so no
+    /// other value can share its address.
+    alias_owner: Option<&'a FileCallData>,
     caller_aliases: std::cell::OnceCell<std::rc::Rc<[super::RustModuleAliases]>>,
 }
 
 impl<'a, I> ViewSurfaceIndex<'a, I> {
-    fn new(inner: &'a I, caller: Option<(&'a str, &'a FileCallData)>) -> Self {
+    /// An index for resolving `caller`'s references, which reads its own
+    /// caller data from `caller` rather than from `inner`.
+    fn for_caller(inner: &'a I, caller: &'a str, data: &'a FileCallData) -> Self {
+        Self::new(inner, Some((caller, data)), Some(data))
+    }
+
+    /// An index that reads every file's caller data from `inner`, keeping
+    /// the `use` answers of `aliases_of` (the file being resolved).
+    fn reading_inner(inner: &'a I, aliases_of: &'a FileCallData) -> Self {
+        Self::new(inner, None, Some(aliases_of))
+    }
+
+    fn new(
+        inner: &'a I,
+        caller: Option<(&'a str, &'a FileCallData)>,
+        alias_owner: Option<&'a FileCallData>,
+    ) -> Self {
         Self {
             inner,
             queries: Default::default(),
             caller,
             crate_roots: Default::default(),
             caller_modules: Default::default(),
+            alias_owner,
             caller_aliases: Default::default(),
         }
     }
@@ -3729,10 +3750,10 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
         segments
     }
     fn rust_module_aliases(&self, data: &FileCallData) -> std::rc::Rc<[super::RustModuleAliases]> {
-        // Kept only for this index's own caller: it borrows that data for
-        // its whole life, so no other value can share its address.
-        match self.caller {
-            Some((_, caller)) if std::ptr::eq(caller, data) && Self::keeps_answers() => {
+        // Kept only for the data this index borrows for its whole life
+        // (`alias_owner`), so no other value can share its address.
+        match self.alias_owner {
+            Some(owner) if std::ptr::eq(owner, data) && Self::keeps_answers() => {
                 std::rc::Rc::clone(
                     self.caller_aliases
                         .get_or_init(|| super::rust_module_aliases_of(data)),
