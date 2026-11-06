@@ -284,7 +284,7 @@ describe("loadAftConfig", () => {
     const directory = join(fixture.projectDirectory, ".opencode");
     mkdirSync(directory, { recursive: true });
     const path = join(directory, "aft.jsonc");
-    const text = '{ "experimental_bash_compress": false, "url_fetch_allow_private": true }\n';
+    const text = '{ "bash": { "compress": false }, "url_fetch_allow_private": true }\n';
     writeFileSync(path, text);
     const result = spawnConfigLoader(
       fixture.projectDirectory,
@@ -368,17 +368,13 @@ describe("loadAftConfig", () => {
       const legacyDir = join(fixture.projectDirectory, directory);
       mkdirSync(legacyDir, { recursive: true });
       const path = join(legacyDir, "aft.jsonc");
-      const text = '{\n // committed legacy settings\n "experimental_bash_compress": false\n}\n';
+      const text = '{\n // committed legacy settings\n "bash": { "compress": false }\n}\n';
       writeFileSync(path, text);
       const result = runConfigLoader(fixture.projectDirectory, {
         HOME: join(fixture.root, "home"),
         XDG_CONFIG_HOME: fixture.xdgConfigHome,
       });
-      expect(JSON.parse(result.stdout).bash).toEqual({
-        rewrite: false,
-        compress: false,
-        background: false,
-      });
+      expect(JSON.parse(result.stdout).bash).toEqual({ compress: false });
       expect(readFileSync(path, "utf8")).toBe(text);
       expect(existsSync(fixture.projectConfigPath)).toBe(false);
       expect(result.stderr).toContain(path);
@@ -393,7 +389,7 @@ describe("loadAftConfig", () => {
     const legacyProjectDir = join(fixture.projectDirectory, ".opencode");
     mkdirSync(legacyUserDir, { recursive: true });
     mkdirSync(legacyProjectDir, { recursive: true });
-    const text = '{ "experimental_bash_rewrite": true }\n';
+    const text = '{ "bash": { "rewrite": true } }\n';
     const legacyUser = join(legacyUserDir, "aft.jsonc");
     const legacyProject = join(legacyProjectDir, "aft.jsonc");
     writeFileSync(legacyUser, text);
@@ -421,7 +417,7 @@ describe("loadAftConfig", () => {
     expect(existsSync(fixture.projectConfigPath)).toBe(false);
   });
 
-  test("project experimental keys keep their bytes after plugin load", () => {
+  test("a project file naming retired experimental keys is refused and keeps its bytes", () => {
     const fixture = createConfigFixture();
     const text = `{
       // Committed project settings must not be rewritten by a plugin.
@@ -436,11 +432,23 @@ describe("loadAftConfig", () => {
     }\n`;
     writeFileSync(fixture.projectConfigPath, text);
 
-    runConfigLoader(fixture.projectDirectory, { XDG_CONFIG_HOME: fixture.xdgConfigHome });
+    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(rejected.errors).toEqual(
+      [
+        "experimental_lsp_ty",
+        "experimental_bash_rewrite",
+        "experimental_bash_compress",
+        "experimental_bash_background",
+        "harnesses.opencode.experimental_bash_rewrite",
+        "harnesses.pi.experimental_lsp_ty",
+      ].map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`),
+    );
     expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(text);
   });
 
-  test("retired keys in either file load, translated, and are never refused", () => {
+  test("retired keys load translated from the user file and refuse a project file", () => {
     const fixture = createConfigFixture();
     const userText = JSON.stringify({
       tool_surface: "all",
@@ -452,24 +460,32 @@ describe("loadAftConfig", () => {
       idle: { lsp_ttl_minutes: 20 },
     });
     const projectText = JSON.stringify({
-      search_index: false,
-      inspect: { tier2_soft_deadline_ms: 50 },
-      idle: { lsp_ttl_minutes: 10 },
+      indexes: { trigram: false },
+      lsp: { idle_minutes: 10 },
     });
     writeFileSync(fixture.userConfigPath, userText);
     writeFileSync(fixture.projectConfigPath, projectText);
-    const merged = JSON.parse(
-      runConfigLoader(fixture.projectDirectory, {
-        HOME: join(fixture.root, "home"),
-        XDG_CONFIG_HOME: fixture.xdgConfigHome,
-      }).stdout,
-    );
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    const merged = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
     expect(merged.disabled_tools).toEqual([]);
     expect(merged.indexes).toEqual({ trigram: false, semantic: false, callgraph: false });
     expect(merged.lsp.idle_minutes).toBe(10);
     // Loading never writes either file for retired keys.
     expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(userText);
     expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
+
+    const retiredProjectText = JSON.stringify({
+      search_index: false,
+      inspect: { tier2_soft_deadline_ms: 50 },
+      idle: { lsp_ttl_minutes: 10 },
+    });
+    writeFileSync(fixture.projectConfigPath, retiredProjectText);
+    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual(
+      ["search_index", "idle.lsp_ttl_minutes", "inspect.tier2_soft_deadline_ms"].map(
+        (path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`,
+      ),
+    );
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(retiredProjectText);
   });
 
   test("inspect and LSP resource settings are tighten-only", () => {
@@ -559,7 +575,7 @@ describe("loadAftConfig", () => {
     expect(enabled.stderr).toContain("Ignoring github from project config");
   });
 
-  test("retired GitHub aliases translate, and a canonical leaf beside them wins", () => {
+  test("retired GitHub aliases translate in the user file, and a canonical leaf beside them wins", () => {
     const fixture = createConfigFixture();
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
     const github = () => JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).github;
@@ -577,11 +593,12 @@ describe("loadAftConfig", () => {
     expect(github()).toMatchObject({ read: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
     expect(github()).toMatchObject({ shim: false });
-    // A project may not set github.read, so a project's gh_read alias, once
-    // translated to github.read, is ignored and the user's value stays.
+    // A project file naming a retired alias is refused.
     writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
-    expect(github()).toMatchObject({ read: false });
+    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual([
+      "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix",
+    ]);
   });
 
   test("edit_mode uses ordinary project-over-user precedence", () => {
@@ -641,7 +658,7 @@ describe("loadAftConfig", () => {
           base_url: "http://localhost:11434",
           api_key_env: "USER_KEY",
         },
-        sandbox: { enabled: true, write_allow: ["/tmp/user-write"] },
+        sandbox: { profile: { worker: "strict", head: "strict" }, write_allow: ["/tmp/user-write"] },
       }),
     );
     writeFileSync(
@@ -657,7 +674,7 @@ describe("loadAftConfig", () => {
               api_key_env: "EVIL_KEY",
             },
             subc: { connection_file: "/tmp/evil-subc.json" },
-            sandbox: { enabled: false, write_allow: ["/tmp/project-write"] },
+            sandbox: { profile: { worker: "off", head: "off" }, write_allow: ["/tmp/project-write"] },
           },
         },
       }),
@@ -765,29 +782,24 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("edit_mode");
   });
 
-  test("legacy project enabled:false disables only unprotected tools", () => {
+  test("a project file setting the retired enabled key is refused", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: false }));
 
-    const result = runConfigLoader(fixture.projectDirectory, {
+    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    const config = JSON.parse(result.stdout) as { disabled_tools: string[]; enabled?: boolean };
-    expect(config.enabled).toBeUndefined();
-    for (const protectedName of ["aft_safety", "read", "write", "edit", "grep", "glob", "bash"]) {
-      expect(config.disabled_tools).not.toContain(protectedName);
-    }
-    expect(config.disabled_tools).toContain("aft_zoom");
-    expect(result.stderr).toContain("disabled_tools.aft_safety");
+    expect(rejected.errors).toEqual([
+      "removed_config_key:enabled; run npx @cortexkit/aft doctor --fix",
+    ]);
   });
 
-  test("legacy user enabled:false disables every tool and project enabled:true adds nothing", () => {
+  test("legacy user enabled:false disables every tool", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: false }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: true }));
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
@@ -1244,7 +1256,8 @@ describe("loadAftConfig", () => {
   // in-memory config exposes them under `bash.*`. The user's on-disk file
   // is left untouched until Rust user auto-migration or explicit doctor --fix. We keep
   // these scenarios to lock in that the legacy nested input shape still
-  // produces the expected runtime state.
+  // produces the expected runtime state for the user file; a project file
+  // naming the block is refused.
   test("user config can set bash.rewrite via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -1267,30 +1280,6 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("project config can override bash.rewrite via legacy experimental block", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({ experimental: { bash: { rewrite: true } } }),
-    );
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ experimental: { bash: { rewrite: false } } }),
-    );
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // Project's false value wins over user's true after graduation.
-    expect(config).toMatchObject({
-      bash: { rewrite: false, compress: false, background: false },
-    });
-    expect(result.stderr).not.toContain("Ignoring experimental from project config");
-  });
-
   test("user config can set bash.compress via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -1310,30 +1299,6 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("project config can override bash.compress via legacy experimental block", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({ experimental: { bash: { compress: false } } }),
-    );
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ experimental: { bash: { compress: true } } }),
-    );
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // Project's true value wins over user's false.
-    expect(config).toMatchObject({
-      bash: { compress: true, rewrite: false, background: false },
-    });
-    expect(result.stderr).not.toContain("Ignoring experimental from project config");
-  });
-
   test("user config can set bash.background via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -1351,26 +1316,6 @@ describe("loadAftConfig", () => {
       bash: { background: true, rewrite: false, compress: false },
     });
     expect(result.stderr).not.toContain("Ignoring");
-  });
-
-  test("project config can set bash.background via legacy experimental block", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({}));
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ experimental: { bash: { background: true } } }),
-    );
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config).toMatchObject({
-      bash: { background: true, rewrite: false, compress: false },
-    });
-    expect(result.stderr).not.toContain("Ignoring experimental from project config");
   });
 
   test("deep merges top-level bash config across user + project", () => {
@@ -1397,19 +1342,7 @@ describe("loadAftConfig", () => {
     });
   });
 
-  test("legacy experimental.bash in both files: project's materialized shape wins on merge", () => {
-    // Regression note for v0.27.2 graduation: when BOTH user and project
-    // files express bash via legacy `experimental.bash.*`, each migrates
-    // independently to top-level `bash` with all three sub-features
-    // materialized (so single-file post-migration behavior matches
-    // pre-migration behavior). The cross-file deep merge then runs against
-    // the materialized shapes, so project's explicit values win for every
-    // key — not just the ones the user explicitly set.
-    //
-    // This is a behavior change vs pre-graduation cross-file merge, and is
-    // documented as a known migration edge case. Users who want field-level
-    // deep merge across user + project should adopt the new top-level
-    // `bash` shape (see the test above).
+  test("a project file setting experimental.bash is refused", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1417,20 +1350,17 @@ describe("loadAftConfig", () => {
     );
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ experimental: { bash: { compress: false } } }),
+      JSON.stringify({ experimental: { bash: { long_running_reminder_enabled: false } } }),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, {
+    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    // After both files migrate independently and the materialized blocks
-    // shallow-merge: project's bash wins for all three keys, user's
-    // rewrite:true is overridden by project's materialized rewrite:false.
-    expect(JSON.parse(result.stdout)).toMatchObject({
-      bash: { rewrite: false, compress: false, background: false },
-    });
+    expect(rejected.errors).toEqual([
+      "removed_config_key:experimental.bash; run npx @cortexkit/aft doctor --fix",
+    ]);
   });
 
   test("translates all experimental keys in memory without rewriting the user file", () => {
@@ -1546,27 +1476,22 @@ describe("loadAftConfig", () => {
     );
   });
 
-  test("translates project and user config independently without writes", () => {
+  test("translates the user file and refuses the project file, without writes", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ experimental_bash_compress: true }));
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
 
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    // experimental_bash_compress lifts to nested experimental.bash.compress,
-    // then graduates to top-level bash.compress with materialized siblings.
-    expect(JSON.parse(result.stdout)).toMatchObject({
+    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual([
+      "removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix",
+    ]);
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ bash: { compress: true } }));
+    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
       experimental: { lsp_ty: true },
-      bash: { compress: true, rewrite: false, background: false },
+      bash: { compress: true },
     });
     expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(
       JSON.stringify({ experimental_lsp_ty: true }),
-    );
-    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(
-      JSON.stringify({ experimental_bash_compress: true }),
     );
   });
 

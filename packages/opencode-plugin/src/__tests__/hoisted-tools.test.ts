@@ -1968,9 +1968,6 @@ describe("Hoisted bash registration follows only bash.background", () => {
     ["bash: false", { bash: false }, false],
     ["bash.enabled: false", { bash: { enabled: false } }, true],
     ["bash.background: false", { bash: { background: false } }, false],
-    // The legacy block is opt-in: a flag it does not set resolves to off.
-    ["legacy rewrite only", { experimental: { bash: { rewrite: true } } }, false],
-    ["legacy background", { experimental: { bash: { background: true } } }, true],
   ] as const) {
     test(`${label} → bash registered, companions ${background ? "registered" : "absent"}`, () => {
       const tools = toolsWithConfig(cfg as Partial<PluginContext["config"]>);

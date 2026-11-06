@@ -154,11 +154,19 @@ describe("feature-config policy", () => {
           },
         },
       });
+      // A block with only reminder settings is retired too: its settings
+      // move to top-level `bash` without setting the feature flags, so they
+      // keep their current defaults.
       const tuning: Record<string, unknown> = {
         experimental: { bash: { long_running_reminder_enabled: false } },
       };
-      expect(translateConfigDocument(tuning, tier).legacyInput).toBe(false);
-      expect(tuning).toEqual({ experimental: { bash: { long_running_reminder_enabled: false } } });
+      const tuningOut = translateConfigDocument(tuning, tier);
+      expect(tuningOut.legacyInput).toBe(true);
+      expect(tuningOut.retiredKeys).toEqual(["experimental.bash.long_running_reminder_enabled"]);
+      expect(tuning).toEqual({ bash: { long_running_reminder_enabled: false } });
+      const empty: Record<string, unknown> = { experimental: { bash: {} } };
+      expect(translateConfigDocument(empty, tier).retiredKeys).toEqual(["experimental.bash"]);
+      expect(empty).toEqual({});
     }
   });
 

@@ -16,7 +16,6 @@ import { join } from "node:path";
 import {
   CANONICAL_TOOLS,
   REMOVED_DATA_LAYER_NOTES,
-  RETIRED_HANG_THRESHOLD_NOTE,
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
 
@@ -205,24 +204,35 @@ describe("OpenCode feature-config registration", () => {
     ).toEqual([]);
   });
 
-  test("retired keys in a project file translate under project limits, with one notice and no write", () => {
+  test("names retired in 0.62 or earlier refuse a project file and leave it unwritten", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     const text = JSON.stringify({
       search_index: false,
       hoist_builtin_tools: false,
       gh_read: { enabled: true },
+      disabled_tools: ["aft_grep"],
     });
     writeFileSync(projectFile, text);
-    const config = loadWithUserConfig({ github: { read: false } });
-    expect(config.indexes?.trigram).toBe(false);
-    for (const host of HOSTS) expect(config.disabled_tools).not.toContain(host);
-    expect(config.github?.read).toBe(false);
-    expect(readFileSync(projectFile, "utf8")).toBe(text);
-    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (gh_read, hoist_builtin_tools, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
+    let rejected: unknown;
+    try {
+      loadWithUserConfig({ github: { read: false } });
+    } catch (error) {
+      rejected = error;
+    }
+    expect((rejected as { errors?: string[] } | undefined)?.errors).toEqual([
+      "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
+      "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
+      "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix",
+      "removed_config_key:aft_grep; run npx @cortexkit/aft doctor --fix",
     ]);
+    expect(readFileSync(projectFile, "utf8")).toBe(text);
+  });
+
+  test("a user file naming retired keys still loads translated, because the binary rewrites it", () => {
+    const config = loadWithUserConfig({ search_index: false, disabled_tools: ["aft_grep"] });
+    expect(config.indexes?.trigram).toBe(false);
+    expect(config.disabled_tools).toEqual(["grep"]);
   });
 
   test("a retired bridge.hang_threshold loads cleanly; a project file gets a notice that it does nothing", () => {
@@ -238,22 +248,6 @@ describe("OpenCode feature-config registration", () => {
     // Nothing was applied, so the notice is only the no-effect sentence.
     expect(notices.map((notice) => notice.message)).toEqual([
       "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
-    ]);
-  });
-
-  test("a project file mixing translated keys with bridge.hang_threshold names only the translated keys, then says the threshold does nothing", () => {
-    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
-    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
-    writeFileSync(
-      projectFile,
-      JSON.stringify({ search_index: false, bridge: { hang_threshold: 4 } }),
-    );
-    const config = loadWithUserConfig({});
-    expect(config.indexes?.trigram).toBe(false);
-    expect(getConfigValidationErrors()).toEqual([]);
-    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
     ]);
   });
 

@@ -2967,47 +2967,13 @@ describe("registerBashTool registers companions only while bash.background is on
     expectBackgroundControls(tools, true);
   });
 
-  // The legacy block is opt-in: a flag it does not set resolves to off, so a
-  // legacy config without `background: true` has no background tasks.
-  test("legacy rewrite=true only → bash registered without companions", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { rewrite: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
-  });
-
-  test("legacy compress=true only → bash registered without companions", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { compress: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
-  });
-
-  test("legacy background=true → full bash surface registered", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { background: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
-  });
-
-  test("all legacy flags true → full bash surface registered", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { rewrite: true, compress: true, background: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
-  });
-
   test("bash_status and bash_kill execute with task_id request shape", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge, calls } = makeTrackableMockBridge({ status: "completed", exit_code: 0 });
     const ctx: PluginContext = {
       pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
-      config: { experimental: { bash: { background: true } } } as PluginContext["config"],
+      config: { bash: { background: true } } as PluginContext["config"],
       storageDir: "/tmp/test",
     };
     registerBashTool(api, ctx);

@@ -79,46 +79,9 @@ describe("resolveBashConfig (Pi)", () => {
     });
   });
 
-  // ---- Top-level wins over legacy --------------------------------------
-
-  test("top-level bash: true wins over legacy experimental.bash.rewrite: false", () => {
-    const r = resolveBashConfig(cfg({ bash: true, experimental: { bash: { rewrite: false } } }));
-    expect(r).toMatchObject({ enabled: true, rewrite: true, compress: true, background: true });
-  });
-
-  test("top-level bash: false wins over legacy background: true", () => {
-    const r = resolveBashConfig(cfg({ bash: false, experimental: { bash: { background: true } } }));
-    expect(r.enabled).toBe(false);
-    expect(r.background).toBe(false);
-  });
-
-  // ---- Legacy fallback (no top-level) ----------------------------------
-
-  test("legacy experimental.bash.rewrite=true → opt-in semantics (rewrite on, others off)", () => {
-    const r = resolveBashConfig(cfg({ experimental: { bash: { rewrite: true } } }));
-    expect(r).toMatchObject({
-      enabled: true,
-      rewrite: true,
-      compress: false,
-      background: false,
-    });
-  });
-
-  test("legacy experimental.bash with all explicit false keeps sub-features off but the runtime gate on", () => {
-    const r = resolveBashConfig(
-      cfg({ experimental: { bash: { rewrite: false, compress: false, background: false } } }),
-    );
-    expect(r).toMatchObject({ enabled: true, rewrite: false, compress: false, background: false });
-  });
-
-  test("empty legacy experimental.bash: {} → falls through to the default", () => {
-    const r = resolveBashConfig(cfg({ experimental: { bash: {} } }));
-    expect(r.enabled).toBe(true);
-  });
-
   // ---- Defaults and the runtime gate ------------------------------------
 
-  test("no top-level, no legacy → all on", () => {
+  test("no top-level bash → all on", () => {
     const r = resolveBashConfig(cfg({}));
     expect(r.enabled).toBe(true);
     expect(r.rewrite).toBe(true);
@@ -164,15 +127,5 @@ describe("resolveBashConfig (Pi)", () => {
     );
     expect(r.long_running_reminder_enabled).toBe(false);
     expect(r.long_running_reminder_interval_ms).toBe(5000);
-  });
-
-  test("top-level reminder wins over legacy reminder when both set", () => {
-    const r = resolveBashConfig(
-      cfg({
-        bash: { long_running_reminder_interval_ms: 1000 },
-        experimental: { bash: { long_running_reminder_interval_ms: 2000 } },
-      }),
-    );
-    expect(r.long_running_reminder_interval_ms).toBe(1000);
   });
 });

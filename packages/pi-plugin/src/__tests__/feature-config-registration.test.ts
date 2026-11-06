@@ -146,7 +146,7 @@ describe("Pi/OMP feature-config registration", () => {
     ).toEqual([]);
   });
 
-  test("retired keys in a project file translate under project limits, with one notice and no write", () => {
+  test("names retired in 0.62 or earlier refuse a project file and leave it unwritten", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     const text = JSON.stringify({
@@ -154,14 +154,17 @@ describe("Pi/OMP feature-config registration", () => {
       idle: { lsp_ttl_minutes: 120 },
     });
     writeFileSync(projectFile, text);
-    const config = loadWithUserConfig({ lsp: { idle_minutes: 30 } });
-    expect(config.indexes?.trigram).toBe(false);
-    expect(config.lsp?.idle_minutes).toBe(30);
-    expect(readFileSync(projectFile, "utf8")).toBe(text);
-    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (idle.lsp_ttl_minutes, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
+    let rejected: unknown;
+    try {
+      loadWithUserConfig({ lsp: { idle_minutes: 30 } });
+    } catch (error) {
+      rejected = error;
+    }
+    expect((rejected as { errors?: string[] } | undefined)?.errors).toEqual([
+      "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
+      "removed_config_key:idle.lsp_ttl_minutes; run npx @cortexkit/aft doctor --fix",
     ]);
+    expect(readFileSync(projectFile, "utf8")).toBe(text);
   });
 
   test("idle.checkout_hours loads and merges per key; a user file's removed keys get one notice naming only them", () => {

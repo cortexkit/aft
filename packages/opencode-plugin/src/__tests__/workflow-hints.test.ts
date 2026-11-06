@@ -227,9 +227,9 @@ describe("buildHintsFromConfig", () => {
     );
   });
 
-  test("legacy background=true still enables bg-bash hint", () => {
+  test("bash.background: true enables the bg-bash hint", () => {
     const on: AftConfig = {
-      experimental: { bash: { background: true } },
+      bash: { background: true },
     };
     expect(buildHintsFromConfig(on, new Set())).toContain("**Long-running commands**");
   });
