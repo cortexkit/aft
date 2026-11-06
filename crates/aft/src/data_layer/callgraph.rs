@@ -261,13 +261,17 @@ impl ResolutionLookup for BTreeMap<String, FileResolution> {
 /// fails is recorded in the publication's failures and the entry reads as
 /// absent, and whoever reads through a publication fails on any recorded
 /// failure.
+///
+/// Each resolution sits behind an `Arc`, so a holder of
+/// [`Self::get_shared`] keeps the resolution as it was without a copy; a
+/// later [`Self::get_mut`] copies it only while such a holder exists.
 #[derive(Default)]
 pub(crate) struct Resolutions {
     map: BTreeMap<String, ResolutionSlot>,
 }
 
 struct ResolutionSlot {
-    value: std::sync::OnceLock<Option<FileResolution>>,
+    value: std::sync::OnceLock<Option<Arc<FileResolution>>>,
     stored: Option<Arc<StoredSlices>>,
 }
 
@@ -278,8 +282,9 @@ impl ResolutionSlot {
                 self.stored
                     .as_ref()
                     .and_then(|stored| stored.resolution_of(path))
+                    .map(Arc::new)
             })
-            .as_ref()
+            .as_deref()
     }
 }
 
@@ -306,17 +311,24 @@ impl Resolutions {
         self.map.get(path)?.read(path)
     }
 
+    /// The resolution of `path`, shared rather than copied.
+    pub(crate) fn get_shared(&self, path: &str) -> Option<Arc<FileResolution>> {
+        let slot = self.map.get(path)?;
+        slot.read(path)?;
+        slot.value.get()?.clone()
+    }
+
     pub(crate) fn get_mut(&mut self, path: &str) -> Option<&mut FileResolution> {
         let slot = self.map.get_mut(path)?;
         slot.read(path);
-        slot.value.get_mut()?.as_mut()
+        slot.value.get_mut()?.as_mut().map(Arc::make_mut)
     }
 
     pub(crate) fn insert(&mut self, path: String, resolution: FileResolution) {
         self.map.insert(
             path,
             ResolutionSlot {
-                value: std::sync::OnceLock::from(Some(resolution)),
+                value: std::sync::OnceLock::from(Some(Arc::new(resolution))),
                 stored: None,
             },
         );
@@ -330,7 +342,8 @@ impl Resolutions {
     pub(crate) fn remove(&mut self, path: &str) -> Option<FileResolution> {
         let slot = self.map.remove(path)?;
         slot.read(path);
-        slot.value.into_inner().flatten()
+        let resolution = slot.value.into_inner().flatten()?;
+        Some(Arc::try_unwrap(resolution).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     pub(crate) fn contains_key(&self, path: &str) -> bool {

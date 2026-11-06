@@ -199,10 +199,10 @@ pub(crate) fn write_segment(
 ///
 /// When a file has no content record and `all_records` asks for one, or
 /// the sections cannot be written.
-pub(crate) fn write_sections(
+pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     writer: &mut SegmentWriter,
     inputs: &CheckoutInputs,
-    resolved: &BTreeMap<String, FileResolution>,
+    resolved: &BTreeMap<String, R>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     all_records: bool,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
@@ -227,6 +227,7 @@ pub(crate) fn write_sections(
     let facts = super::callgraph::CheckoutFacts { inputs };
     let mut subjects = HashMap::new();
     for (file, resolution) in resolved {
+        let resolution: &FileResolution = std::borrow::Borrow::borrow(resolution);
         let (key, parse) = &inputs.parses[file];
         // A segment holding only what changed since a publication writes
         // the records of changed contents; an unchanged one stays where the

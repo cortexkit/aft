@@ -1691,18 +1691,20 @@ impl Checkout {
             // touched by an earlier update keeps the slice it got then.
             for file in &update.touched {
                 match (
-                    engine.live.resolved.get(file),
+                    engine.live.resolved.get_shared(file),
                     engine.live.inputs.parses.get(file),
                 ) {
                     (Some(resolution), Some((key, parse))) => {
                         engine
                             .overlay
-                            .replace(FileSlice::build(file, key, parse, resolution));
+                            .replace(FileSlice::build(file, key, parse, &resolution));
                         engine.refreshed.removed.remove(file);
-                        engine.refreshed.replaced.insert(
-                            file.clone(),
-                            (key.clone(), Arc::clone(parse), Arc::new(resolution.clone())),
-                        );
+                        // Shared with the engine: a later update that changes
+                        // this file copies it then, and only then.
+                        engine
+                            .refreshed
+                            .replaced
+                            .insert(file.clone(), (key.clone(), Arc::clone(parse), resolution));
                     }
                     _ => {
                         engine.overlay.remove(file);
@@ -1785,8 +1787,8 @@ impl Checkout {
                     engine
                         .live
                         .resolved
-                        .get(file)
-                        .map(|resolution| (file.clone(), resolution.clone()))
+                        .get_shared(file)
+                        .map(|resolution| (file.clone(), resolution))
                 })
                 .collect::<BTreeMap<_, _>>();
             (engine.live.inputs.clone(), resolved)
@@ -1912,6 +1914,18 @@ impl Checkout {
             ms: 0.0,
         };
         self.serve_new(snapshot, covered)?;
+        // The engine started from the publication this one replaces, so the
+        // next refresh would start a new one anyway; dropping it now gives
+        // back what it decoded and resolved as soon as the checkout goes
+        // quiet, instead of holding it until the next edit.
+        if let Ok(mut slot) = self.engine.lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|engine| Arc::ptr_eq(&engine.published, &published))
+            {
+                *slot = None;
+            }
+        }
         Ok(Some(DeltaReport {
             ms: elapsed_ms(started),
             ..report
