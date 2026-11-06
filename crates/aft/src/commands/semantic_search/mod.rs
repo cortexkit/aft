@@ -12463,76 +12463,56 @@ mod tests {
             .is_some_and(|reason| reason.contains("tcp connect to 127.0.0.1")));
     }
 
-    /// A first build against an unreachable embedding backend parks in its
-    /// retry loop with the index status still `Building`. The search reply used
-    /// to call that "rebuilding"; it must name the backend outage instead, with
-    /// the configured URL and the engine's reason.
+    /// A first fill against an embedding backend nothing listens on is retried
+    /// later with nothing filled, so the meaning plane reports itself waiting
+    /// for the backend. The search reply used to call that "rebuilding"; it
+    /// must name the backend outage instead, with the configured URL and the
+    /// engine's reason, and status must report the backend unavailable.
     #[test]
     fn unreachable_backend_during_cold_build_is_disclosed_not_called_rebuilding() {
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn needle_symbol() -> bool { true }\n";
-        std::fs::write(&source_file, source).expect("write source file");
-
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                semantic: crate::config::SemanticBackendConfig {
-                    base_url: Some("http://localhost:1234/v1".to_string()),
-                    ..crate::config::SemanticBackendConfig::default()
-                },
-                ..Config::default()
-            },
-        );
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "waiting_for_embedding_backend: connection refused".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        crate::semantic_index::record_embedding_backend_build_failure_for_test(
-            project.path(),
-            "connection refused",
-        );
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.model = "test-unreachable".to_string();
+            config.semantic.base_url = Some(base_url.clone());
+        });
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Building { stage, .. }
+                if stage.starts_with("waiting_for_embedding_backend"))
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("needle_symbol", 5),
             &ctx,
         ));
         let status = ctx.build_status_snapshot();
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        crate::semantic_index::clear_embedding_backend_retry_status(&root);
 
-        assert_eq!(response["success"], true);
-        assert_eq!(response["semantic_status"], "backend_unavailable");
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["semantic_status"], "backend_unavailable", "{response}");
         let text = response["text"].as_str().expect("text");
         assert!(
-            text.starts_with(
-                "Semantic backend unavailable (http://localhost:1234/v1): connection refused; lexical fallback results follow."
-            ),
+            text.starts_with(&format!("Semantic backend unavailable ({base_url}): ")),
             "unexpected disclosure: {text}"
         );
+        assert!(text.contains("lexical fallback results follow."), "{text}");
         assert!(!text.contains("rebuilding"), "{text}");
         assert!(response["note"]
             .as_str()
             .expect("note")
-            .starts_with("Semantic backend unavailable (http://localhost:1234/v1)"));
+            .starts_with(&format!("Semantic backend unavailable ({base_url})")));
 
         let semantic = &status["semantic_index"];
         assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
-        assert_eq!(semantic["reason"], "connection refused");
-        assert_eq!(semantic["backend_url"], "http://localhost:1234/v1");
+        assert_eq!(semantic["backend_url"], base_url.as_str(), "{semantic}");
+        assert!(
+            semantic["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+            "{semantic}"
+        );
     }
 
     #[test]
