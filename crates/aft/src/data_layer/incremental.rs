@@ -52,6 +52,12 @@ pub struct UpdateStats {
     pub answers_changed: usize,
     pub facts_ms: f64,
     pub rebound: usize,
+    /// Why files were bound again: how many through recorded input keys, how
+    /// many through a recorded checkout read whose answer changed, and the
+    /// keys that reached the most files, most first.
+    pub rebound_by_keys: usize,
+    pub rebound_by_answers: usize,
+    pub rebound_top_keys: Vec<(String, usize)>,
     pub surfaces_changed: usize,
     pub replayed: usize,
     pub kept_after_replay: usize,
@@ -750,6 +756,21 @@ impl LiveCheckout {
         }
         binding_keys.extend(changed_crates.iter().cloned());
         let mut rebind = self.reverse.binding_of(&binding_keys);
+        stats.rebound_by_keys = rebind.len();
+        stats.rebound_by_answers = stale.binding.len();
+        if rebind.len() > 100 {
+            let mut by_key = binding_keys
+                .iter()
+                .map(|key| {
+                    let reached = self.reverse.binding_of(&BTreeSet::from([key.clone()]));
+                    (key.replace('\0', "\\0"), reached.len())
+                })
+                .filter(|(_, reached)| *reached > 0)
+                .collect::<Vec<_>>();
+            by_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            by_key.truncate(5);
+            stats.rebound_top_keys = by_key;
+        }
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
