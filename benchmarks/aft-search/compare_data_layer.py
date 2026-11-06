@@ -338,11 +338,17 @@ def count_reads(process: Process, measures: list[JsonObject]) -> None:
 
 
 def semantic_lane_ran(response: JsonObject) -> bool:
-    """Whether the reply's plan names the semantic lane among those it ran."""
+    """Whether the reply ran a semantic search: its plan names the semantic
+    lane and a semantic or hybrid route answered. A regex or literal route
+    answers from grep whatever the plan lists."""
     content = response.get("structuredContent")
     plan = content.get("plan") if isinstance(content, dict) else None
     lanes = plan.get("lanes_run") if isinstance(plan, dict) else None
-    return isinstance(lanes, list) and "semantic" in lanes
+    return (
+        isinstance(lanes, list)
+        and "semantic" in lanes
+        and response.get("interpreted_as") in ("semantic", "hybrid")
+    )
 
 
 def read_replies(path: Path) -> Iterator[JsonObject]:
