@@ -15,7 +15,6 @@ pub enum WatcherState {
 }
 
 const PREFIX: &str = ".aft-cookie-";
-static NEXT: AtomicU64 = AtomicU64::new(0);
 type Pending = Arc<Mutex<BTreeMap<PathBuf, mpsc::Sender<CookieObservation>>>>;
 
 /// A driver delivery cut, not a verified-bind or durable-publication certificate.
@@ -33,18 +32,7 @@ pub struct CookieTicket {
 }
 
 impl CookieTicket {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 
-    /// On timeout or an untrusted watcher, use strict reconciliation rather
-    /// than relying on the cookie acknowledgment.
-    pub fn wait_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<CookieObservation, mpsc::RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
-    }
 }
 
 impl Drop for CookieTicket {
@@ -63,45 +51,7 @@ pub(crate) struct CookieBarrier {
 }
 
 impl CookieBarrier {
-    pub(crate) fn begin(&self, root: &Path) -> std::io::Result<CookieTicket> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = root.join(format!(
-            "{PREFIX}{}-{nonce:x}{:016x}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let (tx, rx) = mpsc::channel();
-        // Hold the registry lock across creation: even immediate delivery must
-        // find the waiter, and create_new cannot overwrite a checkout file.
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        pending.insert(path.clone(), tx);
-        Ok(CookieTicket {
-            path,
-            pending: Arc::clone(&self.pending),
-            rx,
-        })
-    }
 
-    pub(crate) fn observe(&self, path: &Path, observation: CookieObservation) {
-        if let Some(tx) = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(path)
-        {
-            let _ = tx.send(observation);
-        }
-    }
 }
 
 pub(crate) fn is_cookie_path(path: &Path) -> bool {

@@ -270,14 +270,6 @@ pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 /// `view_disk_limits_next_ms` while views are disabled: never due.
 const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
-/// Stable retry outcome used when semantic blobs cannot be published until the
-/// checkout's semantic index has finished loading.
-pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
-    "semantic view publication is waiting for the semantic index";
-/// The publication phase that takes the query pin for a newly assembled
-/// generation. Before it, publication walks source paths, assembles the
-/// generation, and opens the view to load its manifest.
-pub(crate) const VIEW_PUBLICATION_PIN_PHASE: &str = "pin";
 
 /// The call-graph build breaker database for one project under a resolved
 /// cache root, when it exists. Health callers pass a root they resolved once
@@ -293,12 +285,6 @@ pub(crate) fn build_breaker_path_for_health(
             .join("build-breaker.sqlite");
         path.is_file().then_some(path)
     })
-}
-
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 thread_local! {
@@ -2702,39 +2688,7 @@ struct CallGraphStoreBuildSettlement {
 }
 
 impl CallGraphStoreBuildSettlement {
-    fn new(
-        tx: crossbeam_channel::Sender<CallGraphStoreBuildEvent>,
-        force_token: Option<u64>,
-        publication_epoch: u64,
-    ) -> Self {
-        Self {
-            tx,
-            sent: false,
-            force_token,
-            publication_epoch,
-        }
-    }
 
-    fn ready(&mut self, store: CallGraphStore) {
-        let _ = self.tx.send(CallGraphStoreBuildEvent::Ready {
-            store,
-            fulfilled_force_token: self.force_token,
-            publication_epoch: self.publication_epoch,
-        });
-        self.sent = true;
-    }
-
-    fn denied(&mut self, reason: String) {
-        let _ = self.tx.send(CallGraphStoreBuildEvent::Denied { reason });
-        self.sent = true;
-    }
-
-    fn suspended(&mut self, suspension: crate::build_breaker::BuildSuspension) {
-        let _ = self
-            .tx
-            .send(CallGraphStoreBuildEvent::Suspended { suspension });
-        self.sent = true;
-    }
 }
 
 impl Drop for CallGraphStoreBuildSettlement {
@@ -3358,15 +3312,6 @@ pub(crate) struct ReceiverTerminalGuard {
     epoch: u64,
 }
 
-impl ReceiverTerminalGuard {
-    fn new(terminal_epoch: Arc<AtomicU64>, epoch: u64) -> Self {
-        Self {
-            terminal_epoch,
-            epoch,
-        }
-    }
-}
-
 impl Drop for ReceiverTerminalGuard {
     fn drop(&mut self) {
         self.terminal_epoch.fetch_max(self.epoch, Ordering::SeqCst);
@@ -3396,9 +3341,6 @@ pub(crate) struct PendingInstall {
 pub(crate) struct PendingInstallSlot(parking_lot::Mutex<Option<PendingInstall>>);
 
 impl PendingInstallSlot {
-    pub(crate) fn record(&self, epoch: u64, bytes: u64) {
-        *self.0.lock() = Some(PendingInstall { epoch, bytes });
-    }
 
     fn get(&self) -> Option<PendingInstall> {
         *self.0.lock()
@@ -4049,68 +3991,6 @@ impl App {
                 })
                 .collect(),
         )
-    }
-
-    pub(crate) fn adopt_resident_semantic_index(
-        &self,
-        artifact_cache_key: &str,
-        borrower_root: &Path,
-        semantic_config: &crate::config::SemanticBackendConfig,
-    ) -> Option<SemanticIndex> {
-        let contexts = {
-            let mut contexts = self.memory_contexts.lock();
-            contexts.retain(|_, context| context.strong_count() > 0);
-            contexts
-                .iter()
-                .filter_map(|(root, context)| {
-                    context.upgrade().map(|context| (root.clone(), context))
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Normalize comparison-local copies only. Context caches stay keyed by
-        // their original root spelling, so successful candidates are looked up
-        // with the context's stored cache root rather than a normalized re-key.
-        let normalized_borrower = crate::inspect::job::canonicalize_normalized(borrower_root);
-        contexts
-            .into_iter()
-            .filter_map(|(registered_root, context)| {
-                let normalized_registered =
-                    crate::inspect::job::canonicalize_normalized(&registered_root);
-                if normalized_registered == normalized_borrower {
-                    return None;
-                }
-                let cache_root = context.canonical_cache_root_opt()?;
-                if normalized_registered
-                    != crate::inspect::job::canonicalize_normalized(&cache_root)
-                {
-                    return None;
-                }
-                Some((cache_root, context))
-            })
-            .find_map(|(cache_root, context)| {
-                // Only the artifact writer may donate a snapshot. Another
-                // checkout's RAM delta describes that checkout, not this one.
-                if context.shared_artifacts_read_only()
-                    || context.cached_artifact_cache_key(&cache_root).as_deref()
-                        != Some(artifact_cache_key)
-                    || !matches!(
-                        &*context
-                            .semantic_index_status()
-                            .read()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
-                    )
-                {
-                    return None;
-                }
-                context
-                    .semantic_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_mut()?
-                    .adopt_frozen_base_for_root(borrower_root, semantic_config)
-            })
     }
 
     /// Return the process-shared database handle, opening it only when the
@@ -4850,41 +4730,6 @@ pub struct CallgraphViewReadDiagnostics {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-enum CallgraphBackgroundWork {
-    Ensure,
-    ForceRebuild(u64),
-    LegacyMigration,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CallgraphBuildAdmission {
-    Started,
-    CapacityDeferred,
-    NotStarted,
-}
-
-fn retry_changed_callgraph_corpus<T>(
-    mut build: impl FnMut() -> std::result::Result<T, CallGraphStoreError>,
-) -> std::result::Result<T, CallGraphStoreError> {
-    // A writer may change source files while a cold build is reading them.
-    // Retry immediately with a fresh inventory and content hashes, but release
-    // the worker after three attempts so an edited root cannot monopolize a slot.
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match build() {
-            Err(error) if error.is_corpus_change() && attempts < 3 => {
-                crate::slog_info!(
-                    "callgraph corpus changed during cold build; restarting attempt {} of 3",
-                    attempts + 1
-                );
-            }
-            result => return result,
-        }
-    }
-}
-
 #[derive(Clone)]
 struct CallgraphViewInstallTestGate {
     reached: crossbeam_channel::Sender<String>,
@@ -5009,9 +4854,6 @@ fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGua
 
 
 #[cfg(test)]
-impl IdleReapLock {
-}
-
 /// The locks behind the subc maintenance probes (see
 /// [`AppContext::watcher_drain_has_work`] and its siblings), one per field a
 /// probe reads. Tests hold each in turn to prove no probe waits for it.
@@ -5074,9 +4916,6 @@ fn wait_on_callgraph_build_start_gate(root: &Path) {
     }
 }
 
-#[cfg(not(test))]
-fn wait_on_callgraph_build_start_gate(_root: &Path) {}
-
 #[cfg(test)]
 static CALLGRAPH_POINTER_REMOVAL_ARMS: std::sync::OnceLock<parking_lot::Mutex<BTreeSet<PathBuf>>> =
     std::sync::OnceLock::new();
@@ -5126,18 +4965,6 @@ fn remove_callgraph_pointer_before_inline_reopen_for_test(
 ) {
     let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
     remove_armed_callgraph_pointer_for_test(&pointer);
-}
-
-/// Inline wait window for a callgraph-store cold build before returning
-/// `Building`. Default `0` (pure-async: never block the request thread).
-/// Tests set `AFT_CALLGRAPH_BUILD_WAIT_MS` large so small fixture builds
-/// resolve to `Ready` synchronously and exercise query correctness directly.
-fn callgraph_build_wait_window() -> Duration {
-    std::env::var("AFT_CALLGRAPH_BUILD_WAIT_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::ZERO)
 }
 
 // Retain the aggregate for integration harnesses compiled without cfg(test).
@@ -7462,10 +7289,6 @@ impl AppContext {
         self.configure_content_generation.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn configure_content_generation_flag(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.configure_content_generation)
-    }
-
     pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
         let now = Instant::now();
         let mut timing = self.configure_phase_timing.lock();
@@ -7551,14 +7374,6 @@ impl AppContext {
         self.semantic_build_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
-    }
-
-    pub(crate) fn semantic_build_epoch(&self) -> u64 {
-        self.semantic_build_epoch.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn semantic_build_epoch_flag(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.semantic_build_epoch)
     }
 
     pub fn configure_warnings_sender(
@@ -9449,16 +9264,6 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
-    pub(crate) fn callgraph_corpus_memo(&self) -> Weak<crate::callgraph_store::CorpusMemo> {
-        let mut memo = self.callgraph_corpus_memo.lock();
-        // Work already admitted before unbind may finish, but must not recreate
-        // a memo for a root whose binding has been released.
-        if self.subc_lifecycle.unbound_hint.load(Ordering::Acquire) {
-            return Weak::new();
-        }
-        Arc::downgrade(memo.get_or_insert_with(Default::default))
-    }
-
     /// Record the workspace manifests' resolution fields read by this
     /// configure and return the manifests whose fields changed since the
     /// previous configure of the same root. A first configure, or one for a
@@ -9508,25 +9313,6 @@ impl AppContext {
 
     pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
         self.callgraph_force_demand.fulfill(token);
-    }
-
-    /// The pending force token a build on this context may act on. Only a
-    /// callgraph writer can run the forced build. A context that became
-    /// read-only while a token was pending (its owner lease moved to another
-    /// process) would otherwise skip the published store forever while
-    /// waiting for a build it may not start, so the token is dropped and the
-    /// context follows the owner's published store instead.
-    fn callgraph_force_token_for_build(&self) -> Option<u64> {
-        let token = self.pending_callgraph_store_force_token()?;
-        if self.callgraph_writer() {
-            return Some(token);
-        }
-        crate::slog_info!(
-            "callgraph force rebuild dropped on read-only root (requested for: {}); following the owner's published store",
-            self.callgraph_force_demand.reason()
-        );
-        self.fulfill_callgraph_store_force_token(token);
-        None
     }
 
     /// Ask for the store to be compared with the disk, because watcher events
@@ -9811,23 +9597,8 @@ impl AppContext {
         self.callgraph_cold_build_spawn_count.load(Ordering::SeqCst)
     }
 
-    fn callgraph_build_wait_window(&self) -> Duration {
-        #[cfg(test)]
-        if let Some(wait) = *self.callgraph_build_wait_override.lock() {
-            return wait;
-        }
-        callgraph_build_wait_window()
-    }
-
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
         self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None)
-    }
-
-    /// Keep inspect's graph wait inside its request budget. Retain the checkout
-    /// wait outcome so inspect can name files whose edits are not in the graph.
-    pub(crate) fn callgraph_store_for_ops_until(&self, deadline: Instant) -> CallgraphStoreAccess {
-        let _ = deadline;
-        self.callgraph_store_for_ops()
     }
 
 
@@ -9850,20 +9621,7 @@ impl AppContext {
         false
     }
 
-    /// Whether the next view publication may leave the derived call graph
-    /// unbuilt: an on-demand root that no query has needed the graph of yet.
-    pub(crate) fn defer_callgraph_build(&self) -> bool {
-        self.callgraph_build_on_demand() && !self.lazy_callgraph.demanded.load(Ordering::Acquire)
-    }
 
-
-
-    /// A root actor or the standalone scope now publishes for this context.
-    pub(crate) fn note_publication_scope(&self) {
-        self.lazy_callgraph
-            .publication_scoped
-            .store(true, Ordering::Release);
-    }
 
     fn callgraph_store_for_ops_with_wait(
         &self,
@@ -9878,32 +9636,6 @@ impl AppContext {
             return CallgraphStoreAccess::Off;
         }
         CallgraphStoreAccess::Unavailable
-    }
-
-    fn schedule_legacy_callgraph_migration_if_needed(
-        &self,
-        store: &ReadonlyCallGraphStore,
-        project_root: PathBuf,
-        callgraph_dir: PathBuf,
-    ) {
-        let _ = (store, project_root, callgraph_dir);
-    }
-
-    fn configured_callgraph_keys(&self, current_root: &Path) -> BTreeSet<String> {
-        let mut roots = self
-            .configured_session_roots
-            .lock()
-            .iter()
-            .map(|(root, _session)| root.clone())
-            .collect::<BTreeSet<_>>();
-        roots.insert(current_root.to_path_buf());
-        roots
-            .iter()
-            // Configure already derived these keys. Re-running the git
-            // root-commit probe here would block the transport loop on spawn
-            // retries when git is missing from PATH.
-            .map(|root| self.memoized_artifact_cache_key(root))
-            .collect()
     }
 
     /// Access the callgraph-store background-build receiver (drained by the
@@ -10883,60 +10615,6 @@ impl AppContext {
         &self.semantic_index_rx
     }
 
-    pub(crate) fn install_semantic_index_rx(
-        &self,
-        receiver: crossbeam_channel::Receiver<SemanticIndexEvent>,
-        generation: u64,
-    ) -> u64 {
-        let mut slot = self.semantic_index_rx.lock();
-        let replaced = take_undelivered_install(
-            &self.semantic_pending_install,
-            self.semantic_index_rx_epoch(),
-            slot.as_ref(),
-        );
-        self.note_semantic_index_rx_generation(generation);
-        let epoch = self.next_semantic_index_rx_epoch();
-        *slot = Some(receiver);
-        drop(slot);
-        log_discarded_pending_install(
-            "semantic index",
-            self.canonical_cache_root_opt().as_deref(),
-            replaced,
-            "a newer load replaced it",
-        );
-        epoch
-    }
-
-    /// The slot a semantic-index loader records its finished load's size in.
-    pub(crate) fn semantic_pending_install(&self) -> Arc<PendingInstallSlot> {
-        Arc::clone(&self.semantic_pending_install)
-    }
-
-    pub(crate) fn semantic_index_rx_terminal_guard(&self, epoch: u64) -> ReceiverTerminalGuard {
-        ReceiverTerminalGuard::new(Arc::clone(&self.semantic_index_rx_terminal_epoch), epoch)
-    }
-
-    /// Keep generation/epoch validation and receiver mutation under the same
-    /// lock used by receiver installation.
-    pub(crate) fn with_current_semantic_index_rx<R>(
-        &self,
-        generation: u64,
-        epoch: u64,
-        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<SemanticIndexEvent>>) -> R,
-    ) -> Option<R> {
-        self.run_if_subc_bound_generation(generation, || {
-            let mut receiver = self.semantic_index_rx.lock();
-            if receiver.is_none()
-                || self.semantic_index_rx_generation() != generation
-                || self.semantic_index_rx_epoch() != epoch
-            {
-                return None;
-            }
-            Some(action(&mut receiver))
-        })
-        .flatten()
-    }
-
     /// Drop the semantic-index receiver. A finished load still waiting in it
     /// is freed with it and logged with `reason`.
     pub(crate) fn retire_semantic_index_rx(&self, reason: &str) {
@@ -10969,21 +10647,6 @@ impl AppContext {
         true
     }
 
-    /// Retire a build receiver only if no replacement changed its epoch after
-    /// the caller inspected it. `None` means a newer receiver won the race;
-    /// `Some(false)` means the inspected epoch is still current but empty.
-    pub(crate) fn retire_semantic_index_rx_if_epoch(&self, expected_epoch: u64) -> Option<bool> {
-        let mut receiver = self.semantic_index_rx.lock();
-        if self.semantic_index_rx_epoch() != expected_epoch {
-            return None;
-        }
-        let retired = receiver.take().is_some();
-        if retired {
-            self.next_semantic_index_rx_epoch();
-        }
-        Some(retired)
-    }
-
     pub(crate) fn note_semantic_index_rx_generation(&self, generation: u64) {
         self.semantic_index_rx_generation
             .store(generation, Ordering::SeqCst);
@@ -11007,22 +10670,8 @@ impl AppContext {
         self.semantic_persist_epoch.next()
     }
 
-    pub(crate) fn semantic_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
-        self.semantic_persist_epoch.clone()
-    }
-
-    pub(crate) fn semantic_persist_lock(&self) -> Arc<parking_lot::Mutex<()>> {
-        Arc::clone(&self.semantic_persist_lock)
-    }
-
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
         self.semantic_index_status.as_ref()
-    }
-
-    /// Shared handle on the semantic status, for a worker thread that keeps
-    /// it in step with the views-on semantic lane.
-    pub(crate) fn semantic_index_status_handle(&self) -> Arc<RwLock<SemanticIndexStatus>> {
-        Arc::clone(&self.semantic_index_status)
     }
 
     pub(crate) fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
@@ -11037,10 +10686,6 @@ impl AppContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    pub(crate) fn artifact_reload_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.artifact_reload_lock.lock()
     }
 
     /// Reset this context's cold semantic seed gate for a newly accepted
@@ -11110,10 +10755,6 @@ impl AppContext {
             .store(active, Ordering::SeqCst);
     }
 
-    pub(crate) fn semantic_worker_bytes(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.semantic_worker_bytes)
-    }
-
     pub fn install_semantic_refresh_worker(
         &self,
         sender: crossbeam_channel::Sender<SemanticRefreshRequest>,
@@ -11153,62 +10794,6 @@ impl AppContext {
 
     pub(crate) fn semantic_refresh_generation(&self) -> u64 {
         self.semantic_refresh_generation.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn semantic_refresh_epoch(&self) -> u64 {
-        self.semantic_refresh_epoch.load(Ordering::SeqCst)
-    }
-
-    /// Serialize refresh event commit with worker replacement. The receiver
-    /// lock also couples the generation and epoch to the dequeued channel.
-    pub(crate) fn with_current_semantic_refresh_rx<R>(
-        &self,
-        generation: u64,
-        epoch: u64,
-        action: impl FnOnce() -> R,
-    ) -> Option<R> {
-        self.run_if_subc_bound_generation(generation, || {
-            let receiver = self.semantic_refresh_event_rx.lock();
-            if receiver.is_none()
-                || self.semantic_refresh_generation() != generation
-                || self.semantic_refresh_epoch() != epoch
-            {
-                return None;
-            }
-            Some(action())
-        })
-        .flatten()
-    }
-
-    pub(crate) fn clear_semantic_refresh_worker_if_current(
-        &self,
-        generation: u64,
-        epoch: u64,
-    ) -> Option<u64> {
-        let worker_slot = {
-            let mut receiver = self.semantic_refresh_event_rx.lock();
-            if receiver.is_none()
-                || self.semantic_refresh_generation() != generation
-                || self.semantic_refresh_epoch() != epoch
-            {
-                return None;
-            }
-            let disconnected_build_epoch = self.semantic_refresh_build_epoch.load(Ordering::SeqCst);
-            self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
-            let mut request = self.semantic_refresh_tx.lock();
-            let mut worker = self.semantic_refresh_worker.lock();
-            *receiver = None;
-            *request = None;
-            self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
-            self.invalidate_semantic_refresh_probe();
-            (worker.take(), disconnected_build_epoch)
-        };
-        if let Some(worker_slot) = worker_slot.0 {
-            if let Ok(mut handle) = worker_slot.lock() {
-                drop(handle.take());
-            }
-        }
-        Some(worker_slot.1)
     }
 
     pub fn clear_semantic_refresh_worker(&self) {
@@ -11508,12 +11093,6 @@ impl AppContext {
         &self,
     ) -> &parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
-    }
-
-    pub(crate) fn semantic_embedding_model_slot(
-        &self,
-    ) -> Arc<parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>> {
-        Arc::clone(&self.semantic_embedding_model)
     }
 
     /// Access the file watcher handle (kept alive to continue watching).
@@ -14509,34 +14088,6 @@ impl AppContext {
         crate::memory::MemoryEstimate::estimated(semantic_bytes)
             .count("semantic_loads", usize::from(semantic.is_some()))
             .count_u64("semantic_bytes", semantic_bytes)
-    }
-
-    /// Remove the pending-install record for receiver `epoch` once a drain has
-    /// taken that receiver's events, returning the recorded size.
-    pub(crate) fn take_semantic_pending_install(&self, epoch: u64) -> Option<u64> {
-        self.semantic_pending_install
-            .take_for_epoch(epoch)
-            .map(|pending| pending.bytes)
-    }
-
-    /// Why a finished load dequeued from the receiver `receiver_generation` /
-    /// `receiver_epoch` could not be installed. Unbound comes first: an
-    /// unbound root must not install anything, whatever else changed.
-    pub(crate) fn finished_load_discard_reason(
-        &self,
-        receiver_generation: u64,
-        receiver_epoch: u64,
-        current_receiver_epoch: u64,
-    ) -> &'static str {
-        if self.subc_unbound_quiesced() {
-            "the root was unbound"
-        } else if self.configure_generation() != receiver_generation
-            || current_receiver_epoch != receiver_epoch
-        {
-            "a newer load superseded it"
-        } else {
-            "its receiver was retired"
-        }
     }
 
     /// Build one root's memory estimate using only non-blocking lock attempts.

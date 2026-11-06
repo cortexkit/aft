@@ -676,36 +676,6 @@ pub(crate) fn pin_cache_path(path: &Path) -> io::Result<Option<CachePath>> {
     Ok(Some(CachePath { root, relative }))
 }
 
-pub(crate) fn pin_owned_cache_path(path: &Path) -> io::Result<CachePath> {
-    if let Some(access) = pin_cache_path(path)? {
-        return Ok(access);
-    }
-    let owners = STATUS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .owners
-        .clone();
-    for (expected, durable) in owners {
-        let Ok(relative) = path.strip_prefix(&durable) else {
-            continue;
-        };
-        let Ok(root) = PinnedDir::repair_open_path(&durable) else {
-            continue;
-        };
-        if pinned_identity(&root)? != expected {
-            continue;
-        }
-        return Ok(CachePath {
-            root,
-            relative: relative.to_path_buf(),
-        });
-    }
-    Err(io::Error::other(
-        "cache durable owner is unknown; refusing deletion",
-    ))
-}
-
 pub(crate) fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
     let Some(access) = pin_cache_path(path)? else {
         return Ok(None);
@@ -1689,96 +1659,6 @@ fn deletion_protections_with_budget(
         }
     }
     Ok(protected)
-}
-pub(crate) fn retention_protections(storage: &StoragePaths) -> io::Result<Vec<(u64, u64)>> {
-    let (_, durable) = candidates_and_durable(&storage.durable)?;
-    deletion_protections(&durable)
-}
-pub(crate) fn retention_protections_with_budget(
-    storage: &StoragePaths,
-    budget: &mut RepairBudget,
-    examined: &mut crate::bash_background::persistence::IdentityCensus,
-) -> io::Result<Vec<(u64, u64)>> {
-    #[cfg(test)]
-    crate::storage_retention::test_hook(&storage.artifacts, "protection-census");
-    let (_, durable) = candidates_and_durable_with_budget(&storage.durable, budget)?;
-    deletion_protections_with_budget(&durable, budget, examined)
-}
-/// Register an explicitly supplied owner, never infer durable state from a
-/// cache pathname. Split roots also need their persisted namespace marker.
-pub(crate) fn register_durable_owner(storage: &StoragePaths) -> io::Result<()> {
-    let durable = pin_storage_root(&storage.durable)?;
-    let artifacts = if storage.artifacts == storage.durable {
-        durable.repair_clone()?
-    } else {
-        crate::bash_background::persistence::resolve_configured_root(&storage.artifacts)?;
-        real_directory(&storage.artifacts)?;
-        PinnedDir::repair_open_path(&storage.artifacts)?
-    };
-    let artifact_identity = pinned_identity(&artifacts)?;
-    if pinned_identity(&durable)? != artifact_identity {
-        marker_matches_pinned(&artifacts, &durable)?;
-    }
-    STATUS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .owners
-        .insert(artifact_identity, storage.durable.clone());
-    Ok(())
-}
-pub(crate) fn cache_deletion_protections(cache: &Path) -> io::Result<Vec<(u64, u64)>> {
-    let owners = STATUS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .owners
-        .clone();
-    for ancestor in cache.ancestors() {
-        if let Ok(id) = identity(ancestor) {
-            if let Some(durable) = owners.get(&id) {
-                let Ok(storage) = pin_storage_root(durable) else {
-                    continue;
-                };
-                let owner = pinned_identity(&storage)?;
-                if owner != id
-                    && marker_matches_pinned(&PinnedDir::repair_open_path(ancestor)?, &storage)
-                        .is_err()
-                {
-                    continue;
-                }
-                return retention_protections(&StoragePaths::new(
-                    storage.path().to_path_buf(),
-                    ancestor.to_path_buf(),
-                ));
-            }
-        }
-    }
-    for ancestor in cache.ancestors() {
-        if ancestor
-            .file_name()
-            .is_some_and(|name| CACHE_DOMAINS.iter().any(|domain| name == *domain))
-        {
-            if let Some(storage) = ancestor.parent() {
-                let default = crate::bash_background::storage_dir(None);
-                let storage_pin = pin_storage_root(storage)?;
-                if pin_storage_root(&default)
-                    .and_then(|root| pinned_identity(&root))
-                    .ok()
-                    == Some(pinned_identity(&storage_pin)?)
-                    && !storage.join(OWNER).exists()
-                {
-                    return retention_protections(&StoragePaths::same(storage_pin.path()));
-                }
-                return Err(io::Error::other(
-                    "cache durable owner is unknown; refusing deletion",
-                ));
-            }
-        }
-    }
-    Err(io::Error::other(
-        "cache durable owner is unknown; refusing deletion",
-    ))
 }
 fn candidate_protected(
     candidate: &Path,

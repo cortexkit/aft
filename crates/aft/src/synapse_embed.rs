@@ -101,28 +101,6 @@ impl LanePause {
     }
 }
 
-/// Record that a background retry for `pause` will not run before
-/// `retry_at_ms`, so status shows when the wait really ends. A warm-up or
-/// other transient refusal may carry no hint (or a hint shorter than the
-/// worker's backoff); the daemon's own end time of an announced lane pause is
-/// left as it is. Only the recorded pause the worker waits on is extended:
-/// another root's identical pause, or a newer refusal that replaced this one,
-/// keeps its own end time.
-pub(crate) fn note_pause_retry_at(pause: &LanePause, retry_at_ms: u64) {
-    if pause.cause == PauseCause::LanePaused || pause.record_id == 0 {
-        return;
-    }
-    let mut pauses = lane_pauses()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(recorded) = pauses
-        .values_mut()
-        .find(|recorded| recorded.record_id == pause.record_id)
-    {
-        recorded.paused_until_ms = recorded.paused_until_ms.max(retry_at_ms);
-    }
-}
-
 fn next_pause_record_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -349,22 +327,6 @@ pub enum SynapseEmbeddingError {
     CircuitOpen,
     Timeout(String),
     NoProgress(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SemanticBuildFailureClass {
-    ModelLoading,
-    Failure,
-}
-
-/// Classify the daemon's model-loading response after it crosses the existing
-/// string-based semantic-index build boundary.
-pub(crate) fn classify_semantic_build_failure(error: &str) -> SemanticBuildFailureClass {
-    if error.starts_with("synapse_daemon_unavailable: model_loading:") {
-        SemanticBuildFailureClass::ModelLoading
-    } else {
-        SemanticBuildFailureClass::Failure
-    }
 }
 
 impl fmt::Display for SynapseEmbeddingError {

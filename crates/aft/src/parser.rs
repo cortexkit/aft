@@ -786,21 +786,6 @@ fn is_h_header(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("h")
 }
 
-/// Language for a stored-content key, without reading a possibly newer file.
-/// An unresolved header is a cache miss; its source must be parsed before a key
-/// can be chosen safely.
-pub(crate) fn language_for_content_hash(path: &Path, hash: blake3::Hash) -> Option<LangId> {
-    if is_h_header(path) {
-        return HEADER_PARSE_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .get(&hash)
-            .map(|(_, lang)| *lang);
-    }
-    language_for_extension(path)
-}
-
 pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return Some(LangId::Groovy);
@@ -1722,35 +1707,6 @@ impl SymbolCache {
             .count("symbols", symbol_count)
     }
 
-    pub(crate) fn project_root(&self) -> Option<PathBuf> {
-        self.project_root.clone()
-    }
-
-    pub(crate) fn disk_entries(
-        &self,
-    ) -> Vec<(&PathBuf, SystemTime, u64, blake3::Hash, &Vec<Symbol>)> {
-        // Persist EVERY parsed entry, including files that legitimately parse to
-        // zero symbols (e.g. a TS file with only imports, a config-shaped file).
-        // Previously these were filtered out, so they were never written to disk;
-        // on the next spawn `load_from_disk` couldn't reload them, the prewarm
-        // skip-check (`contains_path_with_mtime`) missed, and they were re-parsed
-        // on every startup forever (the "N new" churn in issue #86). An empty
-        // entry serializes to `symbols: []` — a few bytes — and makes the prewarm
-        // skip it. It also makes the "persisted symbol cache: N files" count
-        // accurate (was overstated by the filtered-out empties).
-        self.entries
-            .iter()
-            .map(|(path, cached)| {
-                (
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    cached.symbols.as_ref(),
-                )
-            })
-            .collect()
-    }
 }
 
 pub(crate) fn cached_symbol_count_shared(

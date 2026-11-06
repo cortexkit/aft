@@ -148,7 +148,6 @@ const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
 /// bind. Waiting through that observed window prevents a healthy first search
 /// from returning an empty loading response while keeping a stuck load bounded.
 const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
-const SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
     "trigram index building; results from a bounded walk";
@@ -216,8 +215,6 @@ fn with_search_index_load_wait_hook_for_test<T>(
     action()
 }
 
-const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
-const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
 
 /// The opening line of a reply served while a shared (borrowed) semantic index
@@ -2393,65 +2390,6 @@ fn handle_semantic_search_inner(
     }
 }
 
-/// Report on an external reply whose saved trigram index was compared with
-/// the files on disk first (see `external_disk_check`).
-///
-/// A check that covered every file ends the reply with one line saying so and
-/// what had changed. A check cut short by its time limit keeps the
-/// unchecked-index notice, saying how far the check got, and marks the reply
-/// incomplete. Either way, when the semantic lane answered from a saved
-/// semantic index that predates some files, the reply says how many. `age` is
-/// how long ago the check was made when an earlier query's check was reused;
-/// both sentences then say so.
-fn disclose_checked_saved_index(
-    response: &mut Response,
-    external_root: &Path,
-    search_artifact_path: Option<&Path>,
-    check: &external_disk_check::DiskCheck,
-    age: Option<Duration>,
-    semantic_lane_answered: bool,
-) {
-    if !response.success {
-        return;
-    }
-    let Some(data) = response.data.as_object_mut() else {
-        return;
-    };
-    if data.contains_key("exact_sweep") {
-        return;
-    }
-    let mut summary = check.to_json();
-    summary["reused"] = serde_json::json!(age.is_some());
-    summary["checked_ms_ago"] =
-        serde_json::json!(age.map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)));
-    data.insert("saved_index_check".to_string(), summary);
-    if check.verified() {
-        append_reply_paragraph(
-            data,
-            &external_disk_check::verified_line(check, external_root, age),
-        );
-    } else {
-        data.insert("complete".to_string(), serde_json::json!(false));
-    }
-    let semantic_line = semantic_lane_answered
-        .then(|| external_disk_check::semantic_outdated_line(check, external_root))
-        .flatten();
-    if let Some(line) = &semantic_line {
-        append_reply_paragraph(data, line);
-    }
-    if !check.verified() {
-        disclose_unverified_saved_index(
-            response,
-            external_root,
-            search_artifact_path,
-            Some((
-                &external_disk_check::checked_ago(age),
-                &external_disk_check::unverified_detail(check),
-            )),
-        );
-    }
-}
-
 fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>, paragraph: &str) {
     let text = data
         .get("text")
@@ -2463,85 +2401,6 @@ fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>,
         format!("{text}\n\n{paragraph}")
     };
     data.insert("text".to_string(), serde_json::json!(text));
-}
-
-/// Tell the agent that an external reply came from another project's saved
-/// index without a full check against that project's files on disk.
-///
-/// Nothing in this session refreshes another project's index, and loading it
-/// does not compare it with the files on disk, so text added or changed since
-/// it was saved can be missing from the results. `checked`, when given, is how
-/// long ago a time-limited comparison ran (empty when it ran for this query)
-/// and how far it got; without it nothing was compared.
-/// Replies whose identifier sweep read every changed file from disk (they
-/// carry `exact_sweep`) are already checked and get no notice.
-fn disclose_unverified_saved_index(
-    response: &mut Response,
-    external_root: &Path,
-    search_artifact_path: Option<&Path>,
-    checked: Option<(&str, &str)>,
-) {
-    if !response.success {
-        return;
-    }
-    let Some(data) = response.data.as_object_mut() else {
-        return;
-    };
-    if data.contains_key("exact_sweep") {
-        return;
-    }
-    let saved_at = search_artifact_path
-        .and_then(|path| fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok());
-    let when = saved_at
-        .map(|saved_at| {
-            let millis = saved_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis() as i64);
-            let age = std::time::SystemTime::now()
-                .duration_since(saved_at)
-                .unwrap_or_default();
-            format!(
-                " (saved {}, {} ago)",
-                crate::subc_format::format_unix_millis_utc(millis - millis.rem_euclid(1000)),
-                format_coarse_age(age)
-            )
-        })
-        .unwrap_or_default();
-    let notice = match checked {
-        None => format!(
-            "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
-            external_root.display()
-        ),
-        Some((ago, checked)) => format!(
-            "Answered from the saved AFT index of {}{when}, which was only partly checked against the files on disk{ago}: {checked}. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check.",
-            external_root.display()
-        ),
-    };
-    append_reply_paragraph(data, &notice);
-    data.insert(
-        "saved_index_unverified".to_string(),
-        serde_json::json!({
-            "saved_at_unix_ms": saved_at.and_then(|saved_at| saved_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|since| since.as_millis() as u64)),
-        }),
-    );
-}
-
-/// `45 s`, `12 min`, `6 h`, `3 days`: enough to judge how stale an index is.
-fn format_coarse_age(age: Duration) -> String {
-    let seconds = age.as_secs();
-    if seconds < 60 {
-        format!("{seconds} s")
-    } else if seconds < 3_600 {
-        format!("{} min", seconds / 60)
-    } else if seconds < 172_800 {
-        format!("{} h", seconds / 3_600)
-    } else {
-        format!("{} days", seconds / 86_400)
-    }
 }
 
 /// Bounded lexical scan of a foreign git root that has no borrowable AFT
@@ -2790,15 +2649,6 @@ fn external_fallback_response(
     )
 }
 
-fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
-    let config = ctx.config().semantic.clone();
-    let expected = SemanticIndexFingerprint::for_config_dimension(&config, index.dimension());
-    index
-        .fingerprint()
-        .map(|fingerprint| fingerprint.as_string() == expected.as_string())
-        .unwrap_or(false)
-}
-
 fn stale_cli_snapshot_partial_response(
     mut response: Response,
     stale_cli_snapshot: bool,
@@ -2828,13 +2678,6 @@ fn external_response_extras(
         );
     }
     extras
-}
-
-fn borrowed_drift_log_message(index_kind: &str, root: &Path, drift_count: usize) -> String {
-    format!(
-        "borrowed {index_kind} index for {} has {drift_count} drifted file(s); serving current-disk snippets without agent-facing stale prose",
-        root.display()
-    )
 }
 
 fn absolute_display_root(root: &Path) -> PathBuf {
