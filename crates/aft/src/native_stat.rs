@@ -111,38 +111,6 @@ impl NativeStat {
             && (self.modified_ns as u128) < observed_ns
     }
 
-    pub fn strict_read(path: &Path) -> io::Result<Self> {
-        match Self::read(path) {
-            Ok(stat) => Ok(stat),
-            Err(error) => {
-                let (metadata, identity) = crate::file_identity::symlink_metadata(path)
-                    .map_err(|e| at("reading fallback metadata", path, e))?;
-                let crate::file_identity::FileIdentity::Known { volume, index } = identity else {
-                    return Err(error);
-                };
-                Ok(Self {
-                    identity: FileIdentity::StrictOnly {
-                        volume,
-                        index,
-                        birth: metadata
-                            .created()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos()),
-                    },
-                    size: metadata.len(),
-                    modified_ns: metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map_or(-1, |d| d.as_nanos() as i128),
-                    changed_ns: -1,
-                    mode: 0,
-                    reuse_supported: false,
-                })
-            }
-        }
-    }
 }
 
 #[cfg(unix)]

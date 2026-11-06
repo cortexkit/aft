@@ -29,7 +29,7 @@ use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir_with_key,
-    walk_project_files_bounded_matching, CacheLock, SearchIndex,
+    CacheLock, SearchIndex,
 };
 use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
@@ -40,7 +40,6 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static SEMANTIC_STALE_GENERATION_SIGNAL: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
-static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -304,8 +303,6 @@ thread_local! {
 // observed by every configure in a parallel libtest binary, so a test that
 // asserts "no load started yet" must read its own root's count or a neighbour's
 // background load races it.
-static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT: Mutex<Option<HashMap<PathBuf, usize>>> =
-    Mutex::new(None);
 
 // Keys are canonical so a test that configured `/var/...` matches the load
 // recorded under `/private/var/...`.
@@ -375,14 +372,6 @@ pub fn semantic_stale_generation_discards_for_test() -> usize {
     SEMANTIC_STALE_GENERATION_DISCARDS.load(Ordering::SeqCst)
 }
 
-fn note_semantic_stale_generation_discard() {
-    SEMANTIC_STALE_GENERATION_DISCARDS.fetch_add(1, Ordering::SeqCst);
-    #[cfg(test)]
-    if let Some((_, changed)) = SEMANTIC_STALE_GENERATION_SIGNAL.get() {
-        changed.notify_all();
-    }
-}
-
 #[cfg(test)]
 fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> bool {
     if semantic_stale_generation_discards_for_test() > 0 {
@@ -407,13 +396,6 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
 // matters: unembedded changed files are already excluded from results by the
 // stale-file mask, and grep/read see changes instantly. A batch is admitted
 // after at most four quiet windows even if requests keep arriving.
-const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
-
-const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
-const SEMANTIC_COLD_BUILD_LIMITER_KIND: &str = "semantic post-configure cold build";
-#[cfg(not(test))]
-const INDEX_ORDER_GRACE: Duration = Duration::from_secs(30);
-const SUPERSEDED_SEMANTIC_BUILD: &str = "semantic build superseded";
 
 #[cfg(test)]
 static INDEX_ORDER_GRACE_MS: AtomicU64 = AtomicU64::new(30_000);
@@ -422,62 +404,9 @@ static INDEX_ORDER_TIMEOUT_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 #[cfg(test)]
 static INDEX_ORDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn index_order_grace() -> Duration {
-    #[cfg(test)]
-    {
-        return Duration::from_millis(INDEX_ORDER_GRACE_MS.load(Ordering::SeqCst));
-    }
-    #[cfg(not(test))]
-    INDEX_ORDER_GRACE
-}
-
-fn wait_for_semantic_artifact_start(
-    start_rx: &crossbeam_channel::Receiver<()>,
-    root: &Path,
-) -> bool {
-    let grace = index_order_grace();
-    match start_rx.recv_timeout(grace) {
-        Ok(()) => true,
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            let message = format!(
-                "semantic artifact load proceeding without callgraph build_started after {}s",
-                grace.as_secs()
-            );
-            #[cfg(test)]
-            INDEX_ORDER_TIMEOUT_LOGS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(message.clone());
-            slog_info!("{}", message);
-            crate::logging::release_index_build_start_waiters(
-                crate::logging::IndexPlane::Callgraph,
-                root,
-            );
-            true
-        }
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => false,
-    }
-}
-
 #[derive(Clone)]
 struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
 
-
-impl SemanticRefreshLimiter {
-    fn acquire(
-        &self,
-        root: &Path,
-        admitted: impl Fn() -> bool,
-    ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
-        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-            &self.0,
-            SEMANTIC_REFRESH_LIMITER_KIND,
-            root,
-            admitted,
-        )
-    }
-}
 
 #[cfg(test)]
 static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -935,20 +864,6 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
     }
 }
 
-/// Backoff for build-level retries when the embedding backend is unreachable.
-/// Ramps 15s -> 30s -> 60s then holds at 60s. Keeps the retry cadence cheap
-/// (the build re-walks files each attempt) while recovering within a minute of
-/// the backend returning.
-fn semantic_build_retry_backoff(attempt: usize) -> Duration {
-    Duration::from_millis(crate::semantic_index::build_backend_retry_delay_ms(attempt))
-}
-
-/// How often a semantic build waiting on the plugin's ONNX Runtime download
-/// checks whether the runtime has been published. Each check reads one lock
-/// file and one directory, and a second of delay is invisible next to a
-/// download that takes several.
-const ONNX_RUNTIME_DOWNLOAD_POLL: Duration = Duration::from_secs(1);
-
 
 
 #[cfg(test)]
@@ -1001,22 +916,7 @@ struct SemanticRefreshDebounce {
 }
 
 impl SemanticRefreshDebounce {
-    fn new(now: Instant, quiet_window: Duration) -> Self {
-        Self {
-            quiet_window,
-            quiet_deadline: now + quiet_window,
-            // Allow save/format bursts to settle without postponing embedding forever.
-            batch_deadline: now + quiet_window.saturating_mul(4),
-        }
-    }
 
-    fn extend(&mut self, now: Instant) {
-        self.quiet_deadline = now + self.quiet_window;
-    }
-
-    fn deadline(&self) -> Instant {
-        self.quiet_deadline.min(self.batch_deadline)
-    }
 }
 
 
@@ -2191,14 +2091,6 @@ struct SymbolViewPrewarm {
     skipped: u64,
 }
 
-pub(crate) fn walk_semantic_project_files_bounded(
-    root: &Path,
-    max_files: usize,
-) -> Result<Vec<PathBuf>, usize> {
-    let filters = build_path_filters(&[], &[]).unwrap_or_default();
-    walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
-}
-
 #[cfg(test)]
 mod nested_worktree_semantic_tests {
     use super::*;
@@ -2551,14 +2443,6 @@ fn register_hashline_for_configure(
     );
     if let Some(warning) = &registration.downgrade {
         warnings.push(hashline_downgrade_warning_for(warning));
-    }
-}
-
-fn log_artifact_owner_note(note: &str) {
-    if note.ends_with("(read-only borrow)") {
-        slog_info!("{}", note);
-    } else {
-        slog_warn!("{}", note);
     }
 }
 
@@ -4053,21 +3937,8 @@ fn release_callgraph_start_waiters_for_generation_change(
     }
 }
 
-/// Whether this root may build or refresh its own semantic index (see
-/// `semantic_admission`). A root that may not still reads a saved index.
-fn semantic_work_admitted(ctx: &AppContext) -> bool {
-    ctx.canonical_cache_root_opt().is_some_and(|root| {
-        crate::semantic_admission::admission(&root, &ctx.config().index.roots).admits()
-    })
-}
 
 
-
-
-type ArtifactLoadStarts = (
-    Option<crossbeam_channel::Sender<()>>,
-    Option<crossbeam_channel::Sender<()>>,
-);
 
 
 
@@ -4087,50 +3958,6 @@ thread_local! {
 
 
 
-/// A checkout's semantic worker may outlive a configure change or the brief
-/// disconnect of its last session. Resume cancelled imports before vector fills,
-/// so vectors still in semantic.bin are reused rather than recomputed. An expired
-/// worker epoch must not start another import attempt.
-/// An attempt returns true when it can hand off to fills; false means retry.
-fn finish_legacy_import_before_fill(
-    lane_current: impl Fn() -> bool,
-    mut attempt_is_complete: impl FnMut() -> bool,
-) {
-    while lane_current() {
-        if attempt_is_complete() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-
-/// Account for a finished artifact load at its hand-off to the receiver.
-/// `published` is the outcome of the lifecycle-gated send: `None` when the
-/// root was unbound or a newer configure generation took over, so the load is
-/// dropped right here; `Some(false)` when its receiver was already gone;
-/// `Some(true)` when it now waits for a completion drain, and the census
-/// reports its size under `pending_install` until the drain takes it.
-pub(crate) fn note_finished_load_handoff(
-    plane: &str,
-    root: &Path,
-    lifecycle: &crate::context::SubcLifecycleAdmission,
-    published: Option<bool>,
-    pending_install: &crate::context::PendingInstallSlot,
-    receiver_epoch: u64,
-    bytes: u64,
-) {
-    let reason = match published {
-        Some(true) => {
-            pending_install.record(receiver_epoch, bytes);
-            return;
-        }
-        Some(false) => "its receiver was retired or replaced before the load finished",
-        None if lifecycle.is_bound() => "a newer configure generation superseded it",
-        None => "the root was unbound",
-    };
-    crate::context::log_discarded_finished_load(plane, Some(root), Some(bytes), reason);
-}
 
 /// Open the root's database under the newest open epoch (the configure that
 /// committed last). Used by the per-call retry after a busy open; the deferred
@@ -5260,26 +5087,6 @@ struct ConfigureViewInput {
 }
 
 
-
-fn delay_configure_storage_sweeps_for_debug() {
-    #[cfg(debug_assertions)]
-    {
-        if let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_STORAGE_SWEEP_START_FILE") {
-            let _ = fs::write(path, "started\n");
-        }
-        if let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_STORAGE_SWEEP_RELEASE_FILE") {
-            while !Path::new(&path).exists() {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if let Some(delay_ms) = std::env::var("AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-        {
-            thread::sleep(Duration::from_millis(delay_ms));
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

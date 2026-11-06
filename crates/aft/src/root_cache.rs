@@ -61,11 +61,9 @@ pub(crate) use location::{
     acquire_speech_serving_lease, release_quiescent_speech_serving_lease, SpeechServingLease,
 };
 pub(crate) use location::{
-    cache_deletion_protections, cache_status_code, check_cache_access, durable_route,
-    ensure_config_storage_lease, identity_storage_root, pin_cache_path, pin_owned_cache_path,
-    prepare_process_cache_root, prepare_third_party_cache_dir, refuse_durable_cache_write,
-    refuse_new_durable_cache_entry, register_durable_owner, retention_protections_with_budget,
-    unavailable_code, unavailable_warning,
+    cache_status_code, check_cache_access, durable_route,
+    ensure_config_storage_lease, identity_storage_root, pin_cache_path, prepare_process_cache_root, prepare_third_party_cache_dir, refuse_durable_cache_write,
+    refuse_new_durable_cache_entry, unavailable_code, unavailable_warning,
 };
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -381,19 +379,6 @@ pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
     }
 }
 
-pub(crate) fn live_scope_keys_for_storage(storage_root: &Path) -> HashSet<String> {
-    let storage_root = canonical_root(storage_root);
-    let scopes = match live_scope_keys().lock() {
-        Ok(scopes) => scopes,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    scopes
-        .iter()
-        .filter(|((root, _), scope)| root == &storage_root && scope.count > 0)
-        .map(|((_, key), _)| key.clone())
-        .collect()
-}
-
 /// Register the worktree topology already detected by configure so artifact
 /// APIs can enforce it without repeating a Git subprocess on every write path.
 pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_only_shared: bool) {
@@ -499,15 +484,6 @@ fn shared_process_lease(
         leases.remove(registry_key);
     }
     Ok(None)
-}
-
-pub(crate) fn local_callgraph_writer(cache_dir: &Path) -> Option<Arc<WriterLease>> {
-    shared_process_lease(&ProcessLeaseKey {
-        domain: RootCacheDomain::Callgraph,
-        cache_dir: canonical_process_lease_dir(cache_dir),
-    })
-    .ok()
-    .flatten()
 }
 
 fn process_lease_acquisition_lock(
@@ -1107,20 +1083,6 @@ pub(crate) struct ReadMarkerProtectionCache {
     protected: std::collections::BTreeMap<(PathBuf, String), bool>,
 }
 
-impl ReadMarkerProtectionCache {
-    pub(crate) fn protected(&mut self, cache_dir: &Path, generation: &str) -> bool {
-        let key = (cache_dir.to_path_buf(), generation.to_owned());
-        if let Some(protected) = self.protected.get(&key) {
-            return *protected;
-        }
-        let protected = protected_read_marker_exists(cache_dir, generation);
-        if protected {
-            self.protected.insert(key, protected);
-        }
-        protected
-    }
-}
-
 /// Marker inputs a storage sweep re-reads for every generation it visits:
 /// the process hostname and each live pid's start time. The hostname cannot
 /// change mid-pass and a cached start time only ever over-retains (pids are
@@ -1133,52 +1095,7 @@ pub(crate) struct ReadMarkerSweepContext {
 }
 
 impl ReadMarkerSweepContext {
-    pub(crate) fn new() -> Self {
-        Self {
-            hostname: current_hostname(),
-            started: HashMap::new(),
-        }
-    }
 
-    /// [`sweep_read_markers`] for one generation of an already-pinned
-    /// `<view>/readers` directory. The caller opens the view and its readers
-    /// once per view and sweeps each generation from that handle, instead of
-    /// re-opening both once per generation. Vanished generations stay
-    /// unprotected and unreadable ones stay protected, as with the
-    /// pathname-based sweep.
-    pub(crate) fn sweep_read_markers_from_readers(
-        &mut self,
-        readers: &crate::bash_background::persistence::PinnedDir,
-        generation_label: &str,
-        remove_stale: bool,
-    ) -> ReadMarkerSweep {
-        let Self { hostname, started } = self;
-        let result = (|| {
-            let generation =
-                match readers.repair_child_same_mount(std::ffi::OsStr::new(generation_label)) {
-                    Ok(generation) => generation,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return Ok(ReadMarkerSweep::default())
-                    }
-                    Err(error) => return Err(error),
-                };
-            sweep_marker_generation_cached(
-                &generation,
-                &mut crate::bash_background::persistence::RepairBudget::new(),
-                remove_stale,
-                now_ms(),
-                hostname,
-                started,
-            )
-        })();
-        match result {
-            Ok(sweep) => sweep,
-            Err(_) => ReadMarkerSweep {
-                protected: true,
-                removed_stale: 0,
-            },
-        }
-    }
 }
 
 // Test hook counting hostname resolutions on this thread. Reset before a

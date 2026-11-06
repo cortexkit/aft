@@ -1158,18 +1158,6 @@ impl Drop for SubmissionExecutor {
 }
 
 impl RootMaintenanceExecutor {
-    pub(crate) fn submit_callgraph_acquisition(
-        &self,
-        cancellation: JobCancellation,
-        job: ExecutorJob,
-    ) -> bool {
-        self.submit_maintenance(
-            CALLGRAPH_ACQUISITION_REQUEST_ID,
-            Lane::HeavyInit,
-            cancellation,
-            job,
-        )
-    }
 
     /// Submits `job` as this root's maintenance on `lane`. The executor
     /// refuses it, and drops it unrun, while the root is unbound, and a

@@ -1729,26 +1729,6 @@ impl InspectManager {
             .map_or(0, |state| state.publication_epoch)
     }
 
-    fn note_view_pending(&self, root: &Path, epoch: u64) {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(deferred_view_key(root))
-            .or_default()
-            .pending_epoch
-            .get_or_insert(epoch);
-    }
-
-    pub(crate) fn note_view_publication(&self, root: &Path) -> bool {
-        let mut states = self
-            .deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(deferred_view_key(root)).or_default();
-        state.publication_epoch = state.publication_epoch.wrapping_add(1);
-        state.pending_epoch.is_some()
-    }
-
     pub(crate) fn deferred_view_refresh_ready(&self, root: &Path) -> bool {
         self.deferred_view_refreshes
             .lock()

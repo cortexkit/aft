@@ -620,48 +620,6 @@ pub(crate) fn log_current_index_event(kind: IndexEventKind, extra: &[(&'static s
     log_index_event(event);
 }
 
-/// Most recent build-start sequence observed for one root and index plane.
-pub(crate) fn index_build_start_sequence(plane: IndexPlane, root: &Path) -> u64 {
-    INDEX_BUILD_START_SIGNALS
-        .lock()
-        .ok()
-        .and_then(|signals| {
-            signals
-                .last_by_root_plane
-                .get(&root_plane_key(root, plane))
-                .copied()
-        })
-        .unwrap_or(0)
-}
-
-/// Send a one-shot signal once the current or next build starts for this root and plane.
-pub(crate) fn signal_after_index_build_start(
-    plane: IndexPlane,
-    root: &Path,
-    baseline: u64,
-    sender: crossbeam_channel::Sender<()>,
-) {
-    let Ok(mut signals) = INDEX_BUILD_START_SIGNALS.lock() else {
-        let _ = sender.send(());
-        return;
-    };
-    let key = root_plane_key(root, plane);
-    if signals.in_flight_by_root_plane.contains_key(&key)
-        || signals
-            .last_by_root_plane
-            .get(&key)
-            .is_some_and(|sequence| *sequence > baseline)
-    {
-        let _ = sender.send(());
-    } else {
-        signals
-            .waiters
-            .entry(key)
-            .or_default()
-            .push((baseline, sender));
-    }
-}
-
 /// Release start waiters when a build attempt ends before emitting `build_started`.
 pub(crate) fn release_index_build_start_waiters(plane: IndexPlane, root: &Path) {
     let waiters = INDEX_BUILD_START_SIGNALS

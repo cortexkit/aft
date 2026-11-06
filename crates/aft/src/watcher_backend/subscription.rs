@@ -64,49 +64,6 @@ pub(crate) fn start(root: &Path, coverage: InitialCoverage) -> Subscription {
     }
 }
 
-fn retained(root: &Path) -> Option<Arc<State>> {
-    let mut roots = roots()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match roots.get(root).and_then(Weak::upgrade) {
-        Some(state) => Some(state),
-        None => {
-            roots.remove(root);
-            None
-        }
-    }
-}
-
-pub(crate) fn current(root: &Path) -> Option<Continuity> {
-    retained(root)
-        .filter(|state| state.coverage.is_complete())
-        .map(|state| Continuity {
-            generation: state.generation,
-            gap: state.gap.load(Ordering::Acquire),
-        })
-}
-
-pub(crate) fn status(root: &Path) -> Option<SubscriptionStatus> {
-    retained(root).map(|state| SubscriptionStatus {
-        continuity: Continuity {
-            generation: state.generation,
-            gap: state.gap.load(Ordering::Acquire),
-        },
-        coverage: state.coverage.clone(),
-    })
-}
-
-pub(crate) fn gap(root: &Path) {
-    if let Some(state) = roots()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(root)
-        .and_then(Weak::upgrade)
-    {
-        state.gap.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
 #[cfg(test)]
 mod tests {
 

@@ -207,10 +207,6 @@ enum TransientSearchCacheWalk {
 }
 
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
-/// Borrowed snapshots are rerooted before grep's candidate/file-walk budgets
-/// begin. Cap that parse separately so per-record path containment checks cannot
-/// occupy an interactive lane for the size of an arbitrary foreign corpus.
-pub(crate) const BORROWED_INDEX_LOAD_BUDGET: Duration = Duration::from_secs(1);
 const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,13 +216,6 @@ pub(crate) enum BorrowedIndexLoadStop {
     /// The snapshot was written for a different part of the checkout than the
     /// loading root covers (see `checkout_position`).
     CoverageMismatch,
-}
-
-#[derive(Debug)]
-pub(crate) enum BorrowedIndexLoad {
-    Loaded(SearchIndex, bool),
-    Stopped(BorrowedIndexLoadStop),
-    Invalid,
 }
 
 /// What reconciling a borrowed snapshot against this checkout's files found.
@@ -258,15 +247,6 @@ struct BorrowedIndexLoadBudget<'a> {
 }
 
 impl<'a> BorrowedIndexLoadBudget<'a> {
-    fn new(max_records: usize, duration: Duration, keep_going: &'a dyn Fn() -> bool) -> Self {
-        Self {
-            keep_going,
-            started_at: Instant::now(),
-            duration,
-            max_records,
-            stop: Cell::new(None),
-        }
-    }
 
     fn preflight(&self, records: usize) -> bool {
         if records > self.max_records {
@@ -960,19 +940,6 @@ impl SearchIndexSnapshot {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
             !file.path.as_os_str().is_empty() && is_within_search_root(&search_root, &file.path)
-        })
-    }
-
-    pub(crate) fn has_file_in_scope_with_filters(
-        &self,
-        search_root: &Path,
-        filters: &PathFilters,
-    ) -> bool {
-        let search_root = canonicalize_for_search_membership(search_root);
-        self.files.iter().any(|file| {
-            !file.path.as_os_str().is_empty()
-                && is_within_search_root(&search_root, &file.path)
-                && filters.matches(&self.project_root, &file.path)
         })
     }
 
@@ -1935,24 +1902,6 @@ impl SearchIndex {
         }
     }
 
-    /// A read-only index over a snapshot projected from a published view.
-    /// It is never written or persisted; its holder replaces it with the
-    /// next publication instead of applying file changes to it.
-    pub(crate) fn from_view_snapshot(snapshot: SearchIndexSnapshot) -> Self {
-        Self {
-            base: snapshot.base,
-            delta: snapshot.delta,
-            files: snapshot.files,
-            path_to_id: snapshot.path_to_id,
-            ready: snapshot.ready,
-            project_root: snapshot.project_root,
-            max_file_size: snapshot.max_file_size,
-            file_trigram_count: snapshot.file_trigram_count,
-            unindexed_files: snapshot.unindexed_files,
-            ..Self::new()
-        }
-    }
-
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
         let started = Instant::now();
         let cache_dir = transient_search_cache_dir(root);
@@ -2577,72 +2526,6 @@ impl SearchIndex {
         )
     }
 
-    pub(crate) fn read_from_disk_borrow_tolerant_cancellable(
-        cache_dir: &Path,
-        current_canonical_root: &Path,
-        max_records: usize,
-        duration: Duration,
-        keep_going: &dyn Fn() -> bool,
-    ) -> BorrowedIndexLoad {
-        let load_started = Instant::now();
-        let budget = BorrowedIndexLoadBudget::new(max_records, duration, keep_going);
-        let outcome = match Self::read_from_disk_with_policy(
-            cache_dir,
-            current_canonical_root,
-            false,
-            IgnoreRulesLoadPolicy::BorrowTolerant,
-            Some(&budget),
-        ) {
-            Some((index, ignore_rules_differ)) => {
-                BorrowedIndexLoad::Loaded(index, ignore_rules_differ)
-            }
-            None => budget
-                .stop
-                .get()
-                .map(BorrowedIndexLoad::Stopped)
-                .unwrap_or(BorrowedIndexLoad::Invalid),
-        };
-        let outcome_label = match &outcome {
-            BorrowedIndexLoad::Loaded(_, ignore_rules_differ) if *ignore_rules_differ => "partial",
-            BorrowedIndexLoad::Loaded(_, _) => "ready",
-            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => "budget_stopped",
-            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::CoverageMismatch) => {
-                "coverage_mismatch"
-            }
-            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled)
-            | BorrowedIndexLoad::Invalid => "denied",
-        };
-        // Log the key of the artifact we opened. Adding Git to a folder can
-        // produce a different key than the one under which its index was saved.
-        let key = cache_dir.file_name().unwrap_or_default().to_string_lossy();
-        let build_id = crate::logging::in_flight_build_id(
-            crate::logging::IndexPlane::Search,
-            current_canonical_root,
-        )
-        .unwrap_or_else(crate::logging::mint_index_build_id);
-        crate::logging::log_index_event(
-            crate::logging::IndexEvent::new(
-                crate::logging::IndexEventKind::ArtifactLoaded,
-                crate::logging::IndexPlane::Search,
-                build_id,
-                current_canonical_root,
-                key,
-            )
-            .field("outcome", outcome_label)
-            .field("borrowed", "true")
-            .field(
-                "elapsed_ms",
-                load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            ),
-        );
-        crate::logging::note_tool_call_wait(
-            crate::run_tool_call::WaitingOn::ArtifactLoad,
-            None,
-            load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        );
-        outcome
-    }
-
     fn read_from_disk_with_options(
         cache_dir: &Path,
         current_canonical_root: &Path,
@@ -2973,26 +2856,6 @@ impl SearchIndex {
         self.git_head.as_deref()
     }
 
-    /// Count source files whose current stat no longer matches this persisted
-    /// snapshot. Borrowed readers use this bounded-to-metadata probe to disclose
-    /// a stale standing snapshot without restoring the owner's strict hash census.
-    pub(crate) fn borrowed_stat_mismatch_count(&self) -> usize {
-        self.files
-            .iter()
-            .filter(|entry| {
-                let Ok(metadata) = fs::metadata(&entry.path) else {
-                    return true;
-                };
-                metadata.len() != entry.size
-                    || metadata.modified().unwrap_or(UNIX_EPOCH) != entry.modified
-            })
-            .count()
-    }
-
-    pub(crate) fn set_ready(&mut self, ready: bool) {
-        self.ready = ready;
-    }
-
     pub(crate) fn verify_against_disk_with_strategy(
         &mut self,
         current_head: Option<String>,
@@ -3002,133 +2865,6 @@ impl SearchIndex {
         let changed = verify_file_mtimes(self, verify_strategy);
         self.ready = true;
         changed
-    }
-
-    /// Bring a borrowed (read-only) snapshot in line with the files that are
-    /// actually on disk under this index's root, entirely in RAM.
-    ///
-    /// A linked worktree reads the home checkout's shared `cache.bin`, which
-    /// describes the home checkout, not this worktree. Branch commits, new
-    /// files, uncommitted edits and untracked files that already existed when
-    /// the snapshot was opened never produce a watcher event, so without this
-    /// pass they stay invisible to search while the index reports ready.
-    ///
-    /// The pass walks the root and compares each snapshot record's size and
-    /// mtime with disk. A record whose size and mtime both match is trusted.
-    /// A same-size record with a different mtime (every file of a fresh
-    /// checkout) is content-hashed against the snapshot's stored hash, in a
-    /// bounded parallel pool, and only a real content difference re-indexes
-    /// it. Differing, added and removed files go into the RAM delta; the
-    /// shared file on disk is never written.
-    ///
-    /// `keep_going` is polled between phases and while applying changes.
-    /// Returning false abandons the pass and yields `None`; the caller must
-    /// then discard the index, because it is only partially reconciled.
-    pub(crate) fn reconcile_borrowed_snapshot_with_disk(
-        &mut self,
-        keep_going: &dyn Fn() -> bool,
-    ) -> Option<BorrowedReconcileSummary> {
-        const APPLY_CHECKPOINT_INTERVAL: usize = 256;
-        let mut summary = BorrowedReconcileSummary::default();
-
-        let walk_started = Instant::now();
-        let current_files = walk_project_files(&self.project_root, &PathFilters::default());
-        let current_file_set: HashSet<&PathBuf> = current_files.iter().collect();
-        summary.walked = current_files.len();
-        summary.walk = walk_started.elapsed();
-        if !keep_going() {
-            return None;
-        }
-
-        let verify_started = Instant::now();
-        let mut removed_paths = Vec::new();
-        let mut to_verify = Vec::new();
-        for (file_id, entry) in self.files.iter().enumerate() {
-            if entry.path.as_os_str().is_empty() {
-                continue; // tombstoned entry
-            }
-            if !current_file_set.contains(&entry.path) {
-                removed_paths.push(entry.path.clone());
-                continue;
-            }
-            to_verify.push((
-                file_id,
-                entry.path.clone(),
-                FileFreshness {
-                    mtime: entry.modified,
-                    size: entry.size,
-                    content_hash: entry.content_hash,
-                },
-            ));
-        }
-        let verdicts = cache_freshness::verify_files_bounded(
-            to_verify,
-            cache_freshness::VerifyStrategy::StatFirst,
-        );
-        summary.verify = verify_started.elapsed();
-        if !keep_going() {
-            return None;
-        }
-
-        let apply_started = Instant::now();
-        let mut stale_paths = Vec::new();
-        {
-            let files = Arc::make_mut(&mut self.files);
-            for (file_id, path, verdict) in verdicts {
-                match verdict {
-                    FreshnessVerdict::HotFresh => summary.unchanged += 1,
-                    FreshnessVerdict::ContentFresh {
-                        new_mtime,
-                        new_size,
-                    } => {
-                        // Same bytes as the snapshot: keep serving the shared
-                        // postings and remember the local stat so a later
-                        // watcher event compares against this checkout.
-                        if let Some(entry) = files.get_mut(file_id) {
-                            entry.modified = new_mtime;
-                            entry.size = new_size;
-                        }
-                        summary.unchanged += 1;
-                        summary.hashed_unchanged += 1;
-                    }
-                    FreshnessVerdict::Stale | FreshnessVerdict::Deleted => stale_paths.push(path),
-                }
-            }
-        }
-
-        let mut canonical_parents = ParentCanonicalizationMemo::default();
-        let mut applied = 0usize;
-        let mut checkpoint = || {
-            applied += 1;
-            applied % APPLY_CHECKPOINT_INTERVAL != 0 || keep_going()
-        };
-        for path in &removed_paths {
-            if !checkpoint() {
-                return None;
-            }
-            self.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
-            summary.removed += 1;
-        }
-        for path in &stale_paths {
-            if !checkpoint() {
-                return None;
-            }
-            // `update_file` drops the file when it vanished after the walk.
-            self.update_file_with_canonicalization_memo(path, &mut canonical_parents);
-            summary.reindexed += 1;
-        }
-        for path in &current_files {
-            if self.path_to_id.contains_key(path) {
-                continue;
-            }
-            if !checkpoint() {
-                return None;
-            }
-            self.update_file_with_canonicalization_memo(path, &mut canonical_parents);
-            summary.added += 1;
-        }
-        summary.apply = apply_started.elapsed();
-        Some(summary)
     }
 
     /// True when `path` is answered from the shared snapshot's postings rather
@@ -3374,34 +3110,6 @@ impl SearchIndexSnapshot {
     ) -> std::io::Result<GrepResult> {
         self.search_grep_profiled(pattern, include, exclude, search_root, max_results, None)
             .map(|result| result.0)
-    }
-
-    pub(crate) fn search_grep_bounded(
-        &self,
-        pattern: &CompiledPattern,
-        include: &[String],
-        exclude: &[String],
-        search_root: &Path,
-        max_results: usize,
-        path_exclusion: Option<GrepPathExclusion>,
-        max_files: usize,
-        budget: Duration,
-    ) -> std::io::Result<GrepResult> {
-        let filters = build_path_filters(include, exclude).unwrap_or_default();
-        let query = decompose_grep_pattern(pattern);
-        self.search_grep_profiled_with_filters_and_query_and_limits(
-            pattern,
-            &query,
-            &filters,
-            search_root,
-            max_results,
-            path_exclusion,
-            Some(max_files),
-            budget,
-            GrepScanOrder::Arrival,
-            PATH_ORDER_BATCH_ROW_BUDGET,
-        )
-        .map(|result| result.0)
     }
 
     pub(crate) fn search_grep_profiled(
@@ -6291,17 +5999,6 @@ fn trigram_filter_map(content: &[u8], include_eof_next_char: bool) -> BTreeMap<u
     filters
 }
 
-/// The posting fold this index stores for one file's bytes: each distinct
-/// trigram in ascending order with its next-character mask (end of file
-/// included) and its position mask, as `(trigram, next_mask, loc_mask)`.
-/// Per-checkout trigram payloads are built from it so that their postings
-/// match the index's exactly.
-pub(crate) fn file_posting_fold(content: &[u8]) -> impl Iterator<Item = (u32, u8, u8)> {
-    trigram_filter_map(content, true)
-        .into_iter()
-        .map(|(trigram, filter)| (trigram, filter.next_mask, filter.loc_mask))
-}
-
 pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -6497,11 +6194,6 @@ pub(crate) fn build_path_filters(
     })
 }
 
-pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<PathBuf> {
-    walk_project_files_from_inner(root, root, filters, None, false)
-        .expect("unbounded project walk cannot exceed a file limit")
-}
-
 /// The cold build's file walk, read a chunk at a time. The streaming build
 /// indexes each chunk before asking for the next one, so it never holds the
 /// whole root's path list: on a root with a million files that list alone was
@@ -6568,18 +6260,6 @@ pub fn walk_project_files_bounded_default(
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {
     walk_project_files_from_inner(root, root, &PathFilters::default(), Some(max_files), true)
-}
-
-pub(crate) fn walk_project_files_bounded_matching<F>(
-    root: &Path,
-    filters: &PathFilters,
-    max_files: usize,
-    matches_file: F,
-) -> Result<Vec<PathBuf>, usize>
-where
-    F: Fn(&Path) -> bool,
-{
-    walk_project_files_from_inner_matching(root, root, filters, Some(max_files), matches_file, true)
 }
 
 pub fn walk_project_files_bounded_default_matching<F>(
@@ -6757,78 +6437,6 @@ pub(crate) struct ProjectWalkListing {
     /// ignore file it could not read), with the error. Whether a file at or
     /// under one of them is listed is unknown, not "no".
     pub gaps: Vec<(PathBuf, String)>,
-}
-
-impl ProjectWalkListing {
-    /// The gap that leaves `file`'s listing unknown, if any.
-    pub(crate) fn gap_for(&self, file: &Path) -> Option<&(PathBuf, String)> {
-        self.gaps.iter().find(|(gap, _)| file.starts_with(gap))
-    }
-}
-
-/// The path an `ignore` walk error is about; `None` when it names none.
-fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
-    match error {
-        ignore::Error::WithPath { path, .. } => Some(path),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
-            walk_error_path(err)
-        }
-        ignore::Error::Loop { child, .. } => Some(child),
-        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
-        _ => None,
-    }
-}
-
-/// Which of `files` (absolute paths under `root`, joined onto `root` as given)
-/// the project walk lists, without walking the rest of the project. It runs
-/// the same walk as `walk_project_files(root, &PathFilters::default())`,
-/// pruned to the directories that lead to `files`, so each answer is the
-/// walk's own decision: built-in skipped directories, content exclusions and
-/// every `.gitignore`/`.aftignore` from the root down to the file.
-///
-/// Unlike `walk_project_files`, which drops what it cannot read, this records
-/// walk errors as gaps: when a directory or ignore file on the way could not
-/// be read, the walk cannot tell whether a file beneath it would be listed.
-pub(crate) fn project_walk_lists(root: &Path, files: &BTreeSet<PathBuf>) -> ProjectWalkListing {
-    let mut listing = ProjectWalkListing::default();
-    if files.is_empty() {
-        return listing;
-    }
-    let leads_to_a_file = files
-        .iter()
-        .flat_map(|file| {
-            file.ancestors()
-                .take_while(|ancestor| ancestor.starts_with(root))
-                .map(Path::to_path_buf)
-        })
-        .collect::<HashSet<_>>();
-    let walk = project_walk_builder_pruned(
-        root,
-        crate::project_content::is_excluded_with_file_type,
-        move |path| leads_to_a_file.contains(path),
-    )
-    .build();
-    for item in walk {
-        let entry = match item {
-            Ok(entry) => entry,
-            Err(error) => {
-                let path = walk_error_path(&error).unwrap_or(root).to_path_buf();
-                listing.gaps.push((path, error.to_string()));
-                continue;
-            }
-        };
-        // An ignore file below this entry could not be read, so the rules
-        // for everything under it are unknown.
-        if let Some(error) = entry.error() {
-            listing
-                .gaps
-                .push((entry.path().to_path_buf(), error.to_string()));
-        }
-        if entry.file_type().is_some_and(|kind| kind.is_file()) && files.contains(entry.path()) {
-            listing.listed.insert(entry.into_path());
-        }
-    }
-    listing
 }
 
 /// `project_walk_lists` answers per file with the project walk's own rules,

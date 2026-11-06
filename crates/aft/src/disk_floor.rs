@@ -23,21 +23,6 @@ pub(crate) fn free_disk_floor(capacity: u64) -> u64 {
 static FLOOR_REFUSALS: Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-pub(crate) fn record_floor_refusal(storage: &Path, measurement: Option<(u64, u64)>) {
-    let mut refusals = FLOOR_REFUSALS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if measurement.is_none() && refusals.is_empty() {
-        return;
-    }
-    let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
-    if let Some(measurement) = measurement {
-        refusals.insert(key, measurement);
-    } else {
-        refusals.remove(&key);
-    }
-}
-
 pub(crate) fn floor_refusal_measurement(storage: &Path) -> Option<(u64, u64)> {
     let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
     FLOOR_REFUSALS

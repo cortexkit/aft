@@ -33,12 +33,6 @@ pub(crate) enum InitialCoverage {
     Unproved,
 }
 
-impl InitialCoverage {
-    pub(crate) fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete)
-    }
-}
-
 // Raw-event test shims and other opaque handles cannot grant kernel coverage.
 // Inspect the actual retained native handle without constraining the generic
 // filter API used by those event injectors.

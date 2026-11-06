@@ -410,22 +410,6 @@ pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
     });
 }
 
-/// Changes a fill's stage without resetting its file-work counters. Preparation,
-/// admission and embedding are stages of the same budgeted file queue.
-pub(crate) fn stage(stage: &'static str) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            let mut entry = lock(entry);
-            if entry.phase != stage {
-                entry.phase = stage;
-                if let Some(token) = &entry.cancellation {
-                    token.report_progress();
-                }
-            }
-        }
-    });
-}
-
 pub(crate) fn advance(files: usize) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {

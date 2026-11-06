@@ -45,18 +45,6 @@ impl ChildEngine {
     }
 }
 
-/// Creates the child's engine once its trigram snapshot is loaded, and
-/// installs the child's current snapshots into it. Runs on the worker.
-pub(super) fn sync(session: &ParentSession, child: &Child) {
-    if !session.planes.trigram && !session.planes.semantic {
-        return;
-    }
-    let mut engine = lock(&child.engine);
-    if engine.is_none() {
-        *engine = Some(ChildEngine::new(session, child));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The parent's aft_search
 // ---------------------------------------------------------------------------
