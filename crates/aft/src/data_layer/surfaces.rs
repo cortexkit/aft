@@ -349,6 +349,9 @@ pub(crate) struct MeaningReport {
     /// The running fill round waits for another fill of the repository, in
     /// this process or another, and embeds nothing until that one publishes.
     pub(crate) waiting: bool,
+    /// When the fill and its last store happened, as the fill recorded
+    /// them (see [`super::meaning::FillTimes`]).
+    pub(crate) times: super::meaning::FillTimes,
 }
 
 /// How the meaning plane stands; see [`MeaningReport`].
@@ -527,6 +530,14 @@ impl MeaningReport {
         if self.waiting {
             health.stage = Some(super::meaning::WAITING_STAGE.to_string());
         }
+        if health.status == BUILDING {
+            // Health's stuck-plane check: building since the fill under way
+            // started, and moving whenever a fill stores. Before any fill
+            // starts, health dates the building plane from when it first
+            // saw it.
+            health.since_ms = self.times.started_at_ms;
+            fill.last_progress_at_ms = self.times.stored_at_ms;
+        }
         health.fill = (fill != SemanticFillHealth::default()).then_some(fill);
         health
     }
@@ -567,6 +578,7 @@ fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
         plane,
         filling,
         waiting,
+        times: checkout.meaning_fill_times(),
     })
 }
 
@@ -1701,6 +1713,7 @@ mod tests {
     /// today's index, and only the counts that say something.
     #[test]
     fn health_reports_the_meaning_fill_and_its_failures() {
+        use crate::data_layer::meaning::FillTimes;
         let coverage = MeaningCoverage {
             files: 40,
             files_embedded: 30,
@@ -1720,6 +1733,10 @@ mod tests {
             },
             filling: true,
             waiting: true,
+            times: FillTimes {
+                started_at_ms: Some(1_000),
+                stored_at_ms: Some(2_000),
+            },
         };
         let health = serde_json::to_value(filling.health()).unwrap();
         assert_eq!(
@@ -1737,6 +1754,8 @@ mod tests {
                 "files_failed": 2,
                 "chunks_failed": 3,
                 "filling": true,
+                "since_ms": 1_000,
+                "last_progress_at_ms": 2_000,
             })
         );
         // The status tool keeps its full shape.
@@ -1762,7 +1781,12 @@ mod tests {
             },
             filling: false,
             waiting: false,
+            times: FillTimes {
+                started_at_ms: None,
+                stored_at_ms: Some(2_000),
+            },
         };
+        // Only a building plane is dated.
         assert_eq!(
             serde_json::to_value(ready.health()).unwrap(),
             json!({"status": "ready", "chunks_failed": 3})
@@ -1772,6 +1796,7 @@ mod tests {
             plane: MeaningPlane::Failed("embedding model: no backend".into()),
             filling: false,
             waiting: false,
+            times: FillTimes::default(),
         };
         assert_eq!(
             serde_json::to_value(failed.health()).unwrap(),
@@ -1786,10 +1811,15 @@ mod tests {
             },
             filling: true,
             waiting: false,
+            times: FillTimes {
+                started_at_ms: Some(3_000),
+                stored_at_ms: None,
+            },
         };
         assert_eq!(
             serde_json::to_value(starting.health()).unwrap(),
-            json!({"status": "building", "stage": "loading_embedding_model", "filling": true})
+            json!({"status": "building", "stage": "loading_embedding_model", "filling": true,
+                "since_ms": 3_000})
         );
     }
 

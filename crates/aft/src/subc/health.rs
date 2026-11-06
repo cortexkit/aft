@@ -2720,6 +2720,7 @@ impl HealthRollupCache {
                 continue;
             }
             let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
+            let reported_progress_ms = component.get("last_progress_at_ms").and_then(Value::as_u64);
             let progress_signature = serde_json::to_string(component).unwrap_or_default();
             let timing = timings.entry(key).or_insert_with(|| PlaneTiming {
                 status: status.clone(),
@@ -2736,10 +2737,18 @@ impl HealthRollupCache {
                 timing.last_progress_at_ms = now_ms;
                 timing.progress_signature = progress_signature;
             }
-            component.insert("since_ms".to_string(), json!(timing.since_ms));
+            // A plane that dates itself (the data layer's meaning fill
+            // records when it started and when it last stored) is reported
+            // as it says. The times kept here stand in for a plane that does
+            // not: when health first saw its status, and when its object
+            // last changed.
+            component.insert(
+                "since_ms".to_string(),
+                json!(reported_since_ms.unwrap_or(timing.since_ms)),
+            );
             component.insert(
                 "last_progress_at_ms".to_string(),
-                json!(timing.last_progress_at_ms),
+                json!(reported_progress_ms.unwrap_or(timing.last_progress_at_ms)),
             );
         }
     }
@@ -3802,6 +3811,7 @@ fn build_health_diagnostic_rollup_from_actors(
                         "files_too_large",
                         "files_past_cap",
                         "filling",
+                        "last_progress_at_ms",
                     ] {
                         semantic.remove(progress);
                     }
@@ -9468,6 +9478,10 @@ mod tests {
             },
             filling: true,
             waiting: true,
+            times: crate::data_layer::meaning::FillTimes {
+                started_at_ms: Some(1_790_000_000_000),
+                stored_at_ms: Some(1_790_000_600_000),
+            },
         };
         let fill = serde_json::to_value(fill.health()).unwrap();
         let semantic = report["roots"][0]["semantic_index"]
@@ -10415,6 +10429,50 @@ mod plane_timing_tests {
                 .as_u64()
                 .expect("new progress")
                 > semantic_progress
+        );
+    }
+
+    /// The meaning fill dates itself: its start and its last store reach
+    /// the reply as it recorded them, however long ago, and the times
+    /// health keeps for planes that do not date themselves never replace
+    /// them.
+    #[test]
+    fn a_plane_that_dates_itself_is_reported_as_it_says() {
+        let cache = HealthRollupCache::new();
+        let mut first = json!({
+            "semantic_index": {
+                "status": "building", "stage": "filling", "files_pending": 9,
+                "since_ms": 1_000, "last_progress_at_ms": 2_000,
+            },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut first);
+        assert_eq!(first["semantic_index"]["since_ms"], 1_000);
+        assert_eq!(first["semantic_index"]["last_progress_at_ms"], 2_000);
+
+        // Its counts change but it stored nothing: still 2_000, not the
+        // time health saw the change.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut moved = json!({
+            "semantic_index": {
+                "status": "building", "stage": "filling", "files_pending": 8,
+                "since_ms": 1_000, "last_progress_at_ms": 2_000,
+            },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut moved);
+        assert_eq!(moved["semantic_index"]["last_progress_at_ms"], 2_000);
+
+        // Before its first round it does not date itself yet: health's own
+        // times stand in.
+        let mut undated = json!({
+            "semantic_index": { "status": "building", "stage": "filling" },
+        });
+        cache.annotate_plane_timings("/tmp/other", &mut undated);
+        assert!(undated["semantic_index"]["since_ms"].as_u64().unwrap() > 2_000);
+        assert!(
+            undated["semantic_index"]["last_progress_at_ms"]
+                .as_u64()
+                .unwrap()
+                > 2_000
         );
     }
 

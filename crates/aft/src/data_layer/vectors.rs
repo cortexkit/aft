@@ -876,6 +876,20 @@ pub struct FillProgress {
     /// The round is waiting for another fill of the same repository, in
     /// this process or another, to publish what it is embedding.
     pub waiting: bool,
+    /// When the round this report ends stored what it filled (vectors and
+    /// chunk maps, published as one segment), in milliseconds since the
+    /// Unix epoch; `None` when the round stored nothing, and on the reports
+    /// a wait sends.
+    pub stored_at_ms: Option<u64>,
+}
+
+/// Milliseconds since the Unix epoch now.
+pub(crate) fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// What one fill did.
@@ -1235,6 +1249,7 @@ impl VectorPlane {
                     files_total: report.files_queued,
                     chunks_embedded: report.chunks_embedded,
                     waiting: true,
+                    stored_at_ms: None,
                 };
                 let lock = FillLock::take(self.checkout.family_dir(), &mut || progress(waiting))?;
                 report.wait_ms += elapsed_ms(started);
@@ -1375,9 +1390,11 @@ impl VectorPlane {
             }
             files_done += filled;
             drop(index);
+            let mut stored_at_ms = None;
             if builder.chunk_maps() > 0 || builder.vectors() > 0 {
                 let started = Instant::now();
                 report.segment_bytes += Self::publish(&parts, builder)?;
+                stored_at_ms = Some(unix_ms());
                 report.publish_ms += elapsed_ms(started);
                 report.segments_published += 1;
                 report.files_filled += filled;
@@ -1388,6 +1405,7 @@ impl VectorPlane {
                 files_total: report.files_queued,
                 chunks_embedded: report.chunks_embedded,
                 waiting: false,
+                stored_at_ms,
             });
             if report.error.is_some() {
                 report.files_left += queue.count();
@@ -1661,6 +1679,74 @@ mod tests {
             "#[test]\nfn opens_the_store() {\n    assert_eq!(demo::open_store(\"ab\"), 4);\n}\n",
         );
         write(root, "README.md", "# Demo\n\nNothing to embed here.\n");
+    }
+
+    /// A fill dates its progress by what it stores: each round that stores
+    /// moves the meaning plane's last-store time and keeps the fill's start,
+    /// and what stores nothing (a wait, or a round with nothing left to
+    /// fill) leaves it where it was.
+    #[test]
+    fn each_store_moves_the_fills_progress_time_and_nothing_else_does() {
+        use crate::data_layer::meaning::{Meaning, Round};
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let meaning = Meaning::default();
+        let mut recorder = Recorder::default();
+        let mut round = || {
+            meaning.note_round_started();
+            plane
+                .fill_rounds(
+                    &mut |texts| recorder.embed(texts),
+                    FillBudget {
+                        max_batch: 5,
+                        files_per_round: 1,
+                    },
+                    1,
+                    &mut |step| meaning.note_progress(step),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(round().segments_published, 1);
+        let first = meaning.times();
+        let started = first.started_at_ms.expect("the fill started");
+        let stored = first.stored_at_ms.expect("the round stored");
+        assert!(stored >= started);
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(round().segments_published, 1);
+        let second = meaning.times();
+        assert_eq!(second.started_at_ms, Some(started), "one fill, one start");
+        assert!(second.stored_at_ms.unwrap() > stored, "a store moves it");
+
+        // A wait for another fill stores nothing.
+        meaning.note_progress(FillProgress {
+            waiting: true,
+            ..FillProgress::default()
+        });
+        assert_eq!(meaning.times(), second);
+
+        // Fill the rest; once nothing is left, a round stores nothing and
+        // the time stays where the last store left it.
+        while round().files_left > 0 {}
+        let filled = meaning.times();
+        std::thread::sleep(Duration::from_millis(5));
+        let idle = round();
+        assert_eq!((idle.files_queued, idle.segments_published), (0, 0));
+        assert_eq!(meaning.times(), filled);
+
+        // A round that finishes the fill ends it; the last store stays.
+        meaning.note_round_ended(&Round::Done);
+        assert_eq!(
+            meaning.times(),
+            crate::data_layer::meaning::FillTimes {
+                started_at_ms: None,
+                stored_at_ms: filled.stored_at_ms,
+            }
+        );
     }
 
     /// The plane's memory is what it loaded and built: an unfilled plane

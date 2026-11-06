@@ -1100,7 +1100,8 @@ pub struct SemanticHealthComponentSnapshot {
 /// it inside `semantic_index`, beside the status, `stage` and `reason`.
 /// Health replies are held to a byte budget, so only what says something is
 /// present: `files` while files still wait for vectors, every other count
-/// only when it is above zero, and `filling` only while true. A fill that
+/// only when it is above zero, `filling` only while true, and
+/// `last_progress_at_ms` only while the plane is building. A fill that
 /// waits for another fill of the repository says so in `stage`
 /// (`waiting_for_another_fill`).
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -1129,6 +1130,11 @@ pub struct SemanticFillHealth {
     /// A fill round is queued or running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filling: Option<bool>,
+    /// While the plane is building: when a fill last stored vectors and
+    /// chunk maps, in milliseconds since the Unix epoch, as the fill itself
+    /// recorded it. Health's stuck-plane check reads it with `since_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

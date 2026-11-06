@@ -1087,6 +1087,12 @@ impl DataCheckout {
         self.work.meaning.progress()
     }
 
+    /// When meaning search's fill under way started and when a fill last
+    /// stored what it filled.
+    pub(crate) fn meaning_fill_times(&self) -> super::meaning::FillTimes {
+        self.work.meaning.times()
+    }
+
     /// Gives meaning search `config` as [`Self::configure_meaning`] does,
     /// without starting a fill, so a test can read how the plane reports
     /// before any model loads.

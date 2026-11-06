@@ -105,6 +105,23 @@ pub(crate) struct Meaning {
     failure: Mutex<Option<String>>,
     /// The last round's progress through its fill.
     progress: Mutex<Option<FillProgress>>,
+    /// When the fill under way started and when a fill last stored what
+    /// it filled, for health (see [`FillTimes`]).
+    times: Mutex<FillTimes>,
+}
+
+/// When meaning search's fill moved, for health's stuck-plane check. Both
+/// in milliseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FillTimes {
+    /// When the first round of the fill under way started; `None` when no
+    /// fill is under way. A fill lasts from its first round until a round
+    /// finishes it or finds nothing to do; a failed round keeps it open, so
+    /// a fill that keeps failing keeps its start.
+    pub(crate) started_at_ms: Option<u64>,
+    /// When a round last stored vectors and chunk maps
+    /// ([`FillProgress::stored_at_ms`]), in this fill or an earlier one.
+    pub(crate) stored_at_ms: Option<u64>,
 }
 
 impl Meaning {
@@ -127,6 +144,7 @@ impl Meaning {
         *lock(&self.plane) = None;
         *lock(&self.failure) = None;
         *lock(&self.progress) = None;
+        *lock(&self.times) = FillTimes::default();
         true
     }
 
@@ -174,6 +192,36 @@ impl Meaning {
         *lock(&self.progress)
     }
 
+    /// When the fill under way started and when a fill last stored.
+    pub(crate) fn times(&self) -> FillTimes {
+        *lock(&self.times)
+    }
+
+    /// Records that a round starts: the fill's start, unless a fill is
+    /// already under way.
+    pub(crate) fn note_round_started(&self) {
+        let mut times = lock(&self.times);
+        if times.started_at_ms.is_none() {
+            times.started_at_ms = Some(super::vectors::unix_ms());
+        }
+    }
+
+    /// Records how a round ended: one that finished the fill, or found
+    /// nothing to do, ends it.
+    pub(crate) fn note_round_ended(&self, outcome: &Round) {
+        if matches!(outcome, Round::Done | Round::Idle) {
+            lock(&self.times).started_at_ms = None;
+        }
+    }
+
+    /// Records a round's progress report, and when it stored, if it did.
+    pub(crate) fn note_progress(&self, step: FillProgress) {
+        *lock(&self.progress) = Some(step);
+        if let Some(stored) = step.stored_at_ms {
+            lock(&self.times).stored_at_ms = Some(stored);
+        }
+    }
+
     /// What meaning search holds in memory for the checkout, measured as the
     /// [`aft_store::heap`] module describes: its plane (see
     /// [`VectorPlane::memory`]) and the last fill failure's text. `None`
@@ -214,6 +262,7 @@ impl Meaning {
             // The build that publishes the checkout starts the next fill.
             return Round::Idle;
         }
+        self.note_round_started();
         let mut model = lock(&self.model);
         let outcome = self.fill_round(checkout, &config, &mut model);
         match &outcome {
@@ -228,6 +277,7 @@ impl Meaning {
                 *lock(&self.failure) = Some(error.clone());
             }
         }
+        self.note_round_ended(&outcome);
         outcome
     }
 
@@ -257,7 +307,7 @@ impl Meaning {
             files_per_round: FILES_PER_ROUND,
         };
         let filled = plane.fill_rounds(&mut |texts| model.embed(texts), budget, 1, &mut |step| {
-            *lock(&self.progress) = Some(step);
+            self.note_progress(step);
         });
         match filled {
             Err(DataError::Cancelled) => Round::Idle,
