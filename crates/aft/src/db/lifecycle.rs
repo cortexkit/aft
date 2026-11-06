@@ -246,6 +246,13 @@ pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
     },
 ];
 
+pub(crate) fn uninstrumented_opener(seam: &str) -> Option<SqliteUninstrumentedOpener> {
+    SQLITE_UNINSTRUMENTED_OPENERS
+        .iter()
+        .copied()
+        .find(|opener| opener.seam == seam)
+}
+
 fn live_counts() -> &'static Mutex<BTreeMap<SqliteStore, u64>> {
     static COUNTS: OnceLock<Mutex<BTreeMap<SqliteStore, u64>>> = OnceLock::new();
     COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -544,6 +551,47 @@ pub(crate) fn sqlite_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// An immutable read of a quiescent main file must not create empty WAL/SHM
+/// files. If frames already exist, normal read-only SQLite reads include them.
+/// A racing writer can make this census stale. Before unlinking, generation
+/// cleanup rechecks the pointer in its own transaction (which it can only
+/// promote to a writer if nothing committed since its census) and, for V2,
+/// rechecks membership under the family registry's write transaction.
+pub(crate) fn census_open_path(path: &Path) -> rusqlite::Result<PathBuf> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let quiescent = match std::fs::metadata(PathBuf::from(wal)) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some(error.to_string()),
+            ))
+        }
+    };
+    if !quiescent {
+        return Ok(sqlite_open_path(path).into_owned());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    Some(error.to_string()),
+                )
+            })?
+            .join(path)
+    };
+    let normalized = sqlite_open_path(&absolute);
+    let mut uri = url::Url::from_file_path(normalized.as_ref())
+        .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+    uri.set_query(Some("immutable=1"));
+    Ok(PathBuf::from(uri.as_str()))
+}
+
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
         Self::open_attributed(path, store, path.display().to_string())
@@ -604,6 +652,20 @@ impl TrackedConnection {
         crate::private_storage::prepare_sqlite(path, flags)?;
         let connection =
             crate::db::write_accounting::open_connection(&sqlite_open_path(path), flags)?;
+        Self::from_connection_attributed(connection, store, path.display().to_string())
+    }
+
+    pub(crate) fn open_census(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let _guard = crate::db::file_identity::filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
+        let connection = Connection::open_with_flags(census_open_path(path)?, flags)?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 

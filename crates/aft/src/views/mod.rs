@@ -107,6 +107,16 @@ impl std::error::Error for ViewError {
     }
 }
 
+impl ViewError {
+    pub(crate) fn io_at(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::IoAt {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
 impl From<std::io::Error> for ViewError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -432,6 +442,27 @@ impl Manifest {
         Ok(serde_json::from_slice(bytes)?)
     }
 
+    fn plane_keys(&self) -> impl Iterator<Item = (ArtifactPlane, &str)> {
+        self.entries.values().flat_map(|entry| match entry {
+            ManifestEntry::Regular { planes, .. } => [
+                planes
+                    .semantic
+                    .as_deref()
+                    .map(|key| (ArtifactPlane::Semantic, key)),
+                planes
+                    .callgraph
+                    .as_deref()
+                    .map(|key| (ArtifactPlane::Callgraph, key)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+            ManifestEntry::Synthetic { planes, .. } => {
+                vec![(ArtifactPlane::Callgraph, planes.callgraph.as_str())]
+            }
+            ManifestEntry::Symlink { .. } | ManifestEntry::Gitlink { .. } => Vec::new(),
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize)]

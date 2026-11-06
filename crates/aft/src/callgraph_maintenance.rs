@@ -83,6 +83,13 @@ impl CallgraphForceDemand {
         self.fulfilled.fetch_max(token, Ordering::SeqCst);
     }
 
+    /// The reason given by the most recent request.
+    pub(crate) fn reason(&self) -> String {
+        self.reason
+            .lock()
+            .clone()
+            .unwrap_or_else(|| "unrecorded".to_string())
+    }
 }
 
 /// What one finished reconcile did.

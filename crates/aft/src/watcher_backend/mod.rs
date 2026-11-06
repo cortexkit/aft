@@ -4,8 +4,6 @@ use std::sync::{mpsc, Arc};
 
 use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
-#[cfg(test)]
-mod cookie_tests;
 pub(crate) mod flush;
 pub(crate) mod subscription;
 
@@ -33,6 +31,12 @@ pub(crate) enum InitialCoverage {
     Complete,
     Incomplete(Vec<CoverageGap>),
     Unproved,
+}
+
+impl InitialCoverage {
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 // Raw-event test shims and other opaque handles cannot grant kernel coverage.

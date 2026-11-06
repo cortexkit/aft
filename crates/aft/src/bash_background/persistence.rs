@@ -639,6 +639,13 @@ impl PinnedDir {
         Ok(())
     }
 
+    pub(crate) fn repair_write_durable(&self, name: &OsStr, contents: &[u8]) -> io::Result<()> {
+        let mut file = self.repair_create_file(name)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        self.repair_sync()
+    }
+
     pub(crate) fn repair_descendant(&self, relative: &Path, create: bool) -> io::Result<Self> {
         let mut directory = self.repair_clone()?;
         let mut budget = RepairBudget::new();
@@ -913,6 +920,29 @@ impl PinnedDir {
         Ok(())
     }
 
+    /// Remove only the opened child, never resolve a replaced root pathname.
+    /// Progress survives an error so repair can report partially removed data.
+    pub(crate) fn repair_remove_child(
+        &self,
+        name: &OsStr,
+        expected: (u64, u64),
+        protected: &[(u64, u64)],
+        removed: &mut usize,
+    ) -> io::Result<()> {
+        let mut warnings = Vec::new();
+        let result = self.repair_remove_child_with_warnings(
+            name,
+            expected,
+            protected,
+            removed,
+            &mut warnings,
+        );
+        for warning in warnings {
+            crate::slog_warn!("{warning}");
+        }
+        result
+    }
+
     pub(crate) fn repair_remove_child_with_warnings(
         &self,
         name: &OsStr,
@@ -942,6 +972,27 @@ impl PinnedDir {
     ) -> io::Result<()> {
         self.repair_remove_child_with_policy(
             name, expected, protected, false, removed, warnings, budget,
+        )
+    }
+
+    /// Remove a tree too large to validate in one walk before deleting it.
+    /// The removal applies the validation rules as it goes: it stays on one
+    /// filesystem, skips protected directories, and stops with
+    /// [`NonRegularEntryRetained`] at the first symlink or special file
+    /// instead of unlinking it. A stop (that one, or the budget running out)
+    /// keeps everything not yet removed, and `removed` counts what was, so a
+    /// later call continues where this one stopped rather than starting over.
+    pub(crate) fn repair_remove_regular_child_with_budget(
+        &self,
+        name: &OsStr,
+        expected: (u64, u64),
+        protected: &[(u64, u64)],
+        removed: &mut usize,
+        warnings: &mut Vec<String>,
+        budget: &mut RepairBudget,
+    ) -> io::Result<()> {
+        self.repair_remove_child_with_policy(
+            name, expected, protected, true, removed, warnings, budget,
         )
     }
 
@@ -1524,6 +1575,49 @@ impl PinnedDir {
             )));
         }
         Ok(())
+    }
+
+    /// Type and write access of the entry `name`, read without following a
+    /// symlink.
+    pub(crate) fn repair_entry_status(&self, name: &OsStr) -> io::Result<RepairEntryStatus> {
+        #[cfg(unix)]
+        {
+            let c_name = os_cstring(name)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let stat = unsafe { stat.assume_init() };
+            Ok(RepairEntryStatus::unix(stat.st_mode as u32, stat.st_uid))
+        }
+        #[cfg(windows)]
+        {
+            self.ensure_current_identity()?;
+            Ok(RepairEntryStatus::windows(&fs::symlink_metadata(
+                self.path.join(name),
+            )?))
+        }
+    }
+
+    /// [`Self::repair_entry_status`] for this opened directory itself.
+    pub(crate) fn repair_status(&self) -> io::Result<RepairEntryStatus> {
+        let metadata = self.file.metadata()?;
+        #[cfg(unix)]
+        {
+            Ok(RepairEntryStatus::unix(metadata.mode(), metadata.uid()))
+        }
+        #[cfg(windows)]
+        {
+            Ok(RepairEntryStatus::windows(&metadata))
+        }
     }
 
     /// Give the owner read, write and search permission on this opened
@@ -3802,12 +3896,33 @@ impl Iterator for DirectoryEntries {
 }
 
 impl RepairBudget {
+    pub(crate) fn limited(&self, entries: usize) -> Self {
+        Self {
+            remaining: self.remaining.min(entries),
+            deadline: self.deadline,
+            cancelled: self.cancelled.clone(),
+        }
+    }
+    pub(crate) fn with_entries(entries: usize) -> Self {
+        let mut budget = Self::new();
+        budget.remaining = entries;
+        budget
+    }
     pub(crate) fn new() -> Self {
         Self {
             remaining: 1_000_000,
             deadline: std::time::Instant::now() + Duration::from_secs(60),
             cancelled: None,
         }
+    }
+    pub(crate) fn until(
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        let mut budget = Self::new();
+        budget.deadline = budget.deadline.min(deadline);
+        budget.cancelled = Some(cancelled);
+        budget
     }
     pub(crate) fn enter(&self, depth: usize) -> io::Result<()> {
         if self.cancelled.as_ref().is_some_and(|cancelled| cancelled()) {
@@ -3851,6 +3966,15 @@ impl std::fmt::Display for RepairLimitExceeded {
 
 impl std::error::Error for RepairLimitExceeded {}
 
+/// Whether a repair walk stopped because its budget ran out or its caller
+/// cancelled it, rather than because of what it found on disk.
+pub(crate) fn is_repair_budget_stop(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
+        || error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RepairLimitExceeded>())
+}
+
 /// A tree removed without validating it first met an entry that is neither a
 /// directory nor a regular file (a symlink, socket or device node). It is
 /// kept, untouched, together with everything not yet removed.
@@ -3880,6 +4004,15 @@ pub(crate) struct RepairEntryStatus {
 }
 
 impl RepairEntryStatus {
+    #[cfg(unix)]
+    fn unix(mode: u32, uid: u32) -> Self {
+        let kind = mode & libc::S_IFMT as u32;
+        Self {
+            is_dir: kind == libc::S_IFDIR as u32,
+            is_file: kind == libc::S_IFREG as u32,
+            private: uid == unsafe { libc::geteuid() } && mode & 0o022 == 0,
+        }
+    }
 
     #[cfg(windows)]
     fn windows(metadata: &fs::Metadata) -> Self {

@@ -70,6 +70,10 @@ pub(crate) const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const MIGRATION_MANIFEST_VERSION: u32 = 1;
 const MIGRATION_GENERATION_TAG: &str = ".migrated.";
+const MIGRATION_BACKUP_PAGES_PER_STEP: i32 = 128;
+const MIGRATION_BACKUP_RETRY_BUDGET: usize = 25;
+const MIGRATION_BACKUP_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(10);
+const SQLITE_FILE_SET_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
 const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
 const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
@@ -1214,7 +1218,23 @@ pub(crate) struct CallgraphBackgroundTestHooks {
 }
 
 impl CallgraphBackgroundTestHooks {
+    pub(crate) fn capture() -> Self {
+        Self {
+            available_disk: MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()),
+            swap_observer: COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            extract_observer: COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone()),
+        }
+    }
 
+    pub(crate) fn install(self) -> CallgraphBackgroundTestHooksGuard {
+        let previous = Self::capture();
+        set_legacy_migration_available_disk_for_test(self.available_disk);
+        set_cold_build_swap_observer(self.swap_observer);
+        #[cfg(test)]
+        set_cold_build_extract_observer(self.extract_observer);
+        CallgraphBackgroundTestHooksGuard(previous)
+    }
 }
 
 pub(crate) struct CallgraphBackgroundTestHooksGuard(CallgraphBackgroundTestHooks);
@@ -1268,6 +1288,20 @@ impl Drop for ColdBuildAbandonmentGuard {
             *slot.borrow_mut() = self.previous.take();
         });
     }
+}
+
+/// Run a cold build that stops at its next slice fence once `lifecycle`'s
+/// root has stayed unbound past the abandon grace window. The stop returns
+/// `Superseded`; committed staging slices stay on disk so a later bind resumes
+/// from them. This is independent of the publish epoch, which deliberately
+/// does not advance on route teardown.
+pub(crate) fn with_unbound_abandonment_check<R>(
+    lifecycle: SubcLifecycleAdmission,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = COLD_BUILD_ABANDONMENT.with(|slot| slot.replace(Some(lifecycle)));
+    let _guard = ColdBuildAbandonmentGuard { previous };
+    run()
 }
 
 fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
@@ -6469,6 +6503,21 @@ impl CallGraphStore {
         )
     }
 
+    pub(crate) fn force_cold_build_with_lease_chunked(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+        chunk_size: usize,
+    ) -> Result<(Self, ColdBuildStats)> {
+        Self::cold_build_with_lease_chunked_inner(
+            callgraph_dir,
+            project_root,
+            files,
+            chunk_size,
+            true,
+        )
+    }
+
     fn cold_build_with_lease_chunked_inner(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
@@ -7025,6 +7074,13 @@ impl CallGraphStore {
     /// the root-keyed store has not published a generation yet.
     pub fn is_legacy_fallback(&self) -> bool {
         self.legacy_fallback
+    }
+
+    pub(crate) fn is_legacy_migration(&self) -> bool {
+        self.generation.as_deref().is_some_and(|generation| {
+            migration_generation_requires_manifest(generation)
+                && migration_manifest_valid(&self.publication_dir, generation)
+        })
     }
 
     pub fn writer_epoch_for_test(&self) -> Option<&str> {
@@ -9220,6 +9276,39 @@ impl ReadonlyCallGraphStore {
     }
 
 
+    /// Opens a materialized view database by its path, outside any view
+    /// directory, so the data layer's gates can read the same graph through
+    /// today's queries and compare answers.
+    pub(crate) fn open_materialized_database(
+        project_root: PathBuf,
+        sqlite_path: PathBuf,
+    ) -> Result<Self> {
+        let conn = open_readonly_connection(&sqlite_path)?;
+        ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
+        let directory = sqlite_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut inner = CallGraphStore::from_connection(
+            project_root,
+            "gate".to_string(),
+            sqlite_path,
+            directory,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        );
+        inner.manifest_view = true;
+        inner.database_ready.store(true, AtomicOrdering::Release);
+        Ok(Self {
+            inner,
+            health_stale_census: Mutex::new(None),
+        })
+    }
+
 
 
 
@@ -9228,6 +9317,13 @@ impl ReadonlyCallGraphStore {
             "view"
         } else {
             "legacy"
+        }
+    }
+
+    fn from_inner(inner: CallGraphStore) -> Self {
+        Self {
+            inner,
+            health_stale_census: Mutex::new(None),
         }
     }
 
@@ -11333,6 +11429,63 @@ fn verify_writer_lease(lease: &crate::root_cache::WriterLease) -> Result<()> {
     }
 }
 
+fn legacy_migration_completion_line(
+    project_key: &str,
+    method: &str,
+    legacy_bytes: u64,
+    migrated_bytes: u64,
+) -> String {
+    format!(
+        "migrated root-keyed callgraph store key={project_key} method={method} legacy={legacy_bytes} migrated={migrated_bytes}"
+    )
+}
+
+fn log_legacy_migration_completion(
+    project_key: &str,
+    method: &str,
+    legacy_bytes: u64,
+    migrated_bytes: u64,
+) {
+    crate::slog_info!(
+        "{}",
+        legacy_migration_completion_line(project_key, method, legacy_bytes, migrated_bytes)
+    );
+}
+
+
+fn open_legacy_fallback_store(
+    callgraph_dir: &Path,
+    project_root: &Path,
+    project_key: &str,
+    partitions: &[LegacyCallgraphPartition],
+) -> Result<Option<CallGraphStore>> {
+    let Some(target) = first_ready_legacy_target(partitions)? else {
+        return Ok(None);
+    };
+    crate::slog_warn!(
+        "root-keyed callgraph migration unavailable; serving read-only fallback from legacy {} partition {}",
+        target.partition.harness,
+        target.sqlite_path.display()
+    );
+    let conn = open_readonly_connection(&target.sqlite_path)?;
+    if !readonly_readiness(database_ready(&conn))? {
+        return Ok(None);
+    }
+    configure_serving_reader(&conn)?;
+    let marker_label = legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
+    let read_marker = crate::root_cache::ReadMarker::create(callgraph_dir, &marker_label)?;
+    Ok(Some(CallGraphStore::from_connection(
+        project_root.to_path_buf(),
+        project_key.to_string(),
+        target.sqlite_path,
+        callgraph_dir.to_path_buf(),
+        true,
+        target.generation,
+        None,
+        Some(read_marker),
+        conn,
+    )))
+}
 
 
 
@@ -11346,6 +11499,404 @@ fn root_storage_dir(callgraph_dir: &Path) -> Option<PathBuf> {
 }
 
 
+fn newest_superseded_legacy_generation(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    let Some(current) = read_pointer(&partition.dir, &partition.key) else {
+        return Ok(None);
+    };
+    let prefix = format!("{}.g", partition.key);
+    let Ok(entries) = std::fs::read_dir(&partition.dir) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == current
+            || name.contains(".tmp.")
+            || !name.starts_with(&prefix)
+            || !name.ends_with(".sqlite")
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !db_path_ready(&path)? {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, path, name));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((_modified, sqlite_path, generation)) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let source_bytes = sqlite_file_set_size(&sqlite_path)?;
+    Ok(Some(LegacyCallgraphTarget {
+        partition: partition.clone(),
+        sqlite_path,
+        generation: Some(generation),
+        source_bytes,
+        source_blake3: String::new(),
+    }))
+}
+
+fn current_legacy_generation(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    let Some(target) = ready_legacy_target(partition)? else {
+        return Ok(None);
+    };
+    let has_superseded = newest_superseded_legacy_generation(partition)?.is_some();
+    if has_superseded {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
+
+fn first_ready_legacy_target(
+    partitions: &[LegacyCallgraphPartition],
+) -> Result<Option<LegacyCallgraphTarget>> {
+    for partition in partitions {
+        if let Some(target) = ready_legacy_target(partition)? {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn ready_legacy_target(
+    partition: &LegacyCallgraphPartition,
+) -> Result<Option<LegacyCallgraphTarget>> {
+    if let Some(generation) = read_pointer(&partition.dir, &partition.key) {
+        let sqlite_path = partition.dir.join(&generation);
+        if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
+            let source_bytes = sqlite_file_set_size(&sqlite_path)?;
+            return Ok(Some(LegacyCallgraphTarget {
+                partition: partition.clone(),
+                sqlite_path,
+                generation: Some(generation),
+                source_bytes,
+                source_blake3: String::new(),
+            }));
+        }
+    }
+
+    let sqlite_path = legacy_sqlite_path(&partition.dir, &partition.key);
+    if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
+        let source_bytes = sqlite_file_set_size(&sqlite_path)?;
+        return Ok(Some(LegacyCallgraphTarget {
+            partition: partition.clone(),
+            sqlite_path,
+            generation: None,
+            source_bytes,
+            source_blake3: String::new(),
+        }));
+    }
+    Ok(None)
+}
+
+fn publish_generation_copy_migration(
+    callgraph_dir: &Path,
+    project_key: &str,
+    source: &LegacyCallgraphTarget,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+) -> Result<PublishedLegacyMigration> {
+    let generation = migration_generation_file_name(project_key, "copy");
+    let temp_path = migration_temp_path(callgraph_dir, &generation);
+    remove_sqlite_file_set(&temp_path);
+    copy_sqlite_file_set(&source.sqlite_path, &temp_path)?;
+    fail_after_temp_copy_for_test()?;
+
+    let mut source = source.clone();
+    let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
+    source.source_blake3 = fingerprint.blake3;
+    let generation = publish_migrated_generation(
+        callgraph_dir,
+        project_key,
+        &generation,
+        &temp_path,
+        &source,
+        fingerprint.bytes,
+        writer_lease,
+        "generation_copy",
+    )?;
+    Ok(PublishedLegacyMigration {
+        generation,
+        migrated_bytes: fingerprint.bytes,
+    })
+}
+
+fn publish_backup_migration(
+    callgraph_dir: &Path,
+    project_key: &str,
+    source: &LegacyCallgraphTarget,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+) -> Result<PublishedLegacyMigration> {
+    if MIGRATION_FORCE_BACKUP_BUDGET_EXHAUSTED.with(|slot| slot.get()) {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph backup migration budget exhausted by test seam".to_string(),
+        ));
+    }
+
+    let generation = migration_generation_file_name(project_key, "backup");
+    let temp_path = migration_temp_path(callgraph_dir, &generation);
+    remove_sqlite_file_set(&temp_path);
+
+    let source_conn = open_readonly_connection(&source.sqlite_path)?;
+    let mut destination =
+        TrackedConnection::open(&temp_path, SqliteStore::CallgraphColdGeneration)?;
+    destination.busy_timeout(Duration::from_secs(5))?;
+    let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination)?;
+    let started = Instant::now();
+    let mut retries = 0;
+    loop {
+        match backup.step(MIGRATION_BACKUP_PAGES_PER_STEP)? {
+            rusqlite::backup::StepResult::Done => break,
+            rusqlite::backup::StepResult::More => std::thread::sleep(Duration::from_millis(5)),
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                retries += 1;
+                if retries > MIGRATION_BACKUP_RETRY_BUDGET
+                    || started.elapsed() > MIGRATION_BACKUP_WALL_CLOCK_BUDGET
+                {
+                    return Err(CallGraphStoreError::Unavailable(format!(
+                        "legacy callgraph backup migration exceeded retry/wall-clock budget after {retries} retries"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                return Err(CallGraphStoreError::Unavailable(
+                    "legacy callgraph backup returned an unknown step result".to_string(),
+                ));
+            }
+        }
+    }
+    drop(backup);
+
+    let integrity: String =
+        destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(CallGraphStoreError::Unavailable(format!(
+            "legacy callgraph backup produced a database that failed integrity_check: {integrity}"
+        )));
+    }
+    if !database_ready(&destination)? {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph backup produced a database without ready metadata".to_string(),
+        ));
+    }
+    destination.execute_batch("PRAGMA optimize;")?;
+    drop(destination);
+    fail_after_temp_copy_for_test()?;
+
+    let mut source = source.clone();
+    let fingerprint = sqlite_file_set_fingerprint(&temp_path)?;
+    source.source_blake3 = fingerprint.blake3;
+    let generation = publish_migrated_generation(
+        callgraph_dir,
+        project_key,
+        &generation,
+        &temp_path,
+        &source,
+        fingerprint.bytes,
+        writer_lease,
+        "sqlite_backup",
+    )?;
+    Ok(PublishedLegacyMigration {
+        generation,
+        migrated_bytes: fingerprint.bytes,
+    })
+}
+
+fn publish_migrated_generation(
+    callgraph_dir: &Path,
+    project_key: &str,
+    generation: &str,
+    temp_path: &Path,
+    source: &LegacyCallgraphTarget,
+    migrated_bytes: u64,
+    writer_lease: Arc<crate::root_cache::WriterLease>,
+    method: &str,
+) -> Result<String> {
+    let gen_path = callgraph_dir.join(generation);
+    checkpoint_sqlite_before_publication(temp_path);
+    let publication = publish_if_current(|| {
+        verify_writer_lease(&writer_lease)?;
+        let _publication_gc = crate::fs_lock::try_acquire(
+            &publication_gc_lock(callgraph_dir, project_key),
+            Duration::from_secs(5),
+        )?;
+        remove_sqlite_file_set(&gen_path);
+        rename_sqlite_file_set(temp_path, &gen_path)?;
+        // A backup copy is written in rollback mode; switch it while no
+        // pointer names it, as a cold build does.
+        switch_generation_to_wal_before_publication(&gen_path);
+
+        verify_writer_lease(&writer_lease)?;
+        publish_pointer(callgraph_dir, project_key, generation)?;
+        write_migration_manifest(callgraph_dir, generation, source, migrated_bytes, method)?;
+        Ok(generation.to_string())
+    });
+    if matches!(publication, Err(CallGraphStoreError::Superseded)) {
+        remove_sqlite_file_set(temp_path);
+    }
+    publication
+}
+
+fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    // Hold the filesystem guard for the entire copy so no tracked descriptor
+    // can open between checking that SQLite files are closed and copying them.
+    // On POSIX, closing any descriptor can discard every advisory lock this
+    // process holds on that inode, including locks from another descriptor.
+    let _files = crate::db::file_identity::filesystem_guard();
+    ensure_sqlite_files_closed(source)?;
+    if let Some(parent) = destination.parent() {
+        crate::private_storage::create_dir_all(parent)?;
+    }
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let source_path = sqlite_file_set_path(source, suffix);
+        if !source_path.is_file() {
+            continue;
+        }
+        let destination_path = sqlite_file_set_path(destination, suffix);
+        crate::private_storage::copy(&source_path, &destination_path)?;
+    }
+    Ok(())
+}
+
+fn rename_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    crate::db::file_identity::guard_replacement(source, "callgraph sqlite file-set rename source");
+    crate::db::file_identity::guard_replacement(
+        destination,
+        "callgraph sqlite file-set rename destination",
+    );
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let source_path = sqlite_file_set_path(source, suffix);
+        if !source_path.exists() {
+            continue;
+        }
+        let destination_path = sqlite_file_set_path(destination, suffix);
+        if let Err(error) = crate::fs_lock::rename_over(&source_path, &destination_path) {
+            let _ = std::fs::remove_file(&source_path);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_file_set_size(path: &Path) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let member = sqlite_file_set_path(path, suffix);
+        if !member.is_file() {
+            continue;
+        }
+        bytes = bytes.saturating_add(member.metadata()?.len());
+    }
+    Ok(bytes)
+}
+
+fn sqlite_file_set_fingerprint(path: &Path) -> Result<SourceFingerprint> {
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    for suffix in SQLITE_FILE_SET_SUFFIXES {
+        let member = sqlite_file_set_path(path, suffix);
+        if !member.is_file() {
+            continue;
+        }
+        hasher.update(suffix.as_bytes());
+        let mut file = std::fs::File::open(&member)?;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(SourceFingerprint {
+        bytes,
+        blake3: hash_to_hex(hasher.finalize()),
+    })
+}
+
+fn sqlite_file_set_path(path: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(format!("{}{suffix}", path.display()))
+    }
+}
+
+fn fail_after_temp_copy_for_test() -> Result<()> {
+    if MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.get()) {
+        return Err(CallGraphStoreError::Unavailable(
+            "legacy callgraph migration stopped after temp copy by test seam".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn migration_generation_file_name(project_key: &str, method: &str) -> String {
+    format!(
+        "{project_key}.g{}.{}{}{}.sqlite",
+        now_nanos(),
+        std::process::id(),
+        MIGRATION_GENERATION_TAG,
+        method
+    )
+}
+
+fn migration_temp_path(callgraph_dir: &Path, generation: &str) -> PathBuf {
+    callgraph_dir.join(format!(
+        "{generation}.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ))
+}
+
+fn write_migration_manifest(
+    callgraph_dir: &Path,
+    generation: &str,
+    source: &LegacyCallgraphTarget,
+    migrated_bytes: u64,
+    method: &str,
+) -> Result<()> {
+    let manifest_path = migration_manifest_path(callgraph_dir, generation);
+    let temp_path = manifest_path.with_extension(format!(
+        "migration.json.tmp.{}.{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let manifest = serde_json::json!({
+        "version": MIGRATION_MANIFEST_VERSION,
+        "method": method,
+        "target_generation": generation,
+        "source_harness": source.partition.harness,
+        "source_path": source.sqlite_path.display().to_string(),
+        "source_generation": source.generation,
+        "source_bytes": source.source_bytes,
+        "source_blake3": source.source_blake3,
+        "migrated_bytes": migrated_bytes,
+    });
+    {
+        use std::io::Write as _;
+        let mut file = crate::private_storage::create(&temp_path)?;
+        file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
+        file.write_all(b"\n")?;
+    }
+    if let Err(error) = crate::fs_lock::rename_over(&temp_path, &manifest_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
 
 fn migration_manifest_path(callgraph_dir: &Path, generation: &str) -> PathBuf {
     callgraph_dir.join(format!("{generation}.migration.json"))
@@ -11382,12 +11933,72 @@ fn migration_manifest_valid(callgraph_dir: &Path, generation: &str) -> bool {
             .is_some_and(|hash| hash.len() == 64)
 }
 
+fn cleanup_incomplete_migrations(callgraph_dir: &Path, project_key: &str) {
+    let pointer_generation = read_pointer(callgraph_dir, project_key);
+    if let Some(generation) = pointer_generation.as_deref() {
+        if migration_generation_requires_manifest(generation)
+            && !migration_manifest_valid(callgraph_dir, generation)
+        {
+            let path = callgraph_dir.join(generation);
+            remove_sqlite_file_set(&path);
+            let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, generation));
+            let _ = std::fs::remove_file(pointer_path(callgraph_dir, project_key));
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if name.contains(".tmp.") && name.starts_with(&format!("{project_key}.g")) {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        if name.starts_with(&format!("{project_key}.g"))
+            && name.ends_with(".sqlite")
+            && name.contains(MIGRATION_GENERATION_TAG)
+            && pointer_generation.as_deref() != Some(&name)
+            && !migration_manifest_valid(callgraph_dir, &name)
+        {
+            remove_sqlite_file_set(&path);
+            let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &name));
+        }
+    }
+}
+
+fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    if let Some(generation) = generation {
+        hasher.update(generation.as_bytes());
+    }
+    let digest = hash_to_hex(hasher.finalize());
+    format!("legacy-{}", &digest[..16])
+}
+
 
 
 
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     open_readonly_connection_before(path, Instant::now())
+}
+
+/// A sealed donor (see `views::donor`) is opened with `immutable=1`: SQLite
+/// then takes no locks and never looks for a WAL, which is what lets a
+/// worker clone the file with a plain descriptor.
+fn open_sealed_connection(path: &Path) -> Result<TrackedConnection> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let uri = format!("{}&immutable=1", sqlite_readonly_uri(path));
+    let conn = TrackedConnection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::CallgraphGeneration,
+    )?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(conn)
 }
 
 fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
@@ -11405,6 +12016,14 @@ fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<Tra
     conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
+}
+
+fn configure_serving_reader(conn: &TrackedConnection) -> Result<()> {
+    // Readiness was checked without waiting, but a ready store can still race a
+    // refresh opening its writer or checkpointing. Let normal queries outwait
+    // short exclusive locks without hiding contention that exceeds this bound.
+    conn.busy_timeout(Duration::from_millis(100))?;
+    Ok(())
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
@@ -11519,6 +12138,21 @@ fn switch_generation_to_wal_before_publication(path: &Path) {
             error
         ),
     }
+}
+
+/// A copied migration generation may carry a WAL sidecar. Checkpoint only the
+/// private temporary copy before publishing it; a busy reader is harmless because
+/// the next publication or cleanup pass can retry without affecting the source.
+fn checkpoint_sqlite_before_publication(path: &Path) {
+    let Ok(conn) = crate::db::lifecycle::TrackedConnection::open(
+        path,
+        crate::db::lifecycle::SqliteStore::CallgraphGeneration,
+    ) else {
+        return;
+    };
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    let _ = conn.busy_timeout(Duration::from_secs(5));
+    let _ = checkpoint_wal_truncate(&conn);
 }
 
 fn checkpoint_wal_truncate(conn: &TrackedConnection) -> bool {
@@ -12089,6 +12723,12 @@ fn staging_file_name(project_key: &str) -> String {
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
+}
+
+/// The schema and build-output fingerprint a ready derived database carries,
+/// for keying derived outputs that are interchangeable across checkouts.
+pub(crate) fn derived_build_fingerprint() -> String {
+    schema_fingerprint()
 }
 
 fn schema_fingerprint_for(build_output_version: &str) -> String {
@@ -12971,6 +13611,16 @@ struct GenerationGcCandidate {
 /// current pointer and live readers retain them; age never overrides a reader.
 fn publication_gc_lock(callgraph_dir: &Path, project_key: &str) -> PathBuf {
     callgraph_dir.join(format!("{project_key}.publication.lock"))
+}
+
+pub(crate) fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
+    let Ok(_publication) = crate::fs_lock::try_acquire(
+        &publication_gc_lock(callgraph_dir, project_key),
+        Duration::ZERO,
+    ) else {
+        return 0;
+    };
+    gc_old_generations_locked(callgraph_dir, project_key, current)
 }
 
 fn gc_old_generations_locked(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
@@ -24136,6 +24786,17 @@ thread_local! {
     static CORPUS_MEMO: RefCell<std::sync::Weak<CorpusMemo>> = RefCell::new(std::sync::Weak::new());
 }
 
+pub(crate) fn with_corpus_memo<R>(memo: std::sync::Weak<CorpusMemo>, run: impl FnOnce() -> R) -> R {
+    struct Restore(std::sync::Weak<CorpusMemo>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORPUS_MEMO.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(CORPUS_MEMO.with(|slot| slot.replace(memo)));
+    run()
+}
+
 impl CorpusSnapshot {
     fn file(&self, project_root: &Path, path: &Path) -> Result<Option<&CorpusFile>> {
         // Admission and lookups must share canonical absolute keys, even when
@@ -29543,10 +30204,6 @@ edition = "2021"
     }
 
 
-    fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
-        let view = callgraph_fixture_view_store(root, inputs);
-        project_dead_code_snapshot_from_view(&view).unwrap().1
-    }
 
     #[test]
     fn callgraph_python_receiver_header_dispatch_keeps_defining_caller() {
@@ -29570,689 +30227,6 @@ edition = "2021"
         );
     }
 
-    #[test]
-    fn callgraph_view_macro_and_go_initializer_equal_cold_legacy() {
-        for language in [LangId::Go, LangId::Rust] {
-            let dir = tempdir().unwrap();
-            let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
-            let root = resolved_root.as_path();
-            let (files, manifest) = if language == LangId::Go {
-                let manifest = write_file(root, "go.mod", "module example.com/app\n");
-                let main = write_file(root, "main.go", "package main\nimport (\n \"net/http\"\n c \"example.com/app/cmd\"\n)\nvar Boot = Register()\nfunc Register() int { return 1 }\nfunc main() { _ = http.HandlerFunc(c.F) }\n");
-                let cmd = write_file(root, "cmd/f.go", "package cmd\nvar Command = func() int { InitBackendContext(); return 1 }()\nfunc InitBackendContext() {}\nfunc F() {}\nfunc Spare() {}\n");
-                (vec![main, cmd], manifest)
-            } else {
-                write_rust_manifest(root, "macro-view-bin");
-                let main = write_file(root, "src/main.rs", "pub(crate) fn helper() {}\npub(crate) fn spare() {}\nmacro_rules! m { () => { helper(); } }\nfn main() { m!(); }\n");
-                (vec![main], root.join("Cargo.toml"))
-            };
-            let (_, legacy) = go_fixture_store(root, &files);
-            let mut inputs = files;
-            inputs.push(manifest);
-            let view = callgraph_fixture_view(root, &inputs);
-            assert_eq!(
-                legacy.files, view.files,
-                "legacy/view snapshots must retain the same file path forms"
-            );
-            let owner = if language == LangId::Go {
-                "Command"
-            } else {
-                "m!"
-            };
-            let callee = if language == LangId::Go {
-                "InitBackendContext"
-            } else {
-                "helper"
-            };
-            for snapshot in [&legacy, &view] {
-                if language == LangId::Go {
-                    assert!(
-                        fixture_root_symbols(snapshot, root, "main.go")
-                            .is_some_and(|roots| roots.contains("Boot")),
-                        "package main initializer Boot must be a liveness root"
-                    );
-                    assert!(
-                        snapshot
-                            .outbound_calls
-                            .iter()
-                            .any(|call| call.provenance == "value_ref"
-                                && fixture_target_is(root, &call.target, "cmd/f.go", "F")),
-                        "Go view must resolve callback paths through go.mod: {:?}",
-                        snapshot.outbound_calls
-                    );
-                }
-                assert!(
-                    snapshot
-                        .outbound_calls
-                        .iter()
-                        .any(|c| c.caller_symbol == owner && c.target.ends_with(callee)),
-                    "missing {owner} -> {callee}"
-                );
-            }
-            let cold = callgraph_fixture_scan(root, legacy);
-            let viewed = callgraph_fixture_scan(root, view);
-            assert_eq!(cold["items"], viewed["items"]);
-            assert_eq!(cold["test_only_items"], viewed["test_only_items"]);
-            assert!(!callgraph_fixture_has(&viewed, "items", callee), "{viewed}");
-            assert!(
-                callgraph_fixture_has(
-                    &viewed,
-                    "items",
-                    if language == LangId::Go {
-                        "Spare"
-                    } else {
-                        "spare"
-                    }
-                ),
-                "{viewed}"
-            );
-        }
-    }
-
-
-    #[test]
-    fn callgraph_non_go_exported_variable_retains_view_root_flag() {
-        let dir = tempdir().unwrap();
-        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
-        let root = resolved_root.as_path();
-        let file = write_file(root, "entry.ts", "export const Public = 1;\n");
-        let rust = write_file(
-            root,
-            "entry.rs",
-            "pub struct Widget;\nimpl Widget { pub fn Method(&self) {} }\n",
-        );
-        let (_, legacy) = go_fixture_store(root, &[file.clone(), rust.clone()]);
-        let snapshot = callgraph_fixture_view(root, &[file, rust]);
-        assert_eq!(
-            legacy.files, snapshot.files,
-            "legacy/view snapshots must retain the same file path forms"
-        );
-        assert!(fixture_root_symbols(&snapshot, root, "entry.ts")
-            .is_some_and(|roots| roots.contains("Public")));
-        assert!(
-            fixture_root_symbols(&snapshot, root, "entry.rs")
-                .is_some_and(|roots| roots.contains("Widget::Method")),
-            "non-Go exported methods retain their existing view root flag"
-        );
-    }
-
-    #[test]
-    fn callgraph_go_imported_init_functions_match_legacy_and_view() {
-        for imported in [true, false] {
-            let dir = tempdir().unwrap();
-            let root = dir.path();
-            let manifest = write_file(root, "go.mod", "module example.com/app\n");
-            let import = if imported {
-                "import _ \"example.com/app/cmd\"\n"
-            } else {
-                ""
-            };
-            let main = write_file(
-                root,
-                "main.go",
-                &format!("package main\n{import}func main() {{}}\n"),
-            );
-            let cmd = write_file(root, "cmd/init.go", "package cmd\nfunc init() { Events() }\nfunc init() { OtherEvents() }\nfunc Events() {}\nfunc OtherEvents() {}\n");
-            let (_, legacy) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
-            let view = callgraph_fixture_view(root, &[main, cmd, manifest]);
-            let cold = callgraph_fixture_scan(root, legacy);
-            let viewed = callgraph_fixture_scan(root, view);
-            for symbol in ["Events", "OtherEvents"] {
-                assert_eq!(
-                    callgraph_fixture_has(&cold, "items", symbol),
-                    !imported,
-                    "{cold}"
-                );
-                assert_eq!(
-                    callgraph_fixture_has(&viewed, "items", symbol),
-                    !imported,
-                    "{viewed}"
-                );
-            }
-            assert_eq!(cold["items"], viewed["items"]);
-        }
-    }
-
-    #[test]
-    fn callgraph_go_fluent_http_callback_trace_and_view_parity() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let manifest = write_file(root, "go.mod", "module example.com/app\n");
-        let main = write_file(
-            root,
-            "main.go",
-            "package main\nimport \"example.com/app/web\"\nfunc main() { web.NewRouter() }\n",
-        );
-        let router = write_file(root, "web/router.go", "package web\nimport \"net/http\"\nfunc NewRouter() { GitController(nil, nil) }\nfunc GitController(_ interface{}, r *Router) { r.Handle(\"/\", withParams(withAccess(http.HandlerFunc(GoGetHandler)))).Methods(\"GET\") }\nfunc withParams(h http.Handler) http.Handler { return h }\nfunc withAccess(h http.Handler) http.Handler { return h }\ntype Router struct{}\n");
-        let handler = write_file(
-            root,
-            "web/handler.go",
-            "package web\nfunc GoGetHandler() {}\nfunc UnregisteredHandler() {}\n",
-        );
-        let extract = build_file_extract(root, &router).unwrap();
-        assert!(extract.data.calls_by_symbol["GitController"]
-            .iter()
-            .any(|site| site.callee_name == "withParams"));
-        assert!(extract.data.value_refs_by_symbol.get("GitController").is_some_and(|sites|
-            sites.iter().any(|site| site.full_callee == "GoGetHandler")),
-            "trace: ordinary wrapper calls were extracted, but the fluent selector pruned its callback argument");
-        let (store, legacy) =
-            go_fixture_store(root, &[main.clone(), router.clone(), handler.clone()]);
-        let status: String = store
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT status FROM refs WHERE kind='callback_ref' AND full_ref='GoGetHandler'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "resolved");
-        let view = callgraph_fixture_view(root, &[main, router, handler, manifest]);
-        for snapshot in [&legacy, &view] {
-            assert!(snapshot
-                .outbound_calls
-                .iter()
-                .any(|call| call.caller_symbol == "GitController"
-                    && call.provenance == "value_ref"
-                    && call.target.ends_with("handler.go::GoGetHandler")));
-        }
-        let cold = callgraph_fixture_scan(root, legacy);
-        let viewed = callgraph_fixture_scan(root, view);
-        assert!(
-            !callgraph_fixture_has(&cold, "items", "GoGetHandler"),
-            "{cold}"
-        );
-        assert!(
-            callgraph_fixture_has(&cold, "items", "UnregisteredHandler"),
-            "{cold}"
-        );
-        assert_eq!(cold["items"], viewed["items"]);
-    }
-
-    #[test]
-    fn callgraph_rust_nested_use_tree_aliases_match_legacy_and_view() {
-        let dir = tempdir().unwrap();
-        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
-        let root = resolved_root.as_path();
-        write_rust_manifest(root, "nested-alias-bin");
-        let main = write_file(root, "src/main.rs", "mod flags;\nuse crate::flags::{complete::{bash::generate as direct_bash}, doc::{help::{generate as direct_help}}};\nfn main() { flags::generate_complete_bash(); flags::generate_help(); flags::generate_version(); direct_bash(); direct_help(); }\n");
-        let flags = write_file(root, "src/flags.rs", "mod complete;\nmod doc;\npub(crate) use crate::flags::{complete::{bash::generate as generate_complete_bash}, doc::{help::{generate as generate_help}, version::{generate as generate_version}}};\n");
-        let complete = write_file(root, "src/flags/complete.rs", "pub(crate) mod bash;\n");
-        let bash = write_file(
-            root,
-            "src/flags/complete/bash.rs",
-            "pub(crate) fn generate() {}\npub(crate) fn spare() {}\n",
-        );
-        let doc = write_file(
-            root,
-            "src/flags/doc.rs",
-            "pub(crate) mod help;\npub(crate) mod version;\n",
-        );
-        let help = write_file(
-            root,
-            "src/flags/doc/help.rs",
-            "pub(crate) fn generate() { lookup(); }\npub(crate) fn lookup() {}\n",
-        );
-        let version = write_file(
-            root,
-            "src/flags/doc/version.rs",
-            "pub(crate) fn generate() { digits(); }\npub(crate) fn digits() {}\n",
-        );
-        let files = vec![main, flags, complete, bash, doc, help, version];
-        let (store, legacy) = go_fixture_store(root, &files);
-        assert_direct_caller(
-            &store,
-            "src/flags/complete/bash.rs",
-            "generate",
-            "src/main.rs",
-            "main",
-        );
-        let mut inputs = files;
-        inputs.push(root.join("Cargo.toml"));
-        let view = callgraph_fixture_view(root, &inputs);
-        assert_eq!(
-            legacy.files, view.files,
-            "legacy/view snapshots must retain the same file path forms"
-        );
-        assert!(
-            view.outbound_calls
-                .iter()
-                .any(|call| call.caller_symbol == "main"
-                    && fixture_target_is(
-                        root,
-                        &call.target,
-                        "src/flags/complete/bash.rs",
-                        "generate"
-                    )),
-            "nested alias view trace: {:?}",
-            view.outbound_calls
-        );
-        let cold = callgraph_fixture_scan(root, legacy);
-        let viewed = callgraph_fixture_scan(root, view);
-        for symbol in ["generate", "lookup", "digits"] {
-            assert!(!callgraph_fixture_has(&cold, "items", symbol), "{cold}");
-        }
-        assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
-        assert_eq!(cold["items"], viewed["items"]);
-    }
-
-    #[test]
-    fn callgraph_rust_cross_file_exported_nested_macros_match_legacy_and_view() {
-        for invoked in [true, false] {
-            let dir = tempdir().unwrap();
-            let root = dir.path();
-            write_rust_manifest(root, "cross-file-macro-bin");
-            let invocation = if invoked { "outer!();" } else { "" };
-            let main = write_file(
-                root,
-                "src/main.rs",
-                &format!("#[macro_use]\nmod messages;\nfn main() {{ {invocation} }}\n"),
-            );
-            let messages = write_file(root, "src/messages.rs", "#[macro_export]\nmacro_rules! inner { () => { crate::messages::helper(); } }\n#[macro_export]\nmacro_rules! outer { () => { inner!(); crate::messages::other_helper(); } }\npub(crate) fn helper() {}\npub(crate) fn other_helper() {}\npub(crate) fn spare() {}\n");
-            let trace = build_file_extract(root, &messages).unwrap();
-            assert!(
-                trace
-                    .data
-                    .macro_body_calls_by_macro
-                    .get("outer!")
-                    .is_some_and(|sites| sites.iter().any(|site| site.callee_name == "inner!")),
-                "nested macro extraction trace: {:?}",
-                trace.data.macro_body_calls_by_macro
-            );
-            let (_, legacy) = go_fixture_store(root, &[main.clone(), messages.clone()]);
-            let view = callgraph_fixture_view(root, &[main, messages, root.join("Cargo.toml")]);
-            for (surface, snapshot) in [("legacy", &legacy), ("view", &view)] {
-                assert!(
-                    snapshot
-                        .outbound_calls
-                        .iter()
-                        .any(|call| call.caller_symbol == "outer!"
-                            && call.target.ends_with("::inner!")),
-                    "nested macro {surface} trace: {:?}",
-                    snapshot.outbound_calls
-                );
-            }
-            let cold = callgraph_fixture_scan(root, legacy);
-            let viewed = callgraph_fixture_scan(root, view);
-            for symbol in ["helper", "other_helper"] {
-                assert_eq!(
-                    callgraph_fixture_has(&cold, "items", symbol),
-                    !invoked,
-                    "{cold}"
-                );
-                assert_eq!(
-                    callgraph_fixture_has(&viewed, "items", symbol),
-                    !invoked,
-                    "{viewed}"
-                );
-            }
-            assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
-            assert_eq!(cold["items"], viewed["items"]);
-        }
-    }
-
-    #[test]
-    fn callgraph_rust_nested_aliases_custom_bin_root_match_legacy_and_view() {
-        let dir = tempdir().unwrap();
-        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
-        let root = resolved_root.as_path();
-        let manifest = write_file(root, "Cargo.toml", "[package]\nname='custom-layout'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='rg'\npath='crates/core/main.rs'\n");
-        let main = write_file(root, "crates/core/main.rs", "mod flags;\nfn main() { generate(); special(); }\nfn generate() { flags::generate_complete_bash(); flags::generate_complete_fish(); flags::generate_complete_powershell(); flags::generate_complete_zsh(); flags::generate_man_page(); }\nfn special() { flags::generate_help_short(); flags::generate_help_long(); flags::generate_version_short(); flags::generate_version_long(); flags::generate_version_pcre2(); }\n");
-        let flags = write_file(root, "crates/core/flags/mod.rs", "pub(crate) use crate::flags::{\n complete::{bash::generate as generate_complete_bash, fish::generate as generate_complete_fish, powershell::generate as generate_complete_powershell, zsh::generate as generate_complete_zsh},\n doc::{help::{generate_long as generate_help_long, generate_short as generate_help_short}, man::generate as generate_man_page, version::{generate_long as generate_version_long, generate_pcre2 as generate_version_pcre2, generate_short as generate_version_short}},\n};\nmod complete;\nmod doc;\nmod parse;\n");
-        let complete = write_file(root, "crates/core/flags/complete/mod.rs", "pub(crate) mod bash;\npub(crate) mod fish;\npub(crate) mod powershell;\npub(crate) mod zsh;\n");
-        let bash = write_file(
-            root,
-            "crates/core/flags/complete/bash.rs",
-            "pub(crate) fn generate() {}\npub(crate) fn spare() {}\n",
-        );
-        let fish = write_file(
-            root,
-            "crates/core/flags/complete/fish.rs",
-            "pub(crate) fn generate() {}\n",
-        );
-        let powershell = write_file(
-            root,
-            "crates/core/flags/complete/powershell.rs",
-            "pub(crate) fn generate() {}\n",
-        );
-        let zsh = write_file(
-            root,
-            "crates/core/flags/complete/zsh.rs",
-            "pub(crate) fn generate() {}\n",
-        );
-        let doc = write_file(
-            root,
-            "crates/core/flags/doc/mod.rs",
-            "pub(crate) mod help;\npub(crate) mod man;\npub(crate) mod version;\n",
-        );
-        let help = write_file(root, "crates/core/flags/doc/help.rs", "pub(crate) fn generate_short() { crate::flags::parse::lookup(); }\npub(crate) fn generate_long() { crate::flags::parse::lookup(); }\n");
-        let man = write_file(
-            root,
-            "crates/core/flags/doc/man.rs",
-            "pub(crate) fn generate() { crate::flags::parse::lookup(); }\n",
-        );
-        let version = write_file(root, "crates/core/flags/doc/version.rs", "pub(crate) fn generate_short() { generate_digits(); }\npub(crate) fn generate_long() { generate_short(); generate_pcre2(); }\npub(crate) fn generate_digits() {}\npub(crate) fn generate_pcre2() {}\n");
-        let parse = write_file(
-            root,
-            "crates/core/flags/parse.rs",
-            "pub(crate) fn lookup() {}\n",
-        );
-        let files = vec![
-            main, flags, complete, bash, fish, powershell, zsh, doc, help, man, version, parse,
-        ];
-        let (store, legacy) = go_fixture_store(root, &files);
-        let targets = [
-            (
-                "generate_complete_bash",
-                "crates/core/flags/complete/bash.rs",
-                "generate",
-                "generate",
-            ),
-            (
-                "generate_complete_fish",
-                "crates/core/flags/complete/fish.rs",
-                "generate",
-                "generate",
-            ),
-            (
-                "generate_complete_powershell",
-                "crates/core/flags/complete/powershell.rs",
-                "generate",
-                "generate",
-            ),
-            (
-                "generate_complete_zsh",
-                "crates/core/flags/complete/zsh.rs",
-                "generate",
-                "generate",
-            ),
-            (
-                "generate_man_page",
-                "crates/core/flags/doc/man.rs",
-                "generate",
-                "generate",
-            ),
-            (
-                "generate_help_short",
-                "crates/core/flags/doc/help.rs",
-                "generate_short",
-                "special",
-            ),
-            (
-                "generate_help_long",
-                "crates/core/flags/doc/help.rs",
-                "generate_long",
-                "special",
-            ),
-            (
-                "generate_version_short",
-                "crates/core/flags/doc/version.rs",
-                "generate_short",
-                "special",
-            ),
-            (
-                "generate_version_long",
-                "crates/core/flags/doc/version.rs",
-                "generate_long",
-                "special",
-            ),
-            (
-                "generate_version_pcre2",
-                "crates/core/flags/doc/version.rs",
-                "generate_pcre2",
-                "special",
-            ),
-        ];
-        for (alias, file, symbol, caller) in targets {
-            let target: (String, Option<String>, Option<String>) = store.conn.lock().unwrap().query_row(
-                "SELECT status,target_file,target_symbol FROM refs WHERE kind='call' AND full_ref=?1", [format!("flags::{alias}")],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
-            assert_eq!(target, ("resolved".to_string(), Some(file.to_string()), Some(symbol.to_string())),
-                "custom [[bin]] alias {alias} must land on the real leaf, not a resolved facade name");
-            assert_direct_caller(&store, file, symbol, "crates/core/main.rs", caller);
-        }
-        let mut inputs = files;
-        inputs.push(manifest);
-        let view = callgraph_fixture_view(root, &inputs);
-        assert_eq!(
-            legacy.files, view.files,
-            "legacy/view snapshots must retain the same file path forms"
-        );
-        for (alias, file, symbol, caller) in targets {
-            assert!(
-                view.outbound_calls
-                    .iter()
-                    .any(|call| call.caller_symbol == caller
-                        && fixture_target_is(root, &call.target, file, symbol)),
-                "view custom-root alias {alias} must land on the real leaf"
-            );
-        }
-        let cold = callgraph_fixture_scan(root, legacy);
-        let viewed = callgraph_fixture_scan(root, view);
-        for symbol in [
-            "generate",
-            "generate_short",
-            "generate_long",
-            "generate_digits",
-            "generate_pcre2",
-            "lookup",
-        ] {
-            assert!(!callgraph_fixture_has(&cold, "items", symbol), "{cold}");
-            assert!(!callgraph_fixture_has(&viewed, "items", symbol), "{viewed}");
-        }
-        assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
-        assert_eq!(cold["items"], viewed["items"]);
-    }
-
-    #[test]
-    fn callgraph_go_sort_dispatch_does_not_rescue_same_named_plain_function() {
-        for imported in [false, true] {
-            for body in ["return false", "return i < j", "println(i); return false"] {
-                let dir = tempdir().unwrap();
-                let root = dir.path();
-                let manifest = write_file(root, "go.mod", "module example.com/sort-collision\n");
-                let (main, method_file, source) = if imported {
-                    let main = write_file(root, "main.go", "package main\nimport (\"sort\"; \"example.com/sort-collision/items\")\nfunc main() { values := items.Values(); sort.Sort(values) }\n");
-                    let source = "package items\ntype Sortable []int\nfunc Values() Sortable { return Sortable{3,1,2} }\nfunc (s Sortable) Len() int { return len(s) }\nfunc (s Sortable) Less(i,j int) bool { return s[i]<s[j] }\nfunc (s Sortable) Swap(i,j int) { s[i],s[j]=s[j],s[i] }\nfunc (s Sortable) Unused() {}\nfunc Less(i,j int) bool { return false }\n";
-                    (main, "items/list.go", source)
-                } else {
-                    let source = "package main\nimport \"sort\"\ntype sortable []int\nfunc main() { values := sortable{3,1,2}; sort.Sort(values) }\nfunc (s sortable) Len() int { return len(s) }\nfunc (s sortable) Less(i,j int) bool { return s[i]<s[j] }\nfunc (s sortable) Swap(i,j int) { s[i],s[j]=s[j],s[i] }\nfunc (s sortable) Unused() {}\nfunc Less(i,j int) bool { return false }\n";
-                    (write_file(root, "main.go", source), "main.go", source)
-                };
-                let source = source.replace("return false", body);
-                let methods = write_file(root, method_file, &source);
-                let mut files = vec![main, methods];
-                files.sort();
-                files.dedup();
-                let (store, legacy) = go_fixture_store(root, &files);
-                let mut inputs = files;
-                inputs.push(manifest);
-                let view = callgraph_fixture_view(root, &inputs);
-                let conn = store.conn.lock().unwrap();
-                let mut query = conn
-                    .prepare(
-                        "SELECT count(*) FROM refs WHERE target_file=?1 AND target_symbol='Less'",
-                    )
-                    .unwrap();
-                assert_eq!(
-                    query
-                        .query_row([method_file], |row| row.get::<_, i64>(0))
-                        .unwrap(),
-                    0,
-                    "there is no raw reference to the plain Less function"
-                );
-                drop(query);
-                drop(conn);
-                let go_type = if imported { "Sortable" } else { "sortable" };
-                for snapshot in [&legacy, &view] {
-                    assert!(!snapshot.expanded_outbound_calls().iter().any(|call| call.caller_file.ends_with(method_file)
-                    && call.caller_symbol == "Less" && call.provenance == "go_package_initializer"),
-                    "fabricating Less -> package-init creates a dispatch-root key for an unrelated plain function");
-                    assert!(
-                        !fixture_root_symbols(snapshot, root, method_file)
-                            .is_some_and(|roots| roots.contains("Less")
-                                || roots.contains(&format!("{go_type}::Unused"))),
-                        "exported Go method names are not unconditional projection roots"
-                    );
-                }
-                let cold = callgraph_fixture_scan(root, legacy);
-                let viewed = callgraph_fixture_scan(root, view);
-                let has = |payload: &serde_json::Value, symbol: &str, kind: &str| {
-                    payload["items"].as_array().unwrap().iter().any(|row| {
-                        row["file"] == method_file && row["symbol"] == symbol && row["kind"] == kind
-                    })
-                };
-                for payload in [&cold, &viewed] {
-                    assert!(has(payload, "Unused", "method"), "{payload}");
-                    assert!(
-                        has(payload, "Less", "function"),
-                        "plain Less rescued: {payload}"
-                    );
-                    for symbol in ["Len", "Less", "Swap"] {
-                        assert!(
-                            !has(payload, symbol, "method"),
-                            "used sort method {symbol} lost: {payload}"
-                        );
-                    }
-                }
-                assert_eq!(cold["items"], viewed["items"]);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn callgraph_go_initializer_and_callback_through_symlinked_root() {
-        let temp = tempdir().unwrap();
-        let physical = temp.path().join("physical");
-        fs::create_dir(&physical).unwrap();
-        let root = temp.path().join("alias");
-        std::os::unix::fs::symlink(&physical, &root).unwrap();
-        let manifest = write_file(&root, "go.mod", "module example.com/app\n");
-        let main = write_file(&root, "main.go", "package main\nimport (_ \"example.com/app/cmd\"; \"example.com/app/web\")\nfunc main() { web.NewRouter() }\n");
-        let cmd = write_file(&root, "cmd/command.go", "package cmd\nvar Command = func() { InitBackendContext() }\nfunc InitBackendContext() {}\n");
-        let router = write_file(&root, "web/router.go", "package web\nimport \"net/http\"\nfunc NewRouter() { GitController(nil) }\nfunc GitController(r *Router) { r.Handle(\"/\", http.HandlerFunc(GoGetHandler)).Methods(\"GET\") }\ntype Router struct{}\n");
-        let handler = write_file(
-            &root,
-            "web/handler.go",
-            "package web\nfunc GoGetHandler() {}\nfunc Spare() {}\n",
-        );
-        let files = vec![main.clone(), cmd, router, handler];
-        let (store, legacy) = go_fixture_store(&root, &files);
-        assert!(
-            legacy
-                .entry_points
-                .contains(&fs::canonicalize(main).unwrap()),
-            "main must remain a root across path aliases: {:?}",
-            legacy.entry_points
-        );
-        let conn = store.conn.lock().unwrap();
-        let mut refs = conn.prepare("SELECT full_ref,status,target_file,target_symbol,target_node FROM refs WHERE kind IN ('call','value_ref','import')").unwrap();
-        let trace = refs
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        drop(refs);
-        drop(conn);
-        let mut inputs = files;
-        inputs.push(manifest);
-        let view = callgraph_fixture_view(&root, &inputs);
-        let cold = callgraph_fixture_scan(&root, legacy);
-        let viewed = callgraph_fixture_scan(&root, view);
-        for payload in [&cold, &viewed] {
-            for symbol in [
-                "Command",
-                "InitBackendContext",
-                "NewRouter",
-                "GitController",
-                "GoGetHandler",
-            ] {
-                assert!(
-                    !callgraph_fixture_has(payload, "items", symbol),
-                    "alias trace {trace:?}; {payload}"
-                );
-            }
-            assert!(callgraph_fixture_has(payload, "items", "Spare"));
-        }
-        assert_eq!(cold["items"], viewed["items"]);
-        let physical_snapshot = project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        let physical_result = callgraph_fixture_scan(&physical, physical_snapshot);
-        assert_eq!(
-            cold["items"], physical_result["items"],
-            "comparison-key normalization must not change reported file spellings"
-        );
-    }
-
-    #[test]
-    fn callgraph_go_cobra_imported_initializer_live_unimported_dead() {
-        for imported in [true, false] {
-            let dir = tempdir().unwrap();
-            let root = dir.path();
-            write_file(root, "go.mod", "module example.com/app\n");
-            let import = if imported {
-                "import _ \"example.com/app/cmd\"\n"
-            } else {
-                ""
-            };
-            let main = write_file(
-                root,
-                "main.go",
-                &format!(
-                    "package main\n{import}func main() {{ control() }}\nfunc control() {{}}\n"
-                ),
-            );
-            let cmd = write_file(root, "cmd/command.go", "package cmd\nimport \"github.com/spf13/cobra\"\nvar Command = &cobra.Command{RunE: func() error { InitBackendContext(); return nil }}\nfunc InitBackendContext() {}\n");
-            let (_, snapshot) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
-            assert!(
-                snapshot
-                    .expanded_outbound_calls()
-                    .windows(2)
-                    .all(|pair| pair[0].caller_file <= pair[1].caller_file),
-                "package initialization edges must preserve main's final caller-path grouping"
-            );
-            let has_var_owner = snapshot.outbound_calls.iter().any(|call| {
-                call.caller_symbol == "Command" && call.target.ends_with("::InitBackendContext")
-            });
-            let payload = callgraph_fixture_scan(root, snapshot);
-            assert_eq!(
-                callgraph_fixture_has(&payload, "items", "InitBackendContext"),
-                !imported,
-                "{payload}"
-            );
-            assert!(has_var_owner);
-            assert!(!callgraph_fixture_has(
-                &payload,
-                "test_only_items",
-                "InitBackendContext"
-            ));
-            let viewed_snapshot = callgraph_fixture_view(root, &[main, cmd, root.join("go.mod")]);
-            assert!(
-                viewed_snapshot
-                    .expanded_outbound_calls()
-                    .windows(2)
-                    .all(|pair| pair[0].caller_file <= pair[1].caller_file),
-                "view package initialization edges must preserve main's caller-path grouping"
-            );
-            let view_roots = format!("{:?}", viewed_snapshot.entry_point_symbols);
-            let viewed = callgraph_fixture_scan(root, viewed_snapshot);
-            assert_eq!(
-                payload["items"], viewed["items"],
-                "Go view and legacy initializer liveness differ: {view_roots}"
-            );
-            assert_eq!(payload["test_only_items"], viewed["test_only_items"]);
-        }
-    }
 
     #[test]
     fn callgraph_go_main_boot_register_and_function_values() {
@@ -30676,95 +30650,6 @@ pub fn run() -> bool { create() }
             wrong, 0,
             "associated trait functions are not free functions"
         );
-        assert_rust_exact_view_parity(root, &store);
-    }
-
-    #[test]
-    fn rust_study_associated_constructor_follows_the_type_reexport() {
-        let dir = tempdir().expect("tempdir");
-        let root = dir.path();
-        write_rust_manifest(root, "associated-reexport-fixture");
-        write_file(
-            root,
-            "src/lib.rs",
-            "mod database;\nuse database::Backend as Store;\npub fn run() { Store::new(); }\n",
-        );
-        write_file(
-            root,
-            "src/database/mod.rs",
-            "mod backend;\npub use backend::Backend;\npub fn new() {}\n",
-        );
-        write_file(
-            root,
-            "src/database/backend.rs",
-            "pub struct Backend;\nimpl Backend { pub fn new() -> Self { Self } }\n",
-        );
-        let (store, _) = cold_build_twice(root);
-        assert_direct_caller(
-            &store,
-            "src/database/backend.rs",
-            "Backend::new",
-            "src/lib.rs",
-            "run",
-        );
-        let conn = Connection::open(store.sqlite_path()).expect("reader");
-        let wrong: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM edges WHERE target_symbol = 'new'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            wrong, 0,
-            "a type import must not bind a module's free function"
-        );
-        assert_rust_exact_view_parity(root, &store);
-    }
-
-    #[test]
-    fn rust_study_trait_constructor_requires_the_imported_trait_binding() {
-        let dir = tempdir().expect("tempdir");
-        let root = dir.path();
-        write_rust_manifest(root, "trait-constructor-fixture");
-        write_file(
-            root,
-            "src/lib.rs",
-            "mod database;\nuse database::{Backend, Database};\npub fn run() { Backend::new(); }\n",
-        );
-        write_file(
-            root,
-            "src/database/mod.rs",
-            "mod backend;\npub use backend::Backend;\npub trait Database { fn new() -> Self; }\n",
-        );
-        write_file(root, "src/database/backend.rs", "use super::Database;\npub struct Backend;\nimpl Database for Backend { fn new() -> Self { Self } }\n");
-        let (store, _) = cold_build_twice(root);
-        assert_direct_caller(
-            &store,
-            "src/database/backend.rs",
-            "Database for Backend::new",
-            "src/lib.rs",
-            "run",
-        );
-        assert_rust_exact_view_parity(root, &store);
-        let negative = tempdir().expect("negative tempdir");
-        let root = negative.path();
-        write_rust_manifest(root, "trait-constructor-negative");
-        write_file(
-            root,
-            "src/database/mod.rs",
-            "mod backend;\npub use backend::Backend;\npub trait Database { fn new() -> Self; }\n",
-        );
-        write_file(root, "src/database/backend.rs", "use super::Database;\npub struct Backend;\nimpl Database for Backend { fn new() -> Self { Self } }\n");
-        write_file(root, "src/lib.rs", "mod database;\nuse database::Backend;\ntrait Database { fn new() -> Self; }\npub fn run() { Backend::new(); }\n");
-        let (store, _) = cold_build_twice(root);
-        let conn = Connection::open(store.sqlite_path()).expect("reader");
-        let wrong: i64 = conn.query_row("SELECT COUNT(*) FROM edges WHERE target_symbol='Database for Backend::new' AND provenance='type_match'", [], |r| r.get(0)).unwrap();
-        assert_eq!(
-            wrong, 0,
-            "same-named traits from different modules are not interchangeable"
-        );
-        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]
@@ -30842,54 +30727,8 @@ impl Other { pub fn qualified(self) -> Self { self } }
             )
             .unwrap();
         assert_eq!(wrong, 0);
-        assert_rust_exact_view_parity(root, &store);
     }
 
-    fn assert_rust_exact_view_parity(root: &Path, legacy: &CallGraphStore) {
-        let mut inputs = rust_files(root);
-        inputs.push(root.join("Cargo.toml"));
-        let view_store = callgraph_fixture_view_store(root, &inputs);
-        let view = view_store.sqlite_path();
-        let rows = |database: &Path| {
-            let conn = Connection::open(database).unwrap();
-            let mut query = conn.prepare("SELECT e.target_file, e.target_symbol, n.file_path, n.scoped_name, e.line
-                FROM edges e JOIN nodes n ON n.id=e.source_node JOIN refs r ON r.ref_id=e.ref_id
-                WHERE e.kind='call' AND r.kind='call' AND e.provenance NOT IN ('name_match', 'dispatch')
-                ORDER BY 1,2,3,4,5").unwrap();
-            query
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, u32>(4)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<BTreeSet<_>>>()
-                .unwrap()
-        };
-        let legacy_rows = rows(legacy.sqlite_path());
-        let view_rows = rows(view);
-        if legacy_rows != view_rows {
-            let conn = Connection::open(view).unwrap();
-            let mut facts = conn
-                .prepare("SELECT file_path,facts FROM view_dispatch_files")
-                .unwrap();
-            eprintln!(
-                "dispatch facts: {:?}",
-                facts
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                    .unwrap()
-                    .collect::<Vec<_>>()
-            );
-        }
-        assert_eq!(
-            legacy_rows, view_rows,
-            "exact declaration edges differ between graph producers"
-        );
-    }
 
     #[test]
     fn rust_study_unit_struct_receiver_is_not_a_wildcard_imported_function() {
@@ -30923,56 +30762,6 @@ mod tests {
             .direct_callers_of(Path::new("src/lib.rs"), "Reporter::report")
             .unwrap()
             .is_empty());
-        assert_rust_exact_view_parity(root, &store);
-    }
-
-    #[test]
-    fn rust_study_module_alias_new_keeps_its_ordinary_binding() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        write_rust_manifest(root, "module-new-fixture");
-        write_file(
-            root,
-            "src/lib.rs",
-            "mod database;\nuse crate::database as Factory;\npub fn run() { Factory::new(); }\n",
-        );
-        write_file(root, "src/database.rs", "pub fn new() {}\n");
-        let (store, _) = cold_build_twice(root);
-        assert_direct_caller(&store, "src/database.rs", "new", "src/lib.rs", "run");
-        assert_rust_exact_view_parity(root, &store);
-    }
-
-    #[test]
-    fn rust_study_trait_associated_function_is_not_a_free_import() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        write_rust_manifest(root, "associated-function-fixture");
-        write_file(
-            root,
-            "src/lib.rs",
-            "mod api;\nuse api::*;\npub fn unbound() { create(); }\n",
-        );
-        write_file(
-            root,
-            "src/api.rs",
-            "pub trait Factory { fn create() -> Self; }\n",
-        );
-        let data = callgraph::build_file_data(&root.join("src/api.rs")).unwrap();
-        assert_eq!(
-            data.symbol_metadata["Factory::create"].kind,
-            SymbolKind::Method
-        );
-        let (store, _) = cold_build_twice(root);
-        let conn = Connection::open(store.sqlite_path()).unwrap();
-        let wrong: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM edges WHERE target_file='src/api.rs'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(wrong, 0, "trait members are not module-level imports");
-        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]
@@ -31024,32 +30813,6 @@ mod right {
         assert!(left
             .iter()
             .all(|site| site.caller.symbol == "left::Write for Stream::flush"));
-        assert_rust_exact_view_parity(root, &store);
-    }
-
-    #[test]
-    fn rust_study_instance_and_associated_functions_with_one_name_stay_distinct() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        write_rust_manifest(root, "receiver-shape-fixture");
-        write_file(root, "src/lib.rs", "mod widget;\nuse widget::{Widget, Reset};\npub fn run(widget: &Widget) {\n    widget.new();\n    Widget::new();\n}\n");
-        write_file(root, "src/widget.rs", "pub struct Widget;\npub trait Reset { fn new(&self) -> bool; }\nimpl Widget {\n    pub fn new() -> Self { Self }\n}\nimpl Reset for Widget {\n    fn new(&self) -> bool { true }\n}\n");
-        let (store, _) = cold_build_twice(root);
-        let method = store
-            .direct_callers_of(Path::new("src/widget.rs"), "Reset for Widget::new")
-            .unwrap();
-        assert!(method
-            .iter()
-            .any(|site| site.caller.symbol == "run" && site.line == 4));
-        assert!(method.iter().all(|site| site.line != 5));
-        let associated = store
-            .direct_callers_of(Path::new("src/widget.rs"), "Widget::new")
-            .unwrap();
-        assert!(associated
-            .iter()
-            .any(|site| site.caller.symbol == "run" && site.line == 5));
-        assert!(associated.iter().all(|site| site.line != 4));
-        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]

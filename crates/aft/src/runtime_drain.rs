@@ -376,6 +376,9 @@ fn wait_on_semantic_refresh_recovery_gate_for_test(ctx: &AppContext) {
     }
 }
 
+#[cfg(not(test))]
+fn wait_on_semantic_refresh_recovery_gate_for_test(_ctx: &AppContext) {}
+
 struct WatcherDrainUnitGuard<'a> {
     phase: &'static str,
     path: &'a Path,
@@ -791,6 +794,23 @@ fn semantic_paths_with_recorded_freshness(
         .collect()
 }
 
+/// The watcher-reported semantic paths whose vectors are really stale.
+///
+/// A watcher event says a path was touched, not that its content changed.
+/// Events for files whose bytes still match what the index embedded (a copied
+/// tree, a checkout restoring the same content, a touch storm, FSEvents
+/// replaying events from before the watcher started) must not mask their
+/// vectors or queue them for re-embedding.
+fn semantic_paths_with_changed_content(
+    ctx: &AppContext,
+    index: &crate::semantic_index::SemanticIndex,
+    paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    crate::semantic_index::files_with_changed_content(semantic_paths_with_recorded_freshness(
+        ctx, index, paths,
+    ))
+}
+
 pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
     ctx.clear_all_semantic_refresh_retry_attempts();
     ctx.reset_semantic_refresh_circuit_after_success();
@@ -994,6 +1014,10 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 }
 
+/// How soon the drain looks again for a views-on root whose checkout view
+/// has not loaded yet.
+const VIEW_DISK_LIMITS_UNLOADED_RETRY: Duration = Duration::from_secs(30);
+
 pub const MAX_RETRY_ATTEMPTS: usize = 6;
 pub const BREAKER_TRIP_THRESHOLD: usize = 3;
 
@@ -1066,6 +1090,33 @@ fn next_semantic_refresh_retry_plan(
     }
 }
 
+fn clear_semantic_refresh_retry_attempts(ctx: &AppContext, paths: &[std::path::PathBuf]) {
+    ctx.clear_semantic_refresh_retry_attempts(paths);
+}
+
+fn clear_completed_pending_semantic_index_paths(
+    ctx: &AppContext,
+    completed_paths: &[std::path::PathBuf],
+) {
+    if completed_paths.is_empty() {
+        return;
+    }
+
+    let completed = completed_paths.iter().cloned().collect::<HashSet<_>>();
+    let remaining = ctx
+        .take_pending_semantic_index_paths()
+        .into_iter()
+        .filter(|path| !completed.contains(path))
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        ctx.add_pending_semantic_index_paths(remaining);
+    }
+}
+
+fn semantic_refresh_probe_delay() -> Duration {
+    semantic_refresh_retry_backoff(usize::MAX)
+}
+
 pub fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
     ctx.semantic_refresh_circuit_is_open()
 }
@@ -1078,6 +1129,20 @@ pub fn record_semantic_refresh_transient_failure(ctx: &AppContext, error: &str) 
     ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD, &reason)
 }
 
+fn reset_semantic_refresh_transient_failure_count(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_transient_failure_count();
+}
+
+fn reset_semantic_refresh_circuit_after_success(ctx: &AppContext) {
+    ctx.reset_semantic_refresh_circuit_after_success();
+}
+
+fn mark_semantic_refresh_success(ctx: &AppContext, completed_paths: &[std::path::PathBuf]) {
+    clear_semantic_refresh_retry_attempts(ctx, completed_paths);
+    clear_completed_pending_semantic_index_paths(ctx, completed_paths);
+    reset_semantic_refresh_circuit_after_success(ctx);
+}
+
 #[doc(hidden)]
 pub fn semantic_refresh_transient_failure_count_for_test(ctx: &AppContext) -> usize {
     ctx.semantic_refresh_transient_failure_count()
@@ -1086,6 +1151,70 @@ pub fn semantic_refresh_transient_failure_count_for_test(ctx: &AppContext) -> us
 #[doc(hidden)]
 pub fn semantic_refresh_probe_is_scheduled_for_test(ctx: &AppContext) -> bool {
     ctx.semantic_refresh_probe_is_scheduled()
+}
+
+fn ensure_semantic_refresh_probe_scheduled(ctx: &AppContext) {
+    ctx.ensure_semantic_refresh_probe_scheduled(semantic_refresh_probe_delay());
+}
+
+fn maybe_fire_semantic_refresh_probe(ctx: &AppContext) {
+    let generation = ctx.semantic_refresh_generation();
+    let _ = ctx.run_if_subc_bound_generation(generation, || {
+        if !ctx.take_semantic_refresh_probe_ready() {
+            return;
+        }
+        if !semantic_refresh_circuit_is_open(ctx) {
+            return;
+        }
+
+        if ctx.take_pending_semantic_corpus_refresh() && !ctx.shared_artifacts_read_only() {
+            // Stamp the status BEFORE sending: the worker emits CorpusStarted
+            // only after walking the project, and an unbind cancellation in
+            // that window preserves corpus intent by reading
+            // corpus_refresh_in_flight() from the status. A send without the
+            // stamp would lose the intent entirely.
+            let previous_status = {
+                let mut status = ctx
+                    .semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous = status.clone();
+                *status = SemanticIndexStatus::Building {
+                    stage: "refreshing_corpus".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+                previous
+            };
+            let sent = ctx
+                .semantic_refresh_sender()
+                .is_some_and(|sender| sender.send(SemanticRefreshRequest::Corpus).is_ok());
+            if !sent {
+                *ctx.semantic_index_status()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = previous_status;
+                ctx.mark_pending_semantic_corpus_refresh();
+            }
+            return;
+        }
+
+        let pending_paths = ctx.take_pending_semantic_index_paths();
+        if pending_paths.is_empty() {
+            return;
+        }
+
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest::Files {
+                    paths: pending_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            ctx.add_pending_semantic_index_paths(pending_paths);
+        }
+    });
 }
 
 pub fn schedule_semantic_refresh_retry(

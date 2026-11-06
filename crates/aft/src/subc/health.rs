@@ -3415,6 +3415,21 @@ impl TickStoragePaths {
         resolved
     }
 
+    fn storage_paths(&mut self, config: &crate::config::Config) -> crate::root_cache::StoragePaths {
+        crate::root_cache::StoragePaths::new(
+            self.storage_dir(config.storage_dir.as_deref()),
+            self.cache_dir(config),
+        )
+    }
+
+    fn cache_unavailable_reason(
+        &mut self,
+        ctx: &AppContext,
+        config: &crate::config::Config,
+    ) -> Option<String> {
+        let cache_dir = self.cache_dir(config);
+        ctx.cache_unavailable_reason_for_root(&cache_dir)
+    }
 }
 
 /// The unavailable code of each context whose cache location is unavailable,

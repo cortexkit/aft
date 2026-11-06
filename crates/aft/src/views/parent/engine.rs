@@ -45,6 +45,18 @@ impl ChildEngine {
     }
 }
 
+/// Creates the child's engine once its trigram snapshot is loaded, and
+/// installs the child's current snapshots into it. Runs on the worker.
+pub(super) fn sync(session: &ParentSession, child: &Child) {
+    if !session.planes.trigram && !session.planes.semantic {
+        return;
+    }
+    let mut engine = lock(&child.engine);
+    if engine.is_none() {
+        *engine = Some(ChildEngine::new(session, child));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The parent's aft_search
 // ---------------------------------------------------------------------------
@@ -478,17 +490,3 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     Response::success(&req.id, body)
 }
 
-#[cfg(test)]
-pub(super) mod tests {
-    use super::super::*;
-    use super::*;
-    use crate::blob_store::v2::{ContentHash, FamilyPlane};
-    use crate::views::contracts::{PlaneAdapter, ViewAccess};
-    use crate::views::manifest_v2::{EntryPlanes, EntryV2, ManifestHeader, ManifestV2, Producers};
-    use crate::views::readiness::PlaneState;
-    use crate::views::semantic::{FillBudget, SemanticPlane, SemanticProducer};
-    use crate::views::snapshot::{LiveDelta, OpenGeneration};
-    use crate::views::RelPath;
-
-
-}

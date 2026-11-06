@@ -1999,6 +1999,34 @@ pub(crate) struct DispatchTypeTargets {
     pub trace: DispatchTypeTargetTrace,
 }
 
+/// The previous generation's traces of the files whose trace depends on one of
+/// the given paths or index domains.
+pub(crate) type DispatchTypeTargetTraces<'p> =
+    &'p dyn Fn(
+        &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, DispatchTypeTargetTrace>, ManifestJoinError>;
+
+/// Which Rust files a join resolves receiver type targets for.
+pub(crate) enum DispatchTypeTargetPlan<'p> {
+    /// Every Rust file of the manifest, as a cold build does.
+    All,
+    /// Resolve every file of `recompute`. Other Rust files are checked only
+    /// when their previous trace depends on a path of `recompute`, on a path
+    /// of `membership_changed`, on a file whose index entry this join had to
+    /// rebuild, or, when `module_domain_changed` is set, on the crate-wide
+    /// module domain. The owner clears it only when no input of the module
+    /// index changed, so no domain answer can differ. A checked file is resolved
+    /// again when its trace probed an added or removed path, or when one of
+    /// the index answers it recorded is different now. Every other file keeps
+    /// its previous targets.
+    Selected {
+        recompute: &'p BTreeSet<String>,
+        membership_changed: &'p BTreeSet<String>,
+        module_domain_changed: bool,
+        traces: DispatchTypeTargetTraces<'p>,
+    },
+}
+
 #[cfg(test)]
 #[path = "../../tests/integration/join_manifest_test.rs"]
 mod manifest_integration_tests;
@@ -2034,6 +2062,20 @@ pub(crate) struct ViewBindingDependencies {
 }
 
 impl ViewBindingDependencies {
+    pub(crate) fn from_surface_json(payload: &str) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            surface: Some(serde_json::from_str(payload)?),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn copy_surface_from(&mut self, source: &Self) {
+        self.surface.clone_from(&source.surface);
+    }
+
+    pub(crate) fn surface_json(&self) -> Result<Option<String>, serde_json::Error> {
+        self.surface.as_ref().map(serde_json::to_string).transpose()
+    }
 
     /// This binding without its bound file surface, which is not stored:
     /// binding computes it again from the file's own parse.
@@ -2075,6 +2117,16 @@ impl ViewBindingDependencies {
                 .any(|dependency| changed.contains(dependency))
                 || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
         })
+    }
+
+    /// This binding without the checkout reads recorded with their answers,
+    /// for comparing with a binding recorded without them.
+    pub(crate) fn without_answers(&self) -> Self {
+        Self {
+            binding_answers: super::fact_answers::FactAnswers::new(),
+            resolution_answers: super::fact_answers::FactAnswers::new(),
+            ..self.clone()
+        }
     }
 
     /// Carries a resolution over from `old`, whose recorded answers replay,
@@ -2234,6 +2286,29 @@ impl ViewFileSurface {
         }
     }
 
+    fn restore(&self) -> super::DbFileIndex {
+        super::DbFileIndex {
+            lang: language_id(&self.language),
+            exports: self.exports.iter().cloned().collect(),
+            default_export: self.default_export.clone(),
+            export_aliases: self.export_aliases.clone().into_iter().collect(),
+            node_by_scoped: self.node_by_scoped.clone().into_iter().collect(),
+            node_by_bare: self.node_by_bare.clone().into_iter().collect(),
+            node_kind_by_id: self.node_kind_by_id.clone().into_iter().collect(),
+            module_targets: self.module_targets.clone().into_iter().collect(),
+            declared_module_targets: self.declared_module_targets.clone().into_iter().collect(),
+            macro_use_module_targets: self.macro_use_module_targets.clone(),
+            reexports: self
+                .reexports
+                .iter()
+                .map(|(target_file, named, wildcard)| super::ReexportIndex {
+                    target_file: target_file.clone(),
+                    named: named.clone().into_iter().collect(),
+                    wildcard: *wildcard,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Configuration files read by the manifest resolver's workspace/package and

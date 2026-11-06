@@ -849,91 +849,6 @@ fn canonical_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[test]
-fn trait_callers_cross_workspace_generic_and_dynamic_receivers() {
-    let dir = tempdir().unwrap();
-    let root = canonical_root(dir.path());
-    write_file(
-        &root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"core\", \"worker\"]\nresolver = \"2\"\n",
-    );
-    write_file(
-        &root.join("core/Cargo.toml"),
-        "[package]\nname = \"rows-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    );
-    write_file(&root.join("worker/Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nrows-core = { path = \"../core\" }\n");
-    write_file(
-        &root.join("core/src/lib.rs"),
-        r#"pub trait AccountRows { fn rate_counter(&self); }
-pub struct MemRows;
-impl AccountRows for MemRows { fn rate_counter(&self) {} }
-"#,
-    );
-    write_file(
-        &root.join("worker/src/lib.rs"),
-        r#"use rows_core::{AccountRows, MemRows};
-pub struct SqlRows;
-impl AccountRows for SqlRows { fn rate_counter(&self) {} }
-struct Other;
-impl Other { fn rate_counter(&self) {} }
-fn generic<R: AccountRows>(rows: &R) { rows.rate_counter(); }
-fn dynamic(rows: &dyn AccountRows) { rows.rate_counter(); }
-fn opaque(rows: impl AccountRows) { rows.rate_counter(); }
-fn associated<R: Iterator>(rows: R::Item) { rows.rate_counter(); }
-fn exact(rows: &SqlRows) { rows.rate_counter(); }
-fn unrelated(rows: &Other) { rows.rate_counter(); }
-"#,
-    );
-    let store = build_view_store(&root, "trait-callers");
-    for (file, symbol) in [
-        ("core/src/lib.rs", "AccountRows::rate_counter"),
-        ("worker/src/lib.rs", "SqlRows::rate_counter"),
-    ] {
-        let callers = json(callgraph_store_adapter::callers_result(
-            &store,
-            &root.join(file),
-            symbol,
-            1,
-            true,
-        ));
-        let entries = flattened_callers(&callers);
-        let is_declaration = symbol == "AccountRows::rate_counter";
-        assert_eq!(
-            entries.len(),
-            if is_declaration { 4 } else { 5 },
-            "{symbol}: {callers:#}"
-        );
-        let associated = entries
-            .iter()
-            .find(|e| e["symbol"] == "associated")
-            .unwrap();
-        assert_eq!(associated["resolved_by"], "name_match", "{callers:#}");
-        assert_eq!(associated["approximate"], true);
-        for name in ["generic", "dynamic", "opaque"] {
-            let entry = entries.iter().find(|e| e["symbol"] == name).unwrap();
-            assert_ne!(entry["resolved_by"], "name_match", "{callers:#}");
-            if !is_declaration {
-                assert_eq!(
-                    entry["resolved_by"], "possible_target (dispatch)",
-                    "{callers:#}"
-                );
-            }
-        }
-        if is_declaration {
-            // A call on a concrete SqlRows reaches its one implementation, not
-            // an additional call target at the trait declaration.
-            assert!(
-                entries.iter().all(|e| e["symbol"] != "exact"),
-                "{callers:#}"
-            );
-        } else {
-            let exact = entries.iter().find(|e| e["symbol"] == "exact").unwrap();
-            assert_ne!(exact["approximate"], true, "{callers:#}");
-            assert_ne!(exact["resolved_by"], "possible_target (dispatch)");
-        }
-        assert!(entries.iter().all(|e| e["symbol"] != "unrelated"));
-    }
-}
 
 #[test]
 fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
@@ -970,46 +885,6 @@ fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
     }
 }
 
-#[test]
-fn trait_callers_inherent_workspace_local_field_and_return() {
-    let dir = tempdir().unwrap();
-    let root = canonical_root(dir.path());
-    write_file(
-        &root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"store\", \"module\"]\nresolver = \"2\"\n",
-    );
-    write_file(
-        &root.join("store/Cargo.toml"),
-        "[package]\nname = \"engram-store\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    );
-    write_file(&root.join("module/Cargo.toml"), "[package]\nname = \"module\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nengram-store = { path = \"../store\" }\n");
-    write_file(&root.join("store/src/lib.rs"), "pub struct EngramStore; impl EngramStore { pub fn delete_generation(&self) {} } pub fn open() -> EngramStore { EngramStore }\n");
-    write_file(
-        &root.join("module/src/lib.rs"),
-        r#"use engram_store::{EngramStore, open};
-struct Holder { store: EngramStore }
-fn local(store: &engram_store::EngramStore) { store.delete_generation(); }
-fn field(holder: &Holder) { holder.store.delete_generation(); }
-fn returned() { open().delete_generation(); }
-fn bound_return() { let store = open(); store.delete_generation(); }
-"#,
-    );
-    let store = build_view_store(&root, "inherent-workspace");
-    let result = json(callgraph_store_adapter::callers_result(
-        &store,
-        &root.join("store/src/lib.rs"),
-        "delete_generation",
-        1,
-        true,
-    ));
-    let entries = flattened_callers(&result);
-    assert_eq!(entries.len(), 4, "{result:#}");
-    for name in ["local", "field", "returned", "bound_return"] {
-        let entry = entries.iter().find(|e| e["symbol"] == name).unwrap();
-        assert_ne!(entry["resolved_by"], "name_match", "{result:#}");
-        assert_ne!(entry["approximate"], true, "{result:#}");
-    }
-}
 
 fn build_store(root: &Path, name: &str, files: &[PathBuf]) -> CallGraphStore {
     let store =

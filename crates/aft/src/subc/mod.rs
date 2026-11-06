@@ -18190,13 +18190,6 @@ mod tests {
         );
     }
 
-    /// What the idle-reap test holds: one of the root's own locks, or the
-    /// executor's scheduler lock.
-    #[derive(Clone, Copy, Debug)]
-    enum ReapHeldLock {
-        Root(crate::context::IdleReapLock),
-        ExecutorState,
-    }
 
 
     #[test]

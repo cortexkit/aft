@@ -264,6 +264,18 @@ fn native_publish_no_replace(_from: &Path, _to: &Path) -> io::Result<Option<io::
     ))
 }
 
+/// True when `path` is on a different volume from its parent folder, which is
+/// what a mount point looks like. False when either device cannot be read
+/// (Windows standard metadata has no volume identifier).
+pub(crate) fn is_mount_point(path: &Path) -> io::Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let own = crate::walk_boundary::filesystem_device_id(path)?;
+    let above = crate::walk_boundary::filesystem_device_id(parent)?;
+    Ok(matches!((own, above), (Some(own), Some(above)) if own != above))
+}
+
 /// A successful result always makes the destination authoritative, even when
 /// finalization fails and a stale source copy remains.
 #[derive(Debug)]

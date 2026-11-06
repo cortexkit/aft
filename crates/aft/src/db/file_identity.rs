@@ -206,6 +206,23 @@ fn live_files() -> &'static RwLock<LiveFiles> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdmissionSnapshot(BTreeMap<PathBuf, HashSet<LiveFileIdentity>>);
 
+pub(crate) fn admission_snapshot(storage: &Path) -> AdmissionSnapshot {
+    #[cfg(unix)]
+    refresh_sidecar_identities();
+    let storage = storage
+        .canonicalize()
+        .unwrap_or_else(|_| storage.to_path_buf());
+    AdmissionSnapshot(
+        open_databases()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(path, _)| !path.starts_with(&storage))
+            .map(|(path, database)| (path.clone(), database.identities.clone()))
+            .collect(),
+    )
+}
+
 fn database_files(key: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix| {
         let mut path = key.as_os_str().to_os_string();
@@ -325,6 +342,10 @@ pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()
     filesystem_gate().lock()
 }
 
+pub(crate) fn try_filesystem_guard() -> Option<parking_lot::ReentrantMutexGuard<'static, ()>> {
+    filesystem_gate().try_lock()
+}
+
 /// Identity-only accounting for connections that retain SQLite's native WAL policy.
 /// Kept after the raw connection in `IdentityConnection`, so close completes before
 /// the registry forgets the handle, including on early returns and worker moves.
@@ -332,6 +353,16 @@ pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()
 pub(crate) struct OpenRecord {
     key: Option<PathBuf>,
     store: SqliteStore,
+}
+
+impl OpenRecord {
+    pub(crate) fn new(connection: &rusqlite::Connection, store: SqliteStore) -> Self {
+        let key = connection
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(|path| note_open(Path::new(path), store));
+        Self { key, store }
+    }
 }
 
 impl Drop for OpenRecord {
@@ -351,7 +382,79 @@ pub(crate) struct IdentityConnection {
 }
 
 impl IdentityConnection {
+    pub(crate) fn open_census(path: &Path, seam: &'static str) -> rusqlite::Result<Self> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            crate::db::lifecycle::census_open_path(path)?,
+            flags,
+        )?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        Ok(Self::new(connection, seam))
+    }
 
+    pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
+        super::lifecycle::production_write_gate(path.as_ref())?;
+        super::sealed_database::refuse_sealed_write(path.as_ref())?;
+        let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
+        // Long view-store paths (and their `-journal`/`-wal` sidecars) pass
+        // Windows' MAX_PATH; `sqlite_open_path` spells those in `\\?\` form.
+        let sqlite_path = super::lifecycle::sqlite_open_path(path.as_ref());
+        let connection = crate::db::write_accounting::open_connection(
+            &sqlite_path,
+            rusqlite::OpenFlags::default(),
+        )?;
+        Ok(Self::new(connection, seam))
+    }
+
+    pub(crate) fn open_with_flags(
+        path: impl AsRef<Path>,
+        flags: rusqlite::OpenFlags,
+        seam: &'static str,
+    ) -> rusqlite::Result<Self> {
+        if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            super::lifecycle::production_write_gate(path.as_ref())?;
+            super::sealed_database::refuse_sealed_write(path.as_ref())?;
+        }
+        let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
+        // A `file:` URI is SQLite syntax, not a filesystem path, so it is
+        // passed through; plain paths go through `sqlite_open_path`, which
+        // adds the Windows long-path spelling when a path needs it.
+        let sqlite_path = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI)
+            && path.as_ref().to_string_lossy().starts_with("file:")
+        {
+            std::borrow::Cow::Borrowed(path.as_ref())
+        } else {
+            super::lifecycle::sqlite_open_path(path.as_ref())
+        };
+        let connection = crate::db::write_accounting::open_connection(&sqlite_path, flags)?;
+        Ok(Self::new(connection, seam))
+    }
+
+    pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
+        let record = OpenRecord::new(&connection, SqliteStore::Unmapped(seam));
+        if let Some(opener) = crate::db::lifecycle::uninstrumented_opener(seam) {
+            if opener.class == crate::db::lifecycle::UninstrumentedOpenerClass::Unmeasurable {
+                crate::write_ledger::note_process_unmeasurable(
+                    opener.seam,
+                    opener.reason,
+                    None,
+                    None,
+                );
+            }
+        }
+        Self {
+            connection,
+            _record: record,
+        }
+    }
 }
 
 impl std::ops::Deref for IdentityConnection {
@@ -635,6 +738,18 @@ pub(crate) fn is_live_sqlite_handle(metadata: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     refresh_sidecar_identities();
     known()
+}
+
+/// Called under the filesystem gate before unlinking a whole cache directory.
+/// Consult the registry, not a pre-gate directory inventory: another opener may
+/// have created a new database after that inventory was collected.
+pub(crate) fn has_open_connections_under(path: &Path) -> bool {
+    let key = registry_key(path);
+    open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
 }
 
 /// Report `action` if it is about to delete, rename, or replace the database

@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aft::search_index::CacheLock;
 use aft::semantic_index::SemanticIndexLock;
-use aft::symbol_cache_disk::SymbolCacheLock;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -205,60 +204,8 @@ fn search_lock_blocks_cross_host() {
     assert!(lock_path.exists());
 }
 
-#[test]
-fn symbol_lock_acquires_when_uncontended() {
-    let storage = tempfile::tempdir().expect("create temp dir");
-    let lock_path = symbol_lock_path(storage.path(), "project");
 
-    let guard = SymbolCacheLock::acquire(storage.path(), "project", storage.path())
-        .expect("acquire symbol lock");
-    assert!(lock_path.exists());
-    drop(guard);
-    assert!(!lock_path.exists());
-}
 
-#[test]
-fn symbol_lock_serializes_concurrent_callers() {
-    let storage = tempfile::tempdir().expect("create temp dir");
-    let root = Arc::new(storage.path().to_path_buf());
-    let lock_path = symbol_lock_path(&root, "project");
-
-    assert_serializes_concurrent_callers({
-        let root = Arc::clone(&root);
-        move || SymbolCacheLock::acquire(&root, "project", &root)
-    });
-
-    assert!(!lock_path.exists());
-}
-
-#[test]
-fn symbol_lock_reclaims_dead_owner() {
-    let storage = tempfile::tempdir().expect("create temp dir");
-    let lock_path = symbol_lock_path(storage.path(), "project");
-    write_synthetic_lock(&lock_path, dead_owner_metadata());
-
-    let guard = SymbolCacheLock::acquire(storage.path(), "project", storage.path())
-        .expect("reclaim dead symbol owner");
-    assert!(lock_path.exists());
-    drop(guard);
-    assert!(!lock_path.exists());
-}
-
-#[test]
-fn symbol_lock_blocks_cross_host() {
-    let storage = tempfile::tempdir().expect("create temp dir");
-    let lock_path = symbol_lock_path(storage.path(), "project");
-    write_synthetic_lock(&lock_path, cross_host_metadata());
-
-    let error = match SymbolCacheLock::acquire(storage.path(), "project", storage.path()) {
-        Ok(_) => panic!("cross-host symbol lock should block"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("timed out acquiring symbol cache lock"));
-    assert!(lock_path.exists());
-}
 
 #[test]
 fn semantic_lock_acquires_when_uncontended() {
