@@ -1161,9 +1161,9 @@ impl Checkout {
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
-            &mut |inputs, path, resolution| {
+            &mut |inputs, files| {
                 sections
-                    .add(inputs, path, &resolution)
+                    .add_batch(inputs, files)
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
             },
         )

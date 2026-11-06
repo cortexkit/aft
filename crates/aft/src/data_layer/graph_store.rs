@@ -219,6 +219,13 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     sections.finish(writer, memory)
 }
 
+/// One file's fragment, built and not yet added to a [`SectionsWriter`].
+struct BuiltFragment {
+    fragment: FragmentKey,
+    bytes: Vec<u8>,
+    terms: Vec<(TermKind, Vec<u8>)>,
+}
+
 /// [`write_sections`] one file at a time: each file's fragment is built as
 /// its resolution arrives, so the caller can let the resolution go at once
 /// rather than hold every file's until the segment is written.
@@ -230,7 +237,6 @@ pub(crate) struct SectionsWriter<'i> {
     content: ContentSectionsBuilder,
     graph: GraphSectionsBuilder,
     keys: BTreeMap<String, FragmentKey>,
-    subjects: HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
     /// The file a test's build stores damaged, read from [`DAMAGED_FRAGMENT`]
     /// where the writer is made: a cold build adds fragments from the
     /// resolver's threads, which do not see the test's thread-local.
@@ -272,7 +278,6 @@ impl<'i> SectionsWriter<'i> {
             content,
             graph: GraphSectionsBuilder::new(),
             keys: BTreeMap::new(),
-            subjects: HashMap::new(),
             #[cfg(test)]
             damaged: DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().clone()),
         }
@@ -290,20 +295,49 @@ impl<'i> SectionsWriter<'i> {
         file: &String,
         resolution: &FileResolution,
     ) -> Result<(), String> {
+        let built = self.built(inputs, file, resolution, &mut HashMap::new());
+        self.insert(inputs, file, built)
+    }
+
+    /// [`Self::add`] for a batch of files, whose fragments are built in
+    /// parallel and added in the batch's order. The fragments are the same
+    /// as one at a time: the memo each thread keeps only caches answers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add`].
+    pub(crate) fn add_batch(
+        &mut self,
+        inputs: &CheckoutInputs,
+        files: Vec<(String, FileResolution)>,
+    ) -> Result<(), String> {
+        use rayon::prelude::*;
+        let this = &*self;
+        let built = files
+            .par_iter()
+            .map_init(HashMap::new, |subjects, (file, resolution)| {
+                this.built(inputs, file, resolution, subjects)
+            })
+            .collect::<Vec<_>>();
+        for ((file, _), built) in files.iter().zip(built) {
+            self.insert(inputs, file, built)?;
+        }
+        Ok(())
+    }
+
+    /// `file`'s fragment key, bytes and terms.
+    fn built(
+        &self,
+        inputs: &CheckoutInputs,
+        file: &String,
+        resolution: &FileResolution,
+        subjects: &mut HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
+    ) -> BuiltFragment {
         let facts = super::callgraph::CheckoutFacts { inputs };
         let (key, parse) = &inputs.parses[file];
-        // A segment holding only what changed since a publication writes
-        // the records of changed contents; an unchanged one stays where the
-        // publication stored it.
-        match self.records.get(key) {
-            _ if self.prebuilt => {}
-            Some((record_key, record)) => self.content.add(*record_key, record),
-            None if self.all_records => return Err(format!("no content record for {file}")),
-            None => {}
-        }
         let slice = FileSlice::build(file, key, parse, resolution);
         let mut terms = slice_terms(&slice);
-        terms.extend(input_terms(resolution, &facts, &mut self.subjects));
+        terms.extend(input_terms(resolution, &facts, subjects));
         terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
         // A test stores a fragment that does not decode, as a damaged one
@@ -314,19 +348,50 @@ impl<'i> SectionsWriter<'i> {
         } else {
             bytes
         };
-        let mut subjects = terms
+        let mut fact_subjects = terms
             .iter()
             .filter(|(kind, _)| *kind == TermKind::FactSubject)
             .map(|(_, term)| term.as_slice())
             .collect::<Vec<_>>();
-        subjects.sort_unstable();
-        subjects.dedup();
-        let fragment = fragment_key(key, file, &bytes, &subjects);
-        self.keys.insert(file.clone(), fragment);
-        self.graph.add(
+        fact_subjects.sort_unstable();
+        fact_subjects.dedup();
+        let fragment = fragment_key(key, file, &bytes, &fact_subjects);
+        BuiltFragment {
             fragment,
             bytes,
-            terms.iter().map(|(kind, term)| (*kind, term.as_slice())),
+            terms,
+        }
+    }
+
+    /// Adds `file`'s content record, when the writer takes records one at a
+    /// time, and its built fragment.
+    fn insert(
+        &mut self,
+        inputs: &CheckoutInputs,
+        file: &String,
+        built: BuiltFragment,
+    ) -> Result<(), String> {
+        // A segment holding only what changed since a publication writes
+        // the records of changed contents; an unchanged one stays where the
+        // publication stored it.
+        let key = inputs
+            .parses
+            .key(file)
+            .ok_or_else(|| format!("{file} is not a parsed file"))?;
+        match self.records.get(&key) {
+            _ if self.prebuilt => {}
+            Some((record_key, record)) => self.content.add(*record_key, record),
+            None if self.all_records => return Err(format!("no content record for {file}")),
+            None => {}
+        }
+        self.keys.insert(file.clone(), built.fragment);
+        self.graph.add(
+            built.fragment,
+            built.bytes,
+            built
+                .terms
+                .iter()
+                .map(|(kind, term)| (*kind, term.as_slice())),
         );
         Ok(())
     }

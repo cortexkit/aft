@@ -770,21 +770,22 @@ pub(crate) fn resolve_checkout(
     // none of them go.
     let mut copy = inputs.clone();
     let mut resolved = BTreeMap::new();
-    resolve_checkout_into(&mut copy, threads, None, &mut |_, path, resolution| {
-        resolved.insert(path.clone(), resolution);
+    resolve_checkout_into(&mut copy, threads, None, &mut |_, files| {
+        resolved.extend(files);
         Ok(())
     })?;
     Ok(resolved)
 }
 
 /// How many files each stage of [`resolve_checkout_into`] takes before it
-/// lets the parses they decoded go. Pass 4 also holds each batch's
-/// method-call sites until the batch reaches the sink.
+/// lets the parses they decoded go, and how many decoded resolutions it
+/// hands to the sink at once.
 const BATCH: usize = 1024;
 
-/// [`resolve_checkout`], handing each file's finished resolution to `sink`
-/// in path order instead of keeping them all, and adding to `memory`, when
-/// given, the heap bytes its stages held.
+/// [`resolve_checkout`], handing finished resolutions to `sink` a batch at a
+/// time, in path order, instead of keeping them all, and adding to `memory`,
+/// when given, the heap bytes and times of its stages. `sink` runs inside
+/// the resolver's thread pool, so it can work on its batch in parallel.
 ///
 /// Pass 4 reads every file's method-call inputs, built from that file's
 /// pass-2 and pass-3 results, so it can start only once every file has
@@ -803,7 +804,7 @@ pub(crate) fn resolve_checkout_into(
     inputs: &mut CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
-    sink: &mut (dyn FnMut(&CheckoutInputs, &String, FileResolution) -> Result<(), ManifestJoinError>
+    sink: &mut (dyn FnMut(&CheckoutInputs, Vec<(String, FileResolution)>) -> Result<(), ManifestJoinError>
               + Send),
 ) -> Result<(), ManifestJoinError> {
     fn refs(batch: &[String]) -> Vec<&String> {
@@ -890,27 +891,45 @@ pub(crate) fn resolve_checkout_into(
                 encoded.heap_bytes(&mut seen),
             ));
         }
+        // Pass 4 runs once over every file: its resolvers keep memos per
+        // chunk of files, and smaller runs start more of them cold. Its
+        // sites are small beside the resolutions they join.
+        let mut reached = calls
+            .resolve_sites(inputs, &NoResolutions, &refs(&paths))
+            .into_iter()
+            .map(|(path, sites, dependencies)| (path, (sites, dependencies)))
+            .collect::<HashMap<_, _>>();
+        drop(calls);
+        lap(&mut memory, "sites");
         for batch in paths.chunks(BATCH) {
-            let reached = calls.resolve_sites(inputs, &NoResolutions, &refs(batch));
-            for (path, sites, dependencies) in reached {
-                let bytes = encoded
-                    .remove(&path)
-                    .expect("every parsed file was resolved");
-                let key = inputs
-                    .parses
-                    .key(&path)
-                    .expect("every resolved file is parsed");
-                let mut file = super::fragment::decode(&key, &path, &bytes)
-                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                file.sites = sites;
-                file.site_dependencies = dependencies;
-                sink(&*inputs, &path, file)?;
-            }
+            let parses = &inputs.parses;
+            let files = batch
+                .iter()
+                .map(|path| {
+                    let bytes = encoded
+                        .remove(path)
+                        .expect("every parsed file was resolved");
+                    let (sites, dependencies) =
+                        reached.remove(path).expect("pass 4 ran on every file");
+                    (path.clone(), bytes, sites, dependencies)
+                })
+                .collect::<Vec<_>>();
+            let files = files
+                .into_par_iter()
+                .map(|(path, bytes, sites, dependencies)| {
+                    let key = parses.key(&path).expect("every resolved file is parsed");
+                    let mut file = super::fragment::decode(&key, &path, &bytes)
+                        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                    file.sites = sites;
+                    file.site_dependencies = dependencies;
+                    Ok((path, file))
+                })
+                .collect::<Result<Vec<_>, ManifestJoinError>>()?;
+            sink(&*inputs, files)?;
             inputs.parses.release_decoded();
         }
-        drop(calls);
         relieve_allocator();
-        lap(&mut memory, "sites_and_fragments");
+        lap(&mut memory, "fragments");
         Ok(())
     })
 }
