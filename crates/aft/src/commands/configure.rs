@@ -2176,6 +2176,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
@@ -2243,7 +2244,7 @@ fn explicit_formatter_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
         "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports"
-        | "gofmt" => {
+        | "gofmt" | "nixfmt" => {
             vec![configure_tool_candidate(name, "formatter config", true)]
         }
         _ => Vec::new(),
@@ -2369,7 +2370,8 @@ fn formatter_candidates_with_pyproject(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::Nix => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -2447,7 +2449,8 @@ fn checker_candidates(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::Nix => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }

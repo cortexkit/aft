@@ -1002,8 +1002,10 @@ pub struct Config {
     /// Optional automatic validation mode after edits (default: None, disabled).
     /// When "syntax", only tree-sitter parse check. When "full", runs type checker.
     pub validate_on_edit: Option<String>,
-    /// Per-language formatter overrides. Keys: "typescript", "python", "rust", "go".
-    /// Values: "biome", "oxfmt", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none".
+    /// Per-language formatter overrides. Keys: "typescript", "python", "rust",
+    /// "go", "nix". Values: "biome", "oxfmt", "prettier", "deno", "ruff",
+    /// "black", "rustfmt", "goimports", "gofmt", "nixfmt", "none". Nix has no
+    /// auto-detection and formats only when "nix" is set explicitly.
     pub formatter: HashMap<String, String>,
     /// Per-language type checker overrides. Keys: "typescript", "python", "rust", "go".
     /// Values: "tsc", "tsgo", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".
