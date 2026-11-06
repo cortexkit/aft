@@ -3,6 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
     "crates/aft/src/data_layer/tools/search/meaning.rs",
     "benchmarks/aft-search/compare_data_layer.py"
   ],
