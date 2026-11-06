@@ -344,6 +344,64 @@ pub(super) fn describe_question(
 /// # Errors
 ///
 /// When the pack cannot be read or resolution fails.
+/// Resolves one file of the checkout at `root` again and again, for
+/// profiling: binds every file the checkout tracks once, then times
+/// `iterations` rounds of resolving `file` (passes 2 and 3) and of its
+/// method-call sites (pass 4), on one thread. Prints each round's times to
+/// standard error.
+///
+/// # Errors
+///
+/// When a file cannot be read or extracted, or resolution fails.
+pub fn bench_file(root: &Path, file: &str, iterations: usize) -> Result<(), String> {
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    let mut files = Files::default();
+    for path in listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = String::from_utf8_lossy(path).into_owned();
+        let Ok(text) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        files.set(&path, &text)?;
+    }
+    let inputs = files.inputs();
+    let error = |error: ManifestJoinError| error.to_string();
+    super::callgraph::pool(1).map_err(error)?.install(|| {
+        let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let bound = super::callgraph::BindCache::default();
+        bound.bind_missing(&inputs, &paths).map_err(error)?;
+        let resolved = super::callgraph::resolve_files(&inputs, &bound, &paths).map_err(error)?;
+        let target = paths
+            .iter()
+            .find(|path| path.as_str() == file)
+            .copied()
+            .ok_or_else(|| format!("{file} is not a parsed file"))?;
+        let mut calls = super::callgraph::MethodCallInputs::build(&inputs, &resolved);
+        for round in 0..iterations {
+            let started = std::time::Instant::now();
+            let one = super::callgraph::resolve_files(&inputs, &bound, &[target]).map_err(error)?;
+            let resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            let sites = calls.resolve_sites(&inputs, &resolved, &[target]);
+            let sites_ms = started.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "round {round}: resolve {resolve_ms:.0} ms ({} rows), sites {sites_ms:.0} ms ({} sites)",
+                one[target].rows.len(),
+                sites.first().map_or(0, |(_, sites, _)| sites.len()),
+            );
+        }
+        Ok(())
+    })
+}
+
 pub fn run(
     pack: &Path,
     threads: usize,
