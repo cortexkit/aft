@@ -127,7 +127,19 @@ fn sample(
     let (in_use, held) = allocator_mib();
     let memory = checkout.memory();
     let live = memory.live.unwrap_or_default();
+    // The engine part by part, in MiB, when PROBE_PARTS=1: walking every
+    // decoded file costs time, so it is off unless asked for.
+    let parts = (std::env::var_os("PROBE_PARTS").is_some_and(|value| value == "1"))
+        .then(|| checkout.engine_memory_parts())
+        .flatten()
+        .map(|parts| {
+            parts
+                .into_iter()
+                .map(|(name, bytes)| (name.to_string(), serde_json::json!(bytes >> 20)))
+                .collect::<serde_json::Map<_, _>>()
+        });
     serde_json::json!({
+        "engine_parts_mib": parts,
         "label": label,
         "commit": commit,
         "path": path,
@@ -172,9 +184,22 @@ fn main() {
     ));
     let mut lines = reader.lines();
     let first: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    // PROBE_COMMITS=N replays only the pack's first N commits: a small run
+    // to try the probe on before the whole pack.
+    let commits = std::env::var("PROBE_COMMITS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut seen_commits = Vec::new();
     let edits = lines
         .map(|line| serde_json::from_str::<serde_json::Value>(&line.unwrap()).unwrap())
         .filter(|value| value["type"] == "edit")
+        .take_while(|value| {
+            let commit = value["commit"].clone();
+            if !seen_commits.contains(&commit) {
+                seen_commits.push(commit);
+            }
+            commits.is_none_or(|limit| seen_commits.len() <= limit)
+        })
         .collect::<Vec<_>>();
     let safe = |path: &str| {
         !path.is_empty()

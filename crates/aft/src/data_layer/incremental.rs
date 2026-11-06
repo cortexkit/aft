@@ -1092,4 +1092,35 @@ impl LiveCheckout {
             + reverse.heap_bytes(seen);
         (state, rest)
     }
+
+    /// [`Self::memory`] part by part, for finding what an update holds:
+    /// each part counts the allocations no earlier part reached.
+    pub(crate) fn memory_parts(
+        &self,
+        seen: &mut aft_store::heap::Seen,
+    ) -> Vec<(&'static str, usize)> {
+        use aft_store::heap::HeapBytes as _;
+        let Self {
+            inputs:
+                CheckoutInputs {
+                    state,
+                    parses,
+                    configs,
+                },
+            bound,
+            resolved,
+            calls,
+            reverse,
+            pool: _,
+        } = self;
+        vec![
+            ("engine_state", state.heap_bytes(seen)),
+            ("engine_parses", parses.heap_bytes(seen)),
+            ("engine_configs", configs.heap_bytes(seen)),
+            ("engine_bound", bound.heap_bytes(seen)),
+            ("engine_resolutions", resolved.heap_bytes(seen)),
+            ("engine_method_calls", calls.heap_bytes(seen)),
+            ("engine_reverse_inputs", reverse.heap_bytes(seen)),
+        ]
+    }
 }

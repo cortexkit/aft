@@ -3318,6 +3318,49 @@ impl Checkout {
         };
         CheckoutMemory { live, engine }
     }
+
+    /// The call-graph engine's memory part by part, for finding what an
+    /// update holds; `None` while it is not started or busy. The engine's
+    /// own parts come first, so the refreshed files and the overlay show
+    /// only what they hold besides the engine's copies.
+    #[must_use]
+    pub fn engine_memory_parts(&self) -> Option<Vec<(&'static str, usize)>> {
+        use aft_store::heap::HeapBytes as _;
+        let engine = self.engine.try_lock().ok()?;
+        let GraphEngine {
+            published,
+            live: resolution,
+            applied,
+            overlay,
+            refreshed,
+        } = engine.as_ref()?;
+        let mut seen = aft_store::heap::Seen::new();
+        let mut parts = resolution.memory_parts(&mut seen);
+        let mut published_parts = MemoryParts::default();
+        published_parts.published(published, &mut seen);
+        parts.push((
+            "published",
+            published_parts.shared + published_parts.text + published_parts.callgraph,
+        ));
+        parts.push((
+            "refreshed_replaced",
+            refreshed.replaced.heap_bytes(&mut seen),
+        ));
+        parts.push(("refreshed_other", {
+            let Refreshed {
+                state,
+                replaced: _,
+                removed,
+                dead_code,
+            } = refreshed;
+            state.heap_bytes(&mut seen)
+                + removed.heap_bytes(&mut seen)
+                + dead_code.heap_bytes(&mut seen)
+        }));
+        parts.push(("overlay", overlay.heap_bytes(&mut seen)));
+        parts.push(("applied", applied.heap_bytes(&mut seen)));
+        Some(parts)
+    }
 }
 
 /// The vector plane's access to the store: it publishes vector segments of
