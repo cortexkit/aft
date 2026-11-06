@@ -104,6 +104,9 @@ pub(crate) fn resolve_reusing(
                             Ok(()) => {
                                 let mut binding = bound.clone();
                                 binding.reuse_resolution(&variant.binding);
+                                // As a resolution built in memory: no
+                                // surface (see `callgraph::resolve_files`).
+                                binding.clear_surface();
                                 let reused = FileResolution {
                                     rows: variant.rows.clone(),
                                     binding,

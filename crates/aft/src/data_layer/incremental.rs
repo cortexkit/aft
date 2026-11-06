@@ -921,6 +921,9 @@ impl LiveCheckout {
                     .binding
                     .clone();
                 binding.reuse_resolution(&old.binding);
+                // As a resolution built in memory: no surface (see
+                // `callgraph::resolve_files`).
+                binding.clear_surface();
                 old.binding = binding;
                 self.reverse
                     .note_resolution(path, old, &CheckoutFacts { inputs });

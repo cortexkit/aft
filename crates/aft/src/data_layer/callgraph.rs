@@ -1007,6 +1007,10 @@ pub(crate) fn resolve_files_with<T: Send>(
                     &mut rows,
                 )?;
                 finish_binding(&mut binding);
+                // Copied from the bound file, which keeps it; a resolution
+                // stores none, so one read back from a publication equals
+                // one built here.
+                binding.clear_surface();
                 let dispatch = dispatch_targets(path, parse, index, facts)?;
                 if let Some(error) = files.take_error() {
                     return Err(error);

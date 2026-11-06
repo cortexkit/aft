@@ -2086,6 +2086,13 @@ impl ViewBindingDependencies {
         }
     }
 
+    /// Drops the bound file surface in place, as a stored resolution never
+    /// carries it. Resolution never reads it; whoever compares surfaces
+    /// reads them from the bound file.
+    pub(crate) fn clear_surface(&mut self) {
+        self.surface = None;
+    }
+
     /// Whether binding gave this file the surface `other` recorded, so no
     /// other file's resolution can read a different answer from it.
     pub(crate) fn same_surface(&self, other: &Self) -> bool {
