@@ -10669,26 +10669,6 @@ pub(crate) mod tests {
     }
 
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "manual no-pause cold-build peak RSS measurement"]
-    fn profile_no_pause_cold_build_peak_rss() {
-        let (chunks, work, elapsed_ms) = no_pause_checkpoint_fixture(100, 40, 1024);
-        assert_eq!(chunks, 4_000);
-        let status = fs::read_to_string("/proc/self/status").unwrap();
-        let peak_kib = status
-            .lines()
-            .find(|line| line.starts_with("VmHWM:"))
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        println!("NO_PAUSE_COLD_RSS chunks={chunks} dimension=1024 peak_kib={peak_kib} elapsed_ms={elapsed_ms} checkpoint_allocations={} checkpoint_inserts={} checkpoint_clones={}",
-            work.allocations, work.inserts, work.clones);
-    }
-
 
     #[test]
     fn lane_paused_direct_cold_builder_has_no_implicit_wait() {
