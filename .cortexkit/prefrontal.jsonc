@@ -11,5 +11,10 @@
   // passing runon: "linux" to bash. Lines that need macOS stay local.
   "remote_exec": {
     "enabled": true
+  },
+  // Masons' history is compacted by Magic Context, so a long task (some run
+  // for half a day) does not overflow its context and lose its brief.
+  "workers": {
+    "compaction": true
   }
 }
