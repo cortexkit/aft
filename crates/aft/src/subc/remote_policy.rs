@@ -290,8 +290,11 @@ fn catalog_inner(
         };
         let _scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(identity)));
-        let _grants =
-            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(identity));
+        // A worker's own fetch counts its scope's saved grants as the worker's
+        // file tools will, even when core carries it over its own connection.
+        let _grants = crate::access_policy::scope_grants_guard(
+            access_grants::worker_catalog_sibling_grants_denial(identity, &preset),
+        );
         // Catalog discovery has no permission UI. Use the same scope and saved
         // grants as file calls, but never turn an outside-access ask into approval.
         let _ask =
