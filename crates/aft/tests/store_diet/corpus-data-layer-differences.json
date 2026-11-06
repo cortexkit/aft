@@ -456,13 +456,26 @@
     "operation": "call_tree",
     "file": "src/callers.rs",
     "symbol": "run_template!",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "name": "run_template!",
       "file": "src/callers.rs",
       "line": 3,
       "resolved": true,
-      "children": [],
+      "children": [
+        {
+          "name": "template_target",
+          "file": "src/targets.rs",
+          "line": 5,
+          "signature": "pub fn template_target() {}",
+          "resolved": true,
+          "approximate": true,
+          "resolved_by": "name_match",
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
       "depth_limited": false,
       "truncated": 0
     }
@@ -472,7 +485,7 @@
     "operation": "callers",
     "file": "src/targets.rs",
     "symbol": "template_target",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "symbol": "template_target",
       "file": "src/targets.rs",
@@ -573,7 +586,7 @@
     "operation": "callers",
     "file": "src/callers.rs",
     "symbol": "template_caller_one",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "symbol": "template_caller_one",
       "file": "src/callers.rs",
@@ -592,7 +605,7 @@
     "operation": "call_tree",
     "file": "src/callers.rs",
     "symbol": "template_caller_one",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "name": "template_caller_one",
       "file": "src/callers.rs",
@@ -605,7 +618,20 @@
           "file": "src/callers.rs",
           "line": 3,
           "resolved": true,
-          "children": [],
+          "children": [
+            {
+              "name": "template_target",
+              "file": "src/targets.rs",
+              "line": 5,
+              "signature": "pub fn template_target() {}",
+              "resolved": true,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "children": [],
+              "depth_limited": false,
+              "truncated": 0
+            }
+          ],
           "depth_limited": false,
           "truncated": 0
         }
@@ -749,7 +775,7 @@
     "operation": "callers",
     "file": "src/callers.rs",
     "symbol": "template_caller_two",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "symbol": "template_caller_two",
       "file": "src/callers.rs",
@@ -768,7 +794,7 @@
     "operation": "call_tree",
     "file": "src/callers.rs",
     "symbol": "template_caller_two",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
       "name": "template_caller_two",
       "file": "src/callers.rs",
@@ -781,7 +807,20 @@
           "file": "src/callers.rs",
           "line": 3,
           "resolved": true,
-          "children": [],
+          "children": [
+            {
+              "name": "template_target",
+              "file": "src/targets.rs",
+              "line": 5,
+              "signature": "pub fn template_target() {}",
+              "resolved": true,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "children": [],
+              "depth_limited": false,
+              "truncated": 0
+            }
+          ],
           "depth_limited": false,
           "truncated": 0
         }
@@ -840,11 +879,28 @@
     "file": "src/callers.rs",
     "symbol": "template_caller_two",
     "to": "template_target",
-    "reason": "a call inside a macro_rules! template follows main's macro-template design: callers by name, marked approximate; forward queries do not follow it",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
     "data_layer": {
-      "path": null,
-      "complete": true,
-      "reason": "no_path_found"
+      "path": [
+        {
+          "symbol": "template_caller_two",
+          "file": "src/callers.rs",
+          "line": 30
+        },
+        {
+          "symbol": "run_template!",
+          "file": "src/callers.rs",
+          "line": 3
+        },
+        {
+          "symbol": "template_target",
+          "file": "src/targets.rs",
+          "line": 5,
+          "approximate": true,
+          "resolved_by": "name_match"
+        }
+      ],
+      "complete": true
     }
   }
 ]
