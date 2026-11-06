@@ -19,11 +19,11 @@ pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
 pub(crate) use request::denied_environment_name;
 #[cfg(any(unix, test))]
 pub(crate) use request::requested_return_max_bytes;
-pub(crate) use request::SIBLINGS_REFUSAL;
 pub use request::{
     build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
     RETURN_TOTAL_CAP_BYTES,
 };
+pub(crate) use request::{sibling_refusal, SiblingRefusal};
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
 
 #[derive(Debug, Clone, Copy)]

@@ -6456,10 +6456,12 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
         .collect()
 }
 
+/// `message` is the exact refusal the bash response must carry.
 pub(crate) fn assert_siblings_submit_refused_before_connect(
     ctx: &crate::context::AppContext,
     launch: crate::bash_background::RemoteLaunch,
     daemon: &crate::exec_remote::wire_tests::Daemon,
+    message: &str,
 ) {
     let marker = ctx
         .config()
@@ -6481,11 +6483,9 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
         ctx.bash_background().list(0).is_empty(),
         "a refused sibling must not register a remote or local task"
     );
-    assert!(
-        response.data["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("runon refused: siblings"),
+    assert_eq!(
+        response.data["message"].as_str().unwrap(),
+        message,
         "{response:?}"
     );
     assert!(
@@ -6525,7 +6525,11 @@ fn runon_siblings_refusal_line_is_pinned_byte_for_byte() {
     assert_eq!(response.data["code"], "remote_run_refused");
     assert_eq!(
         response.data["message"].as_str().unwrap().as_bytes(),
-        b"runon refused: siblings must be git checkout roots the session's file tools may read; the command was not run"
+        format!(
+            "runon refused: sibling {} is not the root of a git checkout; the command was not run",
+            folder.display()
+        )
+        .as_bytes()
     );
 }
 

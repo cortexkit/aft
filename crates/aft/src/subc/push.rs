@@ -9,6 +9,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReplayKey {
     pub(super) root: ProjectRootId,
+    pub(super) principal: Option<String>,
     pub(super) harness: String,
     pub(super) session: String,
 }
@@ -17,6 +18,7 @@ impl ReplayKey {
     pub(super) fn from_identity(identity: &RouteIdentity) -> Self {
         Self {
             root: identity.root.clone(),
+            principal: identity.task_identity().principal,
             harness: identity.harness.clone(),
             session: identity.session.clone(),
         }
@@ -60,6 +62,15 @@ fn frame_session(frame: &PushFrame) -> Option<&str> {
     }
 }
 
+fn frame_task_identity(frame: &PushFrame) -> Option<&crate::bash_background::TaskIdentity> {
+    match frame {
+        PushFrame::BashCompleted(frame) => frame.launching_identity.as_ref(),
+        PushFrame::BashLongRunning(frame) => frame.launching_identity.as_ref(),
+        PushFrame::BashPatternMatch(frame) => frame.launching_identity.as_ref(),
+        _ => None,
+    }
+}
+
 fn root_broadcast_kind(frame: &PushFrame) -> Option<&'static str> {
     match frame {
         PushFrame::StatusChanged(status) if status.session_id.is_none() => Some("status_changed"),
@@ -98,12 +109,22 @@ fn completed_task_id(frame: &PushFrame) -> Option<&str> {
 fn durable_bg_session_key(
     root: &ProjectRootId,
     frame: &PushFrame,
-) -> Option<(ProjectRootId, String)> {
+) -> Option<(
+    ProjectRootId,
+    String,
+    Option<crate::bash_background::TaskIdentity>,
+)> {
     match frame {
-        PushFrame::BashCompleted(completed) => Some((root.clone(), completed.session_id.clone())),
-        PushFrame::BashPatternMatch(pattern_match) => {
-            Some((root.clone(), pattern_match.session_id.clone()))
-        }
+        PushFrame::BashCompleted(completed) => Some((
+            root.clone(),
+            completed.session_id.clone(),
+            completed.launching_identity.clone(),
+        )),
+        PushFrame::BashPatternMatch(pattern_match) => Some((
+            root.clone(),
+            pattern_match.session_id.clone(),
+            pattern_match.launching_identity.clone(),
+        )),
         _ => None,
     }
 }
@@ -561,23 +582,23 @@ fn emit_bg_event_wakes_at(
 /// wake that was armed after the maintenance snapshot was taken.
 pub(super) fn arm_bg_wake(
     root: ProjectRootId,
-    session: String,
+    session: crate::bash_background::TaskIdentity,
     channel: RouteChannel,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     metrics: &DispatchPathMetrics,
 ) {
-    metrics.record_bg_arm_hit(&root, &session, channel);
+    metrics.record_bg_arm_hit(&root, &session.session, channel);
     *bg_wake_epoch.entry((root, session)).or_default() += 1;
     bg_wake_pending.insert(channel, BgWakeState::armed(Instant::now()));
 }
 
 pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
     root_id: &ProjectRootId,
-    empty_bg_sessions: &[(String, u64)],
+    empty_bg_sessions: &[(crate::bash_background::TaskIdentity, u64)],
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
 ) {
     for (session, epoch_at_submit) in empty_bg_sessions {
         let key = (root_id.clone(), session.clone());
@@ -665,6 +686,34 @@ pub(super) fn replay_buffered_push_frames(
     trust: BindTrust,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
+    // Tasks saved without launching_identity can still replay within the same
+    // root, harness and session without matching the caller's principal.
+    if trust.allows_bash_observation() {
+        let legacy_keys: Vec<_> = push_buffer
+            .keys()
+            .filter(|candidate| {
+                candidate.root == key.root
+                    && candidate.harness == key.harness
+                    && candidate.session == key.session
+                    && *candidate != key
+            })
+            .cloned()
+            .collect();
+        for legacy_key in legacy_keys {
+            let queue = push_buffer.get_mut(&legacy_key).unwrap();
+            let (legacy, owned): (VecDeque<_>, VecDeque<_>) =
+                std::mem::take(queue).into_iter().partition(|frame| {
+                    frame_is_bash_observation(frame) && frame_task_identity(frame).is_none()
+                });
+            *queue = owned;
+            if queue.is_empty() {
+                push_buffer.remove(&legacy_key);
+            }
+            for frame in legacy {
+                buffer_push_frame(metrics, push_buffer, key.clone(), frame);
+            }
+        }
+    }
     let mut sent = 0;
     let remove_empty;
 
@@ -800,6 +849,15 @@ fn matching_route_channels(
         frame_session(frame),
         frame_is_bash_observation(frame),
     )
+    .into_iter()
+    .filter(|channel| {
+        frame_task_identity(frame).is_none_or(|owner| {
+            routes
+                .get(channel)
+                .is_some_and(|route| route.task_identity() == *owner)
+        })
+    })
+    .collect()
 }
 
 fn matching_session_route_channels(
@@ -845,6 +903,24 @@ fn buffer_detached_reliable_push_frame(
         );
         return;
     };
+
+    if let Some(owner) = frame_task_identity(frame) {
+        buffer_push_frame(
+            metrics,
+            push_buffer,
+            ReplayKey {
+                root: root.clone(),
+                principal: owner.principal.clone(),
+                harness: owner.harness.clone(),
+                session: owner.session.clone(),
+            },
+            frame.clone(),
+        );
+        if let (Some(probe), Some(task_id)) = (lifecycle_probe, completed_task_id(frame)) {
+            probe.reliable_completion_retained(task_id, session);
+        }
+        return;
+    }
 
     if let Some((key, trust)) = replay_key_for_session(session_identity, root, session) {
         if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
@@ -1069,7 +1145,11 @@ fn process_reliable_push_frame(
     root: ProjectRootId,
     frame: PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
-) -> Option<(ProjectRootId, String)> {
+) -> Option<(
+    ProjectRootId,
+    String,
+    Option<crate::bash_background::TaskIdentity>,
+)> {
     let durable_bg_session = durable_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
@@ -1093,19 +1173,29 @@ fn arm_durable_bg_wake(
     metrics: &DispatchPathMetrics,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     root: ProjectRootId,
     session: String,
+    owner: Option<crate::bash_background::TaskIdentity>,
 ) {
-    if let Some(channels) = bg_sub_by_session.get(&(root.clone(), session.clone())) {
+    let mut matched = false;
+    for ((sub_root, identity), channels) in bg_sub_by_session {
+        if sub_root != &root
+            || identity.session != session
+            || owner.as_ref().is_some_and(|owner| owner != identity)
+        {
+            continue;
+        }
+        matched = true;
         *bg_wake_epoch
-            .entry((root.clone(), session.clone()))
+            .entry((root.clone(), identity.clone()))
             .or_default() += 1;
         for channel in channels {
             metrics.record_bg_arm_hit(&root, &session, *channel);
             bg_wake_pending.insert(*channel, BgWakeState::armed(Instant::now()));
         }
-    } else {
+    }
+    if !matched {
         let live_root_subscriptions = bg_sub_by_session
             .keys()
             .filter(|(sub_root, _)| sub_root == &root)
@@ -1126,12 +1216,12 @@ fn process_reliable_push_and_arm_bg_wake(
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     root: ProjectRootId,
     frame: PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
-    if let Some((root, session)) = process_reliable_push_frame(
+    if let Some((root, session, owner)) = process_reliable_push_frame(
         writer_tx,
         metrics,
         routes,
@@ -1151,6 +1241,7 @@ fn process_reliable_push_and_arm_bg_wake(
             bg_wake_epoch,
             root,
             session,
+            owner,
         );
     }
 }
@@ -1167,7 +1258,7 @@ pub(super) fn drain_reliable_push_turn(
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
     first: Option<PushEnvelope>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -1477,6 +1568,406 @@ pub(super) fn process_lossy_push_envelope_batch(
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::protocol::{BashLongRunningFrame, BashPatternMatchFrame};
+
+    fn caller_route(root: &ProjectRootId, principal: &str, harness: &str) -> RouteIdentity {
+        let mut route =
+            route_identity_with_harness(root, "moved-session", BindTrust::FirstParty, harness);
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        if let AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness: bound_harness,
+            ..
+        } = &mut data.spawn_principal
+        {
+            *principal_id = Some(principal.to_string());
+            *bound_harness = harness.to_string();
+        }
+        route
+    }
+
+    fn assert_task_notice_isolation(other_principal: &str, other_harness: &str) {
+        let (_dir, root) = test_root("task-notice-caller-root");
+        let owner = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let other = caller_route(&root, other_principal, other_harness);
+        let owner_channel = route_key(1, 1);
+        let other_channel = route_key(2, 1);
+        let routes = HashMap::from([
+            (owner_channel, owner.clone()),
+            (other_channel, other.clone()),
+        ]);
+        let root_channels =
+            HashMap::from([(root.clone(), HashSet::from([owner_channel, other_channel]))]);
+        let subscriptions = HashMap::from([
+            (
+                (root.clone(), owner.task_identity()),
+                HashSet::from([owner_channel]),
+            ),
+            (
+                (root.clone(), other.task_identity()),
+                HashSet::from([other_channel]),
+            ),
+        ]);
+        let metrics = DispatchPathMetrics::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(16);
+        let mut retry = RetryBuffer::new();
+        let mut buffered = HashMap::new();
+        let mut completed = CompletedTaskIds::default();
+        let mut pending = BgWakePending::new();
+        let mut epochs = HashMap::new();
+        let mut completion = completion_frame_with_session("owned-task", "moved-session");
+        if let PushFrame::BashCompleted(frame) = &mut completion {
+            frame.launching_identity = Some(owner.task_identity());
+        }
+        let mut pattern = BashPatternMatchFrame::new(
+            "owned-task",
+            "moved-session",
+            "watch",
+            "ready",
+            1,
+            "ready",
+            true,
+        );
+        pattern.launching_identity = Some(owner.task_identity());
+        for frame in [completion.clone(), PushFrame::BashPatternMatch(pattern)] {
+            process_reliable_push_and_arm_bg_wake(
+                &writer_tx,
+                &metrics,
+                &routes,
+                &root_channels,
+                &HashMap::new(),
+                &mut retry,
+                &mut buffered,
+                &mut completed,
+                &subscriptions,
+                &mut pending,
+                &mut epochs,
+                root.clone(),
+                frame,
+                None,
+            );
+            assert_eq!(writer_rx.try_recv().unwrap().header.channel, 1);
+            assert!(writer_rx.try_recv().is_err());
+            assert_eq!(
+                pending.keys().copied().collect::<HashSet<_>>(),
+                HashSet::from([owner_channel])
+            );
+        }
+        let bg_subs = HashMap::from([
+            (
+                owner_channel,
+                BgSub {
+                    corr: 11,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: "moved-session".into(),
+                },
+            ),
+            (
+                other_channel,
+                BgSub {
+                    corr: 22,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: "moved-session".into(),
+                },
+            ),
+        ]);
+        emit_bg_event_wakes(&writer_tx, &metrics, &bg_subs, &mut pending);
+        let nudge = writer_rx.try_recv().unwrap();
+        assert_eq!((nudge.header.channel, nudge.header.corr), (1, 11));
+        assert!(writer_rx.try_recv().is_err());
+
+        let mut long = BashLongRunningFrame::new("owned-task", "moved-session", "sleep", 100);
+        long.launching_identity = Some(owner.task_identity());
+        let result = fan_out_lossy_push_frame(
+            &writer_tx,
+            &metrics,
+            &routes,
+            &root_channels,
+            &root,
+            &PushFrame::BashLongRunning(long),
+        );
+        assert_eq!(result.sent_frames, 1);
+        assert_eq!(writer_rx.try_recv().unwrap().header.channel, 1);
+        assert!(writer_rx.try_recv().is_err());
+
+        // The owner disconnects while the other consumer stays bound. Retain the
+        // notice by its launch identity, not the last route using the session id.
+        let detached_routes = HashMap::from([(other_channel, other.clone())]);
+        let detached_channels = HashMap::from([(root.clone(), HashSet::from([other_channel]))]);
+        fan_out_reliable_push_frame(
+            &writer_tx,
+            &metrics,
+            &detached_routes,
+            &detached_channels,
+            &HashMap::new(),
+            &mut retry,
+            &mut buffered,
+            &root,
+            &completion,
+            None,
+        );
+        assert!(writer_rx.try_recv().is_err());
+        assert_eq!(
+            replay_buffered_push_frames(
+                &writer_tx,
+                &metrics,
+                other_channel,
+                &mut buffered,
+                &ReplayKey::from_identity(&other),
+                BindTrust::FirstParty,
+                None
+            ),
+            0
+        );
+        let reconnect = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        assert_eq!(
+            replay_buffered_push_frames(
+                &writer_tx,
+                &metrics,
+                route_key(3, 9),
+                &mut buffered,
+                &ReplayKey::from_identity(&reconnect),
+                BindTrust::FirstParty,
+                None
+            ),
+            1
+        );
+        let replay = writer_rx.try_recv().unwrap();
+        assert_eq!((replay.header.channel, replay.header.epoch), (3, 9));
+        assert!(writer_rx.try_recv().is_err());
+        assert!(buffered.is_empty());
+
+        if other_harness == "opencode" {
+            buffer_push_frame(
+                &metrics,
+                &mut buffered,
+                ReplayKey::from_identity(&other),
+                completion_frame_with_session("legacy-task", "moved-session"),
+            );
+            assert_eq!(
+                replay_buffered_push_frames(
+                    &writer_tx,
+                    &metrics,
+                    route_key(3, 9),
+                    &mut buffered,
+                    &ReplayKey::from_identity(&reconnect),
+                    BindTrust::FirstParty,
+                    None
+                ),
+                1
+            );
+            assert_eq!(
+                push_frame_task_id(&writer_rx.try_recv().unwrap()).as_deref(),
+                Some("legacy-task")
+            );
+        }
+    }
+
+    #[test]
+    fn task_notices_isolate_principals_and_reconnect() {
+        assert_task_notice_isolation("direct", "opencode");
+    }
+
+    #[test]
+    fn task_notices_isolate_harnesses_and_reconnect() {
+        assert_task_notice_isolation("reserved:thalamus-harness", "opencode2");
+    }
+
+    #[tokio::test]
+    async fn codemode_background_task_records_head_identity_and_completes_to_head() {
+        use crate::bash_background::{persistence, TaskIdentity};
+        use subc_protocol::call_mode::CallMode;
+
+        let (_root_dir, root) = test_root("codemode-background-owner");
+        let storage = tempfile::tempdir().unwrap();
+        let storage_root = storage.path().join("opencode");
+        let mut head = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let mut run = caller_route(&root, "reserved:prefrontal-core", "runner");
+        for (route, session) in [(&mut head, "head-session"), (&mut run, "run-session")] {
+            let data = Arc::get_mut(&mut route.0).unwrap();
+            data.session = session.into();
+            if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal
+            {
+                *session_id = session.into();
+            }
+        }
+        Arc::get_mut(&mut head.0).unwrap().scope = Some(
+            serde_json::from_value(json!({
+                "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+                "ref":"head-a", "scope_epoch":3, "kind":"head", "owner_authorized":true,
+                "attributes":{"agent_id":"agent-a"},
+            }))
+            .unwrap(),
+        );
+        let run_data = Arc::get_mut(&mut run.0).unwrap();
+        run_data.call_mode = CallMode::Codemode;
+        run_data.held_reply = true;
+        run_data.tool_result_body = true;
+        run_data.scope = Some(serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+            "ref":"run-scope", "scope_epoch":1, "kind":"ephemeral", "owner_authorized":true,
+            "attributes":{"agent_id":"agent-a","run_id":"run-1"},
+            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head-a","scope_epoch":3},
+            "parent_state":"linked",
+        })).unwrap());
+        let routes = HashMap::from([
+            (route_key(1, 1), head.clone()),
+            (route_key(9, 1), run.clone()),
+        ]);
+        let body = json!({"name":"bash","preset":"head","arguments":{
+            "command":"echo codemode-head-complete", "background":true,
+        }});
+        let effective = match codemode::admit(&routes, route_key(9, 1), Some(&body), |_| {
+            Some(Ok(codemode::EffectiveSavedPolicy::default()))
+        }) {
+            codemode::Admission::Owner(identity) => identity,
+            codemode::Admission::Refused(error) => {
+                panic!("code-mode call refused: {} {:?}", error.code, error.detail)
+            }
+            _ => panic!("code-mode call must resolve its owner"),
+        };
+        let expected = TaskIdentity {
+            principal: Some("reserved:thalamus-harness".into()),
+            harness: "opencode".into(),
+            session: "head-session".into(),
+        };
+        assert_eq!(head.task_identity(), expected);
+        assert_ne!(run.task_identity(), expected);
+        assert_eq!(effective.spawn_principal, head.spawn_principal);
+
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        let sender: ProgressSender = Arc::new(Box::new(move |frame| {
+            let _ = notice_tx.send(frame);
+        }) as Box<dyn Fn(PushFrame) + Send + Sync>);
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(storage.path().into());
+            config.experimental_bash_background = true;
+        });
+        ctx.set_progress_sender(Some(sender));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (done_tx, mut done_rx) = mpsc::channel(4);
+        let (touch_tx, _touch_rx) = mpsc::channel(4);
+        {
+            let _identity =
+                secret_consent::SecretIdentityGuard::install_optional(Some(effective.clone()));
+            bash::submit_deferred_bash(
+                false,
+                &executor,
+                &done_tx,
+                &touch_tx,
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash::handle(&request, ctx),
+                root.clone(),
+                root.as_path().into(),
+                effective.session.clone(),
+                "codemode-background".into(),
+                route_key(9, 1),
+                1,
+                control_flags(),
+                PROTOCOL_VERSION,
+                json!({"command":"echo codemode-head-complete","background":true,"compressed":false,"timeout":5000}),
+                crate::subc_format::FormatContext::default(),
+                bash::BashWaitCancel {
+                    keepalive: None,
+                    speech_seed: None,
+                    run_scope: None,
+                    scope: effective.scope.clone(),
+                    late_results: true,
+                    ledger_carrier: Some("reserved:prefrontal-core".into()),
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                BindTrust::FirstParty,
+                effective.spawn_principal.clone(),
+                None,
+                Some("codemode-background".into()),
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                true,
+                remote_policy::RemoteSource::None,
+                Instant::now() + Duration::from_secs(10),
+            );
+        }
+        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"]
+            .as_str()
+            .expect("background task id")
+            .to_string();
+        let completion = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), notice_rx.recv())
+                .await
+                .unwrap()
+                .expect("background completion");
+            if matches!(&frame, PushFrame::BashCompleted(frame) if frame.task_id == task_id) {
+                break frame;
+            }
+        };
+        let task = persistence::resolve_task_layout(
+            &persistence::session_tasks_dir(&storage_root, "head-session"),
+            &task_id,
+        )
+        .unwrap();
+        let metadata = persistence::read_task_at(&task).unwrap();
+        assert_eq!(metadata.launching_identity, Some(expected));
+        assert_eq!(metadata.session_id, "head-session");
+        // The task belongs to the head the program ran for, under the head's
+        // own scope, so the end of the program's short-lived run scope does
+        // not end it.
+        assert_eq!(metadata.scope, head.scope);
+        assert_ne!(metadata.scope, run.scope);
+        assert_eq!(
+            metadata.call_key.unwrap().requester,
+            "reserved:prefrontal-core"
+        );
+
+        let root_channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(1, 1), route_key(9, 1)]),
+        )]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        let result = fan_out_reliable_push_frame(
+            &writer_tx,
+            &DispatchPathMetrics::new(),
+            &routes,
+            &root_channels,
+            &HashMap::new(),
+            &mut RetryBuffer::new(),
+            &mut HashMap::new(),
+            &root,
+            &completion,
+            None,
+        );
+        assert_eq!(result.matched_channels, 1);
+        assert_eq!(result.sent_frames, 1);
+        let delivered = writer_rx.try_recv().expect("head receives completion");
+        assert_eq!((delivered.header.channel, delivered.header.epoch), (1, 1));
+        assert_eq!(
+            push_frame_task_id(&delivered).as_deref(),
+            Some(task_id.as_str())
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "run route must not receive the head's completion"
+        );
+        ctx.bash_background().shutdown();
+    }
     use crate::protocol::{ConfigureWarningsFrame, StatusChangedFrame};
 
     #[cfg(unix)]
@@ -2085,7 +2576,7 @@ mod tests {
         let (_root_dir, root) = test_root("pattern-match-bg-wake-root");
         assert_eq!(
             durable_bg_session_key(&root, &pattern_match),
-            Some((root, "session-c".to_string())),
+            Some((root, "session-c".to_string(), None)),
             "a durable pattern match needs the same repeating bg_events wake as a completion"
         );
 
@@ -2198,6 +2689,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-bound-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -2232,6 +2724,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-replay-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -2278,6 +2771,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-replay-untrusted-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "mcp".to_string(),
             session: "session-1".to_string(),
         };
@@ -2968,6 +3462,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-incremental-replay-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -3036,6 +3531,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-goodbye-migration-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -3072,6 +3568,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-permanent-failure-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -3143,7 +3640,7 @@ mod tests {
     #[test]
     fn arm_bg_wake_bumps_epoch_even_when_channel_is_already_pending() {
         let (_root_dir, root) = test_root("subc-bg-wake-epoch-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(7, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3234,7 +3731,10 @@ mod tests {
     fn duplicate_session_subscriptions_emit_each_route_correlation() {
         let (_root_dir, root) = test_root("subc-bg-duplicate-session-root");
         let session = "shared-session".to_string();
-        let key = (root.clone(), session.clone());
+        let key = (
+            root.clone(),
+            route_identity(&root, &session).task_identity(),
+        );
         let route_a = route_key(17, 1);
         let route_b = route_key(23, 4);
         let metrics = DispatchPathMetrics::new();
@@ -3250,6 +3750,7 @@ mod tests {
             &mut bg_wake_epoch,
             root.clone(),
             session.clone(),
+            None,
         );
         assert_eq!(bg_wake_pending.len(), 2);
         assert!(bg_wake_pending.contains_key(&route_a));
@@ -3301,7 +3802,7 @@ mod tests {
     #[test]
     fn stale_maintenance_epoch_does_not_clear_newer_bg_wake() {
         let (_root_dir, root) = test_root("subc-bg-wake-stale-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(8, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3343,7 +3844,7 @@ mod tests {
     #[test]
     fn matching_maintenance_epoch_clears_genuinely_stale_bg_wake() {
         let (_root_dir, root) = test_root("subc-bg-wake-clear-root");
-        let session = "session-1".to_string();
+        let session = route_identity(&root, "session-1").task_identity();
         let key = (root.clone(), session.clone());
         let channel = route_key(9, 1);
         let metrics = DispatchPathMetrics::new();
@@ -3388,6 +3889,7 @@ mod tests {
             &mut bg_wake_epoch,
             root.clone(),
             "session-without-subscription".to_string(),
+            None,
         );
 
         assert_eq!(metrics.bg_arm_misses_60s_total(), 1);

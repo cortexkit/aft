@@ -621,9 +621,11 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
 /// disabled tools and sandbox principal (its id included) are the owner
 /// route's: the head's for an agent run, the worker's for a worker run. The
 /// scope stays the run's, so the run's lifetime controls (deadline, scope-end
-/// kill, call ledger settlement) keep applying to the work the program starts;
-/// only the call-ledger carrier is the run route's (see
-/// [`RunOwner::ledger_carrier`]).
+/// kill, call ledger settlement) keep applying to the calls the program makes
+/// and the foreground commands it waits for. A background command it starts
+/// is recorded under the owner route's scope instead (see
+/// `subc::bash::submit_deferred_bash`), so it outlives the run. Only the
+/// call-ledger carrier is the run route's (see [`RunOwner::ledger_carrier`]).
 fn effective_identity(
     run: &RouteIdentity,
     owner: &RouteIdentity,

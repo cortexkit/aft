@@ -7304,6 +7304,113 @@ pub(in crate::subc) mod route_tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_notices_plain_dispatch_and_finalizer_keep_the_bound_caller() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::{BgTaskStatus, TaskIdentity};
+
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (dir, root) = test_support::test_root("task-notices-plain-dispatch");
+        let ctx = test_support::test_ctx();
+        let session = "moved-session";
+        let task_id = "bash-0123456789abcdef";
+        let storage = dir.path().join("tasks");
+        let task = create_task_layout(&storage, session, task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "printf owned-notice".into(),
+            root.as_path().into(),
+            Some(root.as_path().into()),
+            None,
+            true,
+            false,
+        );
+        metadata.launching_identity = Some(TaskIdentity {
+            principal: Some("reserved:thalamus-harness".into()),
+            harness: "opencode".into(),
+            session: session.into(),
+        });
+        metadata.harness = Some("opencode".into());
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).unwrap();
+        std::fs::write(&task.paths.stdout, "owned-notice\n").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
+        std::fs::write(&task.paths.exit, "0\n").unwrap();
+        ctx.bash_background()
+            .replay_session(&storage, session)
+            .unwrap();
+
+        for name in ["bash_drain_completions", "read"] {
+            for (principal, harness, owns) in [
+                ("direct", "opencode", false),
+                ("reserved:thalamus-harness", "pi", false),
+                ("reserved:thalamus-harness", "opencode", true),
+            ] {
+                let mut identity = test_support::route_identity_with_harness(
+                    &root,
+                    session,
+                    BindTrust::FirstParty,
+                    harness,
+                );
+                if let AuthenticatedPrincipal::RouteBind {
+                    principal_id,
+                    harness: bound_harness,
+                    ..
+                } = &mut Arc::get_mut(&mut identity.0).unwrap().spawn_principal
+                {
+                    *principal_id = Some(principal.into());
+                    *bound_harness = harness.into();
+                }
+                let arguments = if name == "read" {
+                    json!({"path":"plain-file.txt"})
+                } else {
+                    json!({})
+                };
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    ctx.clone(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, ctx| {
+                        let caller = TaskIdentity::current()
+                            .expect("ordinary dispatch retains its route identity");
+                        assert_eq!(caller.session, request.session());
+                        if request.command == "bash_drain_completions" {
+                            crate::commands::bash_drain_completions::handle(&request, ctx)
+                        } else {
+                            let mut response = Response::success(&request.id, json!({}));
+                            crate::response_finalize::attach_bg_completions(
+                                &mut response,
+                                ctx,
+                                request.session(),
+                                "read",
+                            );
+                            // Legacy replies carry rendered text, not metadata added
+                            // after rendering. Expose the finalizer's selection here.
+                            response.data = json!({"content": response.data.to_string()});
+                            response
+                        }
+                    },
+                )
+                .await;
+                assert_eq!(reply.header.ty, FrameType::Response);
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(
+                    body["isError"], false,
+                    "{name} {principal}/{harness}: {body}"
+                );
+                assert_eq!(
+                    body.to_string().contains(task_id),
+                    owns,
+                    "{name} {principal}/{harness}: {body}"
+                );
+            }
+        }
+    }
+
     fn task_poll_identity(root: &ProjectRootId, session: &str, carrier: bool) -> RouteIdentity {
         let mut identity = if carrier {
             occipital_identity(root, RouteRole::ToolProviderV1)

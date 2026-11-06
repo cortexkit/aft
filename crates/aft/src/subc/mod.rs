@@ -1621,6 +1621,18 @@ enum ManagementAdmission {
 }
 
 impl RouteIdentity {
+    fn task_identity(&self) -> crate::bash_background::TaskIdentity {
+        let principal = match &self.spawn_principal {
+            AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.clone(),
+            AuthenticatedPrincipal::FirstParty => None,
+        };
+        crate::bash_background::TaskIdentity {
+            principal,
+            harness: self.harness.clone(),
+            session: self.session.clone(),
+        }
+    }
+
     fn reply_policy(&self) -> wire::ToolResponsePolicy {
         self.into()
     }
@@ -1736,6 +1748,7 @@ impl Deref for RouteIdentity {
 
 #[derive(Debug, Clone)]
 struct RetainedSessionIdentity {
+    principal: Option<String>,
     harness: String,
     trust: BindTrust,
 }
@@ -1768,13 +1781,14 @@ type BgWakePending = HashMap<RouteChannel, BgWakeState>;
 
 // A session can be observed by multiple long-lived consumer records. Retain
 // every route so each wake uses the correlation captured by that route's BgSub.
-type BgSubsBySession = HashMap<(ProjectRootId, String), HashSet<RouteChannel>>;
+type BgSubsBySession =
+    HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), HashSet<RouteChannel>>;
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
     kind: MaintenanceDrainKind,
     response: Response,
-    empty_bg_sessions: Vec<(String, u64)>,
+    empty_bg_sessions: Vec<(crate::bash_background::TaskIdentity, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     diagnostics_on_edit: Option<bool>,
@@ -1808,7 +1822,7 @@ impl MaintenanceDrainKind {
 
 #[derive(Debug, Default)]
 struct MaintenanceJobOutcome {
-    empty_bg_sessions: Vec<(String, u64)>,
+    empty_bg_sessions: Vec<(crate::bash_background::TaskIdentity, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     /// The root's `lsp.diagnostics_on_edit` after a config reload, which the
@@ -3031,7 +3045,7 @@ fn purge_deleted_root_residents(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
@@ -3136,7 +3150,7 @@ fn submit_due_maintenance_jobs(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &BgWakePending,
-    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -3928,7 +3942,7 @@ fn sync_bg_live_delivery_sessions(
 fn insert_bg_subscription_index(
     bg_sub_by_session: &mut BgSubsBySession,
     root: ProjectRootId,
-    session: String,
+    session: crate::bash_background::TaskIdentity,
     channel: RouteChannel,
 ) {
     bg_sub_by_session
@@ -3943,7 +3957,7 @@ fn remove_bg_subscription_index(
     identity: Option<&RouteIdentity>,
 ) {
     if let Some(identity) = identity {
-        let key = (identity.root.clone(), identity.session.clone());
+        let key = (identity.root.clone(), identity.task_identity());
         let remove_key = bg_sub_by_session.get_mut(&key).is_some_and(|channels| {
             channels.remove(&channel);
             channels.is_empty()
@@ -4292,6 +4306,7 @@ fn remember_session_identity(
     session_identity.insert(
         key,
         RetainedSessionIdentity {
+            principal: identity.task_identity().principal,
             harness: identity.harness.clone(),
             trust: identity.trust,
         },
@@ -4307,6 +4322,7 @@ fn replay_key_for_session(
     Some((
         push::ReplayKey {
             root: root.clone(),
+            principal: retained.principal.clone(),
             harness: retained.harness.clone(),
             session: session.to_string(),
         },
@@ -5492,7 +5508,8 @@ where
     // are answered at once and foreground bash waits detach to the background.
     let module_drain = drain::ModuleDrainWindow::default();
     let mut drain_progress: Option<drain::DrainProgress> = None;
-    let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
+    let mut bg_wake_epoch: HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64> =
+        HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
@@ -10523,6 +10540,8 @@ impl PlainToolRun {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
+            let _task_identity =
+                crate::bash_background::task_identity_scope(Some(identity_for_run.task_identity()));
             let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
@@ -10897,7 +10916,7 @@ async fn handle_tool_call(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     dispatch: DispatchFn,
     deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
@@ -10969,7 +10988,7 @@ async fn handle_tool_call_with_capabilities(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     dispatch: DispatchFn,
     deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
@@ -11369,13 +11388,13 @@ async fn handle_tool_call_with_capabilities(
         insert_bg_subscription_index(
             bg_sub_by_session,
             identity.root.clone(),
-            identity.session.clone(),
+            identity.task_identity(),
             route_id,
         );
         metrics.record_bg_subscription_installed(&identity.root, &identity.session, route_id);
         push::arm_bg_wake(
             identity.root.clone(),
-            identity.session.clone(),
+            identity.task_identity(),
             route_id,
             bg_wake_pending,
             bg_wake_epoch,
@@ -12636,7 +12655,7 @@ fn submit_maintenance_job(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
     kind: MaintenanceDrainKind,
-    bg_sessions_to_check: Vec<(String, u64)>,
+    bg_sessions_to_check: Vec<(crate::bash_background::TaskIdentity, u64)>,
     completion_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -12697,7 +12716,8 @@ fn submit_maintenance_job(
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()
                     .filter(|(session, _)| {
-                        !ctx.bash_background().has_unacked_wakes_for_session(session)
+                        !ctx.bash_background()
+                            .has_unacked_wakes_for_identity(session)
                     })
                     .collect();
                 MaintenanceJobOutcome {
@@ -15147,6 +15167,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            launching_identity: None,
             changed_files: None,
             frame_type: "bash_completed",
             task_id: task_id.to_string(),
@@ -15179,6 +15200,7 @@ pub(crate) mod test_support {
         elapsed_ms: u64,
     ) -> PushFrame {
         PushFrame::BashLongRunning(BashLongRunningFrame {
+            launching_identity: None,
             frame_type: "bash_long_running",
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
@@ -15189,6 +15211,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            launching_identity: None,
             batch: None,
             frame_type: "bash_pattern_match",
             task_id: "task-pattern".to_string(),
@@ -17347,7 +17370,10 @@ mod tests {
             },
         )]);
         let mut bg_sub_by_session = HashMap::from([(
-            (root.clone(), "deleted-route".to_string()),
+            (
+                root.clone(),
+                route_identity(&root, "deleted-route").task_identity(),
+            ),
             HashSet::from([route]),
         )]);
         let mut bg_wake_pending =
@@ -19019,7 +19045,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), ctx));
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        let session = "idle-session".to_string();
+        let session = route_identity(&root, "idle-session").task_identity();
         let channel = route_key(17, 1);
         let metrics = DispatchPathMetrics::new();
         let bg_sub_by_session =
