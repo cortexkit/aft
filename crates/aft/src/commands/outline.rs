@@ -4548,59 +4548,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_disk_and_manual_tables_hydrate_layout_once() {
-        let (temp, files, ctx) = navigation_fixture();
-        let path = &files[5];
-        let provider = ctx
-            .provider()
-            .as_any()
-            .downcast_ref::<TreeSitterProvider>()
-            .unwrap();
-        let symbols = ctx.provider().list_symbols(path).unwrap();
-        let cache = provider.symbol_cache();
-        let storage = tempfile::tempdir().unwrap();
-        cache
-            .write()
-            .unwrap()
-            .set_project_root(temp.path().to_path_buf());
-        let disk_cache = cache.read().unwrap().clone();
-        crate::symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), "layout").unwrap();
-        for disk in [true, false] {
-            let mut loaded = crate::parser::SymbolCache::new();
-            if disk {
-                assert_eq!(
-                    loaded.load_from_disk(storage.path(), "layout", temp.path()),
-                    1
-                );
-            } else {
-                let meta = std::fs::metadata(path).unwrap();
-                loaded.insert(
-                    path.clone(),
-                    meta.modified().unwrap(),
-                    meta.len(),
-                    blake3::hash(&std::fs::read(path).unwrap()),
-                    symbols.clone(),
-                );
-            }
-            let ctx = AppContext::new(
-                Box::new(TreeSitterProvider::with_symbol_cache(Arc::new(
-                    std::sync::RwLock::new(loaded),
-                ))),
-                crate::config::Config::default(),
-            );
-            let request = serde_json::from_value(
-                serde_json::json!({"id":"layout", "command":"outline", "file":path}),
-            )
-            .unwrap();
-            let (first, reads, parses) = navigation_counts(&request, &ctx);
-            assert_eq!((reads, parses), (1, 1), "disk={disk}");
-            let (warm, reads, parses) = navigation_counts(&request, &ctx);
-            assert_eq!((reads, parses), (0, 0), "disk={disk}");
-            assert_eq!(warm, first);
-        }
-    }
-
-    #[test]
     fn rust_outline_layout_tracks_symbol_freshness_and_invalidation() {
         let (_temp, files, ctx) = navigation_fixture();
         let path = &files[5];

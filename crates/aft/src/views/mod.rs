@@ -473,8 +473,6 @@ impl<'de> Deserialize<'de> for Manifest {
     where
         D: Deserializer<'de>,
     {
-        #[cfg(test)]
-        MANIFEST_DECODES.with(|count| count.set(count.get() + 1));
         let json = JsonManifest::deserialize(deserializer)?;
         if json.path_identity_version != PATH_IDENTITY_VERSION {
             return Err(D::Error::custom(format!(

@@ -14878,63 +14878,6 @@ mod subc_lifecycle_admission_tests {
     }
 
     #[test]
-    fn borrow_only_root_with_partial_tier2_aggregates_reports_disabled() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        ctx.set_artifact_owner(
-            Some(crate::artifact_owner::ArtifactOwnerStatus {
-                mode: crate::artifact_owner::ArtifactOwnerMode::ReadOnly,
-                project_key: "borrowed".to_string(),
-                manifest_path: "manifest.json".to_string(),
-                owner_project_scope_key: "owner".to_string(),
-                owner_checkout_path: "/owner".to_string(),
-                note: None,
-            }),
-            None,
-        );
-        ctx.update_status_bar_tier2(Some(4), None, None, None, true);
-
-        let snapshot = ctx.try_health_snapshot(Path::new("borrow-only-root"));
-
-        assert_eq!(snapshot.tier2.expect("tier2 health").status, "disabled");
-    }
-
-    #[test]
-    fn revision_borrower_is_not_a_resident_semantic_donor() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = App::default_shared();
-        let donor_root = temp.path().join("other_branch");
-        let target = temp.path().join("late_branch");
-        std::fs::create_dir_all(&donor_root).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        let donor = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
-        donor.set_canonical_cache_root(donor_root.clone());
-        donor
-            .artifact_cache_keys
-            .lock()
-            .insert(donor_root.clone(), "family".into());
-        donor.set_cache_writer_capabilities(false, true);
-        let config = crate::config::SemanticBackendConfig::default();
-        let mut index = SemanticIndex::new(donor_root.clone(), 3);
-        index.set_fingerprint(
-            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&config, 3),
-        );
-        *donor.semantic_index().write().unwrap() = Some(index);
-        *donor.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-        app.register_memory_context(donor_root, &donor);
-        assert!(
-            app.adopt_resident_semantic_index("family", &target, &config)
-                .is_none(),
-            "another borrower must never donate branch-local state"
-        );
-        donor.set_cache_writer_capabilities(true, true);
-        assert!(
-            app.adopt_resident_semantic_index("family", &target, &config)
-                .is_some(),
-            "the same matching snapshot is eligible only when owned by the writer"
-        );
-    }
-
-    #[test]
     fn worktree_guard_prevents_partial_tier2_from_reporting_building() {
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(
@@ -15011,21 +14954,6 @@ mod subc_lifecycle_admission_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
         ));
-    }
-
-    #[test]
-    fn conditional_semantic_receiver_retire_preserves_replacement_epoch() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        let (_old_sender, old_receiver) = crossbeam_channel::unbounded();
-        let old_epoch = ctx.install_semantic_index_rx(old_receiver, ctx.configure_generation());
-        let (_replacement_sender, replacement_receiver) = crossbeam_channel::unbounded();
-        let replacement_epoch =
-            ctx.install_semantic_index_rx(replacement_receiver, ctx.configure_generation());
-
-        assert!(replacement_epoch > old_epoch);
-        assert_eq!(ctx.retire_semantic_index_rx_if_epoch(old_epoch), None);
-        assert!(ctx.semantic_index_rx().lock().is_some());
-        assert_eq!(ctx.semantic_index_rx_epoch(), replacement_epoch);
     }
 
     #[test]
@@ -15643,69 +15571,6 @@ mod callgraph_store_for_ops_tests {
         )
         .unwrap();
         store.sqlite_path().to_path_buf()
-    }
-
-    #[test]
-    fn callgraph_view_diagnostics_preserve_busy_cause_and_retry_on_the_same_context() {
-        use crate::db::file_identity::IdentityConnection;
-
-        let _serial = v3::serial_for_test();
-        let (_dirs, ctx) = cold_build_context();
-        let mut config = (*ctx.config()).clone();
-        ctx.set_config(config);
-        let root = ctx.callgraph_project_root().unwrap();
-        ctx.set_canonical_cache_root(root.clone());
-        assert!(matches!(
-            ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
-            CallgraphStoreAccess::Ready(_)
-        ));
-        ctx.callgraph_view.lock().take();
-
-        let storage = ctx.storage_paths().artifacts;
-        let family = ctx.memoized_artifact_cache_key(&root);
-        let path = v3::family_dir(&storage, &family)
-            .unwrap()
-            .join("members.sqlite");
-        let blocker = IdentityConnection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            "callgraph-view-diagnostics-blocker",
-        )
-        .unwrap();
-        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
-        let CallgraphStoreAccess::Error(error) = ctx.callgraph_store_for_ops() else {
-            panic!("a locked view must retain the SQLite busy verdict");
-        };
-        assert!(
-            matches!(
-                &error,
-                CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
-                    if code.extended_code == rusqlite::ffi::SQLITE_BUSY
-            ),
-            "{error}"
-        );
-        assert!(error.is_transient_lock_contention(), "{error}");
-        let busy = ctx.callgraph_view_read_diagnostics();
-        assert_eq!(busy.attempts, 2);
-        let detail = busy
-            .last_error
-            .as_deref()
-            .expect("SQLite busy must retain its acquisition cause");
-        assert!(detail.contains("reservation_ledger_busy"), "{detail}");
-        assert!(detail.contains("read initialization marker"), "{detail}");
-        assert!(detail.contains("members.sqlite"), "{detail}");
-        assert!(detail.contains("database is locked"), "{detail}");
-        blocker.execute_batch("ROLLBACK").unwrap();
-        drop(blocker);
-        ctx.view_load_retry_due_for_test();
-        assert!(matches!(
-            ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
-            CallgraphStoreAccess::Ready(_)
-        ));
-        let ready = ctx.callgraph_view_read_diagnostics();
-        assert_eq!(ready.attempts, 3);
-        assert_eq!(ready.last_error, busy.last_error);
-        assert!(ready.total_attempt_ms >= ready.last_attempt_ms);
     }
 
     #[test]
@@ -16576,36 +16441,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn callgraph_build_wait_override_is_per_context_and_reaches_query_threads() {
-        let (_first_dirs, first) = cold_build_context();
-        let (_second_dirs, second) = cold_build_context();
-        let original = first.callgraph_build_wait_window();
-        let first_wait = callgraph_build_wait_ms(&first, 30_000);
-        let _second_wait = force_async_callgraph_builds(&second);
-
-        let query_ctx = Arc::clone(&first);
-        assert_eq!(
-            std::thread::spawn(move || query_ctx.callgraph_build_wait_window())
-                .join()
-                .expect("query thread"),
-            Duration::from_secs(30),
-            "another root's async policy must not change this root's query wait"
-        );
-        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
-        {
-            let _nested_wait = callgraph_build_wait_ms(&first, 50);
-            assert_eq!(
-                first.callgraph_build_wait_window(),
-                Duration::from_millis(50)
-            );
-        }
-        assert_eq!(first.callgraph_build_wait_window(), Duration::from_secs(30));
-        drop(first_wait);
-        assert_eq!(first.callgraph_build_wait_window(), original);
-        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
-    }
-
-    #[test]
     fn callgraph_cold_build_spawn_count_is_per_context() {
         let (_first_dirs, first) = cold_build_context();
         let (_second_dirs, second) = cold_build_context();
@@ -16900,54 +16735,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
-        let (_ctx_dirs, ctx) = cold_build_context();
-        let _wait_guard = force_async_callgraph_builds(&ctx);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.semantic_index_rx().lock() = Some(rx);
-        ctx.schedule_semantic_cold_seed_gate_for_configure();
-
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Building
-        ));
-        assert_eq!(
-            ctx.callgraph_cold_build_spawn_count_for_test(),
-            1,
-            "the semantic cold seed must not block callgraph admission"
-        );
-        tx.send(SemanticIndexEvent::Ready(empty_semantic_index_for_ctx(
-            &ctx,
-        )))
-        .expect("send ready event");
-
-        crate::runtime_drain::drain_semantic_index_events(&ctx);
-
-        assert!(
-            !ctx.semantic_cold_seed_active(),
-            "semantic Ready must clear the scheduled cold gate"
-        );
-        assert!(
-            ctx.tier2_pull_demand_pending(),
-            "semantic Ready must resume deferred Tier-2 work"
-        );
-        assert_eq!(
-            ctx.callgraph_cold_build_spawn_count_for_test(),
-            1,
-            "semantic Ready must not schedule a duplicate callgraph warm"
-        );
-        let rx = ctx
-            .callgraph_store_rx
-            .lock()
-            .as_ref()
-            .cloned()
-            .expect("callgraph warm should install an in-flight receiver");
-        rx.recv_timeout(Duration::from_secs(30))
-            .expect("background cold build should complete");
-        *ctx.callgraph_store_rx.lock() = None;
-    }
-
-    #[test]
     fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
         let (_ctx_dirs, ctx) = cold_build_context();
         let _wait_guard = force_async_callgraph_builds(&ctx);
@@ -17036,49 +16823,6 @@ mod callgraph_store_for_ops_tests {
         assert!(
             ctx.tier2_pull_demand_pending(),
             "clearing the semantic cold gate should kick a Tier-2 pull refresh"
-        );
-    }
-
-    #[test]
-    fn semantic_failed_event_clears_scheduled_gate_and_requests_tier2_pull() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.semantic_index_rx().lock() = Some(rx);
-        ctx.schedule_semantic_cold_seed_gate_for_configure();
-        tx.send(SemanticIndexEvent::Failed(
-            "embedding backend failed".to_string(),
-        ))
-        .expect("send failed event");
-
-        crate::runtime_drain::drain_semantic_index_events(&ctx);
-
-        assert!(
-            !ctx.semantic_cold_seed_active(),
-            "semantic Failed must clear the scheduled cold gate"
-        );
-        assert!(
-            ctx.tier2_pull_demand_pending(),
-            "semantic Failed must resume deferred Tier-2 work"
-        );
-    }
-
-    #[test]
-    fn semantic_disconnect_clears_scheduled_gate_and_requests_tier2_pull() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
-        *ctx.semantic_index_rx().lock() = Some(rx);
-        ctx.schedule_semantic_cold_seed_gate_for_configure();
-        drop(tx);
-
-        crate::runtime_drain::drain_semantic_index_events(&ctx);
-
-        assert!(
-            !ctx.semantic_cold_seed_active(),
-            "semantic worker disconnect must clear the scheduled cold gate"
-        );
-        assert!(
-            ctx.tier2_pull_demand_pending(),
-            "semantic worker disconnect must resume deferred Tier-2 work"
         );
     }
 
@@ -17211,34 +16955,6 @@ mod callgraph_store_for_ops_tests {
             Some(Tier2TriggerReason::ConfigureWarm),
             "the held scan must dispatch as soon as the callgraph build completes"
         );
-    }
-
-    #[test]
-    fn callgraph_corpus_retry_restarts_inventory_changes_but_not_lookup_bugs() {
-        let mut attempts = 0;
-        let result = retry_changed_callgraph_corpus(|| {
-            attempts += 1;
-            if attempts == 1 {
-                Err(CallGraphStoreError::CorpusInventoryChanged(None))
-            } else {
-                Ok("fresh inventory")
-            }
-        });
-        assert_eq!(result.unwrap(), "fresh inventory");
-        assert_eq!(attempts, 2);
-
-        let mut attempts = 0;
-        let result: std::result::Result<(), _> = retry_changed_callgraph_corpus(|| {
-            attempts += 1;
-            Err(CallGraphStoreError::CorpusSnapshotMissing(PathBuf::from(
-                "missing.rs",
-            )))
-        });
-        assert!(matches!(
-            result,
-            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
-        ));
-        assert_eq!(attempts, 1);
     }
 
     fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
@@ -18568,59 +18284,6 @@ mod view_load_health_tests {
             view_load_cause("lexical source deliberately refused"),
             "other"
         );
-    }
-
-    #[test]
-    fn view_load_failure_marks_project_degraded_until_a_successful_load() {
-        let ctx = ctx();
-        let root = Path::new("/tmp/view-load-health-test");
-        let snapshot = ctx.try_health_snapshot(root);
-        assert!(snapshot.view_load_failures.is_empty());
-        assert!(snapshot.view_load_failure_last.is_none());
-        assert!(!degraded(&ctx));
-
-        let ((), lines) = crate::logging::capture_log_lines(|| {
-            ctx.note_view_load_failure("trigram", "lexical source deliberately refused");
-        });
-        assert_eq!(
-            lines.len(),
-            1,
-            "one error line per minute per plane: {lines:?}"
-        );
-        assert!(lines[0].starts_with("ERROR "), "{lines:?}");
-        for part in [
-            "plane=trigram",
-            "cause=other",
-            "suppressed=0",
-            "deliberately refused",
-        ] {
-            assert!(lines[0].contains(part), "{lines:?}");
-        }
-        assert!(degraded(&ctx));
-
-        // A repeat inside the minute is counted but not logged again.
-        let ((), repeat_lines) = crate::logging::capture_log_lines(|| {
-            ctx.note_view_load_failure("trigram", "lexical source deliberately refused");
-        });
-        assert!(repeat_lines.is_empty(), "{repeat_lines:?}");
-        assert_eq!(ctx.view_load_suppressed_for_test("trigram"), 1);
-        assert!(degraded(&ctx));
-
-        // A later successful load clears the flag but keeps the history.
-        ctx.note_view_load_success("trigram");
-        assert!(!degraded(&ctx));
-        let snapshot = ctx.try_health_snapshot(root);
-        assert_eq!(snapshot.view_load_failures.get("trigram:other"), Some(&2));
-        let last = snapshot
-            .view_load_failure_last
-            .as_ref()
-            .expect("last failure kept");
-        assert_eq!(last.plane, "trigram");
-        assert_eq!(last.cause, "other");
-        assert_eq!(last.count, 2);
-        assert_eq!(last.total, 2);
-        assert!(last.error.contains("deliberately refused"));
-        assert!(last.last_at_ms > 0);
     }
 
     #[test]

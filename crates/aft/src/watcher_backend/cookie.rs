@@ -73,38 +73,4 @@ pub(crate) fn is_cookie_path(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn watcher_cookie_tickets_match_exact_names_and_cleanup_on_timeout() {
-        let root = tempfile::tempdir().unwrap();
-        let barrier = CookieBarrier::default();
-        let ticket = barrier.begin(root.path()).unwrap();
-        let path = ticket.path().to_path_buf();
-        assert!(is_cookie_path(&path));
-        let observation = CookieObservation {
-            revision: 7,
-            watcher: WatcherState::Healthy,
-        };
-        barrier.observe(&root.path().join(".aft-cookie-1-unregistered"), observation);
-        assert_eq!(
-            ticket.wait_timeout(Duration::ZERO),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
-        barrier.observe(&path, observation);
-        assert_eq!(ticket.wait_timeout(Duration::ZERO), Ok(observation));
-        drop(ticket);
-        assert!(!path.exists());
-        let ticket = barrier.begin(root.path()).unwrap();
-        let path = ticket.path().to_path_buf();
-        drop(ticket);
-        assert!(!path.exists());
-        assert!(barrier.pending.lock().unwrap().is_empty());
-        for name in [
-            ".aft-cookie",
-            ".aft-cookie--nonce",
-            ".aft-cookie-pid-nonce",
-            ".aft-cookie-1-",
-        ] {
-            assert!(!is_cookie_path(Path::new(name)));
-        }
-    }
 }

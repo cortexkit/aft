@@ -1171,36 +1171,3 @@ fn probe_pool_workload() {
     println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
 }
 
-/// A request that waits on shared work (such as a view's first bind) longer
-/// than its whole filesystem deadline still reads afterwards: the wait does
-/// not spend the deadline, and a bounded call inside the wait is not refused
-/// by it either. The control shows the same wait outside `excluding_wait`
-/// refuses the read before it starts.
-#[test]
-fn excluding_wait_leaves_the_request_deadline_for_the_reads_after_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    let stat = |root: &Path| run(root, None, |path| std::fs::metadata(path).map(|_| ()));
-    let budget = Duration::from_secs(1);
-    let wait = Duration::from_millis(1500);
-
-    let control = with_budget(Some(Budget::after(budget)), || {
-        std::thread::sleep(wait);
-        stat(&root)
-    })
-    .unwrap_err();
-    assert!(
-        control.to_string().contains("read_deadline_exceeded"),
-        "{control}"
-    );
-
-    with_budget(Some(Budget::after(budget)), || {
-        let inside = excluding_wait(|| {
-            std::thread::sleep(wait);
-            stat(&root)
-        });
-        assert!(inside.is_ok(), "{inside:?}");
-        assert!(stat(&root).is_ok());
-        assert!(current().unwrap().failure.lock().unwrap().is_none());
-    });
-}

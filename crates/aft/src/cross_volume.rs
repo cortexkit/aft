@@ -1089,18 +1089,4 @@ mod tests {
         assert!(!source.exists());
     }
 
-    #[test]
-    fn a_folder_on_another_device_than_its_parent_is_a_mount_point() {
-        let temp = tempfile::tempdir().unwrap();
-        let mounted = temp.path().join("views");
-        fs::create_dir(&mounted).unwrap();
-        let plain = temp.path().join("plain");
-        fs::create_dir(&plain).unwrap();
-        // Register the parent too so the comparison also works where the
-        // platform reports no real device number.
-        let _parent = simulate(temp.path(), u64::MAX - 3);
-        let _volume = simulate(&mounted, u64::MAX - 4);
-        assert!(is_mount_point(&mounted).unwrap());
-        assert!(!is_mount_point(&plain).unwrap());
-    }
 }

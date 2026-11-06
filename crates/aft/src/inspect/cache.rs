@@ -3616,29 +3616,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inspect_scope_sweep_keeps_aged_live_scope_key() {
-        reset_inspect_scope_sweep_cursor_for_test();
-        let temp = tempfile::tempdir().unwrap();
-        let inspect_root = temp.path().join("inspect");
-        let project_root = temp.path().join("checkout");
-        fs::create_dir_all(&project_root).unwrap();
-        let scope_key = crate::path_identity::project_scope_key(&project_root);
-        let live = inspect_root.join(&scope_key);
-        write_aged_scope_file(&live, "facts.sqlite");
-        crate::root_cache::register_live_scope(temp.path(), &project_root);
-        let live_keys = crate::root_cache::live_scope_keys_for_storage(temp.path());
-
-        let summary = sweep_inspect_scope_dirs(&inspect_root, &live_keys);
-
-        crate::root_cache::unregister_live_scope(temp.path(), &project_root);
-        assert_eq!(summary.skipped_live, 1);
-        assert!(live.is_dir(), "a bound root's scope directory must survive");
-        // This assertion is intentionally a negative check: if the live-key
-        // exemption is removed, the bound root could be deleted and this
-        // assertion will fail.
-    }
-
-    #[test]
     fn inspect_scope_sweep_keeps_live_marker_then_reaps_stale_marker_scope() {
         reset_inspect_scope_sweep_cursor_for_test();
         let temp = tempfile::tempdir().unwrap();

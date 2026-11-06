@@ -209,40 +209,6 @@ fn edit(store: &CallGraphStore, source: &Path, name: &str) {
 }
 
 #[test]
-fn s2_connection_roles_keep_their_checkpoint_thresholds() {
-    let (_temp, store, source) = fixture();
-    let ordinary = TrackedConnection::open_in_memory(SqliteStore::CallgraphGeneration).unwrap();
-    configure_connection(&ordinary).unwrap();
-    assert_eq!(ordinary.wal_autocheckpoint_pages(), 4000);
-    let build = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
-    configure_build_connection(&build).unwrap();
-    assert_eq!(
-        build.wal_autocheckpoint_pages(),
-        crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES
-    );
-    let views = Connection::open_in_memory().unwrap();
-    crate::views::materialization::configure_materialization_connection(&views).unwrap();
-    assert_eq!(
-        views
-            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-    edit(&store, &source, "after");
-    let conn = store.conn.lock().unwrap();
-    assert_eq!(
-        conn.wal_autocheckpoint_pages(),
-        0,
-        "only the refresh writer disables autocheckpoint"
-    );
-    assert_eq!(
-        conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-}
-
-#[test]
 fn s2_non_refresh_writer_still_autocheckpoints_at_4000_pages() {
     let temp = tempfile::tempdir().unwrap();
     let raw = open_counted(&temp.path().join("ordinary.sqlite"), OpenFlags::default());

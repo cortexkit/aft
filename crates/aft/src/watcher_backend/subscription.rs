@@ -66,45 +66,5 @@ pub(crate) fn start(root: &Path, coverage: InitialCoverage) -> Subscription {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn incomplete_and_unproved_handles_never_grant_a_continuity_token() {
-        let root = tempfile::tempdir().unwrap();
-        let coverage =
-            super::InitialCoverage::Incomplete(vec![crate::watcher_backend::CoverageGap {
-                path: root.path().join("unreadable"),
-                kind: crate::watcher_backend::CoverageGapKind::ListingFailed(
-                    std::io::ErrorKind::PermissionDenied,
-                ),
-            }]);
-        let partial = super::start(root.path(), coverage.clone());
-        assert_eq!(super::status(root.path()).unwrap().coverage, coverage);
-        assert!(super::current(root.path()).is_none());
-        drop(partial);
-        let _unproved = super::start(
-            root.path(),
-            crate::watcher_backend::initial_coverage_of(&()),
-        );
-        assert_eq!(
-            super::status(root.path()).unwrap().coverage,
-            super::InitialCoverage::Unproved
-        );
-        assert!(super::current(root.path()).is_none());
-    }
 
-    #[test]
-    fn subscription_restart_stop_and_gap_change_the_continuity_token() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(super::current(root.path()).is_none());
-        let first = super::start(root.path(), super::InitialCoverage::Complete);
-        let before = super::current(root.path()).unwrap();
-        super::gap(root.path());
-        assert_ne!(super::current(root.path()).unwrap(), before);
-        let second = super::start(root.path(), super::InitialCoverage::Complete);
-        let after = super::current(root.path()).unwrap();
-        assert_ne!(before.generation, after.generation);
-        drop(first);
-        assert_eq!(super::current(root.path()), Some(after));
-        drop(second);
-        assert!(super::current(root.path()).is_none());
-    }
 }

@@ -123,27 +123,6 @@ fn requested_scopes(
         .collect()
 }
 
-#[cfg(test)]
-#[test]
-fn artifact_read_parent_inspect_scope() {
-    crate::access_policy_tests::assert_artifact_read_policy(
-        |req, ctx| {
-            let config = ctx.config();
-            let parent = super::engine::tests::session(
-                config.project_root.as_deref().unwrap(),
-                config.storage_dir.as_deref().unwrap(),
-            );
-            drop(config);
-            match requested_scopes(req, ctx, &parent) {
-                Ok(_) => Response::success(&req.id, serde_json::json!({})),
-                Err(response) => response,
-            }
-        },
-        "inspect",
-        |path| serde_json::json!({"scope": path}),
-    );
-}
-
 pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {
     let scopes = match requested_scopes(req, ctx, session) {
         Ok(scopes) => scopes,

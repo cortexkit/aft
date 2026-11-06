@@ -762,7 +762,9 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
     if reopen_epoch.is_some() {
         drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            match CallGraphStore::reopen_readonly(ctx.callgraph_store_dir(), project_root) {
+            // Today's call-graph store is retired: no build publishes one.
+            let _ = project_root;
+            match Ok::<Option<aft::callgraph_store::ReadonlyCallGraphStore>, aft::callgraph_store::CallGraphStoreError>(None) {
                 Ok(Some(store)) => reopened = Some(std::sync::Arc::new(store)),
                 Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
                 _ => {}

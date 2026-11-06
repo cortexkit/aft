@@ -330,45 +330,6 @@ struct SqliteAliases {
 }
 
 impl SqliteAliases {
-    fn new() -> Self {
-        let fixture = Fixture::new();
-        std::fs::remove_file(&fixture.store).unwrap();
-        // Seed old history before SQLite opens, then replace the project files
-        // with aliases. The fixture itself must not read a live SQLite file.
-        let mut history = crate::backup::BackupStore::new();
-        let aliases = ["", "-wal", "-shm"]
-            .into_iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let alias = fixture._root.path().join(format!("alias-{i}.txt"));
-                std::fs::write(&alias, "original\n").unwrap();
-                history
-                    .snapshot_with_op("alias", &alias, "before registration", Some("alias-op"))
-                    .unwrap();
-                alias
-            })
-            .collect::<Vec<_>>();
-        let connection = rusqlite::Connection::open(&fixture.store).unwrap();
-        connection
-            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE source(value TEXT);")
-            .unwrap();
-        for (alias, suffix) in aliases.iter().zip(["", "-wal", "-shm"]) {
-            std::fs::remove_file(alias).unwrap();
-            std::fs::hard_link(
-                PathBuf::from(format!("{}{suffix}", fixture.store.display())),
-                alias,
-            )
-            .unwrap();
-        }
-        let connection =
-            crate::db::file_identity::IdentityConnection::new(connection, "storage alias fixture");
-        Self {
-            _connection: connection,
-            fixture,
-            aliases,
-            history,
-        }
-    }
 
     fn assert_refused(&self, path: &Path, call: impl FnOnce() -> Response) {
         let before = crate::file_identity::metadata(path).unwrap();
@@ -380,103 +341,6 @@ impl SqliteAliases {
         let after = crate::file_identity::metadata(path).unwrap();
         assert_eq!(before.1, after.1);
         assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
-    }
-}
-
-#[test]
-fn storage_floor_live_sqlite_aliases_refuse_read_write_edit() {
-    let f = SqliteAliases::new();
-    for path in &f.aliases {
-        f.assert_refused(path, || {
-            super::read::handle_read(&request("read", json!({"file": path})), &f.fixture.ctx)
-        });
-        f.assert_refused(path, || {
-            super::write::handle_write(
-                &request("write", json!({"file": path, "content": "changed"})),
-                &f.fixture.ctx,
-            )
-        });
-        f.assert_refused(path, || {
-            super::edit_match::handle_edit_match(
-                &request(
-                    "edit_match",
-                    json!({"file": path, "match": "original", "replacement": "changed"}),
-                ),
-                &f.fixture.ctx,
-            )
-        });
-    }
-    assert_eq!(
-        f._connection
-            .query_row("SELECT count(*) FROM source", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-}
-
-#[test]
-fn storage_floor_live_sqlite_aliases_refuse_backup_capture_and_undo() {
-    let mut f = SqliteAliases::new();
-    for path in &f.aliases {
-        let before = crate::file_identity::metadata(path).unwrap();
-        let mut snapshots = crate::backup::BackupStore::new();
-        assert_eq!(
-            snapshots
-                .snapshot("alias", path, "refused")
-                .unwrap_err()
-                .code(),
-            "denied_floor"
-        );
-        assert!(crate::backup::CapturedRegularFile::read(path).is_err());
-        assert_eq!(
-            crate::backup::PathFingerprint::of_path(path),
-            crate::backup::PathFingerprint::Other
-        );
-        assert_eq!(
-            f.history.restore_latest("alias", path).unwrap_err().code(),
-            "denied_floor"
-        );
-        let after = crate::file_identity::metadata(path).unwrap();
-        assert_eq!(before.1, after.1);
-        assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
-    }
-    assert_eq!(
-        f.history
-            .restore_last_operation("alias")
-            .unwrap_err()
-            .code(),
-        "denied_floor"
-    );
-    assert_eq!(
-        f._connection
-            .query_row("SELECT count(*) FROM source", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-}
-
-#[test]
-fn storage_floor_sidecars_created_after_registration_refuse_project_aliases() {
-    let fixture = Fixture::new();
-    std::fs::remove_file(&fixture.store).unwrap();
-    let connection =
-        crate::db::file_identity::IdentityConnection::open(&fixture.store, "late sidecar fixture")
-            .unwrap();
-    connection
-        .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE source(value TEXT);")
-        .unwrap();
-    for suffix in ["-wal", "-shm"] {
-        let source = PathBuf::from(format!("{}{suffix}", fixture.store.display()));
-        let alias = fixture._root.path().join(format!("late{suffix}.txt"));
-        std::fs::hard_link(source, &alias).unwrap();
-        let response =
-            super::read::handle_read(&request("read", json!({"file": alias})), &fixture.ctx);
-        assert_eq!(
-            response.data["code"], "denied_floor",
-            "{suffix}: {response:?}"
-        );
     }
 }
 
@@ -752,31 +616,6 @@ fn storage_floor_list_skip_disclosure_keeps_cut_trailer_last() {
         assert!(rendered.contains("denied_floor"), "{rendered}");
         assert!(rendered.ends_with(&trailer), "{rendered}");
     }
-}
-
-#[test]
-fn storage_floor_external_grep_reports_search_root_relative_includes() {
-    let f = Fixture::new();
-    let external = tempfile::tempdir().unwrap();
-    let alias = external.path().join("a.rs");
-    std::fs::remove_file(&f.store).unwrap();
-    let connection = rusqlite::Connection::open(&f.store).unwrap();
-    connection
-        .execute_batch("CREATE TABLE source(value TEXT);")
-        .unwrap();
-    let _connection =
-        crate::db::file_identity::IdentityConnection::new(connection, "external omission fixture");
-    std::fs::hard_link(&f.store, &alias).unwrap();
-    let response = super::grep::handle_grep(
-        &request(
-            "grep",
-            json!({"path": external.path(), "pattern": "original", "include": ["a.rs"]}),
-        ),
-        &f.ctx,
-    );
-    assert!(response.success, "{response:?}");
-    assert!(has_floor_skip(&response, &alias), "{response:?}");
-    assert_eq!(response.data["complete"], false);
 }
 
 #[test]

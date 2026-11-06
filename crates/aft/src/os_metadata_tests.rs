@@ -78,25 +78,7 @@ fn glob_all(root: &Path, use_index: bool) -> Vec<String> {
         .collect()
 }
 
-fn semantic_walk(root: &Path) -> Vec<PathBuf> {
-    let filters = crate::search_index::build_path_filters(&[], &[]).expect("filters");
-    crate::search_index::walk_project_files_bounded_matching(
-        root,
-        &filters,
-        1_000,
-        crate::semantic_index::is_semantic_indexed_extension,
-    )
-    .expect("walk within limit")
-}
 
-fn semantic_entry_count(root: &Path) -> usize {
-    let files = semantic_walk(root);
-    let mut embed =
-        |texts: Vec<String>| Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5]).collect());
-    crate::semantic_index::SemanticIndex::build(root, &files, &mut embed, 16)
-        .expect("semantic build")
-        .entry_count()
-}
 
 #[test]
 fn matches_exact_metadata_names_only() {
@@ -132,25 +114,6 @@ fn matches_exact_metadata_names_only() {
 }
 
 #[test]
-fn metadata_only_folder_indexes_and_globs_nothing() {
-    let (_dir, root) = fixture(&METADATA_ONLY);
-
-    assert_eq!(
-        SearchIndex::build(&root).file_count(),
-        0,
-        "search index files"
-    );
-    assert_eq!(semantic_entry_count(&root), 0, "semantic entries");
-    assert_eq!(glob_all(&root, true), Vec::<String>::new(), "indexed glob");
-    assert_eq!(glob_all(&root, false), Vec::<String>::new(), "walked glob");
-    assert_eq!(
-        crate::callgraph::walk_project_files(&root).count(),
-        0,
-        "callgraph walk"
-    );
-}
-
-#[test]
 fn nested_metadata_files_are_skipped_at_any_depth() {
     // Windows forbids `\r` in file names, so the macOS folder-icon file can
     // only be created on Unix; the name check itself is covered on every
@@ -163,36 +126,6 @@ fn nested_metadata_files_are_skipped_at_any_depth() {
 
     assert_eq!(SearchIndex::build(&root).file_count(), 0);
     assert_eq!(glob_all(&root, false), Vec::<String>::new());
-}
-
-#[test]
-fn source_file_beside_metadata_is_still_indexed() {
-    let mut files = METADATA_ONLY.to_vec();
-    files.push("src/lib.rs");
-    let (_dir, root) = fixture(&files);
-
-    assert_eq!(
-        SearchIndex::build(&root).file_count(),
-        1,
-        "search index files"
-    );
-    assert!(semantic_entry_count(&root) > 0, "semantic entries");
-    assert_eq!(glob_all(&root, true), vec!["src/lib.rs".to_string()]);
-    assert_eq!(glob_all(&root, false), vec!["src/lib.rs".to_string()]);
-    assert_eq!(
-        crate::callgraph::walk_project_files(&root).collect::<Vec<_>>(),
-        vec![root.join("src/lib.rs")]
-    );
-}
-
-#[test]
-fn apple_double_companion_of_a_source_file_is_not_semantically_indexed() {
-    // An AppleDouble file keeps its companion's extension, so the semantic
-    // walk's extension filter alone would let `._lib.rs` through.
-    let (_dir, root) = fixture(&["src/lib.rs", "src/._lib.rs"]);
-
-    assert_eq!(semantic_walk(&root), vec![root.join("src/lib.rs")]);
-    assert_eq!(SearchIndex::build(&root).file_count(), 1);
 }
 
 #[test]

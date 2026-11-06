@@ -37,16 +37,10 @@ use crate::callgraph_store::{
 use crate::cold_build_limiter;
 use crate::config::Config;
 
-#[cfg(test)]
-use crate::views::read::{record_checkout_view_refusal, take_checkout_view_refusal};
-
-// Recording and message formatting compile only in tests; the fallible reads
-// below still return None on exactly the same branches in production.
+// A checkout view's refusal reasons were recorded only by tests of the
+// retired views store; the reads below return None on the same branches.
 macro_rules! note_checkout_view_refusal {
-    ($($arg:tt)*) => {
-        #[cfg(test)]
-        record_checkout_view_refusal(format!($($arg)*));
-    };
+    ($($arg:tt)*) => {};
 }
 
 macro_rules! checkout_view_some {

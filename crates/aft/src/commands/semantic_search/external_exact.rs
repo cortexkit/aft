@@ -911,41 +911,6 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_files_are_answered_by_the_index_and_changed_files_are_read() {
-        let project = identifier_project();
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        // Build the index while `src/late.ts` holds no searched term, then add
-        // the identifier to it, so the index is stale for that one file.
-        let late = root.join("src/late.ts");
-        std::fs::write(&late, "export const placeholder = 1\n").unwrap();
-        let index = {
-            let mut index = SearchIndex::build(&root);
-            index.set_ready(true);
-            index
-        };
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&late, "use(requireCredentialStamps)\n// grown\n").unwrap();
-
-        let outcome = sweep(&root, &terms(), Some(&index), false, far_deadline());
-        let files = hit_files(&outcome, &root);
-
-        assert!(files.contains(&"src/late.ts".to_string()), "{files:?}");
-        assert_eq!(files.len(), 8, "{files:?}");
-        assert!(outcome.used_index);
-        assert!(
-            outcome.index_answered > 0,
-            "unchanged files without the identifier are ruled out by the index"
-        );
-        assert!(outcome.files_read < outcome.files_checked);
-        assert!(outcome.fully_covered());
-        let line = outcome.coverage_line(&root);
-        assert!(
-            line.contains("this project's own AFT index answered"),
-            "{line}"
-        );
-    }
-
-    #[test]
     fn files_are_searched_source_first_then_text_then_data() {
         let root = Path::new("/repo");
         let mut files: Vec<(FileClass, PathBuf)> = [

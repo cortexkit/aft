@@ -233,49 +233,6 @@ pub(crate) fn assert_current_graph(conn: &Connection) {
 }
 
 #[test]
-fn s4_upgrade_views_off_generation_and_legacy_refresh() {
-    for legacy in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        fs::create_dir(&root).unwrap();
-        let file = root.join("fixture.ts");
-        fs::write(
-            &file,
-            "export class C { unique() {} }\nexport function caller(x) { x.unique(); }\n",
-        )
-        .unwrap();
-        let dir = temp.path().join("store");
-        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
-        with_pre_s4_project(&root, || store.cold_build(std::slice::from_ref(&file))).unwrap();
-        let path = store.sqlite_path.clone();
-        let key = store.project_key.clone();
-        {
-            let conn = store.conn.lock().unwrap();
-            assert!(
-                conn.query_row("SELECT count(*) FROM dispatch_hints", [], |r| r
-                    .get::<_, usize>(0))
-                    .unwrap()
-                    > 0
-            );
-            stamp_pre_s4(&conn, false);
-        }
-        drop(store);
-        if legacy {
-            fs::rename(&path, legacy_sqlite_path(&dir, &key)).unwrap();
-            let opened = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
-            assert!(!database_ready(&opened.conn.lock().unwrap()).unwrap());
-            assert!(opened.refresh_files(std::slice::from_ref(&file)).is_err());
-            drop(opened);
-        }
-        let (store, _) =
-            CallGraphStore::ensure_built_with_lease(dir, root, &[file.clone()]).unwrap();
-        store.refresh_files(&[file]).unwrap();
-        assert_current_graph(&store.conn.lock().unwrap());
-        assert!(!store.edge_snapshot().unwrap().is_empty());
-    }
-}
-
-#[test]
 fn s4_upgrade_unversioned_staging_extracting_and_ready_are_removed() {
     for phase in ["extracting", "ready"] {
         let temp = tempfile::tempdir().unwrap();
@@ -330,56 +287,6 @@ pub(crate) fn with_pre_s4_project<T>(root: &Path, run: impl FnOnce() -> T) -> T 
 pub(crate) fn seed_old_dispatch_hint(conn: &Connection) {
     conn.execute("INSERT INTO dispatch_hints SELECT 'pre-s4-hint', 'unique', id, file_path, start_line, 0, 0, 'treesitter' FROM nodes ORDER BY id LIMIT 1", []).unwrap();
     assert!(conn.query_row("SELECT count(*) FROM dispatch_hints WHERE caller_node NOT LIKE 'pos:symbol:%' AND caller_node NOT LIKE 'vp%' AND caller_node NOT LIKE 'vt%'", [], |r| r.get::<_,usize>(0)).unwrap()>0);
-}
-
-#[test]
-fn s4_upgrade_old_legacy_single_file_and_superseded_generation_are_not_migrated() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let file = root.join("fixture.ts");
-    fs::write(
-        &file,
-        "export class C { unique() {} }\nexport function caller(x) { x.unique(); }\n",
-    )
-    .unwrap();
-    let storage = temp.path().join("storage");
-    let legacy_dir = storage.join("opencode/callgraph");
-    let build_dir = temp.path().join("old-build");
-    let store = CallGraphStore::open(build_dir.clone(), root.clone()).unwrap();
-    with_pre_s4_project(&root, || store.cold_build(std::slice::from_ref(&file))).unwrap();
-    let path = store.sqlite_path.clone();
-    let key = store.project_key.clone();
-    stamp_pre_s4(&store.conn.lock().unwrap(), false);
-    drop(store);
-    fs::create_dir_all(&legacy_dir).unwrap();
-    let single = legacy_sqlite_path(&legacy_dir, &key);
-    fs::copy(&path, &single).unwrap();
-    let current = legacy_dir.join(path.file_name().unwrap());
-    fs::copy(&path, &current).unwrap();
-    fs::write(
-        pointer_path(&legacy_dir, &key),
-        current.file_name().unwrap().to_string_lossy().as_bytes(),
-    )
-    .unwrap();
-    let superseded = legacy_dir.join(format!("{key}.g1.1.sqlite"));
-    fs::copy(&path, &superseded).unwrap();
-    let old_bytes = fs::read(&superseded).unwrap();
-    let target = storage.join("callgraph").join(&key);
-    crate::root_cache::configure_artifact_access(&root, &key, false);
-    assert!(
-        CallGraphStore::migrate_legacy_with_lease(target.clone(), root.clone())
-            .unwrap()
-            .is_none()
-    );
-    let (store, stats) = CallGraphStore::ensure_built_with_lease(target, root, &[file]).unwrap();
-    assert!(
-        stats.is_some(),
-        "old migration sources must force a cold build"
-    );
-    assert_current_graph(&store.conn.lock().unwrap());
-    assert_eq!(fs::read(&superseded).unwrap(), old_bytes);
-    assert_eq!(fs::read(&single).unwrap(), old_bytes);
 }
 
 pub(crate) fn language_fixtures() -> [(&'static str, &'static str, &'static str); 33] {

@@ -172,7 +172,6 @@ fn start_embedding_server() -> String {
 }
 
 fn drain(ctx: &AppContext) {
-    aft::runtime_drain::drain_semantic_index_events(ctx);
     aft::runtime_drain::drain_callgraph_store_events(ctx);
 }
 

@@ -490,47 +490,5 @@ pub(super) mod tests {
     use crate::views::snapshot::{LiveDelta, OpenGeneration};
     use crate::views::RelPath;
 
-    pub(crate) fn session(root: &Path, storage: &Path) -> ParentSession {
-        ParentSession {
-            root: root.to_path_buf(),
-            storage: storage.to_path_buf(),
-            planes: RequestedPlanes {
-                trigram: true,
-                semantic: true,
-                callgraph: false,
-            },
-            semantic_config: Default::default(),
-            trigram_policy: crate::blob_store::v2::TrigramPolicy {
-                max_file_size: crate::config::Config::default().search_index_max_file_size,
-            },
-            view_routes: Default::default(),
-            discovery: RwLock::new(None),
-            children: RwLock::new(Vec::new()),
-            semantic: RwLock::new(Plane::Loading),
-            holders: Mutex::new(Vec::new()),
-            stop: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
-            rounds: AtomicUsize::new(0),
-            wake: (Mutex::new(false), Condvar::new()),
-            pointer_interval: Duration::from_secs(1),
-            backstop_interval: Duration::from_secs(1),
-        }
-    }
 
-    #[test]
-    fn artifact_read_parent_search() {
-        crate::access_policy_tests::assert_artifact_read_policy(
-            |req, ctx| {
-                let config = ctx.config();
-                let parent = session(
-                    config.project_root.as_deref().unwrap(),
-                    config.storage_dir.as_deref().unwrap(),
-                );
-                drop(config);
-                search(req, ctx, &parent)
-            },
-            "semantic_search",
-            |path| serde_json::json!({"query": "artifact", "path": path}),
-        );
-    }
 }

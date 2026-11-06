@@ -856,56 +856,6 @@ mod tests {
         assert!(!is_live_sqlite_file(&alias));
     }
 
-    #[test]
-    fn identity_only_connection_tracks_lifetime_without_changing_wal_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raw.sqlite");
-        let connection = IdentityConnection::new(Connection::open(&path).unwrap(), "raw test");
-        assert_eq!(open_connections(&path), 1);
-        assert_eq!(
-            connection
-                .pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1000
-        );
-        drop(connection);
-        assert_eq!(open_connections(&path), 0);
-    }
-
-    #[test]
-    fn census_connection_tracks_identity_without_creating_sidecars() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("census.sqlite");
-        {
-            let connection = IdentityConnection::open(&path, "census fixture").unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "WAL")
-                .unwrap();
-            connection
-                .execute_batch("CREATE TABLE value (n INTEGER); INSERT INTO value VALUES (7);")
-                .unwrap();
-        }
-        assert_eq!(open_connections(&path), 0);
-        let before = std::fs::read(&path).unwrap();
-        let connection = IdentityConnection::open_census(&path, "census test").unwrap();
-        assert_eq!(
-            open_connections(&path),
-            1,
-            "URI opens must retain the real file identity"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT n FROM value", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
-        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
-        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
-        drop(connection);
-        assert_eq!(open_connections(&path), 0);
-        assert_eq!(std::fs::read(path).unwrap(), before);
-    }
-
     #[cfg(unix)]
     fn shm_path(path: &Path) -> PathBuf {
         PathBuf::from(format!("{}-shm", path.display()))

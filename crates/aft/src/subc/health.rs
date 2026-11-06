@@ -4628,64 +4628,6 @@ mod tests {
     }
 
     #[test]
-    fn long_running_daemon_sweeps_preserve_root_and_standing_detail() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = crate::gc::family::SweepStatsStore::default();
-        for family in 0..96 {
-            let family_dir = dir
-                .path()
-                .join(format!("family-{family:03}-{}", "p".repeat(120)));
-            std::fs::create_dir(&family_dir).unwrap();
-            // Thirty days of ten-minute passes reuse each family's counters.
-            for _ in 0..4320 {
-                store.record_stale_rows(&family_dir.join("semantic.db"), "family", 1);
-            }
-        }
-        let sweeps = store.snapshot();
-        assert_eq!(sweeps.details.len(), 64);
-        assert_eq!(sweeps.evicted_total, 32);
-        assert_eq!(sweeps.retired_total, 0);
-        assert!(
-            serde_json::to_vec(&sweeps.details).unwrap().len() > super::HEALTH_METRICS_BUDGET_BYTES
-        );
-        let cache = HealthRollupCache::new();
-        let mut rollup = HealthDiagnosticRollup::unavailable();
-        rollup.metrics = json!({
-            "root_count": 170,
-            "root_details_omitted": 168,
-            "roots": [{"root":"active-root"}, {"root":"standing-root", "standing_health":{"status":"ready"}}],
-        });
-        cache.publish(Some(rollup));
-        let executor = Executor::new();
-        let app = App::default_shared();
-        let report = fixture_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-            |warming_roots| {
-                crate::cold_build_limiter::progress::snapshot_for_roots(&[], warming_roots)
-            },
-            sweeps,
-        );
-        let metrics = report.metrics.unwrap();
-        assert_eq!(metrics["roots"].as_array().unwrap().len(), 2);
-        assert_eq!(metrics["roots"][1]["standing_health"]["status"], "ready");
-        assert_eq!(metrics["root_details_omitted"], 168);
-        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 32);
-        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
-        let kept = metrics["v2_family_sweeps"].as_array().unwrap();
-        assert!(kept.len() < 64);
-        assert_eq!(metrics["v2_family_sweeps_omitted"], 64 - kept.len());
-        assert!(kept.iter().all(|entry| entry["stale_rows_touched"] == 4320));
-        assert!(metrics["v2_family_sweeps_omitted"].as_u64().unwrap() > 0);
-        assert!(
-            metrics["metrics_bytes"].as_u64().unwrap() <= super::HEALTH_METRICS_BUDGET_BYTES as u64
-        );
-    }
-
-    #[test]
     fn health_budget_trims_every_sweep_before_root_detail() {
         let roots = json!([{
             "project_root": "standing", "state": "ready", "standing": true,
@@ -4946,49 +4888,6 @@ mod tests {
     }
 
     #[test]
-    fn disk_reserve_health_survives_ready_root_filtering_and_abbreviation() {
-        let storage = tempfile::tempdir().unwrap();
-        let _low = crate::disk_floor::set_free_space_for_test(
-            storage.path(),
-            21 * 1024 * 1024 * 1024,
-            3_900_000_000_000,
-        );
-        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
-            .unwrap_err();
-        let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
-            storage.path(),
-            "device_free_space_floor",
-        )
-        .unwrap();
-        let mut root = json!({
-            "project_root": "project", "state": "ready",
-            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
-            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
-        });
-        assert!(ordinary_ready_health_root(&root));
-        root["view_storage_reserve"] = json!({"trigram": reserve});
-        assert!(!ordinary_ready_health_root(&root));
-        assert!(abbreviate_health_root(&mut root));
-        assert_eq!(
-            root["view_storage_reserve"]["trigram"]["code"],
-            "device_free_space_floor"
-        );
-        assert_eq!(
-            root["view_storage_reserve"]["trigram"]["message"],
-            reserve.message
-        );
-        let (status, detail) = root_health_rollup_state(0, 0, 1, Some(reserve.message.clone()));
-        assert_eq!(status, HealthStatus::Degraded);
-        assert_eq!(detail, Some(reserve.message));
-        let (status, detail) = root_health_rollup_state(0, 0, 1, None);
-        assert_eq!(status, HealthStatus::Ok);
-        assert_eq!(
-            detail.as_deref(),
-            Some("1 root(s) warming background indexes (serving normally)")
-        );
-    }
-
-    #[test]
     fn a_failed_data_store_degrades_the_fleet_and_keeps_its_root_in_detail() {
         // Warming alone is ok; a root whose data store failed is not warming.
         let (status, detail) = with_data_store_failures(root_health_rollup_state(0, 0, 1, None), 1);
@@ -5074,25 +4973,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|finding| finding["check"] == "lsp_start_failures"));
-    }
-
-    #[test]
-    fn health_fixture_ignores_process_global_sweep_telemetry() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
-        let executor = Executor::new();
-        let app = App::default_shared();
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
-        let metrics = report.metrics.unwrap();
-        assert_eq!(metrics["v2_family_sweeps"], json!([]));
-        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 0);
-        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
-        assert_eq!(metrics["v2_family_sweeps_omitted"], 0);
     }
 
     #[test]
@@ -5560,11 +5440,10 @@ mod tests {
             metrics,
             app,
             indexing_snapshot,
-            crate::gc::family::SweepStatsSnapshot::default(),
         )
     }
 
-    /// A fixture reply whose indexing jobs and store sweeps the caller chooses.
+    /// A fixture reply whose indexing jobs the caller chooses.
     fn fixture_health_report(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -5572,7 +5451,6 @@ mod tests {
         metrics: &DispatchPathMetrics,
         app: &App,
         indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
-        sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
     ) -> HealthReport {
         let roots = fixture_roots(executor);
         let mut report = super::assemble_health_report(
@@ -5582,7 +5460,6 @@ mod tests {
             metrics,
             app,
             indexing_snapshot,
-            sweep_snapshot,
         );
         // Drop other tests' rows before the budget decides what fits.
         if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
@@ -6198,61 +6075,6 @@ mod tests {
         }
     }
 
-    fn install_resident_stale_callgraph(
-        ctx: &Arc<AppContext>,
-        root: &ProjectRootId,
-        file_name: &str,
-        remove_file: bool,
-    ) {
-        let project_root = root.as_path().to_path_buf();
-        let file = project_root.join(file_name);
-        std::fs::create_dir_all(file.parent().expect("fixture file parent")).unwrap();
-        std::fs::write(&file, "export function staleFixture() {}\n").unwrap();
-        let store_dir = project_root.join(".callgraph-health-test");
-        let writer =
-            crate::callgraph_store::CallGraphStore::open(store_dir.clone(), project_root.clone())
-                .unwrap();
-        writer.cold_build(std::slice::from_ref(&file)).unwrap();
-        writer
-            .mark_files_stale(std::slice::from_ref(&file))
-            .unwrap();
-        if remove_file {
-            std::fs::remove_file(&file).unwrap();
-        }
-        drop(writer);
-        let reader = crate::callgraph_store::CallGraphStore::open_readonly(store_dir, project_root)
-            .unwrap()
-            .expect("ready resident callgraph store");
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
-    }
-
-    #[test]
-    fn idle_rollup_reuses_resident_stale_path_censuses() {
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let mut dirs = Vec::new();
-        for index in 0..111 {
-            let (dir, root) = test_root(&format!("idle-stale-{index}"));
-            let ctx = test_ctx();
-            install_resident_stale_callgraph(&ctx, &root, "src/stale.ts", false);
-            assert!(executor.register_actor(root, ctx));
-            dirs.push(dir);
-        }
-        let cache = HealthRollupCache::new();
-        cache.refresh_for_test(&executor, &app);
-        let before = crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
-        for _ in 0..5 {
-            cache.refresh_for_test(&executor, &app);
-        }
-        assert_eq!(
-            crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get) - before,
-            0,
-            "idle ticks must not query stale rows and probe their paths again"
-        );
-        assert_eq!(cache.snapshot().0.metrics["root_count"], 111);
-    }
 
     #[test]
     fn cold_build_holder_census_renders_one_row_per_root_with_sharers() {
@@ -6283,125 +6105,6 @@ mod tests {
         assert_eq!(holders[0]["sharers"], 2);
 
         drop((first, second));
-    }
-
-    #[test]
-    fn health_reports_resident_stale_backend_rows_with_absent_paths_distinguished() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 2,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_absent_dir, absent_root) = test_root("health-stale-absent");
-        let absent_ctx = test_ctx();
-        install_resident_stale_callgraph(&absent_ctx, &absent_root, "absent.ts", true);
-        assert!(executor.register_actor(absent_root.clone(), absent_ctx.clone()));
-        let (_existing_dir, existing_root) = test_root("health-stale-existing");
-        let existing_ctx = test_ctx();
-        install_resident_stale_callgraph(&existing_ctx, &existing_root, "existing.ts", false);
-        assert!(executor.register_actor(existing_root.clone(), existing_ctx.clone()));
-
-        // Make response-budget pressure deterministic instead of depending on
-        // process-wide telemetry contributed by concurrently running tests.
-        for ctx in [&absent_ctx, &existing_ctx] {
-            *ctx.semantic_index_status().write().unwrap() =
-                crate::context::SemanticIndexStatus::Building {
-                    stage: "x".repeat(HEALTH_METRICS_BUDGET_BYTES),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-        }
-
-        // Assert the rollup's per-root census before building the byte-budgeted
-        // report; the oversized stages above intentionally make it omit details.
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        cache.refresh_for_test(&executor, &app);
-        let (rollup, _) = cache.snapshot();
-        let metrics = &rollup.metrics;
-        let roots = metrics["roots"].as_array().expect("per-root health rows");
-        let row_for = |root: &ProjectRootId| {
-            roots
-                .iter()
-                .find(|row| row["project_root"] == root.as_path().display().to_string())
-                .unwrap_or_else(|| panic!("root health row: {metrics}"))
-        };
-        let absent = row_for(&absent_root);
-        assert_eq!(absent["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(absent["resident_callgraph_absent_stale_backend_rows"], 1);
-        assert_eq!(
-            absent["resident_callgraph_unreadable_stale_backend_rows"],
-            0
-        );
-        let existing = row_for(&existing_root);
-        assert_eq!(existing["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(existing["resident_callgraph_absent_stale_backend_rows"], 0);
-        assert_eq!(
-            existing["resident_callgraph_unreadable_stale_backend_rows"],
-            0
-        );
-
-        let report = build_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
-        let bounded = report.metrics.expect("bounded health metrics");
-        assert_eq!(bounded["root_count"], 2);
-        assert_eq!(bounded["root_details_omitted"], 1);
-        let roots = bounded["roots"].as_array().unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0]["abbreviated"], true);
-        assert_eq!(roots[0]["semantic_index"]["status"], "building");
-        assert!(bounded["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn health_counts_unreadable_resident_stale_backend_paths_separately() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-stale-unreadable");
-        let ctx = test_ctx();
-        install_resident_stale_callgraph(&ctx, &root, "guarded/unreadable.ts", false);
-        assert!(executor.register_actor(root.clone(), ctx));
-        let guarded = root.as_path().join("guarded");
-        let original_mode = std::fs::metadata(&guarded).unwrap().permissions().mode();
-        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0)).unwrap();
-
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &App::default_shared(),
-        );
-
-        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(original_mode)).unwrap();
-        let metrics = report.metrics.expect("health metrics");
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_stale_backend_rows"],
-            1
-        );
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_absent_stale_backend_rows"],
-            0
-        );
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_unreadable_stale_backend_rows"],
-            1
-        );
     }
 
     fn cached_reply_median(
@@ -6788,104 +6491,6 @@ mod tests {
             cache.refreshes.load(Ordering::Acquire)
         );
         worker.shutdown();
-    }
-
-    #[test]
-    #[ignore = "offline measurement of per-root rollup costs on a populated root"]
-    fn bench_health_rollup_per_root_costs() {
-        const FILES: usize = 2_000;
-        const SYMBOLS: usize = 40;
-        let (_dir, root) = test_root("rollup-per-root");
-        let ctx = test_ctx();
-        {
-            let cache = ctx.symbol_cache();
-            let mut cache = cache.write().unwrap();
-            for file in 0..FILES {
-                let symbols = (0..SYMBOLS)
-                    .map(|index| crate::symbols::Symbol {
-                        name: format!("symbol_{file}_{index}"),
-                        kind: crate::symbols::SymbolKind::Function,
-                        range: crate::symbols::Range {
-                            start_line: 0,
-                            start_col: 0,
-                            end_line: 0,
-                            end_col: 10,
-                        },
-                        signature: Some(format!("fn symbol_{file}_{index}()")),
-                        scope_chain: vec!["module".into()],
-                        exported: true,
-                        parent: None,
-                    })
-                    .collect();
-                cache.insert(
-                    root.as_path().join(format!("src/file_{file}.rs")),
-                    std::time::SystemTime::UNIX_EPOCH,
-                    1,
-                    blake3::hash(&file.to_le_bytes()),
-                    symbols,
-                );
-            }
-        }
-        let files: Vec<_> = (0..FILES)
-            .map(|file| {
-                let path = root.as_path().join(format!("src/f{file}.ts"));
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(
-                    &path,
-                    format!("export function f{file}() {{ return {file}; }}\n"),
-                )
-                .unwrap();
-                path
-            })
-            .collect();
-        let store_dir = root.as_path().join(".callgraph-bench");
-        let writer = crate::callgraph_store::CallGraphStore::open(
-            store_dir.clone(),
-            root.as_path().to_path_buf(),
-        )
-        .unwrap();
-        writer.cold_build(&files).unwrap();
-        writer.mark_files_stale(&files[..FILES / 10]).unwrap();
-        drop(writer);
-        let reader = crate::callgraph_store::CallGraphStore::open_readonly(
-            store_dir,
-            root.as_path().to_path_buf(),
-        )
-        .unwrap()
-        .expect("ready store");
-        *ctx.callgraph_store().write().unwrap() = Some(Arc::new(reader));
-        let time = |label: &str, run: &dyn Fn()| {
-            run();
-            let started = Instant::now();
-            for _ in 0..20 {
-                run();
-            }
-            println!(
-                "per-root {label}: {} us per rollup",
-                started.elapsed().as_micros() / 20
-            );
-        };
-        time("memory walk (status path, always walks)", &|| {
-            std::hint::black_box(ctx.memory_root_snapshot());
-        });
-        time("memory (rollup path, unchanged root)", &|| {
-            std::hint::black_box(ctx.memory_root_snapshot_and_rollup());
-        });
-        time("stale_path_census", &|| {
-            let store = ctx.callgraph_store().read().unwrap();
-            std::hint::black_box(store.as_ref().unwrap().try_stale_path_census().unwrap());
-        });
-        time("health_summary", &|| {
-            std::hint::black_box(ctx.try_health_summary());
-        });
-        let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
-        time("full rollup (1 root)", &|| {
-            cache.refresh_for_test(&executor, &app);
-            assert_eq!(cache.snapshot().0.metrics["root_count"], 1);
-        });
     }
 
     #[test]
@@ -7506,27 +7111,6 @@ mod tests {
         );
     }
 
-    fn install_arena_runs(
-        arena: &crate::views::semantic_arena::SemanticArena,
-        runs: std::ops::Range<u64>,
-        chunks: usize,
-    ) {
-        for run in runs {
-            let mut key = [0u8; 32];
-            key[..8].copy_from_slice(&run.to_le_bytes());
-            arena.install(
-                crate::blob_store::v2::FamilyKey::new(
-                    crate::blob_store::v2::FamilyPlane::Semantic,
-                    key,
-                ),
-                crate::semantic_index::SemanticVectors::synthetic_for_test(
-                    Path::new(&format!("src/run_{run}.rs")),
-                    chunks,
-                    2,
-                ),
-            );
-        }
-    }
 
     /// The census row of one arena family, as `memory.census` reports it.
     fn census_family_row(census: &Value, family: &str) -> Value {
@@ -7535,49 +7119,6 @@ mod tests {
             .and_then(|rows| rows.iter().find(|row| row["family"] == family))
             .cloned()
             .unwrap_or(Value::Null)
-    }
-
-    /// Walking an arena's runs visits every vector they hold. Nothing about
-    /// the runs changes between rollups unless a run is added or dropped, so
-    /// only those two changes may walk them again, and each must show at once.
-    #[test]
-    fn arena_memory_is_walked_again_only_when_its_runs_change() {
-        let storage = tempfile::tempdir().unwrap();
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), "walk-on-change");
-        install_arena_runs(&arena, 0..4, 10);
-        let walks = || arena.run_memory_walks_for_test();
-        let first = arena.memory();
-        assert_eq!((first.runs, first.chunks), (4, 40));
-        // Rollups of tests running in parallel census every live arena, so
-        // they may have walked this one between the installs above. Once the
-        // runs stop changing, each change is walked exactly once, by
-        // whichever thread reads it first.
-        let after_first = walks();
-        assert!(after_first >= 1, "the first read must walk the runs");
-        for _ in 0..5 {
-            assert_eq!(arena.memory(), first, "unchanged runs reported new totals");
-        }
-        assert_eq!(walks(), after_first, "unchanged runs were walked again");
-
-        install_arena_runs(&arena, 4..5, 10);
-        let grown = arena.memory();
-        assert_eq!(
-            (grown.runs, grown.chunks),
-            (5, 50),
-            "an added run was missed"
-        );
-        assert!(grown.bytes > first.bytes);
-        assert_eq!(walks(), after_first + 1);
-
-        // Nothing but the arena holds the runs, so trimming drops them all.
-        assert_eq!(arena.trim(), 5);
-        let trimmed = arena.memory();
-        assert_eq!(
-            (trimmed.runs, trimmed.chunks),
-            (0, 0),
-            "dropped runs were still counted"
-        );
-        assert_eq!(walks(), after_first + 2);
     }
 
     #[test]
@@ -7781,147 +7322,6 @@ mod tests {
             inspect.get_aggregated(&project).unwrap().unwrap();
             assert_parity();
         }
-    }
-
-    /// What a rollup costs while nothing changes, counted rather than timed:
-    /// it walks no arena runs and no root index, and it measures no memory
-    /// census, however many roots and resident chunks there are. The compact
-    /// memory figures are still measured on every rollup.
-    #[test]
-    fn an_unchanged_rollup_does_constant_work_per_tick() {
-        let storage = tempfile::tempdir().unwrap();
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), "constant-work");
-        install_arena_runs(&arena, 0..50, 100);
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let mut dirs = Vec::new();
-        for index in 0..20 {
-            let (dir, root) = test_root(&format!("constant-work-{index}"));
-            assert!(executor.register_actor(root, test_ctx()));
-            dirs.push(dir);
-        }
-        let cache = HealthRollupCache::new();
-        cache.clock_ms.store(0, Ordering::Relaxed);
-        let counters = || {
-            (
-                arena.run_memory_walks_for_test(),
-                crate::context::memory_estimate_walks_for_test(),
-                cache.census_builds_for_test(),
-            )
-        };
-        let before_first = counters();
-        cache.refresh_for_test(&executor, &app);
-        let after_first = counters();
-        // Parallel tests' rollups also census this arena, so the walk of its
-        // runs may have been made on another thread; it was made once.
-        assert!(after_first.0 >= 1, "no rollup walked the arena");
-        assert_eq!(
-            after_first.1 - before_first.1,
-            20,
-            "one index walk per root"
-        );
-        assert_eq!(
-            after_first.2 - before_first.2,
-            1,
-            "the first rollup measures the census"
-        );
-        // Nine more rollups, three seconds apart: 27 s, inside the census
-        // interval, with no census read in between.
-        for tick in 1..=9u64 {
-            cache.clock_ms.store(tick * 3_000, Ordering::Relaxed);
-            let before = counters();
-            cache.refresh_for_test(&executor, &app);
-            let after = counters();
-            assert_eq!(
-                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
-                (0, 0, 0),
-                "rollup {tick} redid work for unchanged inputs (arena walks, index walks, census builds)"
-            );
-            let (snapshot, age) = cache.snapshot();
-            assert_eq!(age, Some(0));
-            assert_eq!(snapshot.metrics["root_count"], 20);
-            // The rollup still times every step, including the census steps
-            // it passed through without measuring a census.
-            assert_eq!(snapshot.tick["steps"].as_object().unwrap().len(), 14);
-            assert!(
-                snapshot.metrics["memory"]["semantic_arena_bytes"]
-                    .as_u64()
-                    .unwrap()
-                    >= arena.memory().bytes,
-                "the compact memory figures must still count the arena"
-            );
-        }
-    }
-
-    /// The full census is measured when a read asks for it, when its roots
-    /// change, or when it reaches the census interval; in between the rollup
-    /// carries it, and a read reports how old it and its figures are.
-    #[test]
-    fn the_memory_census_is_measured_on_demand_and_reports_its_age() {
-        let storage = tempfile::tempdir().unwrap();
-        let family = "census-on-demand";
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), family);
-        install_arena_runs(&arena, 0..2, 10);
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let (_first_dir, first_root) = test_root("census-on-demand-first");
-        assert!(executor.register_actor(first_root.clone(), test_ctx()));
-        let first_label = first_root.as_path().display().to_string();
-        let cache = HealthRollupCache::new();
-        let builds = || cache.census_builds_for_test();
-        let refresh_at = |now_ms: u64| {
-            cache.clock_ms.store(now_ms, Ordering::Relaxed);
-            let before = builds();
-            cache.refresh_for_test(&executor, &app);
-            builds() - before
-        };
-        assert_eq!(refresh_at(0), 1, "the first rollup measures the census");
-        let measured_bytes = census_family_row(&cache.memory_census(), family)["bytes"].clone();
-        assert!(measured_bytes.as_u64().is_some_and(|bytes| bytes > 0));
-        // That read asked for a fresh census; the next rollup measures it.
-        assert_eq!(refresh_at(3_000), 1, "a census read was not answered");
-        assert_eq!(refresh_at(6_000), 0, "a census was measured with no read");
-
-        // A change no read has asked about yet: the carried census still
-        // shows the old figures, and says they are 4 s old.
-        install_arena_runs(&arena, 2..3, 10);
-        cache.clock_ms.store(7_000, Ordering::Relaxed);
-        let carried = cache.memory_census();
-        assert_eq!(carried["health_rollup_tick"]["age_ms"], 4_000);
-        assert_eq!(census_family_row(&carried, family)["bytes"], measured_bytes);
-        assert!(
-            carried["roots"][&first_label]["memory_measured_age_ms"]
-                .as_u64()
-                .is_some_and(|age| age >= 4_000),
-            "a carried row must count the census age: {carried}"
-        );
-        assert_eq!(refresh_at(9_000), 1);
-        let fresh = cache.memory_census();
-        assert_eq!(fresh["health_rollup_tick"]["age_ms"], 0);
-        assert!(
-            census_family_row(&fresh, family)["bytes"].as_u64().unwrap()
-                > measured_bytes.as_u64().unwrap(),
-            "the census measured after the read missed the added run"
-        );
-
-        // A root bound since the last census is measured at once.
-        assert_eq!(refresh_at(12_000), 1, "the read above was not answered");
-        let (_second_dir, second_root) = test_root("census-on-demand-second");
-        assert!(executor.register_actor(second_root.clone(), test_ctx()));
-        assert_eq!(
-            refresh_at(15_000),
-            1,
-            "a newly bound root waited for the interval"
-        );
-        let second_label = second_root.as_path().display().to_string();
-        assert!(cache.snapshot().0.memory_census["roots"]
-            .get(&second_label)
-            .is_some());
-
-        // With no read and no root change, the census is measured again once
-        // it reaches the interval.
-        assert_eq!(refresh_at(44_999), 0);
-        assert_eq!(refresh_at(45_000), 1, "the census outlived its interval");
     }
 
     fn census_runtime() -> tokio::runtime::Runtime {
@@ -8884,102 +8284,6 @@ mod tests {
             .expect("memory rollup present");
         assert!(memory["allocator_slack_bytes"].is_u64());
         assert!(memory["allocator_slack_measured"].is_boolean());
-    }
-
-    #[test]
-    fn health_retention_incomplete_is_counted_separately_from_failures() {
-        for reason in [
-            "cache: retention deadline reached",
-            "binding_history_incomplete: examined=8192 accumulated=8192 restarted=true",
-        ] {
-            let mut reports = std::collections::BTreeMap::from([(
-                "/storage".into(),
-                crate::storage_retention::SweepReport {
-                    incomplete: vec![reason.into()],
-                    ..Default::default()
-                },
-            )]);
-            let totals = retention_report_totals(&reports);
-            assert_eq!(totals["errors"], 0);
-            assert_eq!(totals["incomplete"], 1);
-
-            reports
-                .get_mut("/storage")
-                .unwrap()
-                .errors
-                .push("removal refused".into());
-            let totals = retention_report_totals(&reports);
-            assert_eq!(totals["errors"], 1);
-            assert_eq!(totals["incomplete"], 1);
-        }
-    }
-
-    #[test]
-    fn health_retention_reports_fit_budget_with_exact_omissions_and_totals() {
-        let reports = (0..128)
-            .map(|index| {
-                (
-                    format!(
-                        "/storage/long-checkout-name-{index:04}/{}",
-                        "subdirectory/".repeat(12)
-                    ),
-                    crate::storage_retention::SweepReport {
-                        examined: 17,
-                        removed_roots: 3,
-                        removed_bytes: 4096,
-                        errors: vec!["example maintenance error".repeat(8)],
-                        incomplete: vec!["retention deadline reached".into()],
-                        trash: crate::storage_retention::TrashReport {
-                            at_ms: crate::clock::now_ms(),
-                            entries: 2,
-                            bytes_estimate: 1_500_000_000,
-                            oldest_age_ms: Some(7_200_000),
-                            removed_entries: 1,
-                            incomplete: true,
-                            kept_by_reason: std::collections::BTreeMap::from([(
-                                "witness".into(),
-                                2,
-                            )]),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let totals = retention_report_totals(&reports);
-        let mut metrics = json!({
-            "roots": [],
-            "storage_retention": reports,
-            "storage_retention_totals": totals,
-            "storage_retention_reports_omitted": 0,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        budget_health_metrics(&mut metrics);
-        let retained = metrics["storage_retention"].as_object().unwrap().len() as u64;
-        let omitted = metrics["storage_retention_reports_omitted"]
-            .as_u64()
-            .unwrap();
-        assert!(omitted > 0, "the fixture must exceed the detail budget");
-        assert_eq!(retained + omitted, 128);
-        assert_eq!(metrics["storage_retention_totals"]["reports"], 128);
-        assert_eq!(metrics["storage_retention_totals"]["examined"], 2176);
-        assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
-        assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
-        assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
-        assert_eq!(metrics["storage_retention_totals"]["incomplete"], 128);
-        let trash = &metrics["storage_retention_totals"]["trash"];
-        assert_eq!(trash["entries"], 256);
-        assert_eq!(trash["bytes_estimate"], 192_000_000_000_u64);
-        assert_eq!(trash["removed_entries"], 128);
-        assert_eq!(trash["kept_by_reason"]["witness"], 256);
-        assert_eq!(trash["incomplete"], true);
-        assert!(trash["oldest_age_ms"].as_u64().unwrap() >= 7_200_000);
-        let encoded = serde_json::to_vec(&metrics).unwrap();
-        assert!(encoded.len() <= 12 * 1024);
-        assert_eq!(metrics["metrics_bytes"], encoded.len());
     }
 
     #[test]

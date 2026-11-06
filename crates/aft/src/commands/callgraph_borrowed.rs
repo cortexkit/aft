@@ -1134,23 +1134,8 @@ mod tests {
         );
     }
 
-    fn identity(content: &str) -> FileIdentity {
-        (
-            content.len() as u64,
-            cache_freshness::hash_bytes(content.as_bytes()),
-        )
-    }
 
-    fn unhashed(content: &str) -> FileIdentity {
-        (content.len() as u64, cache_freshness::zero_hash())
-    }
 
-    fn files(entries: &[(&str, FileIdentity)]) -> HashMap<String, FileIdentity> {
-        entries
-            .iter()
-            .map(|(path, identity)| (path.to_string(), *identity))
-            .collect()
-    }
 
     /// A checkout and an owner directory holding the given files.
     fn trees(
@@ -1169,123 +1154,6 @@ mod tests {
             }
         }
         (temp, checkout, owner)
-    }
-
-    #[test]
-    fn identical_files_never_count_even_when_one_side_never_hashed_them() {
-        let big = "x".repeat(64);
-        let (_temp, checkout, owner) = trees(
-            &[
-                ("src/a.ts", "a"),
-                ("src/big.ts", &big),
-                ("src/huge.ts", "huge"),
-            ],
-            &[],
-        );
-        // The graph hashed big.ts but the search index held it unindexed
-        // (too large for it), so its content is read from disk; huge.ts is
-        // past the graph's hash cap, so only sizes are compared.
-        let graph = files(&[
-            ("src/a.ts", identity("a")),
-            ("src/big.ts", identity(&big)),
-            ("src/huge.ts", unhashed("huge")),
-        ]);
-        let here = files(&[
-            ("src/a.ts", identity("a")),
-            ("src/big.ts", unhashed(&big)),
-            ("src/huge.ts", identity("huge")),
-            // Files the graph's walk never includes: no supported source
-            // type, a hidden path, the `.git` file that points a linked
-            // worktree at its git directory, or an always-skipped directory.
-            ("assets/blob.bin", unhashed("\0\x01")),
-            ("notes.txt", identity("notes")),
-            (".github/ci.ts", identity("ci")),
-            (".git", identity("gitdir: elsewhere")),
-            ("dist/out.ts", identity("built")),
-        ]);
-        assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
-            known(&[])
-        );
-    }
-
-    #[test]
-    fn edited_missing_and_new_source_files_each_count_once() {
-        let (_temp, checkout, owner) = trees(
-            &[
-                ("src/edited.ts", "new body"),
-                ("src/unhashed.ts", "other!"),
-                ("src/unindexed.ts", "on disk only"),
-                ("src/added.ts", "added here"),
-                ("src/rejected.ts", "same in both"),
-            ],
-            &[("src/rejected.ts", "same in both")],
-        );
-        let graph = files(&[
-            ("src/edited.ts", identity("old body")),
-            ("src/unhashed.ts", identity("origin")),
-            ("src/unindexed.ts", identity("on disk only")),
-            ("src/gone.ts", identity("deleted here")),
-            ("src/gone_unhashed.ts", unhashed("too big")),
-        ]);
-        let here = files(&[
-            ("src/edited.ts", identity("new body")),
-            // Same size as the graph's copy, different bytes on disk.
-            ("src/unhashed.ts", unhashed("other!")),
-            ("src/added.ts", identity("added here")),
-            // The graph lacks it, but the borrowed checkout holds the same
-            // content: the graph leaves it out there just as it would here.
-            ("src/rejected.ts", identity("same in both")),
-        ]);
-        // unindexed.ts is in the graph but has no record in this checkout's
-        // index; its file on disk is hashed instead and matches the graph.
-        assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
-            known(&[
-                "src/added.ts",
-                "src/edited.ts",
-                "src/gone.ts",
-                "src/gone_unhashed.ts",
-                "src/unhashed.ts",
-            ])
-        );
-    }
-
-    #[test]
-    fn a_new_file_counts_when_the_owner_is_unknown_and_reading_past_the_budget_is_incomplete() {
-        let (_temp, checkout, owner) = trees(
-            &[("src/a.ts", "aa"), ("src/b.ts", "bb")],
-            &[("src/a.ts", "aa")],
-        );
-        let here = files(&[("src/a.ts", identity("aa"))]);
-        assert_eq!(
-            compare_with_graph(&HashMap::new(), here, &checkout, None, 8, None),
-            known(&["src/a.ts"])
-        );
-        let graph = files(&[("src/a.ts", identity("aa")), ("src/b.ts", identity("bb"))]);
-        let here = files(&[("src/a.ts", unhashed("aa")), ("src/b.ts", unhashed("bb"))]);
-        assert_eq!(
-            compare_with_graph(&graph, here.clone(), &checkout, Some(&owner), 2, None),
-            known(&[])
-        );
-        // Past the budget the files found so far are kept, but the list is
-        // marked incomplete so that no count is reported from it.
-        assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 1, None),
-            DifferingFiles {
-                files: Vec::new(),
-                complete: false
-            }
-        );
-        let graph = files(&[("src/a.ts", identity("zz")), ("src/b.ts", identity("bb"))]);
-        let here = files(&[("src/a.ts", identity("aa")), ("src/b.ts", unhashed("bb"))]);
-        assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 0, None),
-            DifferingFiles {
-                files: vec!["src/a.ts".to_string()],
-                complete: false
-            }
-        );
     }
 
     fn known(paths: &[&str]) -> DifferingFiles {

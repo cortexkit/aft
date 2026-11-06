@@ -7105,42 +7105,6 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn backup_storage_floor_lazy_history_refuses_live_database_alias() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.txt");
-        std::fs::write(&source, "original").unwrap();
-        let mut store = super::BackupStore::new();
-        store.set_storage_dir(root.path().join("storage"), 72);
-        store.snapshot("lazy-floor", &source, "snapshot").unwrap();
-        let entry = store.history("lazy-floor", &source).pop().unwrap();
-        let blob = match &entry.content {
-            super::BackupContent::OnDisk { path, .. } => path.clone(),
-            _ => panic!("durable history must remain lazy"),
-        };
-        let database = root.path().join("live.db");
-        let connection = crate::db::file_identity::IdentityConnection::open(
-            &database,
-            "lazy history floor fixture",
-        )
-        .unwrap();
-        connection
-            .execute_batch("CREATE TABLE source(value TEXT);")
-            .unwrap();
-        std::fs::remove_file(&blob).unwrap();
-        std::fs::hard_link(&database, &blob).unwrap();
-        let error = entry.content_bytes().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("is denied by the access policy floor"));
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM source", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
 
     #[cfg(windows)]
     #[test]

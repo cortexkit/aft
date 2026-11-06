@@ -503,27 +503,6 @@ fn resolve_path(
     Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
-#[cfg(test)]
-#[test]
-fn artifact_read_parent_callgraph_path() {
-    crate::access_policy_tests::assert_artifact_read_policy(
-        |req, ctx| {
-            let config = ctx.config();
-            let parent = super::engine::tests::session(
-                config.project_root.as_deref().unwrap(),
-                config.storage_dir.as_deref().unwrap(),
-            );
-            drop(config);
-            match resolve_path(req, ctx, &parent, req.params["file"].as_str().unwrap()) {
-                Ok(_) => Response::success(&req.id, serde_json::json!({})),
-                Err(response) => response,
-            }
-        },
-        "callers",
-        |path| serde_json::json!({"file": path}),
-    );
-}
-
 /// A response naming why the parent could not answer from one child.
 fn gap_response(req: &RawRequest, operation: &str, gaps: Gaps) -> Response {
     let gaps = gaps.into_values();
@@ -745,65 +724,4 @@ fn inspect(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Respo
 mod disk_reserve_tests {
     use super::*;
 
-    #[test]
-    fn disk_reserve_parent_gap_keeps_the_other_child_text_and_health() {
-        let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().canonicalize().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let _low = crate::disk_floor::set_free_space_for_test(
-            storage.path(),
-            21 * 1024 * 1024 * 1024,
-            3_900_000_000_000,
-        );
-        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
-            .unwrap_err();
-        let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
-            storage.path(),
-            "device_free_space_floor",
-        )
-        .unwrap();
-        let message = reserve.message.clone();
-        let unrelated = "call graph view unavailable: invalid manifest";
-        super::super::record_child_failure(
-            &root,
-            "paused",
-            "parent_callgraph",
-            "device_free_space_floor",
-            Some(reserve),
-        );
-        super::super::record_child_failure(&root, "other", "parent_callgraph", unrelated, None);
-        let mut gaps = Gaps::default();
-        gaps.push("child_unavailable", "paused".into(), message.clone());
-        gaps.push("child_unavailable", "other".into(), unrelated.into());
-        let req: RawRequest =
-            serde_json::from_value(json!({"id":"parent-reserve", "command":"callers"})).unwrap();
-        let response = gap_response(&req, "callers", gaps);
-        assert!(!response.success);
-        assert_eq!(response.data["code"], "parent_child_unavailable");
-        assert_eq!(response.data["message"], format!("callers: not answered from this parent folder: paused: {message}; other: {unrelated}"));
-        assert_eq!(response.data["gaps"][0]["reason"], message);
-        assert_eq!(response.data["gaps"][1]["reason"], unrelated);
-        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 2);
-        let mut config = crate::config::Config::default();
-        config.project_root = Some(root.clone());
-        config.storage_dir = Some(storage.path().to_path_buf());
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            config,
-        );
-        let health = ctx.try_health_snapshot(&root);
-        assert_eq!(health.view_storage_reserve.len(), 1);
-        assert_eq!(
-            health.view_storage_reserve.values().next().unwrap().message,
-            message
-        );
-        assert_eq!(
-            health.view_load_failures.get("parent_callgraph:invalid"),
-            Some(&1)
-        );
-        assert_eq!(
-            health.view_load_failure_last.unwrap().error,
-            format!("other: {unrelated}")
-        );
-    }
 }

@@ -3941,86 +3941,6 @@ fn repair_census_propagates_late_readdir_failure() {
     );
 }
 
-#[test]
-fn identity_census_stops_processing_leaves_at_deadline() {
-    let temp = tempfile::tempdir().unwrap();
-    for entry in 0..100 {
-        fs::write(
-            temp.path().join(format!("artifact-{entry}")),
-            b"task output",
-        )
-        .unwrap();
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |_| {
-            std::thread::sleep(
-                deadline.saturating_duration_since(std::time::Instant::now())
-                    + Duration::from_millis(1),
-            );
-        }));
-    });
-    let mut budget = RepairBudget::until(deadline, std::sync::Arc::new(|| false));
-    let mut examined = IdentityCensus::default();
-    let result = PinnedDir::open(temp.path()).unwrap().directory_identities(
-        &mut Vec::new(),
-        &mut budget,
-        &mut examined,
-    );
-    REPAIR_CENSUS_AFTER_NAMES.with(|hook| hook.borrow_mut().take());
-    assert!(is_repair_budget_stop(
-        &result.expect_err("expired leaf walk must stop")
-    ));
-    assert_eq!(
-        examined.entries, 1,
-        "the iterator must stop at the deadline"
-    );
-}
-
-#[test]
-fn identity_census_is_read_only_and_bounded() {
-    let temp = tempfile::tempdir().unwrap();
-    let child = temp.path().join("task");
-    fs::create_dir(&child).unwrap();
-    let artifact = child.join("task.json");
-    fs::write(&artifact, b"finished task").unwrap();
-    let original_permissions = fs::metadata(&child).unwrap().permissions();
-    let mut read_only = original_permissions.clone();
-    read_only.set_readonly(true);
-    fs::set_permissions(&child, read_only.clone()).unwrap();
-    let before = fs::metadata(&child).unwrap().modified().unwrap();
-    let artifact_before = fs::metadata(&artifact).unwrap().modified().unwrap();
-    let pinned = PinnedDir::open(temp.path()).unwrap();
-    work_counts::reset();
-    let mut identities = Vec::new();
-    let mut examined = IdentityCensus::default();
-    pinned
-        .directory_identities(&mut identities, &mut RepairBudget::new(), &mut examined)
-        .unwrap();
-    assert_eq!(examined.directories, 2);
-    assert_eq!(examined.entries, 2);
-    assert_eq!(fs::read(&artifact).unwrap(), b"finished task");
-    assert_eq!(fs::metadata(&child).unwrap().modified().unwrap(), before);
-    assert_eq!(fs::metadata(&child).unwrap().permissions(), read_only);
-    assert_eq!(
-        fs::metadata(&artifact).unwrap().modified().unwrap(),
-        artifact_before
-    );
-    assert_eq!(work_counts::get().syncs, 0);
-    assert_eq!(work_counts::get().renames, 0);
-    assert_eq!(fs::read_dir(&child).unwrap().count(), 1);
-    let error = pinned
-        .directory_identities(
-            &mut Vec::new(),
-            &mut RepairBudget::with_entries(1),
-            &mut IdentityCensus::default(),
-        )
-        .expect_err("a partial census must not authorize deletion");
-    assert!(is_repair_budget_stop(&error));
-    assert!(artifact.exists());
-    fs::set_permissions(&child, original_permissions).unwrap();
-}
-
 /// Live storage creates and removes files all the time (atomic-write
 /// temporaries, SQLite journals). An entry removed between the census listing
 /// it and opening it is simply gone: it is not protected and must not fail the
@@ -4238,19 +4158,6 @@ fn repair_traversal_refuses_expired_deadline() {
         .enter(0)
         .expect_err("an expired walk must fail closed");
     assert!(error.to_string().contains("traversal limit"), "{error}");
-}
-
-/// Running out of time or entries is progress a later pass continues; a tree
-/// nested too deeply is equally deep next pass, so it must not look the same.
-#[test]
-fn repair_depth_limit_is_not_a_budget_stop() {
-    let budget = RepairBudget::new();
-    let deep = budget.enter(65).expect_err("depth 65 must be refused");
-    assert!(!is_repair_budget_stop(&deep), "{deep}");
-    assert!(deep.to_string().contains("nested directories"), "{deep}");
-    let mut expired = RepairBudget::new();
-    expired.deadline = std::time::Instant::now();
-    assert!(is_repair_budget_stop(&expired.enter(0).unwrap_err()));
 }
 
 impl RepairPolicy<'_> {

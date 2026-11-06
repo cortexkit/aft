@@ -436,10 +436,6 @@ unsafe extern "C" fn tracked_wal_hook(
 ) -> c_int {
     let state = unsafe { &*(context.cast::<WalHookState>()) };
     state.observe_commit(frame_count);
-    #[cfg(test)]
-    unsafe {
-        crate::views::materialization::probe_wal(db, frame_count)
-    };
     let threshold = state.threshold_pages.load(Ordering::Relaxed);
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
@@ -459,15 +455,6 @@ unsafe extern "C" fn tracked_wal_hook(
         )
     };
     if result == rusqlite::ffi::SQLITE_OK {
-        #[cfg(test)]
-        unsafe {
-            crate::views::materialization::probe_checkpoint(
-                db,
-                0,
-                log_frames.into(),
-                checkpointed_frames.into(),
-            )
-        };
         let frames = state.record_checkpoint(log_frames, checkpointed_frames);
         state
             .checkpoint_counter
@@ -570,12 +557,6 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        #[cfg(test)]
-        let connection = crate::views::materialization::open_probe_connection(
-            &sqlite_open_path(path),
-            OpenFlags::default(),
-        )?;
-        #[cfg(not(test))]
         let connection = crate::db::write_accounting::open_connection(
             &sqlite_open_path(path),
             OpenFlags::default(),
@@ -599,19 +580,9 @@ impl TrackedConnection {
         // store's `sqlite_readonly_uri`).
         let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
         {
-            #[cfg(test)]
-            let connection =
-                crate::views::materialization::open_probe_connection(Path::new(path), flags)?;
-            #[cfg(not(test))]
             let connection = crate::db::write_accounting::open_connection(Path::new(path), flags)?;
             connection
         } else {
-            #[cfg(test)]
-            let connection = crate::views::materialization::open_probe_connection(
-                &sqlite_open_path(Path::new(path)),
-                flags,
-            )?;
-            #[cfg(not(test))]
             let connection = crate::db::write_accounting::open_connection(
                 &sqlite_open_path(Path::new(path)),
                 flags,
@@ -631,10 +602,6 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
-        #[cfg(test)]
-        let connection =
-            crate::views::materialization::open_probe_connection(&sqlite_open_path(path), flags)?;
-        #[cfg(not(test))]
         let connection =
             crate::db::write_accounting::open_connection(&sqlite_open_path(path), flags)?;
         Self::from_connection_attributed(connection, store, path.display().to_string())
@@ -818,15 +785,6 @@ impl TrackedConnection {
                     checkpointed_frames: row.get(2)?,
                 })
             })?;
-        #[cfg(test)]
-        unsafe {
-            crate::views::materialization::probe_checkpoint(
-                self.connection.as_ref().unwrap().handle(),
-                result.busy,
-                result.log_frames,
-                result.checkpointed_frames,
-            )
-        };
         Ok(result)
     }
 

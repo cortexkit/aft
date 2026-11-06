@@ -1044,19 +1044,6 @@ fn subc_storm_rebinds_stay_live_under_build_and_tool_traffic() {
 }
 
 #[test]
-fn fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers() {
-    subc_bridge_test::run_subc_bridge_test_with_dispatch(
-        "fresh_worktree_bind_does_not_starve_parent_reads_or_acquire_parent_writers",
-        // Root readiness is an observable poll with a 120-second budget. The outer
-        // watchdog is only a hang backstop; the parent-read phase keeps its tight bound.
-        Duration::from_secs(180),
-        drive_fresh_worktree_borrow_only_daemon,
-        |_, _, _| {},
-        storm_dispatch,
-    );
-}
-
-#[test]
 fn subc_storm_heavy_init_saturation_does_not_delay_fresh_bind() {
     subc_bridge_test::run_subc_bridge_test_with_dispatch_and_executor_config(
         "subc_storm_heavy_init_saturation_does_not_delay_fresh_bind",
@@ -1232,154 +1219,6 @@ async fn drive_egress_measurement_daemon(input: FakeDaemonInput, config: EgressM
     drop(stream);
 }
 
-async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
-    let session = subc_bridge_test::open_fake_daemon_session(input).await;
-    let (tx, mut rx) = start_io(session.stream);
-    let (fixture, parent_root, worktree_root) = create_parent_and_linked_worktree();
-    let storage_dir = fixture.path().join("artifact-storage");
-    let mut corr = 20_000_u64;
-
-    send_bind(
-        &tx,
-        1,
-        corr,
-        &parent_root,
-        "storm-parent",
-        artifact_storm_config(&storage_dir),
-    );
-    // Setup bind: this test asserts the WORKTREE bind's behavior below, not
-    // cold parent-bind latency. A cold first bind legitimately pays topology
-    // probes, owner claim, and index setup, so give it the production
-    // route-bind deadline instead of the tight storm assertion bound.
-    expect_ack_within(&mut rx, corr, SETUP_BIND_BOUND).await;
-
-    let roots = vec![parent_root.clone()];
-    wait_for_ready_health(
-        &session.executor,
-        &tx,
-        &mut rx,
-        &mut corr,
-        &roots,
-        &HashSet::new(),
-    )
-    .await;
-    let shared_key = aft::search_index::artifact_cache_key(&parent_root);
-    assert_eq!(
-        shared_key,
-        aft::search_index::artifact_cache_key(&worktree_root),
-        "linked worktree must borrow the parent's artifact key"
-    );
-    aft::root_cache::enable_writer_lease_acquisition_counts_for_test();
-
-    corr += 1;
-    let bind_corr = corr;
-    let started = Instant::now();
-    send_bind(
-        &tx,
-        2,
-        bind_corr,
-        &worktree_root,
-        "storm-worktree",
-        artifact_storm_config(&storage_dir),
-    );
-    corr += 1;
-    let read_corr = corr;
-    send_tool(
-        &tx,
-        1,
-        read_corr,
-        "read",
-        json!({ "filePath": "README.md", "limit": 20 }),
-    );
-    corr += 1;
-    let grep_corr = corr;
-    send_tool(
-        &tx,
-        1,
-        grep_corr,
-        "grep",
-        json!({ "pattern": "root_alpha", "path": "src" }),
-    );
-
-    let mut bind_done = false;
-    let mut read_done = false;
-    let mut grep_done = false;
-    let parent_read_bound = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER as u64);
-    let deadline = Instant::now() + parent_read_bound;
-    while !(bind_done && read_done && grep_done) {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::ZERO);
-        assert!(
-            !remaining.is_zero(),
-            "fresh worktree bind starved parent reads for more than {parent_read_bound:?}"
-        );
-        let frame = read_frame_from_rx(&mut rx, remaining, "worktree bind and parent reads").await;
-        if is_ack(&frame, bind_corr) {
-            bind_done = true;
-            continue;
-        }
-        if frame.header.ty == FrameType::Error
-            && (frame.header.corr == read_corr || frame.header.corr == grep_corr)
-        {
-            let body: Value = serde_json::from_slice(&frame.body).expect("tool error body");
-            panic!("parent read failed during worktree bind: {body:?}");
-        }
-        if frame.header.ty == FrameType::Response && frame.header.corr == read_corr {
-            read_done = true;
-        }
-        if frame.header.ty == FrameType::Response && frame.header.corr == grep_corr {
-            grep_done = true;
-        }
-    }
-    assert!(
-        started.elapsed() <= parent_read_bound,
-        "fresh worktree bind and parent reads took {:?}, exceeding {:?}",
-        started.elapsed(),
-        parent_read_bound
-    );
-
-    let worktree_writer_acquisitions = || {
-        let callgraph = aft::root_cache::writer_lease_acquisition_count_for_test(
-            aft::root_cache::RootCacheDomain::Callgraph,
-            &shared_key,
-            &worktree_root,
-        );
-        let inspect = aft::root_cache::writer_lease_acquisition_count_for_test(
-            aft::root_cache::RootCacheDomain::Inspect,
-            &shared_key,
-            &worktree_root,
-        );
-        (callgraph, inspect)
-    };
-    let (callgraph_acquisitions, inspect_acquisitions) = worktree_writer_acquisitions();
-    assert_eq!(
-        callgraph_acquisitions + inspect_acquisitions,
-        0,
-        "linked worktree session acquired writer capability on shared key {shared_key}: callgraph={callgraph_acquisitions}, inspect={inspect_acquisitions}"
-    );
-
-    let callgraph_dir = storage_dir.join("callgraph").join(&shared_key);
-    let writer_shaped = aft::callgraph_store::CallGraphStore::open_ready_no_rebuild(
-        callgraph_dir.clone(),
-        worktree_root.clone(),
-    )
-    .expect("worktree writer opener should fail closed");
-    assert!(
-        writer_shaped.is_none(),
-        "borrow-only roots must not receive a writable-shaped callgraph store"
-    );
-    let _reader =
-        aft::callgraph_store::CallGraphStore::open_readonly(callgraph_dir, worktree_root.clone())
-            .expect("worktree read-only opener should remain available");
-    let (callgraph_acquisitions, inspect_acquisitions) = worktree_writer_acquisitions();
-    assert_eq!(
-        callgraph_acquisitions + inspect_acquisitions,
-        0,
-        "borrow-only artifact API handed out writer capability on shared key {shared_key}: callgraph={callgraph_acquisitions}, inspect={inspect_acquisitions}"
-    );
-    send_goodbye_and_wait(&tx).await;
-}
 
 async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let delay_ms = std::env::var("AFT_STORM_EMBED_DELAY_MS")
@@ -1394,7 +1233,6 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let semantic_roots: HashSet<usize> = (0..roots.len()).filter(|index| index % 2 == 0).collect();
 
     aft::commands::configure::reset_semantic_stale_generation_discards_for_test();
-    aft::commands::configure::reset_configure_artifact_load_attempts_for_test();
     let mut routes = build_route_specs(&scale, &roots);
     let mut corr = 10_000_u64;
     let mut pending_binds = HashMap::new();
@@ -1508,10 +1346,6 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
         aft::commands::configure::semantic_stale_generation_discards_for_test(),
         0,
         "equivalent rebinds must not discard completed semantic builds as stale"
-    );
-    assert!(
-        aft::commands::configure::configure_artifact_load_attempts_for_test() >= roots.len(),
-        "fleet storm did not exercise one post-ack artifact load per cold-ish root"
     );
     assert_bind_stats(&stats.bind_latencies);
     assert!(

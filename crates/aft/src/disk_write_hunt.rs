@@ -120,64 +120,6 @@ fn usage() -> (u64, u64) {
 }
 
 #[test]
-#[ignore = "offline probe copies large production artifacts; Darwin write accounting required"]
-fn bench_disk_write_hunt() {
-    let input =
-        PathBuf::from(std::env::var_os("AFT_DISK_HUNT_INPUT").expect("set input directory"));
-    let temp = tempfile::tempdir_in(&input).unwrap();
-    let aft = temp.path().join("aft.db");
-    copy_db(&input.join("aft.db"), &aft);
-    let mut conn = measure("retention-schema-migration", || {
-        crate::db::open(&aft).unwrap()
-    });
-    reset(&conn, &aft);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let rows = measure("retention-pass", || {
-        crate::db::compression_events::prune_compression_events(&mut conn, now).unwrap()
-    });
-    eprintln!("hunt retention: rows={rows}");
-    assert!(rows > 0 && rows <= 500);
-    wal_report(&conn, &aft);
-    drop(conn);
-
-    let root = temp.path().join("project");
-    fs::create_dir(&root).unwrap();
-    let root = root.canonicalize().unwrap();
-    let index = crate::semantic_index::SemanticIndex::from_bytes(
-        &fs::read(input.join("semantic.bin")).unwrap(),
-        &root,
-    )
-    .unwrap();
-    measure("semantic-save", || {
-        assert!(index.write_to_disk(temp.path(), "offline"))
-    });
-    eprintln!(
-        "hunt semantic: bytes={}",
-        fs::metadata(temp.path().join("semantic/offline/semantic.bin"))
-            .unwrap()
-            .len()
-    );
-    drop(index);
-
-    let derived = temp.path().join("derived.sqlite");
-    let blob = temp.path().join("callgraph.sqlite");
-    copy_db(&input.join("derived.sqlite"), &derived);
-    copy_db(&input.join("callgraph.sqlite"), &blob);
-    let manifest: crate::views::Manifest =
-        serde_json::from_slice(&fs::read(input.join("manifest.json")).unwrap()).unwrap();
-    let keeper = Connection::open(&derived).unwrap();
-    reset(&keeper, &derived);
-    measure("view-materialize", || {
-        crate::callgraph_store::materialize_manifest_view_database(&derived, &blob, &manifest)
-            .unwrap()
-    });
-    wal_report(&keeper, &derived);
-}
-
-#[test]
 #[ignore = "offline query-plan inventory on production artifact copies"]
 fn bench_disk_write_query_plans() {
     let input =
