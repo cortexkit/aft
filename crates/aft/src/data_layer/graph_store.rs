@@ -184,7 +184,7 @@ pub(crate) fn write_segment(
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut writer = SegmentWriter::create(path, meta).map_err(|error| error.to_string())?;
-    let keys = write_sections(&mut writer, inputs, resolved, records, true)?;
+    let keys = write_sections(&mut writer, inputs, resolved, records, true, None)?;
     writer.finish().map_err(|error| error.to_string())?;
     Ok(keys)
 }
@@ -205,6 +205,7 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     resolved: &BTreeMap<String, R>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     all_records: bool,
+    memory: Option<&mut Vec<(String, usize)>>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut content = ContentSectionsBuilder::new();
     // Configuration files' records too, so a reader of the segment can give
@@ -264,6 +265,18 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
             bytes,
             terms.iter().map(|(kind, term)| (*kind, term.as_slice())),
         );
+    }
+    if let Some(memory) = memory {
+        use aft_store::heap::HeapBytes as _;
+        let mut seen = aft_store::heap::Seen::new();
+        memory.push((
+            "write.content_builder".to_string(),
+            content.heap_bytes(&mut seen),
+        ));
+        memory.push((
+            "write.graph_builder".to_string(),
+            graph.heap_bytes(&mut seen),
+        ));
     }
     content.write(writer).map_err(|error| error.to_string())?;
     graph.write(writer).map_err(|error| error.to_string())?;

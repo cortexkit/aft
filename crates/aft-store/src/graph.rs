@@ -178,6 +178,20 @@ pub struct GraphSectionsBuilder {
     fragments: BTreeMap<FragmentKey, PendingFragment>,
 }
 
+impl crate::heap::HeapBytes for GraphSectionsBuilder {
+    fn heap_bytes(&self, _seen: &mut crate::heap::Seen) -> usize {
+        let entry = std::mem::size_of::<FragmentKey>() + std::mem::size_of::<PendingFragment>();
+        crate::heap::btree_bytes(self.fragments.len(), entry)
+            + self
+                .fragments
+                .values()
+                .map(|(bytes, terms)| {
+                    bytes.capacity() + terms.capacity() * std::mem::size_of::<(TermKind, u64)>()
+                })
+                .sum::<usize>()
+    }
+}
+
 impl GraphSectionsBuilder {
     #[must_use]
     pub fn new() -> Self {

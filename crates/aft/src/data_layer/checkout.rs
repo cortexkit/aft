@@ -1129,8 +1129,12 @@ impl Checkout {
         checkpoint()?;
 
         let started = Instant::now();
-        let resolved = resolve_checkout(&inputs, self.layer.threads)
-            .map_err(|error| DataError::Resolve(error.to_string()))?;
+        let resolved = super::callgraph::resolve_checkout_measuring(
+            &inputs,
+            self.layer.threads,
+            measure.then_some(&mut report.memory),
+        )
+        .map_err(|error| DataError::Resolve(error.to_string()))?;
         report.resolve_ms = elapsed_ms(started);
         if measure {
             use aft_store::heap::HeapBytes as _;
@@ -1165,6 +1169,7 @@ impl Checkout {
             &resolved,
             &collected.records,
             true,
+            measure.then_some(&mut report.memory),
         )
         .map_err(DataError::Store)?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
@@ -1920,7 +1925,7 @@ impl Checkout {
         text_units
             .write(pending.writer())
             .map_err(DataError::store)?;
-        let fragments = write_sections(pending.writer(), &inputs, &resolved, &records, false)
+        let fragments = write_sections(pending.writer(), &inputs, &resolved, &records, false, None)
             .map_err(DataError::Store)?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let per_path = inputs

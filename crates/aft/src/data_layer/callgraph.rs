@@ -654,12 +654,34 @@ pub(crate) fn resolve_checkout(
     inputs: &CheckoutInputs,
     threads: usize,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    resolve_checkout_measuring(inputs, threads, None)
+}
+
+/// [`resolve_checkout`], also adding to `memory`, when given, the heap bytes
+/// its bound files and method-call inputs held. For measurement.
+pub(crate) fn resolve_checkout_measuring(
+    inputs: &CheckoutInputs,
+    threads: usize,
+    mut memory: Option<&mut Vec<(String, usize)>>,
+) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let bound = BindCache::default();
         bound.bind_missing(inputs, &paths)?;
         let mut resolved = resolve_files(inputs, &bound, &paths)?;
         let mut calls = MethodCallInputs::build(inputs, &resolved);
+        if let Some(memory) = memory.as_deref_mut() {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            // The parses are counted by the caller; mark them seen so the
+            // parts below count only what they hold besides.
+            let _ = inputs.parses.heap_bytes(&mut seen);
+            memory.push(("resolve.bound".to_string(), bound.heap_bytes(&mut seen)));
+            memory.push((
+                "resolve.method_call_inputs".to_string(),
+                calls.heap_bytes(&mut seen),
+            ));
+        }
         for (path, sites, dependencies) in calls.resolve_sites(inputs, &resolved, &paths) {
             let file = resolved
                 .get_mut(&path)

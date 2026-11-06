@@ -56,6 +56,18 @@ pub struct ContentSectionsBuilder {
     records: BTreeMap<RecordKey, (Vec<u8>, Vec<u8>)>,
 }
 
+impl crate::heap::HeapBytes for ContentSectionsBuilder {
+    fn heap_bytes(&self, _seen: &mut crate::heap::Seen) -> usize {
+        let entry = std::mem::size_of::<RecordKey>() + std::mem::size_of::<(Vec<u8>, Vec<u8>)>();
+        crate::heap::btree_bytes(self.records.len(), entry)
+            + self
+                .records
+                .values()
+                .map(|(surface, body)| surface.capacity() + body.capacity())
+                .sum::<usize>()
+    }
+}
+
 impl ContentSectionsBuilder {
     #[must_use]
     pub fn new() -> Self {
