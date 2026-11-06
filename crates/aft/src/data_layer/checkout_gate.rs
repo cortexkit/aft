@@ -1028,11 +1028,11 @@ impl MemoryLog {
         let parts = checkouts
             .iter()
             .map(|(name, checkout)| {
-                let memory = checkout.memory();
+                let memory = checkout.memory(&mut aft_store::heap::Seen::new());
                 let live = memory.live.map(|live| {
                     serde_json::json!({
                         "state_paths": live.state_paths,
-                        "state_kib": live.state_bytes / 1024,
+                        "shared_kib": live.shared_bytes / 1024,
                         "text_paths": live.text_overlay_paths,
                         "text_kib": live.text_overlay_bytes / 1024,
                         "changes": live.changes,

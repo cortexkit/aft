@@ -125,7 +125,7 @@ fn sample(
 ) -> serde_json::Value {
     let (peak_rss, peak_in_use) = peaks.take();
     let (in_use, held) = allocator_mib();
-    let memory = checkout.memory();
+    let memory = checkout.memory(&mut aft_store::heap::Seen::new());
     let live = memory.live.unwrap_or_default();
     // The engine part by part, in MiB, when PROBE_PARTS=1: walking every
     // decoded file costs time, so it is off unless asked for.
@@ -153,7 +153,7 @@ fn sample(
         "changes": live.changes,
         "text_overlay_paths": live.text_overlay_paths,
         "text_overlay_kib": live.text_overlay_bytes >> 10,
-        "state_kib": live.state_bytes >> 10,
+        "shared_kib": live.shared_bytes >> 10,
         "refreshed_files": live.refreshed_files,
     })
 }
