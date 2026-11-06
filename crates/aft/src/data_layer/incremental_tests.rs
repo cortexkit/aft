@@ -284,10 +284,10 @@ fn a_new_crate_nothing_names_rebinds_only_its_own_files() {
 #[test]
 fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
     // `app` resolves `crate::` and `mod` paths, which looks up its crate
-    // root through `app/Cargo.toml`. A manifest added for an unrelated
-    // folder changes no answer `app` recorded, so only the new folder's file
-    // is bound again; a single key for every config file added or removed
-    // would bind `app` again as well.
+    // root through `app/Cargo.toml`, and `web` finds its `package.json` and
+    // `tsconfig.json`. A manifest added for an unrelated folder changes no
+    // answer either recorded, so neither is bound or resolved again; one key
+    // for every config file added or removed would reach both.
     let base = [
         ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n"),
         ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
@@ -307,12 +307,6 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
     ];
     let mut after = base.to_vec();
     after.push(("tools/Cargo.toml", "[package]\nname = \"tools\"\n"));
-    // Which files recorded the one key for config files added or removed:
-    // printed when the rebound count below fails, to name the reader.
-    let readers = LiveCheckout::cold(checkout(&base, &[]), 1)
-        .unwrap()
-        .binding_readers_of(crate::callgraph_store::join::VIEW_CONFIG_MEMBERSHIP_DOMAIN);
-    eprintln!("config-membership readers: {readers:?}");
     let (stats, cold) = update_checked(
         checkout(&base, &[]),
         checkout(&after, &[]),
@@ -325,10 +319,9 @@ fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
             .is_some_and(|path| path == b"app/src/inner.rs")),
         "the fixture must resolve the crate path"
     );
-    assert!(
-        stats.rebound <= 1,
-        "config-membership readers {readers:?}; {stats:?}"
-    );
+    for untouched in ["app/src/lib.rs", "web/src/a.ts"] {
+        assert!(!stats.touched.contains(untouched), "{untouched}: {stats:?}");
+    }
 }
 
 #[test]

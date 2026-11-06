@@ -36,8 +36,10 @@ use crate::parser::LangId;
 /// sites of C++ member calls whose receiver's type is declared; 6 added each
 /// symbol's entry facts (where a program starts, its entry attribute),
 /// which `trace_to` and `impact` label roots with; 7 marked Go `func init()`
-/// as a program start, and made a Rust resolution record each workspace
-/// crate name it looked up rather than only the whole crate map.
+/// as a program start, made a Rust resolution record each workspace crate
+/// name it looked up rather than only the whole crate map, and made a
+/// resolution record each config file it found by its path rather than one
+/// key for every config file.
 pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-7";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or

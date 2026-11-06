@@ -28,10 +28,18 @@ use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion
 use crate::callgraph_store::facts::{FactPaths, ProjectFacts};
 use crate::callgraph_store::join::{
     rust_crate_key, rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies,
-    ViewBindingFacts, VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN,
-    VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
+    ViewBindingFacts, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_JS_WORKSPACES_DOMAIN,
+    VIEW_RUST_MODULE_DOMAIN,
 };
 use crate::callgraph_store::{go_module_map, rust_crate_map};
+
+/// Whether the checkout path `path` is a file called `name`.
+fn is_config_named(path: &str, name: &str) -> bool {
+    path == name
+        || path
+            .strip_suffix(name)
+            .is_some_and(|parent| parent.ends_with('/'))
+}
 
 use aft_store::graph::TermKind;
 
@@ -602,15 +610,6 @@ impl LiveCheckout {
     /// # Errors
     ///
     /// When resolution fails on a file.
-    /// The files whose binding recorded `key`.
-    #[cfg(test)]
-    pub(crate) fn binding_readers_of(&self, key: &str) -> Vec<String> {
-        self.reverse
-            .binding_of(&BTreeSet::from([key.to_string()]))
-            .into_iter()
-            .collect()
-    }
-
     pub(crate) fn update(
         &mut self,
         next: CheckoutInputs,
@@ -684,12 +683,15 @@ impl LiveCheckout {
             .collect::<Vec<_>>();
         // Configuration files added or removed. A content change of an
         // existing one reaches its readers through their recorded field
-        // answers, which are asked again below; only membership changes need
-        // every config reader to bind again.
-        let config_membership = configs
-            .intersection(&membership)
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        // answers, which are asked again below. Adding or removing one
+        // reaches the files that probed its path, by their recorded answers
+        // and (for one they found) their recorded path, and the crate root
+        // answers that name it; only a JavaScript workspace member list,
+        // which globs for manifests, depends on manifests it never probed by
+        // path.
+        let workspace_members_changed = configs.intersection(&membership).any(|path: &String| {
+            is_config_named(path, "package.json") || is_config_named(path, "pnpm-workspace.yaml")
+        });
         // The Go module map and the Rust crate map are each built from a
         // walk of the checkout, and a reader records keys for the map, not
         // the walk. Build each map before and after whenever its inputs can
@@ -698,12 +700,7 @@ impl LiveCheckout {
         // `src` folder can appear). A Go reader records the module map's one
         // key; a Rust reader records the key of each crate name it looked
         // up, so only the names whose entry changed are set.
-        let is_named = |path: &String, name: &str| {
-            path == name
-                || path
-                    .strip_suffix(name)
-                    .is_some_and(|parent| parent.ends_with('/'))
-        };
+        let is_named = |path: &String, name: &str| is_config_named(path, name);
         let maps = |build: &dyn Fn(&FactPaths<'_>) -> HashMap<String, String>| {
             let root = std::path::Path::new("/");
             let before = build(&FactPaths {
@@ -757,8 +754,8 @@ impl LiveCheckout {
         // exist, and on configuration it read.
         let started = Instant::now();
         let mut binding_keys = membership.clone();
-        if !config_membership.is_empty() {
-            binding_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
+        if workspace_members_changed {
+            binding_keys.insert(VIEW_JS_WORKSPACES_DOMAIN.to_string());
         }
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
@@ -861,8 +858,8 @@ impl LiveCheckout {
         // What a recorded answer can depend on that changed.
         let mut changed_keys = surfaces_changed.clone();
         changed_keys.extend(membership.iter().cloned());
-        if !config_membership.is_empty() {
-            changed_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
+        if workspace_members_changed {
+            changed_keys.insert(VIEW_JS_WORKSPACES_DOMAIN.to_string());
         }
         if module_tree_changed {
             changed_keys.insert(VIEW_RUST_MODULE_DOMAIN.to_string());

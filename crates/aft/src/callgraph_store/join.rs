@@ -2453,7 +2453,11 @@ impl<'a> ViewBindingFacts<'a> {
         // Directory discovery may probe thousands of missing package manifests.
         // One membership domain rechecks those bindings on config add/remove;
         // individual config content changes use the field consultations instead.
-        if view_resolution_config(path) {
+        // A typed recorder (the data layer) also keeps every probe, found or
+        // missing, as a question with its answer, so a config file added or
+        // removed reaches exactly the files whose answer it changes; it keeps
+        // a found config file as a path like any other.
+        if !self.typed && view_resolution_config(path) {
             self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
             return;
         }
@@ -2526,7 +2530,13 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     fn config_fact(&self, rel: &[u8], name: &str) {
         self.record(rel);
         if matches!(name, "workspaces" | "packages") {
-            self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
+            // The members a workspace list names depend on which package
+            // manifests exist under its globs, not only on this field.
+            self.record(if self.typed {
+                VIEW_JS_WORKSPACES_DOMAIN.as_bytes()
+            } else {
+                VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes()
+            });
         }
         self.config_event(rel, Some(name));
         // The resolver records a field each time it uses one, though it reads
@@ -3422,7 +3432,16 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
     )
 }
 
+/// Recorded by today's views for every config file a resolution found, and
+/// by every JavaScript workspace member list; set when any config file is
+/// added or removed.
 pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
+/// The data layer's key for a JavaScript workspace member list: set when a
+/// `package.json` or `pnpm-workspace.yaml` is added or removed, since either
+/// can change which members a list's globs name. The data layer keeps every
+/// other config probe as a path and a recorded answer, so it does not use
+/// [`VIEW_CONFIG_MEMBERSHIP_DOMAIN`].
+pub(crate) const VIEW_JS_WORKSPACES_DOMAIN: &str = "\0view:js-workspaces";
 /// The Rust module tree: which files exist and which modules each declares.
 /// `Parent` answers read it; a file whose module declarations change, or a
 /// Rust file added or removed, sets it.
@@ -3481,8 +3500,21 @@ impl ViewSurfaceQuery {
                 VIEW_RUST_CRATES_DOMAIN.into(),
                 rust_crate_key(name),
             ],
+            // The nearest `Cargo.toml` above the file decides its crate:
+            // today's views set the config domain when any is added or
+            // removed, the data layer the path of each one that was.
             Self::CrateRoot(file) => {
-                vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()]
+                let mut dependencies = vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()];
+                let mut directory = std::path::Path::new(file).parent();
+                while let Some(current) = directory {
+                    dependencies.push(if current.as_os_str().is_empty() {
+                        "Cargo.toml".to_string()
+                    } else {
+                        format!("{}/Cargo.toml", current.display())
+                    });
+                    directory = current.parent();
+                }
+                dependencies
             }
             Self::Parent(file) => vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()],
             // An inline lookup checks the files whose module path is a
