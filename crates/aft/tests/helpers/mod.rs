@@ -280,7 +280,7 @@ impl AftProcess {
     /// Only configure requests change. The harness adds
     /// `indexes.semantic: false` to the request's user-tier config (creating
     /// that tier when absent) unless the test opted in, or the user doc
-    /// already sets `indexes.semantic` or the legacy `semantic_search` key.
+    /// already sets `indexes.semantic`.
     /// Requests that are not valid JSON, or whose user doc is not a JSON object,
     /// are sent unchanged.
     fn prepare_request(&self, request: &str) -> String {
@@ -326,11 +326,10 @@ impl AftProcess {
         else {
             return request.to_string();
         };
-        if doc.contains_key("semantic_search")
-            || doc
-                .get("indexes")
-                .and_then(|indexes| indexes.get("semantic"))
-                .is_some()
+        if doc
+            .get("indexes")
+            .and_then(|indexes| indexes.get("semantic"))
+            .is_some()
         {
             return request.to_string();
         }

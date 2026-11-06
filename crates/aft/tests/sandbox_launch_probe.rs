@@ -655,7 +655,7 @@ fn native_background_exit_marker_survives_landlock_launcher() {
             "bash_permissions": true,
             "config": user_config(serde_json::json!({
                 "bash": { "background": true, "rewrite": true },
-                "sandbox": { "enabled": true },
+                "sandbox": { "profile": { "worker": "strict", "head": "strict" } },
             })),
         })
         .to_string(),

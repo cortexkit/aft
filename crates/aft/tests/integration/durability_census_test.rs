@@ -494,7 +494,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "experimental": { "bash": { "background": true } } })),
+            "config": user_config(json!({ "bash": { "rewrite": false, "compress": false, "background": true } })),
         }),
     );
     assert_eq!(configured["success"], true, "{configured:?}");

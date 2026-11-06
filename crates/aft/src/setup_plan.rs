@@ -666,7 +666,18 @@ pub fn derive_plan(
     harness: Option<SetupHarness>,
     observer: &dyn FeatureObserver,
 ) -> Result<PlanOutcome, Vec<String>> {
-    let user_raw = inputs.user.as_ref().map(parse_config_object).transpose();
+    // AFT rewrites the user file's retired keys when it loads the file
+    // (`config_fix::auto_migrate_user_config`), so the plan reads the text
+    // that rewrite leaves. Otherwise a name AFT refuses, but rewrites before
+    // it ever reads the file, would make the plan fail. A file the rewrite
+    // cannot parse keeps its own text and reports its own error below.
+    let user_file = inputs.user.as_ref().map(|file| ConfigFile {
+        path: file.path.clone(),
+        text: crate::config_fix::migrate_user_config_text(&file.text)
+            .map(|migration| migration.text)
+            .unwrap_or_else(|_| file.text.clone()),
+    });
+    let user_raw = user_file.as_ref().map(parse_config_object).transpose();
     let project_raw = inputs.project.as_ref().map(parse_config_object).transpose();
     let (user_raw, project_raw) = match (user_raw, project_raw) {
         (Ok(user), Ok(project)) => (user, project),
@@ -679,7 +690,7 @@ pub fn derive_plan(
     };
 
     let mut tiers = Vec::new();
-    if let Some(file) = &inputs.user {
+    if let Some(file) = &user_file {
         tiers.push(ConfigTier {
             tier: "user".to_string(),
             source: file.path.to_string_lossy().into_owned(),

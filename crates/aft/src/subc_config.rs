@@ -109,8 +109,8 @@ const CONFIG_READ_LIMIT: usize = 1024 * 1024;
 
 /// Rewrite the user file's retired keys before it is read (see
 /// [`crate::config_fix::auto_migrate_user_config`]) and log the outcome. A
-/// file that cannot be rewritten is still read as it is; the resolver
-/// translates its retired keys in memory.
+/// file that cannot be rewritten is still read as it is: the resolver
+/// translates its recently retired keys in memory and refuses the older ones.
 fn migrate_user_file(user_path: &Path) -> Option<UserConfigMigration> {
     let outcome = crate::config_fix::auto_migrate_user_config(user_path)?;
     crate::slog_warn!("config user: {}", outcome.notice());
@@ -304,7 +304,8 @@ mod tests {
 
     /// Reading migrates the user file off retired keys and reads the new text;
     /// the project file is shared through its repository, so its bytes stay
-    /// exactly as they were and its retired keys are translated in memory.
+    /// exactly as they were, and the names it still uses that were retired in
+    /// 0.62 or earlier are refused.
     #[test]
     fn reading_migrates_the_user_file_and_never_writes_the_project_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -333,9 +334,16 @@ mod tests {
         assert_eq!(tiers[1].doc, project_text);
 
         let resolved = crate::config_resolve::resolve_config(&tiers);
-        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
-        assert!(!resolved.config.indexes.trigram);
-        assert!(!resolved.config.indexes.semantic);
+        assert_eq!(
+            resolved.errors,
+            [
+                "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
+                "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix",
+            ]
+        );
+        let user_only = crate::config_resolve::resolve_config(&tiers[..1]);
+        assert!(user_only.errors.is_empty(), "{:?}", user_only.errors);
+        assert!(!user_only.config.indexes.trigram);
 
         let (_, again) =
             read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
@@ -369,9 +377,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
         assert_eq!(tiers[1].doc, project_text);
         let resolved = crate::config_resolve::resolve_config(&tiers);
-        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
-        assert!(resolved.config.experimental_lsp_ty);
-        assert!(!resolved.config.experimental_bash_compress);
+        assert_eq!(
+            resolved.errors,
+            ["removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix"]
+        );
+        let user_only = crate::config_resolve::resolve_config(&tiers[..1]);
+        assert!(user_only.errors.is_empty(), "{:?}", user_only.errors);
+        assert!(user_only.config.experimental_lsp_ty);
+        assert!(user_only.config.experimental_bash_compress);
         let user_after = std::fs::read_to_string(&user).unwrap();
         let (_, again) =
             read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
@@ -478,8 +491,10 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
             assert_eq!(tiers[0].source, path.to_string_lossy());
             assert_eq!(tiers[0].doc, text);
             let resolved = crate::config_resolve::resolve_config(&tiers);
-            assert!(resolved.errors.is_empty());
-            assert!(!resolved.config.experimental_bash_compress);
+            assert_eq!(
+                resolved.errors,
+                ["removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix"]
+            );
         }
         for file in files {
             assert_eq!(

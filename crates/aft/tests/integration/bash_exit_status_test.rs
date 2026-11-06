@@ -12,7 +12,7 @@ fn exit_status_matrix(form: &str) {
             "harness": "opencode",
             "project_root": project.path(),
             "config": user_config(json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

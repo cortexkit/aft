@@ -22,7 +22,7 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
             "max_background_bash_tasks": 32,
         })

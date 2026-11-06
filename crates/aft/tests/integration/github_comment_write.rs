@@ -566,17 +566,8 @@ fn write_surfaces_exit_86_as_typed_shim_refusal() {
 }
 
 #[test]
-fn write_gate_and_master_off_refuse_before_any_gh_traffic() {
-    for github in [
-        json!({ "write": false }),
-        // The legacy master switch now only fills absent leaves with false,
-        // so a master-off block without an explicit write leaf must refuse.
-        json!({
-            "enabled": false,
-            "read": true,
-            "shim": true
-        }),
-    ] {
+fn write_gate_refuses_before_any_gh_traffic() {
+    for github in [json!({ "write": false })] {
         let fixture = Fixture::new(github);
         let mut aft = fixture.spawn(false);
         let response = aft.send(

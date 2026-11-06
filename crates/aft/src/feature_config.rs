@@ -9,13 +9,17 @@
 //! per-block translation of those keys into canonical ones, validation of a
 //! resolved configuration object and the migration-notice projection digest.
 //!
-//! Retired keys are not refused. Every load translates them in memory into
-//! their current equivalents, and the current keys then pass through the
-//! normal user/project trust rules. The one exception is the keys the
-//! per-repository data store retires ([`DATA_LAYER_RETIRED_PATHS`]): they get
-//! a notice until [`DATA_LAYER_KEYS_REFUSED_FROM`] and are refused from that
-//! release on. The user's own file is additionally
-//! rewritten on disk by [`crate::config_fix::auto_migrate_user_config`]; a
+//! A name retired two or more releases ago ([`REFUSED_RETIRED_PATHS`] and the
+//! prefixed tool names in [`LEGACY_TOOL_ALIASES`]) is refused with
+//! `removed_config_key`. The translation below still covers those names,
+//! because `aft doctor --fix` and the automatic rewrite of the user file
+//! ([`crate::config_fix::auto_migrate_user_config`]) build their rewrite from
+//! it; ordinary loading refuses them before translating. Names retired more
+//! recently are translated in memory into their current equivalents on every
+//! load, and the current keys then pass through the normal user/project trust
+//! rules. The keys the per-repository data store retires
+//! ([`DATA_LAYER_RETIRED_PATHS`]) get a notice until
+//! [`DATA_LAYER_KEYS_REFUSED_FROM`] and are refused from that release on. A
 //! project file is never written, only reported with a notice. The TypeScript plugins carry a mirror of
 //! the same rules in `packages/aft-bridge/src/feature-config.ts`; the config
 //! parity fixtures and the shared notice-projection fixtures keep them equal.
@@ -184,6 +188,11 @@ pub fn removed_config_key_errors_at(map: &Map<String, Value>, release: (u64, u64
 
 fn removed_block_key_errors(map: &Map<String, Value>, release: (u64, u64)) -> Vec<String> {
     let mut errors = removed_opencode_key_errors(map);
+    errors.extend(
+        refused_retired_names(map)
+            .into_iter()
+            .map(|name| format!("removed_config_key:{name}; run npx @cortexkit/aft doctor --fix")),
+    );
     if release >= DATA_LAYER_KEYS_REFUSED_FROM {
         for path in DATA_LAYER_RETIRED_PATHS {
             if has_path(map, path) {
@@ -209,6 +218,56 @@ fn removed_opencode_key_errors(map: &Map<String, Value>) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Names retired in 0.62 or earlier, refused from 0.64, in the order a
+/// refusal lists them. A config that still sets one is refused with
+/// `removed_config_key`; `doctor --fix` (or the automatic rewrite of the user
+/// file) replaces it with its current equivalent or deletes it. Names retired
+/// more recently (`bridge.hang_threshold` and the data-layer keys) are not
+/// listed: they are still translated, with a notice. Mirrors the TypeScript
+/// `REFUSED_RETIRED_PATHS`.
+pub const REFUSED_RETIRED_PATHS: [&str; 20] = [
+    "sandbox.enabled",
+    "tool_surface",
+    "hoist_builtin_tools",
+    "enabled",
+    "search_index",
+    "experimental_search_index",
+    "semantic_search",
+    "experimental_semantic_search",
+    "callgraph_store",
+    "github.enabled",
+    "gh_read",
+    "gh_shim.enabled",
+    "experimental_lsp_ty",
+    "experimental_bash_rewrite",
+    "experimental_bash_compress",
+    "experimental_bash_background",
+    "experimental.bash",
+    "idle.lsp_ttl_minutes",
+    "inspect.tier2_soft_deadline_ms",
+    "inspect.max_drill_down_items",
+];
+
+/// The refused retired names one block sets: the paths in
+/// [`REFUSED_RETIRED_PATHS`], then each prefixed tool name
+/// ([`LEGACY_TOOL_ALIASES`]) its `disabled_tools` list contains, once each and
+/// by its bare name, as the retired-key notices list it.
+fn refused_retired_names(map: &Map<String, Value>) -> Vec<String> {
+    let mut names: Vec<String> = REFUSED_RETIRED_PATHS
+        .iter()
+        .filter(|path| has_path(map, path))
+        .map(|path| (*path).to_string())
+        .collect();
+    if let Some(Value::Array(entries)) = map.get("disabled_tools") {
+        for name in entries.iter().filter_map(Value::as_str) {
+            if legacy_tool_alias(name).is_some() && !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Retired top-level (or nested) config paths and their replacement.
@@ -596,9 +655,10 @@ fn translate_data_layer_paths(
 /// `RETIRED_ENABLED_FALSE_INDEXES_NOTE`.
 pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
 
-/// Translate flat experimental aliases to nested settings. Graduating
-/// `experimental.bash` explicitly sets omitted feature flags to false;
-/// otherwise the current default-on bash settings would silently enable them.
+/// Translate flat experimental aliases to nested settings and move the
+/// `experimental.bash` block to top-level `bash`. Graduating a block that sets
+/// a feature flag explicitly sets its omitted flags to false; otherwise the
+/// current default-on bash settings would silently enable them.
 fn translate_experimental_paths(
     map: &mut Map<String, Value>,
     prefix: &str,
@@ -655,11 +715,8 @@ fn translate_experimental_paths(
         return;
     };
     if let Some(legacy) = legacy.as_object() {
-        if !["rewrite", "compress", "background"]
-            .iter()
-            .any(|leaf| legacy.contains_key(*leaf))
-        {
-            return;
+        if legacy.is_empty() {
+            record_retired(out, prefix, "experimental.bash");
         }
         for leaf in legacy.keys() {
             record_retired(out, prefix, &format!("experimental.bash.{leaf}"));
@@ -673,11 +730,19 @@ fn translate_experimental_paths(
             );
         } else {
             let mut bash = Map::new();
-            for leaf in ["rewrite", "compress", "background"] {
-                bash.insert(
-                    leaf.to_string(),
-                    Value::Bool(legacy.get(leaf) == Some(&Value::Bool(true))),
-                );
+            // A block with only reminder settings never opted into the
+            // feature flags, so they keep their current defaults instead of
+            // being written as false.
+            if ["rewrite", "compress", "background"]
+                .iter()
+                .any(|leaf| legacy.contains_key(*leaf))
+            {
+                for leaf in ["rewrite", "compress", "background"] {
+                    bash.insert(
+                        leaf.to_string(),
+                        Value::Bool(legacy.get(leaf) == Some(&Value::Bool(true))),
+                    );
+                }
             }
             for leaf in [
                 "long_running_reminder_enabled",
@@ -687,7 +752,9 @@ fn translate_experimental_paths(
                     bash.insert(leaf.to_string(), value.clone());
                 }
             }
-            map.insert("bash".to_string(), Value::Object(bash));
+            if !bash.is_empty() {
+                map.insert("bash".to_string(), Value::Object(bash));
+            }
         }
     } else {
         record_retired(out, prefix, "experimental.bash");
@@ -781,12 +848,9 @@ fn translate_block(
         }
     }
 
+    // `experimental.bash` was already recorded, leaf by leaf, and removed by
+    // `translate_experimental_paths`.
     for (path, _) in RETIRED_PATHS {
-        // A block with only reminder settings never opted into experimental
-        // bash features. Leave it unchanged instead of adding false flags.
-        if path == "experimental.bash" {
-            continue;
-        }
         if has_path(map, path) {
             record_retired(out, &prefix, path);
         }

@@ -13,7 +13,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "harness": "opencode",
             "project_root": dir.path(),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

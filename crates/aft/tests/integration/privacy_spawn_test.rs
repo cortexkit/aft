@@ -21,10 +21,15 @@ fn macos_native_fixture_project() -> tempfile::TempDir {
 }
 
 fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, sandbox: bool) {
+    let (worker, head) = if sandbox {
+        ("strict", "strict")
+    } else {
+        ("relaxed", "off")
+    };
     let response = aft.send(&json!({
         "id": "cfg-privacy", "session_id": SESSION, "command": "configure",
         "harness": "opencode", "project_root": project, "storage_dir": storage,
-        "config": user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "enabled": sandbox } })),
+        "config": user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "profile": { "worker": worker, "head": head } } })),
     }).to_string());
     assert_eq!(response["success"], true, "{response}");
 }

@@ -471,38 +471,12 @@ pub struct RawBashFeatures {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawExperimental {
-    pub bash: Option<RawExperimentalBash>,
     pub lsp_ty: Option<bool>,
 }
 
 impl RawExperimental {
     fn is_empty(&self) -> bool {
-        self.bash.is_none() && self.lsp_ty.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct RawExperimentalBash {
-    pub rewrite: Option<bool>,
-    pub compress: Option<bool>,
-    pub background: Option<bool>,
-    pub long_running_reminder_enabled: Option<bool>,
-    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
-    pub long_running_reminder_interval_ms: Option<u64>,
-}
-
-impl RawExperimentalBash {
-    fn has_any_value(&self) -> bool {
-        self.rewrite.is_some()
-            || self.compress.is_some()
-            || self.background.is_some()
-            || self.long_running_reminder_enabled.is_some()
-            || self.long_running_reminder_interval_ms.is_some()
-    }
-
-    fn has_legacy_feature_flag(&self) -> bool {
-        self.rewrite.is_some() || self.compress.is_some() || self.background.is_some()
+        self.lsp_ty.is_none()
     }
 }
 
@@ -1156,7 +1130,8 @@ fn parse_tier(
         return Err(vec!["invalid_config_document".to_string()]);
     };
     // Retired keys are translated on the raw document, before the strict
-    // schema sees it, so they never reach `RawAftConfig`. Only the user
+    // schema sees it, so they never reach `RawAftConfig`; the names retired in
+    // 0.62 or earlier were already refused by `removed_config_key_errors`. Only the user
     // tier's base block may receive the absent-base default disables.
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
@@ -1453,8 +1428,9 @@ pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
 /// error: a typo must not reset
 /// a key (possibly a security key the harness block set) to its default while
 /// the root stays bound, so the reload calls this first and keeps the last
-/// valid configuration instead. Retired keys are translated first, exactly as
-/// the resolver translates them, so they never count as invalid here.
+/// valid configuration instead. Names retired in 0.62 or earlier are refused,
+/// and the more recently retired keys are translated first, exactly as the
+/// resolver translates them, so they never count as invalid here.
 pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option<String> {
     let stripped = strip_jsonc(&tier.doc);
     let value = match serde_json::from_str::<Value>(&stripped) {
@@ -2118,30 +2094,8 @@ fn merge_experimental_config(
 
     let mut experimental = base.unwrap_or_default();
     experimental.lsp_ty = override_experimental.lsp_ty.or(experimental.lsp_ty);
-    experimental.bash = merge_experimental_bash(experimental.bash, override_experimental.bash);
 
     (!experimental.is_empty()).then_some(experimental)
-}
-
-fn merge_experimental_bash(
-    base: Option<RawExperimentalBash>,
-    override_bash: Option<RawExperimentalBash>,
-) -> Option<RawExperimentalBash> {
-    let Some(override_bash) = override_bash else {
-        return base;
-    };
-    let mut bash = base.unwrap_or_default();
-    bash.rewrite = override_bash.rewrite.or(bash.rewrite);
-    bash.compress = override_bash.compress.or(bash.compress);
-    bash.background = override_bash.background.or(bash.background);
-    bash.long_running_reminder_enabled = override_bash
-        .long_running_reminder_enabled
-        .or(bash.long_running_reminder_enabled);
-    bash.long_running_reminder_interval_ms = override_bash
-        .long_running_reminder_interval_ms
-        .or(bash.long_running_reminder_interval_ms);
-
-    bash.has_any_value().then_some(bash)
 }
 
 fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
@@ -3352,21 +3306,14 @@ fn resolve_bash_config(
     warnings: &mut Vec<ConfigWarning>,
 ) -> ResolvedBashConfig {
     let top = raw.bash.as_ref();
-    let legacy = raw
-        .experimental
-        .as_ref()
-        .and_then(|experimental| experimental.bash.as_ref());
 
     let top_features = match top {
         Some(RawBash::Features(features)) => Some(features),
         _ => None,
     };
-    let reminder_enabled = top_features
-        .and_then(|features| features.long_running_reminder_enabled)
-        .or_else(|| legacy.and_then(|legacy| legacy.long_running_reminder_enabled));
-    let reminder_interval = top_features
-        .and_then(|features| features.long_running_reminder_interval_ms)
-        .or_else(|| legacy.and_then(|legacy| legacy.long_running_reminder_interval_ms));
+    let reminder_enabled = top_features.and_then(|features| features.long_running_reminder_enabled);
+    let reminder_interval =
+        top_features.and_then(|features| features.long_running_reminder_interval_ms);
     let top_host_fallback = top_features
         .and_then(|features| features.host_fallback)
         .unwrap_or(false);
@@ -3450,31 +3397,13 @@ fn resolve_bash_config(
             runon_env: features.runon_env.clone().unwrap_or_default(),
             ..base
         },
-        None => {
-            if legacy.is_some_and(RawExperimentalBash::has_legacy_feature_flag) {
-                let legacy = legacy.cloned().unwrap_or_default();
-                let rewrite = legacy.rewrite == Some(true);
-                let compress = legacy.compress == Some(true);
-                let background = legacy.background == Some(true);
-                // The runtime gate stays on: only `bash: false` or
-                // `bash.enabled: false` switch it off.
-                return ResolvedBashConfig {
-                    enabled: true,
-                    rewrite,
-                    compress,
-                    background,
-                    ..base
-                };
-            }
-
-            ResolvedBashConfig {
-                enabled: true,
-                rewrite: true,
-                compress: true,
-                background: true,
-                ..base
-            }
-        }
+        None => ResolvedBashConfig {
+            enabled: true,
+            rewrite: true,
+            compress: true,
+            background: true,
+            ..base
+        },
     }
 }
 
@@ -4222,69 +4151,168 @@ mod tests {
         assert!(drop_keys(&result).contains(&"inspect.categories.dead_code".to_string()));
     }
 
-    /// The retired inspect/LSP keys load in either tier. The idle value moves
-    /// to `lsp.idle_minutes` and is then held to that key's project rule: a
-    /// project may only shorten the user's idle window.
+    /// One document per name retired in 0.62 or earlier, with the name the
+    /// refusal reports. Every entry of `REFUSED_RETIRED_PATHS` and every
+    /// prefixed tool name appears.
+    fn refused_retired_documents() -> Vec<(&'static str, Value)> {
+        let mut documents = vec![
+            ("sandbox.enabled", serde_json::json!({"sandbox": {"enabled": true}})),
+            ("tool_surface", serde_json::json!({"tool_surface": "minimal"})),
+            ("hoist_builtin_tools", serde_json::json!({"hoist_builtin_tools": false})),
+            ("enabled", serde_json::json!({"enabled": false})),
+            ("search_index", serde_json::json!({"search_index": false})),
+            (
+                "experimental_search_index",
+                serde_json::json!({"experimental_search_index": false}),
+            ),
+            ("semantic_search", serde_json::json!({"semantic_search": false})),
+            (
+                "experimental_semantic_search",
+                serde_json::json!({"experimental_semantic_search": false}),
+            ),
+            ("callgraph_store", serde_json::json!({"callgraph_store": false})),
+            ("github.enabled", serde_json::json!({"github": {"enabled": false}})),
+            ("gh_read", serde_json::json!({"gh_read": {"enabled": true}})),
+            (
+                "gh_shim.enabled",
+                serde_json::json!({"gh_shim": {"enabled": false, "binary_path": "/opt/aft/bin/aft"}}),
+            ),
+            ("experimental_lsp_ty", serde_json::json!({"experimental_lsp_ty": true})),
+            (
+                "experimental_bash_rewrite",
+                serde_json::json!({"experimental_bash_rewrite": true}),
+            ),
+            (
+                "experimental_bash_compress",
+                serde_json::json!({"experimental_bash_compress": true}),
+            ),
+            (
+                "experimental_bash_background",
+                serde_json::json!({"experimental_bash_background": true}),
+            ),
+            (
+                "experimental.bash",
+                serde_json::json!({"experimental": {"bash": {"background": true}}}),
+            ),
+            (
+                "experimental.bash",
+                serde_json::json!({"experimental": {"bash": {"long_running_reminder_interval_ms": 5000}}}),
+            ),
+            (
+                "idle.lsp_ttl_minutes",
+                serde_json::json!({"idle": {"lsp_ttl_minutes": 10}}),
+            ),
+            (
+                "inspect.tier2_soft_deadline_ms",
+                serde_json::json!({"inspect": {"tier2_soft_deadline_ms": 50}}),
+            ),
+            (
+                "inspect.max_drill_down_items",
+                serde_json::json!({"inspect": {"max_drill_down_items": 20}}),
+            ),
+        ];
+        for (alias, _) in feature_config::LEGACY_TOOL_ALIASES {
+            documents.push((alias, serde_json::json!({"disabled_tools": [alias]})));
+        }
+        documents
+    }
+
+    /// A name retired in 0.62 or earlier is refused with `removed_config_key`
+    /// in either tier and in a harness block, and `doctor --fix` rewrites the
+    /// file into one that loads.
     #[test]
-    fn retired_inspect_and_lsp_keys_translate_under_current_key_rules() {
-        let minutes = |result: &ResolveResult| {
-            serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"].clone()
-        };
-        let user = resolve_config(&[tier("user", r#"{"idle":{"lsp_ttl_minutes":10}}"#)]);
-        assert!(user.errors.is_empty(), "{:?}", user.errors);
-        assert_eq!(minutes(&user), 10);
+    fn names_retired_two_releases_ago_are_refused_and_doctor_fix_repairs_them() {
+        let documents = refused_retired_documents();
+        let listed: std::collections::BTreeSet<&str> =
+            documents.iter().map(|(name, _)| *name).collect();
+        for path in feature_config::REFUSED_RETIRED_PATHS {
+            assert!(listed.contains(path), "{path} has no refusal case");
+        }
+        for (name, document) in documents {
+            for (prefix, document) in [
+                ("", document.clone()),
+                (
+                    "harnesses.pi.",
+                    serde_json::json!({"harnesses": {"pi": document}}),
+                ),
+            ] {
+                let text = document.to_string();
+                for tier_name in ["user", "project"] {
+                    let refused = resolve_config_for_harness(
+                        &[tier(tier_name, &text)],
+                        Some(&Harness::Pi),
+                    );
+                    assert_eq!(
+                        refused.errors,
+                        [format!(
+                            "removed_config_key:{prefix}{name}; run npx @cortexkit/aft doctor --fix"
+                        )],
+                        "{tier_name}: {text}"
+                    );
 
-        let tighten = resolve_config(&[
-            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
-            tier("project", r#"{"idle":{"lsp_ttl_minutes":10}}"#),
-        ]);
-        assert!(tighten.errors.is_empty(), "{:?}", tighten.errors);
-        assert_eq!(minutes(&tighten), 10);
-
-        let loosen = resolve_config(&[
-            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
-            tier("project", r#"{"idle":{"lsp_ttl_minutes":120}}"#),
-        ]);
-        assert!(loosen.errors.is_empty(), "{:?}", loosen.errors);
-        assert_eq!(minutes(&loosen), 30);
-        assert!(drop_keys(&loosen).contains(&"lsp.idle_minutes".to_string()));
-
-        for (tier_name, doc) in [
-            ("user", r#"{"inspect":{"tier2_soft_deadline_ms":50}}"#),
-            ("project", r#"{"inspect":{"max_drill_down_items":20}}"#),
-        ] {
-            let result = resolve_config(&[tier(tier_name, doc)]);
-            assert!(result.errors.is_empty(), "{doc}: {:?}", result.errors);
+                    let fix_tier = if tier_name == "user" {
+                        crate::config_fix::FixTier::User
+                    } else {
+                        crate::config_fix::FixTier::Project
+                    };
+                    let fixed = crate::config_fix::migrate_config_text(&text, fix_tier)
+                        .expect("doctor --fix rewrites the file");
+                    assert!(fixed.changed, "{tier_name}: {text}");
+                    let repaired = resolve_config_for_harness(
+                        &[tier(tier_name, &fixed.text)],
+                        Some(&Harness::Pi),
+                    );
+                    assert!(
+                        repaired.errors.is_empty(),
+                        "{tier_name}: {text} -> {}: {:?}",
+                        fixed.text,
+                        repaired.errors
+                    );
+                }
+            }
         }
     }
 
-    /// Retired keys never refuse a load, in either tier. A project file's
-    /// translated values are current keys, so the project trust rules apply:
-    /// an index may be switched off, and protected tools stay registered.
+    /// `doctor --fix` keeps what a refused name meant: the replacement keys
+    /// carry its value.
     #[test]
-    fn retired_keys_resolve_in_both_tiers() {
-        let user = resolve_config(&[tier("user", r#"{"search_index":false}"#)]);
-        assert!(user.errors.is_empty(), "{:?}", user.errors);
-        assert!(!user.config.indexes.trigram);
+    fn doctor_fix_carries_refused_values_to_their_replacements() {
+        let fixed = |text: &str| {
+            let text = crate::config_fix::migrate_config_text(text, crate::config_fix::FixTier::User)
+                .unwrap()
+                .text;
+            let result = resolve_config(&[tier("user", &text)]);
+            assert!(result.errors.is_empty(), "{text}: {:?}", result.errors);
+            result.config
+        };
+        let minutes = |config: &Config| serde_json::to_value(config).unwrap()["lsp_idle_minutes"].clone();
+        assert_eq!(minutes(&fixed(r#"{"idle":{"lsp_ttl_minutes":10}}"#)), 10);
+        assert!(!fixed(r#"{"search_index":false}"#).indexes.trigram);
+        let reminder =
+            fixed(r#"{"experimental":{"bash":{"long_running_reminder_interval_ms":5000}}}"#);
+        assert_eq!(reminder.bash_long_running_reminder_interval_ms, 5000);
+        assert!(reminder.experimental_bash_rewrite, "the flags keep their defaults");
+        let background = fixed(r#"{"experimental":{"bash":{"background":true}}}"#);
+        assert!(background.experimental_bash_background);
+        assert!(!background.experimental_bash_rewrite);
+        assert!(!background.experimental_bash_compress);
+        let disabled = fixed(r#"{"disabled_tools":["aft_read"]}"#);
+        assert_eq!(disabled.disabled_tools, ["read"]);
+    }
 
-        let project = resolve_config(&[
-            tier("user", "{}"),
-            tier(
-                "project",
-                r#"{"search_index":false,"hoist_builtin_tools":false,"harnesses":{"opencode":{"tool_surface":"minimal"}}}"#,
-            ),
-        ]);
-        assert!(project.errors.is_empty(), "{:?}", project.errors);
-        assert!(!project.config.indexes.trigram);
-        for host in ["read", "write", "edit", "bash"] {
-            assert!(
-                !project
-                    .config
-                    .disabled_tools
-                    .iter()
-                    .any(|name| name == host),
-                "{host} is protected from a project file"
-            );
+    /// Names retired in 0.63 or 0.64 still load in either tier: AFT
+    /// translates them in memory and says so in a notice.
+    #[test]
+    fn names_retired_in_the_last_two_releases_still_translate() {
+        for tier_name in ["user", "project"] {
+            let hang = resolve_config(&[tier(tier_name, r#"{"bridge":{"hang_threshold":2}}"#)]);
+            assert!(hang.errors.is_empty(), "{tier_name}: {:?}", hang.errors);
+            let checkout = resolve_config(&[tier(
+                tier_name,
+                r#"{"views":{"idle_checkout_hours":72}}"#,
+            )]);
+            assert!(checkout.errors.is_empty(), "{tier_name}: {:?}", checkout.errors);
+            assert_eq!(checkout.config.idle.checkout_hours, 72);
         }
     }
 
@@ -4401,15 +4429,12 @@ mod tests {
         ));
     }
 
-    /// A project's legacy keys never bring back the move/delete default the
-    /// user switched off with an explicit empty list.
+    /// A project's former registration gates (`backup.enabled: false`,
+    /// `bash: false`) never bring back the move/delete default the user
+    /// switched off with an explicit empty list.
     #[test]
     fn project_legacy_keys_do_not_reapply_the_default_disables() {
-        for project in [
-            r#"{"hoist_builtin_tools": false}"#,
-            r#"{"backup": {"enabled": false}}"#,
-            r#"{"bash": false}"#,
-        ] {
+        for project in [r#"{"backup": {"enabled": false}}"#, r#"{"bash": false}"#] {
             let result = resolve_config_for_harness(
                 &[
                     tier("user", r#"{"disabled_tools": []}"#),
@@ -4921,18 +4946,18 @@ mod tests {
             tier(
                 "user",
                 r#"{
-                  "hoist_builtin_tools": false,
+                  "disabled_tools": ["aft_delete", "aft_move", "apply_patch", "bash", "edit", "glob", "grep", "read", "write"],
                   "harnesses": {
-                    "opencode": { "hoist_builtin_tools": true },
-                    "pi": { "hoist_builtin_tools": false }
+                    "opencode": { "disabled_tools": [] },
+                    "pi": { "disabled_tools": ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"] }
                   }
                 }"#,
             ),
             tier(
                 "project",
                 r#"{
-                  "hoist_builtin_tools": false,
-                  "harnesses": { "opencode": { "hoist_builtin_tools": true } }
+                  "disabled_tools": ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"],
+                  "harnesses": { "opencode": { "disabled_tools": [] } }
                 }"#,
             ),
         ];
@@ -4940,11 +4965,10 @@ mod tests {
         let opencode = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
         let pi = resolve_config_for_harness(&tiers, Some(&Harness::Pi));
 
-        // The legacy hoist choice now translates into disabled host names. The
-        // user base (hoist false) already disables them; a harness block can
-        // only add disables, so the OpenCode `true` cannot re-enable them.
-        // The project's hoist false is ignored: host slots are protected from
-        // project disables.
+        // The user base already disables the host names; a harness block can
+        // only add disables, so the OpenCode empty list cannot re-enable them.
+        // The project's host disables are ignored: host slots are protected
+        // from project disables.
         let hosts_and_default = [
             "aft_delete",
             "aft_move",
@@ -4961,7 +4985,7 @@ mod tests {
 
         let harness_only = [tier(
             "user",
-            r#"{ "harnesses": { "pi": { "hoist_builtin_tools": false } } }"#,
+            r#"{ "harnesses": { "pi": { "disabled_tools": ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"] } } }"#,
         )];
         assert_eq!(
             resolve_config_for_harness(&harness_only, Some(&Harness::Opencode),)
@@ -4990,7 +5014,7 @@ mod tests {
                         "base_url": "http://localhost:11434",
                         "api_key_env": "USER_KEY"
                       },
-                      "sandbox": { "enabled": true, "write_allow": ["/user/write"] }
+                      "sandbox": { "profile": { "worker": "strict", "head": "strict" }, "write_allow": ["/user/write"] }
                     }"#,
                 ),
                 tier(
@@ -5006,7 +5030,7 @@ mod tests {
                             "api_key_env": "EVIL_KEY"
                           },
                           "subc": { "connection_file": "/tmp/evil-subc.json" },
-                          "sandbox": { "enabled": false, "write_allow": ["/project/write"] }
+                          "sandbox": { "profile": { "worker": "relaxed", "head": "off" }, "write_allow": ["/project/write"] }
                         }
                       }
                     }"#,
@@ -5100,42 +5124,6 @@ mod tests {
     }
 
     #[test]
-    fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
-        // The legacy GitHub master switch no longer overrides explicit leaves;
-        // it only supplies false for permissions omitted from the block.
-        let explicit = resolve_config_for_harness(
-            &[tier(
-                "user",
-                r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
-            )],
-            None,
-        );
-        assert!(explicit.errors.is_empty());
-        assert_eq!(
-            explicit.config.github,
-            GithubConfig {
-                shim: true,
-                read: true,
-                write: true,
-            }
-        );
-
-        let master_only =
-            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":false}}"#)], None);
-        assert_eq!(
-            master_only.config.github,
-            GithubConfig {
-                shim: false,
-                read: false,
-                write: false,
-            }
-        );
-        let master_true =
-            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":true}}"#)], None);
-        assert_eq!(master_true.config.github, GithubConfig::default());
-    }
-
-    #[test]
     fn github_write_forces_read_and_records_a_warning_naming_both_keys() {
         let result = resolve_config(&[tier("user", r#"{"github":{"write":true,"read":false}}"#)]);
 
@@ -5151,47 +5139,15 @@ mod tests {
         assert!(warning.message.contains("github.read"));
     }
 
-    /// The GitHub enable aliases translate to the canonical leaves in either
-    /// tier. A canonical leaf in the same block wins, and a project's
-    /// translated leaf is dropped exactly like a spelled-out `github.read`.
+    /// `gh_shim.enabled` is refused, but the supported binary override alone
+    /// is not a retired name and still loads.
     #[test]
-    fn retired_github_aliases_translate_and_keep_the_project_boundary() {
-        let alias = resolve_config(&[tier("user", r#"{"gh_read":{"enabled":false}}"#)]);
-        assert!(alias.errors.is_empty(), "{:?}", alias.errors);
-        assert!(!alias.config.github.read);
-        let canonical = resolve_config(&[tier(
-            "user",
-            r#"{"github":{"read":false},"gh_read":{"enabled":true}}"#,
-        )]);
-        assert!(canonical.errors.is_empty(), "{:?}", canonical.errors);
-        assert!(!canonical.config.github.read);
-        let shim = resolve_config(&[tier("user", r#"{"gh_shim":{"enabled":false}}"#)]);
-        assert!(shim.errors.is_empty(), "{:?}", shim.errors);
-        assert!(!shim.config.github.shim);
-
-        let project = resolve_config(&[
-            tier("user", r#"{"github":{"read":false}}"#),
-            tier("project", r#"{"gh_read":{"enabled":true}}"#),
-        ]);
-        assert!(project.errors.is_empty(), "{:?}", project.errors);
-        assert!(
-            !project.config.github.read,
-            "a project cannot enable GitHub reads"
-        );
-        assert!(
-            drop_keys(&project)
-                .iter()
-                .any(|key| key.starts_with("github")),
-            "{:?}",
-            drop_keys(&project)
-        );
-
-        // The supported binary override alone is not a retired alias.
+    fn gh_shim_binary_path_alone_still_loads() {
         let binary = resolve_config(&[tier(
             "user",
             r#"{"gh_shim":{"binary_path":"/opt/aft/bin/aft"}}"#,
         )]);
-        assert!(binary.errors.is_empty());
+        assert!(binary.errors.is_empty(), "{:?}", binary.errors);
         assert_eq!(
             binary.config.gh_shim.binary_path,
             Some(PathBuf::from("/opt/aft/bin/aft"))
@@ -5541,11 +5497,11 @@ mod tests {
     #[test]
     fn project_indexes_can_only_turn_an_index_off() {
         // A project may switch an index off but never back on: its values AND
-        // with the user resolution (legacy keys translate first).
+        // with the user resolution.
         let result = resolve_config_for_harness(
             &[
-                tier("user", r#"{ "search_index": false }"#),
-                tier("project", r#"{ "search_index": true }"#),
+                tier("user", r#"{ "indexes": { "trigram": false } }"#),
+                tier("project", r#"{ "indexes": { "trigram": true } }"#),
             ],
             None,
         );
@@ -5694,18 +5650,28 @@ mod tests {
         // Hardening is one-way: a repo may opt itself into kernel confinement.
         let opt_in = resolve_config(&[
             tier("user", r#"{}"#),
-            tier("project", r#"{ "sandbox": { "enabled": true } }"#),
+            tier(
+                "project",
+                r#"{ "sandbox": { "profile": { "worker": "strict", "head": "strict" } } }"#,
+            ),
         ]);
         assert!(opt_in.config.sandbox.head_enabled());
         assert!(
             !drop_keys(&opt_in).contains(&"sandbox.profile.head".to_string()),
-            "project enabled:true is an accepted opt-in, not a dropped key"
+            "a stricter project profile is an accepted opt-in, not a dropped key"
         );
 
-        // The weakening direction stays user-only: project false cannot win.
+        // The weakening direction stays user-only: a looser project profile
+        // cannot win.
         let opt_out = resolve_config(&[
-            tier("user", r#"{ "sandbox": { "enabled": true } }"#),
-            tier("project", r#"{ "sandbox": { "enabled": false } }"#),
+            tier(
+                "user",
+                r#"{ "sandbox": { "profile": { "worker": "strict", "head": "strict" } } }"#,
+            ),
+            tier(
+                "project",
+                r#"{ "sandbox": { "profile": { "worker": "relaxed", "head": "off" } } }"#,
+            ),
         ]);
         assert!(opt_out.config.sandbox.head_enabled());
         assert!(drop_keys(&opt_out).contains(&"sandbox.profile.head".to_string()));
@@ -5992,31 +5958,10 @@ mod tests {
         assert!(!object_partial_result.config.experimental_bash_compress);
         assert!(object_partial_result.config.experimental_bash_background);
 
-        let legacy_result = resolve_config(&[tier(
-            "user",
-            r#"{ "experimental": { "bash": { "rewrite": true } } }"#,
-        )]);
-        assert!(legacy_result.config.experimental_bash_rewrite);
-        assert!(!legacy_result.config.experimental_bash_compress);
-        assert!(!legacy_result.config.experimental_bash_background);
-
         let surface_default_result = resolve_config(&[tier("user", r#"{}"#)]);
         assert!(surface_default_result.config.experimental_bash_rewrite);
         assert!(surface_default_result.config.experimental_bash_compress);
         assert!(surface_default_result.config.experimental_bash_background);
-
-        // The legacy minimal surface no longer switches the bash runtime off; it
-        // unregisters bash and its companions through disabled_tools instead.
-        let minimal_surface_result =
-            resolve_config_for_harness(&[tier("user", r#"{ "tool_surface": "minimal" }"#)], None);
-        assert!(minimal_surface_result.config.bash.enabled);
-        assert!(minimal_surface_result.config.experimental_bash_rewrite);
-        assert!(minimal_surface_result
-            .config
-            .disabled_tools
-            .iter()
-            .any(|tool| tool == "bash"));
-
         assert!(!false_result.config.bash.enabled);
         assert!(true_result.config.bash.enabled);
         assert!(object_default_result.config.bash.enabled);

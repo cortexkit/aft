@@ -191,7 +191,7 @@ fn windows_cmd_background_wrapper_allows_bang_in_path() {
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

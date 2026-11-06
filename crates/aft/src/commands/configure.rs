@@ -7673,15 +7673,17 @@ mod tests {
     }
 
     /// Configure migrates a user file that uses retired keys and reports it
-    /// once; a project file with retired keys is translated in memory and its
-    /// bytes are never touched. Neither refuses the configure.
+    /// once. A project file's recently retired keys are translated in memory,
+    /// and its bytes are never touched; a project file that names a key
+    /// retired in 0.62 or earlier rejects the configure.
     #[test]
     fn configure_migrates_the_user_file_and_translates_the_project_file() {
         let temp = tempfile::tempdir().unwrap();
         let ctx = test_context();
         let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
         let project_path = temp.path().join(".cortexkit/aft.jsonc");
-        let project_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        let project_text =
+            r#"{ "indexes": { "semantic": false }, "bridge": { "hang_threshold": 2 } }"#;
         write_config(&user_path, r#"{ "search_index": false }"#);
         write_config(&project_path, project_text);
         let request = || {
@@ -7696,10 +7698,6 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
         assert!(!ctx.config().indexes.trigram);
         assert!(!ctx.config().indexes.semantic);
-        assert!(
-            !ctx.config().github.read,
-            "a project cannot enable GitHub reads"
-        );
         let migrated: Vec<&Value> = response.data["warnings"]
             .as_array()
             .expect("warnings")
@@ -7724,6 +7722,21 @@ mod tests {
                 .iter()
                 .any(|warning| warning["kind"] == "config_migrated")));
         assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+
+        let refused_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        write_config(&project_path, refused_text);
+        let refused = handle_configure_for_test(&request(), &ctx);
+        assert!(!refused.success, "{refused:?}");
+        assert_eq!(refused.data["code"], "config_rejected", "{refused:?}");
+        assert!(
+            refused.data["message"].as_str().is_some_and(|message| message.contains(
+                "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix"
+            ) && message.contains(
+                "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix"
+            )),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), refused_text);
     }
 
     #[test]
@@ -7816,7 +7829,7 @@ mod tests {
             // "dir/file" literal keeps its `/` on Windows and would not match.
             let project_path = temp.path().join(format!(".{harness}")).join("aft.jsonc");
             let canonical = temp.path().join(".cortexkit").join("aft.jsonc");
-            let text = "{\n // committed config\n \"experimental_bash_compress\": false,\n \"callgraph_chunk_size\": 7,\n \"url_fetch_allow_private\": true\n}\n";
+            let text = "{\n // committed config\n \"bash\": { \"compress\": false },\n \"callgraph_chunk_size\": 7,\n \"url_fetch_allow_private\": true\n}\n";
             write_config(&project_path, text);
             let request = configure_request_with_params(json!({
                 "project_root": temp.path(),
@@ -9335,7 +9348,7 @@ mod tests {
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-                "experimental": { "bash": { "compress": true } }
+                "bash": { "rewrite": false, "compress": true, "background": false }
             }))]
         }));
         assert!(handle_configure_for_test(&request, &ctx).success);
@@ -10767,7 +10780,7 @@ mod tests {
             "sandbox",
             json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-                "sandbox": {"enabled": true}
+                "sandbox": {"profile": {"worker": "strict", "head": "strict"}}
             }),
         );
 

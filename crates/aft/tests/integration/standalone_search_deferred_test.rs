@@ -156,7 +156,7 @@ fn standalone_configure_replays_completed_task_before_queued_completion_drain() 
             "storage_dir": storage.path(),
             "config": user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
             "max_background_bash_tasks": 4
         })

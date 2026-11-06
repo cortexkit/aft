@@ -1,15 +1,14 @@
 //! The retired-key configuration migration behind `aft doctor --fix` and the
 //! automatic rewrite of the user config file.
 //!
-//! Ordinary loading translates the retired keys (`tool_surface`,
-//! `hoist_builtin_tools`, top-level `enabled`, `search_index`,
-//! `semantic_search`, `callgraph_store`, `github.enabled`, the GitHub enable
-//! aliases `gh_read`/`gh_shim.enabled`, the prefixed `aft_*` host names,
-//! `idle.lsp_ttl_minutes`, the two removed inspect keys and
-//! `views.idle_checkout_hours`) in memory and never refuses them before the
-//! release that retires them. This module rewrites a config file so that it
-//! states the same intent with canonical keys, and splices the changes into
-//! the original text so comments, formatting and unrelated keys survive.
+//! Ordinary loading refuses the names retired in 0.62 or earlier
+//! ([`feature_config::REFUSED_RETIRED_PATHS`] and the prefixed `aft_*` host
+//! names) with `removed_config_key`, and translates the more recently retired
+//! `bridge.hang_threshold` and `views.idle_checkout_hours` in memory. This
+//! module rewrites a config file so that it states the same intent with
+//! canonical keys, whichever of those groups its retired names belong to, and
+//! splices the changes into the original text so comments, formatting and
+//! unrelated keys survive.
 //! `doctor --fix` runs it for the user and project files on request, and also
 //! deletes the removed data-layer keys (`views.enabled`,
 //! `views.callgraph_copies`, `worktree.ram_overlay`);
@@ -294,14 +293,6 @@ fn migrate_block(
         .chain([feature_config::RETIRED_IDLE_CHECKOUT_HOURS])
         .chain(removed_paths.iter().map(|path| (*path, "")))
     {
-        if path == "experimental.bash"
-            && translated
-                .get("experimental")
-                .and_then(|experimental| experimental.get("bash"))
-                .is_some()
-        {
-            continue;
-        }
         let segments: Vec<&str> = path.split('.').collect();
         let present = match segments.as_slice() {
             [key] => raw.contains_key(*key),
@@ -327,6 +318,14 @@ fn migrate_block(
 /// migration.
 pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, String> {
     migrate_config_text_with(text, tier, RemovedKeys::Delete)
+}
+
+/// The text the automatic rewrite of the user file
+/// ([`auto_migrate_user_config`]) would leave: retired keys become their
+/// current equivalents and the removed data-layer keys stay. Nothing is
+/// written.
+pub fn migrate_user_config_text(text: &str) -> Result<Migration, String> {
+    migrate_config_text_with(text, FixTier::User, RemovedKeys::Keep)
 }
 
 fn migrate_config_text_with(
@@ -471,7 +470,8 @@ pub enum UserConfigMigration {
         notice: String,
     },
     /// The file still uses retired keys because it could not be rewritten.
-    /// Loading translates them in memory, so nothing is refused.
+    /// Loading translates the recently retired ones in memory and refuses the
+    /// names retired in 0.62 or earlier.
     NotMigrated {
         path: PathBuf,
         reason: String,
@@ -492,7 +492,7 @@ impl UserConfigMigration {
 /// treated as left behind by a crash and removed.
 const MIGRATION_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a loader waits for another process that is migrating the same
-/// file before it gives up and translates in memory.
+/// file before it gives up and reads the file as it is.
 const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The retired-key translation of a config text, when it parses as an object
@@ -505,6 +505,19 @@ fn retired_key_translation(text: &str) -> Option<feature_config::DocumentTransla
     let translation =
         feature_config::translate_document(&mut map, feature_config::DocumentTier::User);
     translation.legacy_input.then_some(translation)
+}
+
+/// Whether loading refuses a config text for a retired or removed key
+/// ([`feature_config::removed_config_key_errors`]).
+fn names_refused_key(text: &str) -> bool {
+    serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text))
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|map| !feature_config::removed_config_key_errors(map).is_empty())
+        })
+        .unwrap_or(false)
 }
 
 /// Exclusive, cross-process right to rewrite one config file, held as a lock
@@ -686,7 +699,15 @@ fn auto_migrate_user_config_with_reader(
     let text = read(path).ok()?;
     let translation = retired_key_translation(&text)?;
     let display = path.display().to_string();
-    let not_migrated = |reason: String, translation: &feature_config::DocumentTranslation| {
+    let not_migrated = |reason: String,
+                        translation: &feature_config::DocumentTranslation,
+                        text: &str| {
+        // Loading refuses a file that still names a key retired in 0.62 or
+        // earlier, and that refusal names the key and `doctor --fix`. A notice
+        // saying AFT applied the current equivalents would be wrong for it.
+        if names_refused_key(text) {
+            return None;
+        }
         Some(UserConfigMigration::NotMigrated {
             path: path.to_path_buf(),
             notice: feature_config::user_config_not_migrated_notice(&display, &reason, translation),
@@ -696,46 +717,58 @@ fn auto_migrate_user_config_with_reader(
 
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(reason) = crate::production_storage::config_write_refusal(&target) {
-        return not_migrated(reason, &translation);
+        return not_migrated(reason, &translation, &text);
     }
     match std::fs::metadata(&target) {
         Ok(metadata) if metadata.permissions().readonly() => {
-            return not_migrated("the file is read-only".to_string(), &translation);
+            return not_migrated("the file is read-only".to_string(), &translation, &text);
         }
         Ok(_) => {}
-        Err(error) => return not_migrated(format!("could not inspect it: {error}"), &translation),
+        Err(error) => {
+            return not_migrated(
+                format!("could not inspect it: {error}"),
+                &translation,
+                &text,
+            )
+        }
     }
     let _lock = match acquire_migration_lock(&target) {
         LockAttempt::Acquired(lock) => lock,
         // Another loader is rewriting the file and will report it.
         LockAttempt::Busy => return None,
         LockAttempt::Failed(error) => {
-            return not_migrated(format!("could not lock it: {error}"), &translation);
+            return not_migrated(format!("could not lock it: {error}"), &translation, &text);
         }
     };
 
     // Re-read under the lock: another process may have finished meanwhile.
     let text = match read(&target) {
         Ok(text) => text,
-        Err(error) => return not_migrated(format!("could not read it: {error}"), &translation),
+        Err(error) => {
+            return not_migrated(format!("could not read it: {error}"), &translation, &text)
+        }
     };
     let translation = retired_key_translation(&text)?;
     let migration = match migrate_config_text_with(&text, FixTier::User, RemovedKeys::Keep) {
         Ok(migration) if migration.changed => migration,
         Ok(_) => return None,
-        Err(error) => return not_migrated(error, &translation),
+        Err(error) => return not_migrated(error, &translation, &text),
     };
     let backup = match write_backup(&target, &text) {
         Ok(backup) => backup,
         Err(error) => {
-            return not_migrated(format!("could not write a backup: {error}"), &translation);
+            return not_migrated(
+                format!("could not write a backup: {error}"),
+                &translation,
+                &text,
+            );
         }
     };
     let sync_warning = match write(&target, &migration.text) {
         Ok(warning) => warning,
         Err(error) => {
             let _ = std::fs::remove_file(&backup);
-            return not_migrated(format!("could not write it: {error}"), &translation);
+            return not_migrated(format!("could not write it: {error}"), &translation, &text);
         }
     };
     let mut notice = feature_config::user_config_migrated_notice(

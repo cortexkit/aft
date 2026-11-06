@@ -625,7 +625,7 @@ mod session_owned_artifacts {
                 "project_root": project,
                 "storage_dir": storage,
                 "config": super::super::helpers::user_config(json!({
-                    "experimental": { "bash": { "background": true } }
+                    "bash": { "rewrite": false, "compress": false, "background": true }
                 })),
             }))
             .unwrap(),
