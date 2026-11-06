@@ -740,15 +740,46 @@ fn store_diet_language_corpus_views() {
 }
 
 /// Replays every query the views corpus golden recorded on main through the
-/// data layer's call graph, case by case, and fails listing each reply that
-/// differs from the recorded one. The golden pins main's answers; the data
-/// layer replaces the views store, so a difference here is either a fix to
-/// review or a regression.
+/// data layer's call graph, case by case. The golden pins main's answers;
+/// the data layer replaces the views store, so a reply may differ from main
+/// only where `corpus-data-layer-differences.json` lists it, with the
+/// reason, and the reply the data layer gives instead. Any other difference
+/// fails, as does a listed difference that no longer occurs or whose reply
+/// changed.
 #[test]
-#[ignore = "diagnostic: compares the data layer's answers with main's recorded views answers"]
 fn store_diet_language_corpus_data_layer_answers() {
     let golden: Value =
         serde_json::from_slice(&read_capture(assets().join("corpus-views.json"))).unwrap();
+    let reviewed: Vec<Value> = serde_json::from_slice(&read_capture(
+        assets().join("corpus-data-layer-differences.json"),
+    ))
+    .unwrap();
+    let key = |entry: &Value| {
+        ["case", "operation", "file", "symbol", "to", "expression"].map(|field| {
+            entry
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+    };
+    let mut expected = reviewed
+        .iter()
+        .map(|entry| {
+            assert!(
+                entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty()),
+                "a listed difference must give its reason: {entry}"
+            );
+            (key(entry), entry["data_layer"].clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        expected.len(),
+        reviewed.len(),
+        "a difference is listed twice"
+    );
     let mut differences = Vec::new();
     let mut compared = 0usize;
     for case in corpus_cases() {
@@ -799,12 +830,17 @@ fn store_diet_language_corpus_data_layer_answers() {
             }
             for (operation, actual) in replies {
                 compared += 1;
-                if recorded[operation] != actual {
-                    differences.push(json!({
-                        "case": name, "file": file, "symbol": symbol,
-                        "to": recorded.get("to_symbol"), "expression": recorded.get("expression"),
-                        "operation": operation, "main": recorded[operation], "data_layer": actual,
-                    }));
+                let found = json!({
+                    "case": name, "file": file, "symbol": symbol,
+                    "to": recorded.get("to_symbol"), "expression": recorded.get("expression"),
+                    "operation": operation, "main": recorded[operation], "data_layer": actual,
+                });
+                match expected.remove(&key(&found)) {
+                    // Listed: the data layer must give the reviewed reply,
+                    // and it must still differ from main's.
+                    Some(reviewed) if reviewed == actual && recorded[operation] != actual => {}
+                    None if recorded[operation] == actual => {}
+                    _ => differences.push(found),
                 }
             }
         }
@@ -812,11 +848,19 @@ fn store_diet_language_corpus_data_layer_answers() {
     for difference in &differences {
         println!("DIFFERENCE {difference}");
     }
-    println!("compared {compared} replies; {} differ", differences.len());
+    println!(
+        "compared {compared} replies; {} differ from main and the reviewed list",
+        differences.len()
+    );
     assert!(compared > 0, "no recorded query was replayed");
     assert!(
+        expected.is_empty(),
+        "listed differences no recorded query reaches: {:?}",
+        expected.keys().collect::<Vec<_>>()
+    );
+    assert!(
         differences.is_empty(),
-        "{} replies differ",
+        "{} replies differ from main's recorded answers and the reviewed list",
         differences.len()
     );
 }
