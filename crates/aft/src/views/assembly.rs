@@ -30,17 +30,9 @@ pub(crate) fn release_manifest_cache(view_dir: &Path) {
     manifest_incremental::release_cache(view_dir);
 }
 
-pub(crate) fn try_release_manifest_cache(view_dir: &Path) -> bool {
-    manifest_incremental::try_release_cache(view_dir)
-}
-
 #[cfg(test)]
 #[path = "manifest_publication_bench.rs"]
 mod manifest_publication_bench;
-
-pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
-    manifest_incremental::full_verification_due(view_dir)
-}
 
 /// Avoid build admission for notifications outside committed membership. This
 /// does not replace rescans, semantic handoffs, artifact repair or graph builds.

@@ -40,48 +40,6 @@ pub(crate) struct TreeBaseInput<'a> {
     pub ignore_fingerprint: Option<String>,
 }
 
-/// Read-only helper for copy admission. It computes the
-/// checkout's tree or membership identity without claiming or building a base.
-pub(crate) fn identity_for_admission(
-    input: TreeBaseInput<'_>,
-    deadline: std::time::Instant,
-    known: Option<&std::collections::HashMap<String, (u64, blake3::Hash)>>,
-) -> Option<BaseIdentity> {
-    let guard = BindGuard::capture(input.root, None).ok()?;
-    if input.ignore_fingerprint.as_deref() != Some(guard.policy.base_digest.as_str()) {
-        return None;
-    }
-    if let Ok(proven) = prove_until(&input, &guard, Some(deadline)) {
-        return BaseIdentity::of(&input.route.family, &proven.manifest).ok();
-    }
-    // Tracked edits cannot use the Git tree base. Match the same membership
-    // identity the checkout driver builds from known paths, sizes and hashes instead.
-    let mut manifest = ManifestV2::new_v3(
-        ManifestHeader {
-            producers: input.producers.clone(),
-            head_tree: None,
-            ignore_fingerprint: input.ignore_fingerprint.clone(),
-            segment: None,
-        },
-        None,
-        Default::default(),
-    );
-    for (path, (size, hash)) in known? {
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        let path = RelPath::new(path.as_bytes().to_vec()).ok()?;
-        let content = crate::blob_store::v2::ContentHash::from_bytes(*hash.as_bytes());
-        manifest
-            .insert(
-                path.clone(),
-                super::base_builder::base_entry(&path, content, *size, Default::default()),
-            )
-            .ok()?;
-    }
-    BaseIdentity::of(&input.route.family, &manifest).ok()
-}
-
 /// A base manifest whose every member was read and matched to the index,
 /// with the bytes read and their receipts.
 struct ProvenMembers {

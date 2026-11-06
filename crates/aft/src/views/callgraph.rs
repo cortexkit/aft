@@ -169,15 +169,6 @@ pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Has
     Some(blake3::Hash::from_bytes(*key.as_bytes()))
 }
 
-/// The subset of a checkout's file identities a call graph is built from, so
-/// documents a call graph never holds do not count as files that differ.
-pub(crate) fn callgraph_inputs(
-    mut identities: std::collections::HashMap<String, (u64, blake3::Hash)>,
-) -> std::collections::HashMap<String, (u64, blake3::Hash)> {
-    identities.retain(|path, _| applies_to_relative(path.as_bytes()));
-    identities
-}
-
 /// Attach evidence computed from exactly the caller's already-read byte buffer.
 /// No disk access, blob put, publication or membership decision occurs here.
 pub fn attach(
@@ -526,12 +517,6 @@ pub(crate) struct CallgraphViewError {
     pub building: bool,
 }
 
-impl CallgraphViewError {
-    pub(crate) fn is_planned(&self) -> bool {
-        self.busy || self.building
-    }
-}
-
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
@@ -828,20 +813,6 @@ pub(crate) fn view_scope(root: &Path) -> String {
 }
 
 impl CallgraphView {
-    pub(crate) fn matches(
-        &self,
-        root: &Path,
-        storage: &crate::root_cache::StoragePaths,
-        family: &str,
-        policy: crate::blob_store::v2::TrigramPolicy,
-    ) -> bool {
-        self.root == root
-            && self.storage == *storage
-            && self.family == family
-            && self.policy == policy
-            && !self.owner.stopped()
-            && (self.current)()
-    }
 
     #[cfg(test)]
     pub(crate) fn new(
@@ -860,128 +831,12 @@ impl CallgraphView {
         )
     }
 
-    pub(crate) fn new_with_import(
-        root: PathBuf,
-        storage: crate::root_cache::StoragePaths,
-        family: String,
-        policy: crate::blob_store::v2::TrigramPolicy,
-        current: crate::migration::v3_ledger::ImportControl,
-        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
-    ) -> Result<Self, CallgraphViewError> {
-        if !current() {
-            return Err(CallgraphViewError {
-                reason: "checkout is unbound".into(),
-                busy: true,
-                building: false,
-            });
-        }
-        let legacy_import = crate::migration::views_background::BackgroundImport::start(
-            &storage.artifacts,
-            &family,
-            &root,
-            policy,
-            current.clone(),
-            limiter,
-        );
-        let scope = view_scope(&root);
-        let producers = super::manifest_v2::Producers {
-            trigram: policy.fingerprint_hex(),
-            semantic: None,
-            callgraph: PRODUCER.into(),
-        };
-        let trigram = Arc::new(super::first_load::TrigramBridge::new(
-            storage.artifacts.clone(),
-            policy,
-        ));
-        let bridge = Arc::new(super::first_load::CallgraphBridge::default());
-        let adapter: Arc<dyn PlaneAdapter> = bridge.adapter.clone();
-        let driver = Arc::new(
-            super::first_load::CheckoutDriver::new_v3(
-                &storage.artifacts,
-                &family,
-                &scope,
-                &root,
-                producers.clone(),
-                Arc::new(super::first_load::ConfiguredMembershipWalker),
-                vec![trigram, bridge.clone()],
-            )
-            .map_err(CallgraphViewError::from)?
-            .with_adapters(vec![adapter]),
-        );
-        driver.register_write_intent();
-        let source = Arc::new(CheckoutCallgraphSource {
-            access: driver.access(),
-            driver,
-            bridge,
-            storage: storage.artifacts.clone(),
-            family: family.clone(),
-            scope,
-            producers,
-        });
-        let mut view = Self::with_source(root, storage, family, policy, source);
-        view.legacy_import = legacy_import;
-        view.current = current;
-        Ok(view)
-    }
-
-    pub(crate) fn with_source(
-        root: PathBuf,
-        storage: crate::root_cache::StoragePaths,
-        family: String,
-        policy: crate::blob_store::v2::TrigramPolicy,
-        source: Arc<dyn CallgraphReaderSource>,
-    ) -> Self {
-        Self {
-            owner: super::callgraph_acquisition::AcquisitionOwner::new(root.clone()),
-            root,
-            storage,
-            family,
-            policy,
-            source,
-            query: parking_lot::Mutex::new(super::contracts::LoadRetry::default()),
-            acquisition: std::sync::Mutex::new(None),
-            steady: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            acquisitions: Default::default(),
-            ready: std::sync::atomic::AtomicBool::new(false),
-            legacy_import: None,
-            current: Arc::new(|| true),
-        }
-    }
-
-    pub(crate) fn record_change(&self, path: &Path) {
-        self.ready
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.source.record_change(path);
-    }
-
-    pub(crate) fn set_executor(
-        &mut self,
-        executor: Option<crate::executor::RootMaintenanceExecutor>,
-    ) {
-        self.owner.set_executor(executor);
-    }
-
-    pub(crate) fn set_publish_fence(&self, fence: Arc<dyn super::first_load::PublishFence>) {
-        self.source.set_publish_fence(fence);
-    }
-
     pub(crate) fn cancel(&self) {
         self.owner.cancel();
     }
 
     pub(crate) fn shutdown(&self) {
         self.owner.shutdown();
-    }
-
-    pub(crate) fn record_overflow(&self) {
-        self.ready
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.source.record_overflow();
-    }
-
-    pub(crate) fn record_cookie(&self, path: &Path) {
-        self.source.record_cookie(path);
     }
 
     pub(crate) fn is_ready(&self) -> bool {

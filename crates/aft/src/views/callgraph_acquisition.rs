@@ -29,19 +29,6 @@ impl Drop for AcquisitionCompletion {
 }
 
 impl AcquisitionOwner {
-    pub(super) fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            executor: None,
-            stopped: Arc::new(AtomicBool::new(false)),
-            active: Mutex::new(Vec::new()),
-            standalone: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub(super) fn set_executor(&mut self, executor: Option<RootMaintenanceExecutor>) {
-        self.executor = executor;
-    }
 
     pub(super) fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)

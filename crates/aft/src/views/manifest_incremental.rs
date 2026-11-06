@@ -479,33 +479,6 @@ pub(super) fn release_cache(view_dir: &Path) {
     drop(retired);
 }
 
-pub(super) fn try_release_cache(view_dir: &Path) -> bool {
-    let mut caches = match caches().try_lock() {
-        Ok(caches) => caches,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return false,
-    };
-    let states = match verification_states().try_lock() {
-        Ok(states) => states,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return false,
-    };
-    let state = states.get(view_dir).and_then(Weak::upgrade);
-    drop(states);
-    if let Some(state) = state {
-        let mut state = match state.try_lock() {
-            Ok(state) => state,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return false,
-        };
-        state.epoch = state.epoch.wrapping_add(1);
-    }
-    let retired = caches.remove(view_dir);
-    drop(caches);
-    drop(retired);
-    true
-}
-
 impl Drop for CacheLease {
     fn drop(&mut self) {
         {
@@ -996,27 +969,6 @@ fn full_verification_required(cache: &VerificationState, now: Instant) -> bool {
         || cache
             .last_full
             .is_none_or(|last| now.saturating_duration_since(last) >= FULL_VERIFICATION_INTERVAL)
-}
-
-pub(super) fn full_verification_due(view_dir: &Path) -> bool {
-    // The registry protects only map metadata, never per-view locks or I/O.
-    // Wait for that short lookup: another view's registry activity is not
-    // evidence that this view needs a full verification.
-    let states = verification_states()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let Some(state) = states.get(view_dir).and_then(Weak::upgrade) else {
-        return true;
-    };
-    drop(states);
-    let state = match state.try_lock() {
-        Ok(state) => state,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return true,
-    };
-    state.domain.active()
-        && state.active_preparations == 0
-        && full_verification_required(&state, Instant::now())
 }
 
 pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {

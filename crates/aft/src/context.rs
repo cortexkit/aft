@@ -1159,9 +1159,6 @@ struct CallgraphBorrow {
     checked_at: Instant,
 }
 
-const CALLGRAPH_READMIT_AFTER: Duration = Duration::from_secs(60);
-const CALLGRAPH_BORROW_RECHECK_AFTER: Duration = Duration::from_secs(1);
-
 /// Per-project checkout view load health. Counts every load attempt the
 /// queries actually made (grep, glob, aft_search binds for the lexical view;
 /// navigation, zoom and inspect for the callgraph view), so a persistent
@@ -7311,13 +7308,6 @@ impl AppContext {
             })
     }
 
-    /// The idle maintenance pump also enforces the view's full-read deadline.
-    /// Probe subsystem state without blocking the dispatch frame loop; only
-    /// the verification registry's short map lookup may wait.
-    pub(crate) fn view_full_verification_due(&self) -> bool {
-        false
-    }
-
     pub fn lsp_drain_has_work(&self) -> bool {
         match self.lsp_manager.try_lock() {
             Some(lsp) => lsp.has_pending_events(),
@@ -10101,17 +10091,6 @@ impl AppContext {
         true
     }
 
-    /// Drop one degraded reason, keeping the order of the rest.
-    /// Returns whether it was present.
-    pub(crate) fn remove_degraded_reason(&self, reason: &str) -> bool {
-        let mut reasons = self.degraded_reasons.lock();
-        let Some(index) = reasons.iter().position(|existing| existing == reason) else {
-            return false;
-        };
-        reasons.remove(index);
-        true
-    }
-
     /// Record a checkout view load that failed for a query on this project.
     /// The agent-visible error is returned unchanged by the caller; this only
     /// counts the failure (by plane and cause), keeps the last error and
@@ -10193,21 +10172,6 @@ impl AppContext {
                 error
             );
         }
-    }
-
-    /// A checkout view load succeeded: the project is no longer degraded for
-    /// view loads. History counts and the last error are kept.
-    pub(crate) fn note_view_load_success(&self, plane: &str) {
-        self.view_load_health.lock().disk_reserve.remove(plane);
-        self.remove_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
-    }
-
-    fn view_storage_refusal_message(&self, error: String) -> String {
-        crate::view_storage_reserve::DiskReserveCondition::observed(
-            &self.storage_paths().artifacts,
-            &error,
-        )
-        .map_or(error, |condition| condition.message)
     }
 
     #[cfg(test)]
@@ -10350,10 +10314,6 @@ impl AppContext {
         if let Some(view_dir) = view_dir {
             crate::views::assembly::release_manifest_cache(&view_dir);
         }
-    }
-
-    fn try_release_view_publication_cache(&self) -> bool {
-        false
     }
 
     pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
@@ -11176,15 +11136,6 @@ impl AppContext {
         None
     }
 
-    pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
-    }
-
-    pub(crate) fn record_checkout_watcher_overflow(&self) {
-    }
-
-    pub(crate) fn record_checkout_watcher_cookie(&self, path: &Path) {
-    }
-
     pub(crate) fn record_checkout_pending_watcher_gap(&self) {
         if self
             .watcher_counters()
@@ -11986,137 +11937,9 @@ impl AppContext {
         None
     }
 
-    /// This checkout's current file identities (size and content hash by
-    /// relative path) from its lexical view, when that view is ready.
-    pub(crate) fn lexical_file_identities(
-        &self,
-    ) -> Option<std::collections::HashMap<String, (u64, blake3::Hash)>> {
-        match self.lexical_view_snapshot("bind")? {
-            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
-                Some(snapshot.live_file_identities())
-            }
-            _ => None,
-        }
-    }
-
-    /// When this checkout is over `views.callgraph_copies` or the live-base cap,
-    /// the reader of the call graph it borrows; `None` when it builds its own view. Admission
-    /// is decided again once a minute. A failed admission builds the
-    /// checkout's own view, as before the limit existed, and logs why.
-    fn borrowed_callgraph_view_reader(
-        &self,
-        root: &Path,
-        storage: &crate::root_cache::StoragePaths,
-        family: &str,
-        policy: crate::blob_store::v2::TrigramPolicy,
-        at_base_cap: bool,
-    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
-    {
-        use crate::views::callgraph_copies::{self, Admission};
-        let now = Instant::now();
-        let readmit = at_base_cap
-            || self.callgraph_borrow.lock().as_ref().is_none_or(|borrow| {
-                now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER
-            });
-        if readmit {
-            let admission = if at_base_cap {
-                callgraph_copies::borrow_at_base_cap(&storage.artifacts, family, policy, root)
-            } else {
-                callgraph_copies::admit(
-                    storage,
-                    family,
-                    policy,
-                    root,
-                    self.config().views.callgraph_copies,
-                    || self.lexical_file_identities(),
-                )
-            };
-            let mut borrow = self.callgraph_borrow.lock();
-            match admission {
-                Ok(Admission::Own) => {
-                    borrow.take();
-                    return None;
-                }
-                Ok(Admission::Borrow {
-                    root: target_root,
-                    scope,
-                }) => {
-                    let reader = borrow
-                        .take()
-                        .filter(|current| current.scope == scope)
-                        .and_then(|current| current.reader);
-                    *borrow = Some(CallgraphBorrow {
-                        scope,
-                        target_root,
-                        decided_at: now,
-                        reader,
-                        checked_at: now,
-                    });
-                }
-                Err(reason) => {
-                    crate::slog_warn!(
-                        "views callgraph copy admission failed root={}: {reason}",
-                        root.display()
-                    );
-                    borrow.take();
-                    return None;
-                }
-            }
-        }
-        let mut guard = self.callgraph_borrow.lock();
-        let borrow = guard.as_mut()?;
-        if let Some((generation, store)) = &borrow.reader {
-            if now.duration_since(borrow.checked_at) < CALLGRAPH_BORROW_RECHECK_AFTER
-                || callgraph_copies::published_generation(&storage.artifacts, family, &borrow.scope)
-                    .as_deref()
-                    == Some(generation.as_str())
-            {
-                borrow.checked_at = now;
-                return Some(Ok(store.clone()));
-            }
-        }
-        if callgraph_copies::needs_producer_rebuild(
-            &storage.artifacts,
-            family,
-            policy,
-            &borrow.scope,
-        ) {
-            guard.take();
-            return None;
-        }
-        borrow.checked_at = now;
-        Some(
-            match callgraph_copies::open_published(
-                &storage.artifacts,
-                family,
-                policy,
-                &borrow.scope,
-                root,
-            ) {
-                Ok((store, generation)) => {
-                    let store = Arc::new(store);
-                    borrow.reader = Some((generation, store.clone()));
-                    Ok(store)
-                }
-                Err((reason, busy)) => Err(crate::views::callgraph::CallgraphViewError {
-                    reason,
-                    busy,
-                    building: false,
-                }),
-            },
-        )
-    }
-
     /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
     pub fn lexical_view_route_counts(&self) -> [u64; 3] {
         std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
-        let lifecycle = self.subc_lifecycle_admission();
-        let generation = self.configure_generation_flag();
-        let expected = generation.load(Ordering::Acquire);
-        Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
     pub(crate) fn install_callgraph_executor(
@@ -12155,15 +11978,6 @@ impl AppContext {
         if let Some(view) = view {
             view.shutdown();
         }
-    }
-
-    fn callgraph_view_control(&self) -> crate::migration::v3_ledger::ImportControl {
-        let unbound = self.subc_lifecycle.unbound_hint.clone();
-        let generation = self.configure_generation_flag();
-        let expected = generation.load(Ordering::Acquire);
-        Arc::new(move || {
-            !unbound.load(Ordering::Acquire) && generation.load(Ordering::Acquire) == expected
-        })
     }
 
     #[cfg(test)]
