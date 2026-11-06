@@ -231,9 +231,20 @@ fn main() {
     let checkout = Checkout::bind(Arc::clone(&layer), Path::new(&store), family, &root).unwrap();
     peaks.take();
     let started = Instant::now();
-    checkout.build().unwrap();
+    let report = checkout.build_measuring_memory().unwrap();
     let built = sample("built", 0, "", &peaks, &checkout, &layer);
     println!("{built}");
+    println!(
+        "{}",
+        serde_json::json!({
+            "label": "cold build parts",
+            "parts_mib": report
+                .memory
+                .iter()
+                .map(|(part, bytes)| (part.clone(), serde_json::json!(bytes >> 20)))
+                .collect::<serde_json::Map<_, _>>(),
+        })
+    );
     eprintln!(
         "process before binding {start_rss} MiB, with the pack loaded {loaded_rss} MiB; cold build {:.1} s",
         started.elapsed().as_secs_f64()

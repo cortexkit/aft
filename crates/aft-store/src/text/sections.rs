@@ -101,6 +101,19 @@ pub struct TextSectionsBuilder {
     units: BTreeMap<ContentKey, (TextUnit, Vec<(u32, u8)>)>,
 }
 
+impl crate::heap::HeapBytes for TextSectionsBuilder {
+    fn heap_bytes(&self, _seen: &mut crate::heap::Seen) -> usize {
+        let entry =
+            std::mem::size_of::<ContentKey>() + std::mem::size_of::<(TextUnit, Vec<(u32, u8)>)>();
+        crate::heap::btree_bytes(self.units.len(), entry)
+            + self
+                .units
+                .values()
+                .map(|(_, trigrams)| trigrams.capacity() * std::mem::size_of::<(u32, u8)>())
+                .sum::<usize>()
+    }
+}
+
 impl TextSectionsBuilder {
     #[must_use]
     pub fn new() -> Self {

@@ -467,6 +467,10 @@ pub struct BuildReport {
     /// run (the publication stands either way).
     pub reclaimed_files: usize,
     pub reclaim_error: Option<String>,
+    /// What the build held at each stage, in bytes, as `stage.part`; only
+    /// from [`Checkout::build_measuring_memory`], since walking the
+    /// structures costs time.
+    pub memory: Vec<(String, usize)>,
 }
 
 impl Checkout {
@@ -970,14 +974,29 @@ impl Checkout {
     /// When the scan, resolution or store fails. Nothing is published then,
     /// and the previous view, if any, keeps serving.
     pub fn build(&self) -> Result<BuildReport, DataError> {
+        self.build_as(false)
+    }
+
+    /// [`Self::build`], also reporting in [`BuildReport::memory`] what the
+    /// build held at each stage. For measurement.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build`].
+    #[doc(hidden)]
+    pub fn build_measuring_memory(&self) -> Result<BuildReport, DataError> {
+        self.build_as(true)
+    }
+
+    fn build_as(&self, measure: bool) -> Result<BuildReport, DataError> {
         self.write_live().building = true;
-        let result = self.build_inner();
+        let result = self.build_inner(measure);
         self.write_live().building = false;
         self.note_outcome("build", &result);
         result
     }
 
-    fn build_inner(&self) -> Result<BuildReport, DataError> {
+    fn build_inner(&self, measure: bool) -> Result<BuildReport, DataError> {
         let mut report = BuildReport::default();
         let build_started = Instant::now();
         // A newer build wrote a file the build would retire, reclaim or
@@ -1078,12 +1097,49 @@ impl Checkout {
                 .with_root_of(&scanned.state);
         let inputs = collected.inputs(&state);
         report.parsed_files = inputs.parses.len();
+        if measure {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            report.memory.extend([
+                (
+                    "scan.text".to_string(),
+                    collected.text.heap_bytes(&mut seen),
+                ),
+                (
+                    "scan.records".to_string(),
+                    collected
+                        .records
+                        .iter()
+                        .map(|(key, (_, record))| {
+                            key.heap_bytes(&mut seen) + record.heap_bytes(&mut seen)
+                        })
+                        .sum(),
+                ),
+                (
+                    "scan.parses".to_string(),
+                    inputs.parses.heap_bytes(&mut seen),
+                ),
+                (
+                    "scan.configs".to_string(),
+                    inputs.configs.heap_bytes(&mut seen),
+                ),
+                ("scan.state".to_string(), state.heap_bytes(&mut seen)),
+            ]);
+        }
         checkpoint()?;
 
         let started = Instant::now();
         let resolved = resolve_checkout(&inputs, self.layer.threads)
             .map_err(|error| DataError::Resolve(error.to_string()))?;
         report.resolve_ms = elapsed_ms(started);
+        if measure {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            report.memory.push((
+                "resolve.resolutions".to_string(),
+                resolved.heap_bytes(&mut seen),
+            ));
+        }
         checkpoint()?;
 
         let started = Instant::now();
