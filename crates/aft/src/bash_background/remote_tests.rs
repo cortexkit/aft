@@ -6503,6 +6503,30 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
     );
 }
 
+/// Submit a runon command under `launch`, wait until its task completes, and
+/// return the parameters of the one `exec.run` the daemon received.
+pub(crate) async fn submit_runon_for_test(
+    ctx: &crate::context::AppContext,
+    launch: crate::bash_background::RemoteLaunch,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) -> serde_json::Value {
+    let response = handle_with_policy(
+        ctx,
+        Some(launch),
+        serde_json::json!({"command":"printf remote", "runon":"linux", "compressed":false}),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let mut runs = exec_runs(daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    runs.remove(0)
+}
+
 #[test]
 fn runon_siblings_refusal_line_is_pinned_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
