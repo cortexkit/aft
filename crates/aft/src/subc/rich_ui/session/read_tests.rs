@@ -77,15 +77,8 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
     crate::runtime_drain::drain_deferred_configure_maintenance(&f.ctx);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        crate::runtime_drain::drain_search_index_events(&f.ctx);
         crate::runtime_drain::drain_callgraph_store_events(&f.ctx);
-        let search_ready = f
-            .ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|i| i.ready);
+        let search_ready = crate::data_layer::surfaces::text_plane_ready(&f.ctx) == Some(true);
         let graph_ready = matches!(
             f.ctx.callgraph_store_for_ops(),
             crate::context::CallgraphStoreAccess::Ready(_)

@@ -107,14 +107,8 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        crate::runtime_drain::drain_search_index_events(&ctx);
         crate::runtime_drain::drain_callgraph_store_events(&ctx);
-        let search_ready = ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready);
+        let search_ready = crate::data_layer::surfaces::text_plane_ready(&ctx) == Some(true);
         let graph_ready = matches!(
             ctx.callgraph_store_for_ops(),
             crate::context::CallgraphStoreAccess::Ready(_)

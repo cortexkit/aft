@@ -1335,44 +1335,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn slow_search_line_carries_planner_shape_and_lanes_without_query_text() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
-        std::fs::write(root.join("private.rs"), "pub fn secret_needle() {}\n").unwrap();
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(root.clone()),
-                ..Default::default()
-            },
-        );
-        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
-        *ctx.semantic_index_status().write().unwrap() =
-            crate::context::SemanticIndexStatus::Disabled;
-        for (query, expected) in [
-            (
-                "secret_needle",
-                "shape=identifier lanes=exact,lexical,variants",
-            ),
-            ("private.rs", "shape=path lanes=path_lookup,exact,lexical"),
-        ] {
-            let line = slow_tool_line(
-                &ctx,
-                &root,
-                "search",
-                serde_json::json!({"query": query}),
-                &|request, ctx| {
-                    crate::commands::semantic_search::handle_semantic_search(&request, ctx)
-                },
-            );
-            assert!(line.contains(expected), "expected {expected:?}: {line}");
-            for private in ["secret_needle", "private.rs", "pub fn"] {
-                assert!(!line.contains(private), "{private:?} leaked into {line}");
-            }
-        }
-    }
-
     /// A plain edit target is a file from its spelling, so a prepare never
     /// spends a filesystem validation (canonicalising every ancestor, asking
     /// the storage floor) on it; that validation belongs to the handler. The

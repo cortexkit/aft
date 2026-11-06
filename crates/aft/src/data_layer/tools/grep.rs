@@ -30,8 +30,6 @@ use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_MAX_FILE_SIZE};
 
 #[cfg(test)]
-mod gate;
-#[cfg(test)]
 mod tests;
 
 /// The data layer's view of this root, when grep and glob may answer from

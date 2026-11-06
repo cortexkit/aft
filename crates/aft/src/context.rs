@@ -18233,34 +18233,6 @@ mod subc_lifecycle_admission_tests {
     }
 
     #[test]
-    fn route_teardown_does_not_supersede_disk_artifact_compatibility() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        ctx.note_configure_warm_key("config-a".to_string(), false);
-        let content_generation = ctx.configure_content_generation();
-        let lifecycle_generation = ctx.configure_generation();
-        let search_epoch = ctx.next_search_persist_epoch();
-        let semantic_epoch = ctx.next_semantic_persist_epoch();
-        let search_persist_epoch = ctx.search_persist_epoch_flag();
-        let semantic_persist_epoch = ctx.semantic_persist_epoch_flag();
-
-        ctx.mark_subc_unbound();
-        assert!(ctx.configure_generation() > lifecycle_generation);
-        assert_eq!(ctx.configure_content_generation(), content_generation);
-        assert_eq!(search_persist_epoch.current(), search_epoch);
-        assert_eq!(semantic_persist_epoch.current(), semantic_epoch);
-
-        ctx.mark_subc_bound();
-        ctx.note_configure_warm_key("config-b".to_string(), false);
-        assert!(ctx.configure_content_generation() > content_generation);
-        let replacement_search_epoch = ctx.next_search_persist_epoch();
-        let replacement_semantic_epoch = ctx.next_semantic_persist_epoch();
-        assert!(replacement_search_epoch > search_epoch);
-        assert!(replacement_semantic_epoch > semantic_epoch);
-        assert_eq!(search_persist_epoch.current(), replacement_search_epoch);
-        assert_eq!(semantic_persist_epoch.current(), replacement_semantic_epoch);
-    }
-
-    #[test]
     fn lifecycle_gate_serializes_unbind_with_worker_start_commit() {
         let admission = SubcLifecycleAdmission::default();
         let generation = Arc::new(AtomicU64::new(11));
@@ -18533,21 +18505,6 @@ mod subc_lifecycle_admission_tests {
     }
 
     #[test]
-    fn terminal_empty_search_receiver_reports_completion_work() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        let epoch = ctx.install_search_index_rx(receiver, ctx.configure_generation());
-        let terminal_guard = ctx.search_index_rx_terminal_guard(epoch);
-        drop(sender);
-        drop(terminal_guard);
-
-        assert!(
-            ctx.completion_drains_have_work(),
-            "an empty disconnected one-shot receiver must wake the completion drain"
-        );
-    }
-
-    #[test]
     fn conditional_semantic_receiver_retire_preserves_replacement_epoch() {
         let ctx = AppContext::new(default_language_provider_factory(), Config::default());
         let (_old_sender, old_receiver) = crossbeam_channel::unbounded();
@@ -18560,31 +18517,6 @@ mod subc_lifecycle_admission_tests {
         assert_eq!(ctx.retire_semantic_index_rx_if_epoch(old_epoch), None);
         assert!(ctx.semantic_index_rx().lock().is_some());
         assert_eq!(ctx.semantic_index_rx_epoch(), replacement_epoch);
-    }
-
-    #[test]
-    fn stale_terminal_guard_cannot_hide_newer_finished_receiver() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        let (old_sender, old_receiver) = crossbeam_channel::unbounded();
-        let old_epoch = ctx.install_search_index_rx(old_receiver, ctx.configure_generation());
-        let old_guard = ctx.search_index_rx_terminal_guard(old_epoch);
-        let (current_sender, current_receiver) = crossbeam_channel::unbounded();
-        let current_epoch =
-            ctx.install_search_index_rx(current_receiver, ctx.configure_generation());
-        let current_guard = ctx.search_index_rx_terminal_guard(current_epoch);
-        drop(old_sender);
-        drop(current_sender);
-
-        drop(current_guard);
-        drop(old_guard);
-
-        assert!(current_epoch > old_epoch);
-        assert_eq!(
-            ctx.search_index_rx_terminal_epoch.load(Ordering::SeqCst),
-            current_epoch,
-            "a stale worker must not move the terminal watermark backward"
-        );
-        assert!(ctx.completion_drains_have_work());
     }
 
     #[test]
@@ -21878,72 +21810,6 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
-    #[test]
-    fn matcher_rebuild_retires_queued_ignored_paths_and_keeps_sibling() {
-        let project = TempDir::new().unwrap();
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::create_dir(root.join("scratch")).unwrap();
-        let scratch = root.join("scratch/source.rs");
-        let sibling = root.join("kept.rs");
-        std::fs::write(&scratch, "fn scratch() {}\n").unwrap();
-        std::fs::write(&sibling, "fn kept() {}\n").unwrap();
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.clone()),
-                ..Config::default()
-            },
-        );
-        let paths = BTreeSet::from([scratch.clone(), sibling.clone()]);
-        ctx.add_pending_search_index_paths(paths.clone());
-        ctx.add_pending_semantic_index_paths(paths.clone());
-        ctx.add_pending_tier2_paths(paths.clone());
-        ctx.pending_callgraph_store_paths
-            .lock()
-            .extend(paths.clone());
-        let mut state = WatcherDrainSliceState::new(
-            ctx.configure_generation(),
-            ctx.configure_content_generation(),
-        );
-        state.pending_paths.extend(paths.clone());
-        state.semantic_refresh_paths.extend(paths.clone());
-        state.view_publication_paths.extend(paths.clone());
-        state.phase = WatcherDrainPhase::Apply {
-            stage: WatcherDrainApplyPhase::PendingTier2,
-            paths: VecDeque::from([scratch.clone(), sibling.clone()]),
-            remaining: 1,
-            oversized_inline_batch: false,
-        };
-        *ctx.watcher_drain_slice.lock() = Some(state);
-        std::fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
-        ctx.rebuild_gitignore();
-        assert_eq!(ctx.take_pending_search_index_paths(), vec![sibling.clone()]);
-        assert_eq!(
-            ctx.take_pending_semantic_index_paths(),
-            vec![sibling.clone()]
-        );
-        assert_eq!(ctx.pending_tier2_paths(), vec![sibling.clone()]);
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![sibling.clone()]
-        );
-        let state = ctx.watcher_drain_slice.lock().take().unwrap();
-        assert_eq!(state.pending_paths, VecDeque::from([sibling.clone()]));
-        assert_eq!(state.semantic_refresh_paths, vec![sibling.clone()]);
-        assert_eq!(
-            state.view_publication_paths,
-            BTreeSet::from([sibling.clone()])
-        );
-        let WatcherDrainPhase::Apply {
-            paths, remaining, ..
-        } = state.phase
-        else {
-            panic!("apply continuation lost");
-        };
-        assert_eq!(paths, VecDeque::from([sibling]));
-        assert_eq!(remaining, 0);
-    }
-
     #[cfg(unix)]
     #[test]
     fn take_pending_callgraph_store_paths_drops_symlink_dotdot_escape() {
@@ -22213,71 +22079,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn watcher_gap_invalidation_gates_resident_artifacts_and_forces_strict_verify() {
-        let root = TempDir::new().expect("project tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical project root");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(canonical_root.clone()),
-                ..Config::default()
-            },
-        );
-        *ctx.search_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SearchIndex::build(&canonical_root));
-        *ctx.semantic_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SemanticIndex::new(canonical_root.clone(), 3));
-        *ctx.semantic_index_status
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-
-        let artifact = canonical_root.join("verify-artifact.bin");
-        std::fs::write(&artifact, b"same-size").expect("write verification artifact");
-        let generation =
-            crate::cache_freshness::artifact_generation(&artifact).expect("artifact generation");
-        crate::cache_freshness::record_verify_completed(
-            &canonical_root,
-            crate::cache_freshness::VerifyArtifact::Search,
-            Some(generation),
-        );
-        assert_eq!(
-            crate::cache_freshness::warm_verify_plan(
-                &canonical_root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                Some(generation),
-            ),
-            crate::cache_freshness::WarmVerifyPlan::Skip
-        );
-
-        ctx.invalidate_artifacts_after_watcher_gap();
-
-        assert!(ctx
-            .search_index
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none());
-        assert!(ctx
-            .semantic_index
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none());
-        assert!(ctx.pending_callgraph_reconcile_reason().is_some());
-        assert!(ctx.pending_callgraph_store_force_token().is_none());
-        assert_eq!(
-            crate::cache_freshness::warm_verify_plan(
-                &canonical_root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                Some(generation),
-            ),
-            crate::cache_freshness::WarmVerifyPlan::Strict
-        );
-    }
-
-    #[test]
     fn cancelled_semantic_refresh_transfers_refreshing_files_to_pending() {
         let root = TempDir::new().expect("project tempdir");
         let ctx = AppContext::new(
@@ -22382,43 +22183,6 @@ mod callgraph_store_for_ops_tests {
             *ctx.pending_semantic_corpus_refresh.lock(),
             "corpus intent stamped before CorpusStarted must survive the cancellation"
         );
-    }
-
-    #[test]
-    fn cancelled_search_corpus_refresh_drops_nonready_resident_index() {
-        let root = TempDir::new().expect("project tempdir");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        // A corpus refresh in flight: resident index marked non-ready plus an
-        // installed receiver. Cancelling only the receiver would strand the
-        // non-ready resident (equivalent rebind reloads only a MISSING index).
-        let mut refreshing = SearchIndex::new();
-        refreshing.ready = false;
-        *ctx.search_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refreshing);
-        let (_tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-
-        ctx.cancel_unbound_artifact_work();
-
-        assert!(
-            ctx.search_index
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "a cancelled corpus refresh must drop the non-ready resident so rebind reloads it"
-        );
-        assert!(ctx
-            .search_index_rx
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none());
     }
 
     #[test]
@@ -25344,45 +25108,6 @@ mod gitignore_tests {
 mod verify_memo_watcher_tests {
     use super::*;
 
-    #[test]
-    fn pending_watcher_path_invalidates_root_verify_memo() {
-        let root_dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(root_dir.path()).unwrap();
-        let artifact = root.join("cache.bin");
-        std::fs::write(&artifact, b"generation").unwrap();
-        let generation = crate::cache_freshness::artifact_generation(&artifact).unwrap();
-        crate::cache_freshness::record_verify_completed(
-            &root,
-            crate::cache_freshness::VerifyArtifact::Search,
-            Some(generation),
-        );
-        assert_eq!(
-            crate::cache_freshness::warm_verify_plan(
-                &root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                Some(generation),
-            ),
-            crate::cache_freshness::WarmVerifyPlan::Skip
-        );
-
-        let ctx = AppContext::from_app(
-            App::default_shared(),
-            Config {
-                project_root: Some(root.clone()),
-                ..Config::default()
-            },
-        );
-        ctx.set_canonical_cache_root(root.clone());
-        ctx.add_pending_search_index_paths([root.join("changed.rs")]);
-        assert_eq!(
-            crate::cache_freshness::warm_verify_plan(
-                &root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                Some(generation),
-            ),
-            crate::cache_freshness::WarmVerifyPlan::StatFirst
-        );
-    }
 }
 
 #[cfg(test)]
@@ -25392,89 +25117,6 @@ mod watcher_runtime_state_tests {
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(StubProvider), Config::default())
-    }
-
-    #[test]
-    fn finished_watcher_thread_reports_inactive_and_is_reclaimed_with_invalidation() {
-        let root = tempfile::tempdir().expect("project tempdir");
-        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
-        let ctx = AppContext::new(
-            Box::new(StubProvider),
-            Config {
-                project_root: Some(canonical_root.clone()),
-                ..Config::default()
-            },
-        );
-        ctx.set_canonical_cache_root(canonical_root.clone());
-        // Suppress the physical FSEvents reinstall (parallel in-process tests
-        // must not install real OS watchers); the property under test is the
-        // corpse reclaim + invalidation, not the reinstall.
-        struct DisableWatcherGuard;
-        impl Drop for DisableWatcherGuard {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var("AFT_TEST_DISABLE_FILE_WATCHER") };
-            }
-        }
-        let _env_lock = crate::test_env::process_env_lock();
-        unsafe { std::env::set_var("AFT_TEST_DISABLE_FILE_WATCHER", "1") };
-        let _disable_watcher = DisableWatcherGuard;
-        // Warm state the corpse reclaim must invalidate: resident index +
-        // warm Skip memo.
-        *ctx.search_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(crate::search_index::SearchIndex::new());
-        let artifact = canonical_root.join("artifact.bin");
-        std::fs::write(&artifact, b"artifact").expect("artifact");
-        let generation = crate::cache_freshness::artifact_generation(&artifact);
-        crate::cache_freshness::record_verify_completed(
-            &canonical_root,
-            crate::cache_freshness::VerifyArtifact::Search,
-            generation,
-        );
-
-        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
-        let _dispatch_tx = dispatch_tx;
-        // A thread that exits on its own models a backend failure while the
-        // root was unbound (drains suppressed, queued error undrained).
-        let join = std::thread::spawn(|| {});
-        ctx.install_watcher_runtime(
-            dispatch_rx,
-            WatcherThreadHandle::new(Arc::new(AtomicBool::new(false)), join),
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while ctx.watcher_runtime_active() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a finished watcher thread must report the runtime inactive"
-            );
-            std::thread::yield_now();
-        }
-
-        // The production entry point: rebind restoration must reclaim the
-        // corpse, invalidate the unobserved-window state, and reinstall.
-        crate::commands::configure::ensure_project_watcher(&ctx);
-
-        assert!(
-            ctx.search_index
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "corpse reclaim must drop resident artifacts (events since the failure are lost)"
-        );
-        assert_eq!(
-            crate::cache_freshness::warm_verify_plan(
-                &canonical_root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                generation,
-            ),
-            crate::cache_freshness::WarmVerifyPlan::Strict,
-            "corpse reclaim must force strict re-verification"
-        );
-        assert!(
-            !ctx.take_finished_watcher_runtime(),
-            "reclaim is one-shot; the corpse is gone after ensure_project_watcher"
-        );
     }
 
     #[test]

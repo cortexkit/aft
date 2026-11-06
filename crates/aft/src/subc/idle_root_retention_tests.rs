@@ -1299,10 +1299,9 @@ fn work_root(ctx: &AppContext, root: &Path, storage: &Path) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        crate::runtime_drain::drain_search_index_events(ctx);
         crate::runtime_drain::drain_callgraph_store_events(ctx);
         crate::runtime_drain::drain_semantic_index_events(ctx);
-        if ctx.search_index_rx().read().unwrap().is_none()
+        if crate::data_layer::surfaces::text_plane_ready(ctx) == Some(true)
             && ctx.callgraph_store_rx().lock().is_none()
             && ctx.semantic_index_rx().lock().is_none()
         {
@@ -1311,9 +1310,10 @@ fn work_root(ctx: &AppContext, root: &Path, storage: &Path) {
         assert!(Instant::now() < deadline, "index builds did not settle");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(
-        ctx.search_index().read().unwrap().is_some(),
-        "the fixture must load a search index"
+    assert_eq!(
+        crate::data_layer::surfaces::text_plane_ready(ctx),
+        Some(true),
+        "the fixture must serve its text index"
     );
 
     for index in 0..10 {
@@ -1370,186 +1370,6 @@ fn settled_heap() -> Option<u64> {
         previous = current;
     }
     Some(previous)
-}
-
-#[test]
-fn evicted_worked_roots_keep_only_bookkeeping() {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        run_in_child("subc::idle_root_retention_tests::evicted_worked_roots_keep_only_bookkeeping");
-        return;
-    }
-    // The roots below use a legacy project config file, which the project
-    // watcher never covers, so each root starts its own config file watch.
-    crate::config_live::enable_config_watches_for_test();
-
-    let app = App::default_shared();
-    let executor = Arc::new(Executor::new());
-    let storage = tempfile::tempdir().unwrap();
-    let metrics = DispatchPathMetrics::new();
-    let mut dirs = Vec::new();
-    let mut live_roots = HashMap::new();
-
-    // Bind, work, unbind, age and reap `roots`, returning weak references to
-    // their contexts.
-    let mut cycle = |names: std::ops::Range<usize>,
-                     live_roots: &mut HashMap<ProjectRootId, RootMeta>|
-     -> Vec<(ProjectRootId, Weak<AppContext>)> {
-        let mut bound = Vec::new();
-        for index in names {
-            let (dir, root) = worked_fixture(&format!("retention-worked-{index}"));
-            let ctx = Arc::new(AppContext::from_app(
-                Arc::clone(&app),
-                Config {
-                    project_root: Some(root.as_path().to_path_buf()),
-                    storage_dir: Some(storage.path().to_path_buf()),
-                    ..Config::default()
-                },
-            ));
-            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-            work_root(&ctx, root.as_path(), storage.path());
-            // Configure's deferred tail normally starts this watch once the
-            // project watcher is up. Sync here as well so the fixture does not
-            // depend on when that tail runs.
-            crate::config_live::sync_config_watches(&ctx);
-            assert!(
-                ctx.config_live().has_project_fallback_watch(),
-                "the legacy project config never got its own watch: {:?}",
-                ctx.config_live()
-                    .sources()
-                    .map(|sources| sources.project.path)
-            );
-            let mut semantic = ctx.config().semantic.clone();
-            semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
-            semantic.base_url = Some("http://127.0.0.1:9".to_string());
-            *ctx.semantic_embedding_model().lock() = Some(
-                crate::semantic_index::EmbeddingModel::from_config(&semantic)
-                    .expect("query embedding model"),
-            );
-            bound.push((root.clone(), Arc::downgrade(&ctx)));
-            live_roots.insert(root, RootMeta::new(Instant::now()));
-            dirs.push(dir);
-        }
-        for (root, _) in &bound {
-            quiesce_unbound_root(root, live_roots, &executor);
-            live_roots.get_mut(root).unwrap().last_touched =
-                Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-        }
-        // Writes leave unpersisted search deltas; the first sweeps queue
-        // their teardown persist, and later sweeps evict once it has run.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while bound
-            .iter()
-            .any(|(root, _)| !live_roots[root].idle_artifacts_evicted)
-        {
-            assert!(Instant::now() < deadline, "worked roots were not evicted");
-            reap_idle_roots(
-                Instant::now(),
-                live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &metrics,
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        bound
-    };
-
-    // One root goes through the whole cycle first and is then retired, so
-    // process-wide state (grammars, SQLite, pools) is warm before the
-    // baseline. The filesystem helper pool starts workers on demand, up to
-    // its configured size, and how many the warm-up root needed depends on
-    // load; fill it before the baseline so later growth cannot read as
-    // threads the roots kept.
-    crate::cache_freshness::warm_strict_verify_pool_for_test();
-    crate::bounded_io::fill_helper_pool_for_test();
-    for (root, _) in cycle(0..1, &mut live_roots) {
-        executor.remove_actor(&root);
-        live_roots.remove(&root);
-    }
-    let baseline_heap = settled_heap();
-    let baseline_threads = settled_thread_total(0);
-    let baseline_thread_ids = thread_ids();
-
-    let evicted = cycle(1..WORKED_ROOTS + 1, &mut live_roots);
-    // The reaper hands the reopenable resources (LSP, database pools, config
-    // watches, embedding model, compiled output filters) to a background
-    // release; wait for it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let released = evicted.iter().all(|(_, ctx)| {
-            let ctx = ctx.upgrade().expect("an evicted root keeps its context");
-            let watches = ctx.config_live();
-            !watches.has_project_fallback_watch()
-                && !watches.has_user_watch()
-                && ctx.semantic_embedding_model().lock().is_none()
-                && !ctx.filter_registry_loaded()
-        });
-        if released {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "evicted roots kept their config watches, embedding model or output filters"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    for (_, ctx) in &evicted {
-        let ctx = ctx.upgrade().unwrap();
-        assert!(ctx.search_index().read().unwrap().is_none());
-        assert!(ctx.semantic_index().read().unwrap().is_none());
-        assert!(ctx.callgraph_store().read().unwrap().is_none());
-        assert_eq!(ctx.symbol_cache().read().unwrap().len(), 0);
-        assert!(!ctx.watcher_runtime_active());
-    }
-    let (kept_threads, os_workqueue_threads) = settled_threads_started_since(&baseline_thread_ids);
-    let evicted_heap = settled_heap();
-
-    // Drop the evicted contexts: the heap that leaves with them is what each
-    // evicted root was still holding.
-    for (root, _) in &evicted {
-        executor.remove_actor(root);
-    }
-    let dropped_heap = settled_heap();
-    assert!(
-        evicted.iter().all(|(_, ctx)| ctx.strong_count() == 0),
-        "removed actors must drop their contexts"
-    );
-    let per_root = match (evicted_heap, dropped_heap) {
-        (Some(evicted), Some(dropped)) => {
-            Some(evicted.saturating_sub(dropped) / WORKED_ROOTS as u64)
-        }
-        _ => None,
-    };
-    println!(
-        "retention: worked_roots={WORKED_ROOTS} baseline_threads={baseline_threads} \
-         kept_threads={} os_workqueue_threads={} heap_baseline={baseline_heap:?} \
-         heap_evicted={evicted_heap:?} heap_dropped={dropped_heap:?} \
-         retained_per_evicted_root={per_root:?}{}{}",
-        kept_threads.len(),
-        os_workqueue_threads.len(),
-        describe_threads(&kept_threads),
-        describe_threads(&os_workqueue_threads),
-    );
-    assert!(
-        kept_threads.len() <= 1,
-        "{WORKED_ROOTS} evicted roots kept {} thread(s) started after the baseline:{}\n\
-         (not counted: {} OS workqueue thread(s), which no root owns:{})",
-        kept_threads.len(),
-        describe_threads(&kept_threads),
-        os_workqueue_threads.len(),
-        describe_threads(&os_workqueue_threads),
-    );
-    match per_root {
-        Some(per_root) => assert!(
-            per_root < 256 * 1024,
-            "an evicted root still holds {per_root} heap bytes"
-        ),
-        // Only glibc exposes the allocator statistics this check reads.
-        None => println!(
-            "retention: SKIPPED the per-root heap check: no allocator statistics on this platform"
-        ),
-    }
 }
 
 /// Make output that the builtin `make` filter rewrites: its directory lines

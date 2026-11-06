@@ -167,7 +167,6 @@ fn wait_until_ready(ctx: &AppContext) {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         aft::runtime_drain::drain_watcher_events(ctx);
-        aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_callgraph_store_events(ctx);
         let callgraph_ready = match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(_) => true,
@@ -177,12 +176,7 @@ fn wait_until_ready(ctx: &AppContext) {
             CallgraphStoreAccess::Off => panic!("callgraph index off"),
             CallgraphStoreAccess::Error(error) => panic!("callgraph failed: {error}"),
         };
-        let search_ready = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|index| index.ready);
+        let search_ready = aft::data_layer::surfaces::text_plane_ready(ctx) == Some(true);
         if callgraph_ready && search_ready {
             return;
         }
@@ -270,7 +264,6 @@ fn callers_including(ctx: &AppContext, root: &Path, expected: &[&str]) -> Respon
             "callers of target never included {expected:?}: {response:?}"
         );
         aft::runtime_drain::drain_watcher_events(ctx);
-        aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_callgraph_store_events(ctx);
         thread::sleep(Duration::from_millis(25));
     }
@@ -449,7 +442,6 @@ fn navigate_once_differing(
             response.data
         );
         aft::runtime_drain::drain_watcher_events(ctx);
-        aft::runtime_drain::drain_search_index_events(ctx);
         thread::sleep(Duration::from_millis(25));
     }
 }

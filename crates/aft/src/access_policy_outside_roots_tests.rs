@@ -148,10 +148,7 @@ impl Fixture {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             crate::context::SemanticIndexStatus::Disabled;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(crate::search_index::SearchIndex::build(&self.root));
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         (ctx, nested, outside_repo)
     }
 

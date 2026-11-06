@@ -64,15 +64,6 @@ fn build() -> BusyRoot {
     }
     ctx.inspect_manager()
         .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
-    let mut index = crate::search_index::SearchIndex::new();
-    for i in 0..6200 {
-        index.index_file(
-            &root.join(format!("src/module_{}/file_{i}.rs", i % 64)),
-            format!("pub fn symbol_{i}() {{}}\n").as_bytes(),
-        );
-    }
-    index.ready = true;
-    *ctx.search_index().write().unwrap() = Some(index);
     *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::Building {
         stage: "embedding".into(),
         files: Some(6200),

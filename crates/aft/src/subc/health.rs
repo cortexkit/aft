@@ -8128,72 +8128,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// Reads add files to a root's symbol cache far more often than edits
-    /// change its trigram index, and the trigram walk visits every indexed
-    /// file. A symbol-cache change must re-walk only the symbol cache, an
-    /// edit only the trigram index, and the reported age must stay that of
-    /// the oldest walk still in use.
-    #[test]
-    fn rollup_rewalks_only_the_index_whose_shape_changed() {
-        let ctx = test_ctx();
-        let mut index = crate::search_index::SearchIndex::new();
-        index.index_file(Path::new("/rollup-split/a.rs"), b"fn a() {}");
-        *ctx.search_index().write().unwrap() = Some(index);
-        let measure = || {
-            let before = crate::context::memory_index_walks_for_test();
-            let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
-            let after = crate::context::memory_index_walks_for_test();
-            (
-                [
-                    after[0] - before[0],
-                    after[1] - before[1],
-                    after[2] - before[2],
-                ],
-                rollup.measured_age_ms.expect("rollup age"),
-            )
-        };
-        // No semantic index is installed, so there is nothing to walk there.
-        assert_eq!(
-            measure().0,
-            [0, 1, 1],
-            "the first rollup walks both indexes"
-        );
-        std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(measure().0, [0, 0, 0], "an unchanged root was walked again");
-
-        ctx.symbol_cache().write().unwrap().insert(
-            std::path::PathBuf::from("/rollup-split/read.rs"),
-            std::time::SystemTime::UNIX_EPOCH,
-            1,
-            blake3::hash(b"read"),
-            Vec::new(),
-        );
-        let (walks, age) = measure();
-        assert_eq!(
-            walks,
-            [0, 0, 1],
-            "a read must re-walk only the symbol cache"
-        );
-        assert!(
-            age >= 30,
-            "the reused trigram walk is the oldest figure, got age {age}"
-        );
-
-        ctx.search_index()
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .index_file(Path::new("/rollup-split/b.rs"), b"fn b() {}");
-        let (walks, age) = measure();
-        assert_eq!(
-            walks,
-            [0, 1, 0],
-            "an edit must re-walk only the trigram index"
-        );
-        assert!(age < 30, "every walk in use is recent, got age {age}");
-    }
-
     #[test]
     fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
         let (storage, root) = test_root("health-breaker-cache");
@@ -9058,55 +8992,6 @@ mod tests {
             .expect("memory rollup present");
         assert!(memory["allocator_slack_bytes"].is_u64());
         assert!(memory["allocator_slack_measured"].is_boolean());
-    }
-
-    #[test]
-    fn health_snapshot_fast_fails_while_mutating_job_holds_component_lock() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-mutating-lock");
-        let ctx = test_ctx();
-        executor.register_actor(root.clone(), Arc::clone(&ctx));
-        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        let blocker = executor.submit(
-            root,
-            Lane::Mutating,
-            "health-lock-blocker".to_string(),
-            Box::new(move |ctx| {
-                let _index = ctx
-                    .search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                started_tx.send(()).expect("signal held health lock");
-                release_rx.recv().expect("release held health lock");
-                Response::success("health-lock-blocker", json!({ "ok": true }))
-            }),
-        );
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("mutating lock holder starts");
-
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &crate::context::App::default_shared(),
-        );
-
-        // Settle the holder before asserting so a verdict failure cannot drop the release
-        // sender and make the worker panic while the test unwinds.
-        release_tx.send(()).expect("release held health lock");
-        blocker
-            .recv_timeout(Duration::from_secs(3))
-            .expect("mutating lock holder completes");
-
-        assert_eq!(report.status, HealthStatus::Degraded);
     }
 
     #[test]

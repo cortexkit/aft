@@ -108,13 +108,10 @@ impl Fixture {
     }
 }
 
-/// The search lane published an index: a built one or a denied (empty) one.
+/// The text index settled: the index store serves it, or the checkout
+/// reports no text plane at all (a refused or disabled store).
 fn search_settled(ctx: &AppContext) -> bool {
-    ctx.search_index().read().ok().is_some_and(|index| {
-        index
-            .as_ref()
-            .is_some_and(|index| index.ready || index.build_denied)
-    })
+    aft::data_layer::surfaces::text_plane_ready(ctx) != Some(false)
 }
 
 /// A minimal OpenAI-compatible embedding endpoint, so a semantic cold build
@@ -175,7 +172,6 @@ fn start_embedding_server() -> String {
 }
 
 fn drain(ctx: &AppContext) {
-    aft::runtime_drain::drain_search_index_events(ctx);
     aft::runtime_drain::drain_semantic_index_events(ctx);
     aft::runtime_drain::drain_callgraph_store_events(ctx);
 }

@@ -372,7 +372,6 @@ fn configure_payload(
 
 fn drain(ctx: &AppContext) {
     aft::runtime_drain::drain_watcher_events(ctx);
-    aft::runtime_drain::drain_search_index_events(ctx);
     aft::runtime_drain::drain_semantic_index_events(ctx);
     aft::runtime_drain::drain_semantic_refresh_events(ctx);
 }

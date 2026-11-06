@@ -79,7 +79,7 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             ..crate::config::Config::default()
         },
     );
-    let mut search_tx = None;
+    let search_tx = None;
     let mut callgraph_tx = None;
     match name {
         "off" => ctx.update_config(|config| {
@@ -88,9 +88,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             config.indexes.callgraph = false;
         }),
         "building" => {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.search_index_rx().write().unwrap() = Some(rx);
-            search_tx = Some(tx);
             *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
                 stage: "embedding".to_string(),
                 files: None,
@@ -103,9 +100,7 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),
         "partially_ready" => {
-            let index = crate::search_index::SearchIndex::build(&project_root);
-            assert!(index.ready, "a built search index is ready");
-            *ctx.search_index().write().unwrap() = Some(index);
+            crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
             ctx.trip_semantic_refresh_circuit(1, "embedding backend refused the connection");
             let (tx, rx) = crossbeam_channel::unbounded();
             *ctx.callgraph_store_rx().lock() = Some(rx);

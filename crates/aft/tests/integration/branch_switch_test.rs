@@ -449,7 +449,6 @@ fn wait_until_ready_observed(
     let deadline = started + ROW_DEADLINE;
     loop {
         aft::runtime_drain::drain_watcher_events(ctx);
-        aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_callgraph_store_events(ctx);
         aft::runtime_drain::drain_semantic_index_events(ctx);
         aft::runtime_drain::drain_semantic_refresh_events(ctx);
@@ -489,12 +488,7 @@ fn wait_until_ready_observed(
         // demand and no legacy search index is ever built; their readiness
         // is checked by the grep answers the callers wait for.
         let search_ready = ctx.config().views.enabled
-            || ctx
-                .search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(|index| index.ready);
+            || (aft::data_layer::surfaces::text_plane_ready(ctx) == Some(true));
         diagnostics.status.insert(
             "lexical",
             if ctx.config().views.enabled {

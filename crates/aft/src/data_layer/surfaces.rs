@@ -263,6 +263,42 @@ pub struct DataStoreFailure {
 
 /// How `ctx`'s checkout stands in the data layer, without binding it or
 /// waiting for a bind; `None` when the data layer is off.
+#[cfg(test)]
+thread_local! {
+    /// Storage folders handed out by `serve_text_index_for_test`, removed when
+    /// the test's thread ends.
+    static TEST_STORAGE: std::cell::RefCell<Vec<tempfile::TempDir>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Binds `ctx`'s index-store checkout over the files already on disk and
+/// waits until its text index serves them. A context with no storage folder
+/// gets a throwaway one, so a test never writes into the real storage.
+#[cfg(test)]
+pub(crate) fn serve_text_index_for_test(ctx: &AppContext) {
+    if ctx.config().storage_dir.is_none() {
+        let dir = tempfile::tempdir().expect("test storage folder");
+        let path = dir.path().to_path_buf();
+        TEST_STORAGE.with(|dirs| dirs.borrow_mut().push(dir));
+        ctx.update_config(|config| config.storage_dir = Some(path));
+    }
+    if ctx.canonical_cache_root_opt().is_none() {
+        if let Some(root) = ctx.config().project_root.clone() {
+            ctx.set_canonical_cache_root(std::fs::canonicalize(&root).unwrap_or(root));
+        }
+    }
+    ctx.data_checkout().expect("the index store binds the root");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while text_plane_ready(ctx) != Some(true) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the text index never served: {:?}",
+            report(ctx).map(|report| report.text.status)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Whether this root's text index serves: `Some(true)` ready, `Some(false)`
 /// still building, `None` when no checkout is bound or its text plane is off.
 /// For callers outside the crate, such as `aft warmup`.

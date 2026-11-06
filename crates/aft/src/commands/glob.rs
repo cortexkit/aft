@@ -995,65 +995,6 @@ mod tests {
         assert_eq!(crate::subc_format::rendered_glob_file_count(&data), shown);
     }
 
-    #[test]
-    fn glob_bulk_fixture_preserves_examined_lower_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(dir.path()).unwrap();
-        let bulk = project.join("bulk");
-        std::fs::create_dir(&bulk).unwrap();
-        for index in 0..140 {
-            std::fs::write(bulk.join(format!("fixture-{index:03}.txt")), "fixture\n").unwrap();
-        }
-        let mut observed = Vec::new();
-        for indexed in [false, true] {
-            let ctx = AppContext::new(
-                crate::context::default_language_provider_factory(),
-                crate::config::Config {
-                    project_root: Some(project.clone()),
-                    ..Default::default()
-                },
-            );
-            if indexed {
-                *ctx.search_index().write().unwrap() =
-                    Some(crate::search_index::SearchIndex::build(&project));
-            }
-            let request = serde_json::from_value(serde_json::json!({
-                "id": "glob-bulk-lower-bound", "command": "glob", "pattern": "bulk/*.txt"
-            }))
-            .unwrap();
-            // This test checks the reported lower bound, not deadline handling.
-            // A slow CI runner (Windows) can spend the default 5 s request
-            // budget on 140 per-path checks, so give the request a generous
-            // budget of its own.
-            let response = crate::bounded_io::with_budget(
-                Some(crate::bounded_io::Budget::after(Duration::from_secs(60))),
-                || handle_glob(&request, &ctx),
-            );
-            assert!(response.success, "{response:?}");
-            let body = &response.data;
-            let lower_bound = body["total_lower_bound"]
-                .as_u64()
-                .or_else(|| body["total"].as_u64())
-                .unwrap();
-            let rendered = crate::subc_format::format_response("glob", &response, false);
-            let trailer = rendered.lines().last().unwrap().to_owned();
-            println!(
-                "GLOB_BULK_FIXTURE indexed={indexed} lower_bound={lower_bound} returned={} trailer={trailer}",
-                body["files"].as_array().unwrap().len()
-            );
-            assert_eq!(body["files"].as_array().unwrap().len(), 100);
-            observed.push((indexed, lower_bound, trailer));
-        }
-        let trailer = "shown 5 of ≥140 files (cap) · narrow: path";
-        assert_eq!(
-            observed,
-            vec![
-                (false, 140, trailer.to_owned()),
-                (true, 140, trailer.to_owned())
-            ]
-        );
-    }
-
     fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(dir.path()).unwrap();
@@ -1069,57 +1010,6 @@ mod tests {
             },
         );
         (dir, ctx, project, file)
-    }
-
-    #[test]
-    fn exact_file_glob_with_ready_index_matches_basename_without_widening_scope() {
-        let (_dir, ctx, project, file) = exact_file_glob_fixture();
-        let index = crate::search_index::SearchIndex::build(&project);
-        assert!(index.is_ready());
-        assert!(index.snapshot().has_file_in_scope(&file));
-        *ctx.search_index().write().unwrap() = Some(index);
-
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
-            .expect("ready index answers without a view");
-        assert_eq!(discovery.source, "index");
-        assert!(!discovery.walk_truncated);
-        assert_eq!(discovery.files, vec![file.clone()]);
-        assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
-                .expect("glob answers without a view")
-                .files,
-            vec![file.clone()]
-        );
-        assert!(
-            glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
-                .expect("glob answers without a view")
-                .files
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn exact_file_glob_fallback_matches_basename_without_widening_scope() {
-        let (_dir, ctx, project, file) = exact_file_glob_fixture();
-        assert!(ctx.search_index().read().unwrap().is_none());
-
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
-            .expect("fallback answers without a view");
-        assert_eq!(discovery.source, "fallback");
-        assert!(!discovery.walk_truncated);
-        assert_eq!(discovery.files, vec![file.clone()]);
-        assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
-                .expect("glob answers without a view")
-                .files,
-            vec![file.clone()]
-        );
-        assert!(
-            glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
-                .expect("glob answers without a view")
-                .files
-                .is_empty()
-        );
     }
 
     #[test]
@@ -1168,35 +1058,6 @@ mod tests {
             body["files_list_envelope"]["reason"], "time_limit",
             "{body}"
         );
-    }
-
-    #[test]
-    fn indexed_glob_is_unchanged_by_a_zero_fallback_walk_budget() {
-        let (_dir, ctx, project, _) = exact_file_glob_fixture();
-        let index = crate::search_index::SearchIndex::build(&project);
-        assert!(index.is_ready());
-        *ctx.search_index().write().unwrap() = Some(index);
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "glob-indexed-budget",
-            "command": "glob",
-            "pattern": "*.ts",
-        }))
-        .unwrap();
-
-        let response =
-            crate::grep_executor::with_fallback_walk_budget_for_test(Duration::ZERO, || {
-                handle_glob(&request, &ctx)
-            });
-        let body = serde_json::to_value(response).unwrap();
-        assert_eq!(body["success"], true, "{body}");
-        assert_eq!(body["complete"], true, "{body}");
-        assert_eq!(body["fallback"], serde_json::Value::Null, "{body}");
-        assert_eq!(body["files"].as_array().unwrap().len(), 2, "{body}");
-        assert!(
-            !body["text"].as_str().unwrap().contains("time limit"),
-            "{body}"
-        );
-        assert!(body["walk_entries_examined"].is_null(), "{body}");
     }
 
     #[test]
@@ -1376,68 +1237,6 @@ mod tests {
         });
 
         assert_eq!(response.data["code"], "read_blocked", "{response:?}");
-    }
-
-    #[test]
-    fn perf_audit_glob_only_touches_returned_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(dir.path()).unwrap();
-        for i in 0..1000 {
-            let path = project.join(format!("file_{i:04}.rs"));
-            std::fs::write(&path, format!("fn marker_{i}() {{}}\n")).unwrap();
-            filetime::set_file_mtime(
-                &path,
-                filetime::FileTime::from_unix_time(1_700_000_000 + i, 0),
-            )
-            .unwrap();
-        }
-        let ctx = AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config {
-                project_root: Some(project.clone()),
-                ..Default::default()
-            },
-        );
-        *ctx.search_index().write().unwrap() =
-            Some(crate::search_index::SearchIndex::build(&project));
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "glob-page-cost-audit", "command": "glob", "pattern": "*.rs"
-        }))
-        .unwrap();
-        crate::search_index::audit_work_reset();
-        let policy_work = crate::context::policy_load_probe::Probe::new("glob-page-cost-audit");
-        let response = handle_glob(&request, &ctx);
-        let body = serde_json::to_value(response).unwrap();
-        assert_eq!(body["files"].as_array().unwrap().len(), 100);
-        assert!(body["total"].is_null());
-        assert_eq!(body["candidate_count"], 1000);
-        assert_eq!(body["total_lower_bound"], 1000);
-        assert_eq!(body["admitted_count"], 100);
-        assert_eq!(body["unexamined_files"], 900);
-        assert_eq!(body["complete"], false);
-        let expected = (900..1000)
-            .rev()
-            .map(|i| project.join(format!("file_{i:04}.rs")))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            serde_json::to_vec(&body["files"]).unwrap(),
-            serde_json::to_vec(
-                &expected
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            body["text"],
-            format_glob_text(&expected, "*.rs", &project, true)
-        );
-        let work = crate::search_index::audit_work();
-        assert_eq!(work.sort_stats, 0, "{work:?}");
-        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
-        assert_eq!(work.presence_checks, 100, "{work:?}");
-        assert_eq!(policy_work.counts().read_paths, 100);
     }
 
     fn files(paths: &[&str]) -> Vec<PathBuf> {

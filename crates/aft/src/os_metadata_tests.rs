@@ -59,9 +59,7 @@ fn request(command: &str, params: Value) -> RawRequest {
 fn glob_all(root: &Path, use_index: bool) -> Vec<String> {
     let ctx = context(root, use_index);
     if use_index {
-        let index = SearchIndex::build(root);
-        assert!(index.ready, "a built search index is ready");
-        *ctx.search_index().write().unwrap() = Some(index);
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
     }
     let response =
         crate::commands::glob::handle_glob(&request("glob", json!({ "pattern": "**/*" })), &ctx);
