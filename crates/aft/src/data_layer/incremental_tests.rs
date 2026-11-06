@@ -282,6 +282,39 @@ fn a_new_crate_nothing_names_rebinds_only_its_own_files() {
 }
 
 #[test]
+fn a_cargo_manifest_added_elsewhere_rebinds_only_the_files_under_it() {
+    // `app` resolves `crate::` and `mod` paths, which looks up its crate
+    // root through `app/Cargo.toml`. A manifest added for an unrelated
+    // folder changes no answer `app` recorded, so only the new folder's file
+    // is bound again; a single key for every config file added or removed
+    // would bind `app` again as well.
+    let base = [
+        ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
+        (
+            "app/src/lib.rs",
+            "mod inner;\npub fn start() {\n    crate::inner::help();\n}\n",
+        ),
+        ("app/src/inner.rs", "pub fn help() {}\n"),
+        ("tools/src/lib.rs", "pub fn tool() {}\n"),
+    ];
+    let mut after = base.to_vec();
+    after.push(("tools/Cargo.toml", "[package]\nname = \"tools\"\n"));
+    let (stats, cold) = update_checked(
+        checkout(&base, &[]),
+        checkout(&after, &[]),
+        &["tools/Cargo.toml"],
+    );
+    assert!(
+        cold["app/src/lib.rs"].rows.iter().any(|row| row
+            .target_path
+            .as_deref()
+            .is_some_and(|path| path == b"app/src/inner.rs")),
+        "the fixture must resolve the crate path"
+    );
+    assert!(stats.rebound <= 1, "{stats:?}");
+}
+
+#[test]
 fn a_new_crate_a_file_already_names_reaches_that_file() {
     // `app` calls `newdep::go`, which no crate defines until `newdep`
     // appears: the miss must be recorded, or the new crate never reaches
