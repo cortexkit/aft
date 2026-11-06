@@ -2930,6 +2930,314 @@ fn siblings_worker_fetch_counts_only_saved_grants() {
     );
 }
 
+/// Who carries a worker's catalog fetch. Broca, the worker's session host,
+/// binds as `reserved:broca`. Core reads the worker's shell schema before the
+/// worker starts over its own connection, so that route's principal is
+/// `reserved:prefrontal-core`, the scope's owner, and not a session host.
+const BROCA: &str = "reserved:broca";
+const CORE: &str = "reserved:prefrontal-core";
+
+/// A worker scope `scope_ref` of the fixture's head, carried by `principal`.
+fn fixture_worker(
+    fixture: &SiblingGrantFixture,
+    scope_ref: &str,
+    principal: &str,
+) -> RouteIdentity {
+    let head = fixture.head.scope.as_ref().unwrap();
+    let parent = serde_json::from_value(json!({
+        "owner":head.owner, "ref":head.scope_ref, "scope_epoch":head.scope_epoch,
+    }))
+    .unwrap();
+    let mut worker = identity(&fixture.path("head"), "session", 7, true);
+    let data = Arc::get_mut(&mut worker.0).unwrap();
+    let stamp = data.scope.as_mut().unwrap();
+    stamp.scope_ref = scope_ref.into();
+    stamp.parent = Some(parent);
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some(principal.into());
+    }
+    worker
+}
+
+/// The worker plan core sends with each fetch: runon enabled, `siblings`, and
+/// a read `allow_paths` entry for each of `readable`. A `sibling: true` entry
+/// reaches AFT as the sibling plus a read entry for the same path.
+fn sibling_plan(siblings: &[&Path], readable: &[&Path]) -> Value {
+    let allow_paths: Vec<Value> = readable
+        .iter()
+        .map(|path| json!({"path":path, "mode":"read"}))
+        .collect();
+    json!({"preset":"worker", "params":{
+        "remote_exec":{"enabled":true}, "siblings":siblings, "allow_paths":allow_paths,
+    }})
+}
+
+/// Core's fetches for a worker launched with a sibling checkout, in core's
+/// order and with the same plan each time: the launch approval and the plan
+/// composed at the first send, both under the head's scope, then the shell
+/// schema read under the worker's own scope over core's connection. Broca
+/// then fetches under the worker's scope, and the worker submits a runon job
+/// naming the sibling.
+#[cfg(unix)]
+#[tokio::test]
+async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
+    let daemon = crate::exec_remote::wire_tests::daemon(
+        crate::exec_remote::wire_tests::Script::Plain,
+        "exec-remote/v1",
+    )
+    .await;
+    let fixture = SiblingGrantFixture::new("siblings-launch-head");
+    let ctx = &fixture.ctx;
+    init_remote_git_fixture(&fixture.path("head"));
+    ctx.update_config(|config| {
+        config.semantic.subc_connection_file = Some(daemon.connection.clone());
+    });
+    let commons = fixture.path("granted/commons");
+    let plan = sibling_plan(&[&commons], &[&commons]);
+    for fetch in ["launch approval", "plan composition"] {
+        if let Err(error) = catalog(plan.clone(), &fixture.head, ctx) {
+            panic!("{fetch} under the head's scope: {error:?}");
+        }
+    }
+    let core = fixture_worker(&fixture, "siblings-launch-worker", CORE);
+    if let Err(error) = catalog(plan.clone(), &core, ctx) {
+        panic!("shell schema read under the worker's scope: {error:?}");
+    }
+    let broca = fixture_worker(&fixture, "siblings-launch-worker", BROCA);
+    catalog(plan, &broca, ctx).unwrap();
+    let sibling = commons.canonicalize().unwrap();
+    let launch = lookup(ctx, &RemoteSource::Worker(key(&broca, Some("worker")))).unwrap();
+    assert_eq!(launch.params.siblings, [sibling.to_str().unwrap()]);
+    // The worker's runon call, under Broca's route policy.
+    let _scope = crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&broca)));
+    let _grants =
+        crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&broca));
+    let _ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+            once: vec![],
+            launch: access_grants::launch_key(&broca, "worker"),
+        }));
+    let run =
+        crate::bash_background::registry::remote::submit_runon_for_test(ctx, launch, &daemon).await;
+    assert_eq!(run["siblings"], json!([sibling]));
+}
+
+/// The worker-scope fetches still refuse a sibling the plan's allow_paths
+/// leave out, a sibling that is not a checkout root, and an allow_paths entry
+/// the head may not grant, with the same answer whether core or Broca
+/// carries the fetch.
+#[test]
+fn siblings_worker_scope_fetches_still_refuse_ungranted_plans() {
+    use crate::access_policy::policy_path;
+    let fixture = SiblingGrantFixture::new("siblings-refused-head");
+    let ctx = &fixture.ctx;
+    let commons = fixture.path("granted/commons");
+    let plain = fixture.path("granted/plain");
+    let granted = fixture.path("granted");
+    let other = fixture.path("other");
+    let refused = |code: &str, message: String| (code.to_owned(), message);
+    let cases = [
+        // The plan grants a folder beside the sibling, not the sibling.
+        (
+            sibling_plan(&[&commons], &[&plain]),
+            refused("invalid_request", not_readable(&policy_path(&commons))),
+        ),
+        (
+            sibling_plan(&[&plain], &[&granted]),
+            refused("invalid_request", not_checkout_root(&plain)),
+        ),
+        // `other` is a checkout root outside every grant the head holds.
+        (
+            sibling_plan(&[&other], &[&other]),
+            refused("plan_param_refused", "allow_paths[0]: head_not_held".into()),
+        ),
+    ];
+    for (index, (plan, expected)) in cases.into_iter().enumerate() {
+        // Core's fetch comes first and Broca's follows, for the same worker.
+        let scope_ref = format!("siblings-refused-worker-{index}");
+        for principal in [CORE, BROCA] {
+            let worker = fixture_worker(&fixture, &scope_ref, principal);
+            let error = catalog(plan.clone(), &worker, ctx).unwrap_err();
+            assert_eq!(
+                (error.code, error.message),
+                expected,
+                "case {index} carried by {principal}"
+            );
+        }
+        assert!(lookup(
+            ctx,
+            &RemoteSource::Worker(key(
+                &fixture_worker(&fixture, &scope_ref, BROCA),
+                Some("worker")
+            ))
+        )
+        .is_none());
+    }
+}
+
+/// A worker stamp whose owner the daemon did not authorize may not use the
+/// grants saved for a worker scope of the same name, nor save its own, so its
+/// siblings are refused whichever connection carries the fetch.
+#[test]
+fn siblings_unauthorized_worker_scope_is_refused() {
+    use crate::access_policy::policy_path;
+    let fixture = SiblingGrantFixture::new("siblings-unauthorized-head");
+    let ctx = &fixture.ctx;
+    let commons = fixture.path("granted/commons");
+    let plan = sibling_plan(&[&commons], &[&commons]);
+    let scope_ref = "siblings-unauthorized-worker";
+    // The authorized worker scope of that name holds a grant on the sibling.
+    catalog(
+        plan.clone(),
+        &fixture_worker(&fixture, scope_ref, BROCA),
+        ctx,
+    )
+    .unwrap();
+    let siblings_only = json!({"preset":"worker", "params":{
+        "remote_exec":{"enabled":true}, "siblings":[commons],
+    }});
+    for principal in [CORE, BROCA] {
+        let mut worker = fixture_worker(&fixture, scope_ref, principal);
+        Arc::get_mut(&mut worker.0)
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .owner_authorized = false;
+        let error = catalog(plan.clone(), &worker, ctx).unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            ("plan_param_refused", "allow_paths[0]: head_policy_unknown"),
+            "carried by {principal}"
+        );
+        assert_siblings_refused(
+            catalog(siblings_only.clone(), &worker, ctx),
+            &not_readable(&policy_path(&commons)),
+        );
+    }
+}
+
+/// The waiver that lets core's worker-scope fetch count the worker's saved
+/// grants covers only that fetch, carried by the scope's own owner. After
+/// core's fetch has saved the worker's grant on the sibling, the same check is
+/// still refused when a module that is neither a session host nor the owner
+/// carries the fetch, when the stamp names a flow, and when the scope is not
+/// an Alfonso worker scope. A read on core's connection outside the catalog
+/// still may not use the saved grant. And a worker scope saves its launch
+/// grants once, so a later plan naming the sibling in allow_paths adds none.
+#[test]
+fn siblings_owner_waiver_covers_only_the_owner_carried_worker_fetch() {
+    use crate::access_policy::{policy_path, ScopeGrantsDenial};
+    let fixture = SiblingGrantFixture::new("siblings-waiver-head");
+    let ctx = &fixture.ctx;
+    let commons = fixture.path("granted/commons");
+    let plan = sibling_plan(&[&commons], &[&commons]);
+    let refused = not_readable(&policy_path(&commons));
+    let scope_ref = "siblings-waiver-worker";
+    let core = fixture_worker(&fixture, scope_ref, CORE);
+    catalog(plan.clone(), &core, ctx).unwrap();
+
+    let module = "reserved:example-module";
+    let other_carrier = fixture_worker(&fixture, scope_ref, module);
+    assert_eq!(
+        access_grants::scope_grants_denial(&other_carrier),
+        Some(ScopeGrantsDenial::NotSessionHost)
+    );
+    assert_siblings_refused(catalog(plan.clone(), &other_carrier, ctx), &refused);
+
+    let mut flow = fixture_worker(&fixture, scope_ref, CORE);
+    Arc::get_mut(&mut flow.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .attributes
+        .flow_id = Some("flow-1".into());
+    assert_eq!(
+        access_grants::scope_grants_denial(&flow),
+        Some(ScopeGrantsDenial::Flow)
+    );
+    assert_siblings_refused(catalog(plan.clone(), &flow, ctx), &refused);
+
+    // A worker scope owned by another module and carried by that owner, which
+    // holds a saved grant on the sibling.
+    let mut foreign = fixture_worker(&fixture, "siblings-waiver-foreign", module);
+    Arc::get_mut(&mut foreign.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .owner =
+        serde_json::from_value(json!({"kind":"reserved","module_id":"example-module"})).unwrap();
+    access_grants::register(&foreign, ctx).unwrap();
+    crate::db::access_grants::insert(
+        &ctx.db().unwrap().lock().unwrap(),
+        &access_grants::policy_scope_key(&foreign),
+        &crate::access_policy::AccessGrant {
+            path: policy_path(&commons),
+            kind: crate::access_policy::GrantKind::Subtree,
+            operation: crate::access_policy::AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        access_grants::scope_grants_denial(&foreign),
+        Some(ScopeGrantsDenial::UnknownScopeKind)
+    );
+    assert_siblings_refused(
+        catalog(
+            json!({"preset":"worker", "params":{
+                "remote_exec":{"enabled":true}, "siblings":[commons],
+            }}),
+            &foreign,
+            ctx,
+        ),
+        &refused,
+    );
+
+    // A file read on core's connection, outside the catalog's sibling check.
+    assert_eq!(
+        access_grants::scope_grants_denial(&core),
+        Some(ScopeGrantsDenial::NotSessionHost)
+    );
+    {
+        let _scope =
+            crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&core)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&core));
+        let _ask =
+            crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+                once: vec![],
+                launch: access_grants::launch_key(&core, "worker"),
+            }));
+        assert!(ctx
+            .validate_read_path_without_approval(
+                "core-read",
+                &core.session,
+                &commons.canonicalize().unwrap()
+            )
+            .is_err());
+    }
+
+    let earlier = "siblings-waiver-earlier";
+    catalog(
+        sibling_plan(&[], &[&fixture.path("granted/plain")]),
+        &fixture_worker(&fixture, earlier, CORE),
+        ctx,
+    )
+    .unwrap();
+    for principal in [CORE, BROCA] {
+        assert_siblings_refused(
+            catalog(
+                plan.clone(),
+                &fixture_worker(&fixture, earlier, principal),
+                ctx,
+            ),
+            &refused,
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact() {

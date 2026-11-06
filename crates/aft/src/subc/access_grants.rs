@@ -140,6 +140,34 @@ pub(super) fn scope_grants_denial_for_parent(
     }
 }
 
+/// Saved-grant eligibility for checking a worker plan's siblings at the
+/// worker's own catalog fetch. Core makes one such fetch over its own
+/// connection before the worker starts, so that route's principal is the
+/// scope's owner rather than one of the session hosts that later run the
+/// worker's file tools. The checked siblings are saved for those file tools,
+/// so the check counts the grants saved on the worker's scope as its session
+/// host would. Only the session-host denial is waived, and only when the
+/// route's principal is the owner named on an authorized Alfonso worker
+/// stamp: flow scopes, other scope kinds, codemode runs and every other
+/// carrier keep their denial. Tool calls on the owner's connection keep it
+/// too, because they read [`scope_grants_denial`].
+pub(super) fn worker_catalog_sibling_grants_denial(
+    identity: &RouteIdentity,
+    preset: &str,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    let denial = scope_grants_denial(identity);
+    let owner_carried = identity.run_owner.is_none()
+        && launch_key(identity, preset).is_some()
+        && identity.scope.as_ref().is_some_and(|stamp| {
+            principal_id(&Some(stamp.owner.clone())).as_deref()
+                == principal_label_for_identity(identity)
+        });
+    match denial {
+        Some(crate::access_policy::ScopeGrantsDenial::NotSessionHost) if owner_carried => None,
+        denial => denial,
+    }
+}
+
 pub(super) fn register(
     identity: &RouteIdentity,
     ctx: &AppContext,

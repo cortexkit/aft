@@ -6032,7 +6032,7 @@ fn proves_no_start(error: &exec::Error) -> bool {
 mod tests;
 
 #[cfg(all(test, unix))]
-pub(crate) use tests::assert_siblings_submit_refused_before_connect;
+pub(crate) use tests::{assert_siblings_submit_refused_before_connect, submit_runon_for_test};
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::{
