@@ -263,6 +263,17 @@ pub struct DataStoreFailure {
 
 /// How `ctx`'s checkout stands in the data layer, without binding it or
 /// waiting for a bind; `None` when the data layer is off.
+/// Whether this root's text index serves: `Some(true)` ready, `Some(false)`
+/// still building, `None` when no checkout is bound or its text plane is off.
+/// For callers outside the crate, such as `aft warmup`.
+pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
+    match report(ctx)?.text.status {
+        READY => Some(true),
+        BUILDING => Some(false),
+        _ => None,
+    }
+}
+
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
     Some(match ctx.probe_data_checkout()? {
         DataCheckoutProbe::NotBound => {

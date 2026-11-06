@@ -358,7 +358,6 @@ fn wait_until_ready(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut last_labels = WarmupLabels::default();
     loop {
-        drain_search_index_events(ctx);
         drain_semantic_index_events(ctx);
 
         let snapshot = WarmupSnapshot::from_context(ctx, &callgraph_override);
@@ -531,27 +530,10 @@ fn search_index_state(ctx: &AppContext) -> SubsystemState {
     if !ctx.config().indexes.trigram {
         return SubsystemState::Disabled;
     }
-    let index_ready = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index.as_ref().is_some_and(|index| index.ready)
-    };
-    if index_ready {
-        return SubsystemState::Ready;
-    }
-    let build_in_progress = {
-        let search_index_rx = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index_rx.is_some()
-    };
-    if build_in_progress {
-        SubsystemState::Pending("building".to_string())
-    } else {
-        SubsystemState::Pending("loading".to_string())
+    match aft::data_layer::surfaces::text_plane_ready(ctx) {
+        Some(true) => SubsystemState::Ready,
+        Some(false) => SubsystemState::Pending("building".to_string()),
+        None => SubsystemState::Pending("loading".to_string()),
     }
 }
 
@@ -851,30 +833,6 @@ fn callgraph_store_state(
     // The previous attempt terminated without a usable pointer. The wait loop
     // retriggers the cold build and eventually reports its hard error or timeout.
     SubsystemState::Pending("retrying".to_string())
-}
-
-fn drain_search_index_events(ctx: &AppContext) {
-    let latest = {
-        let rx_ref = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-
-        let mut latest = None;
-        while let Ok(index) = rx.try_recv() {
-            latest = Some(index);
-        }
-        latest
-    };
-
-    if let Some(index) = latest {
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-    }
 }
 
 fn drain_semantic_index_events(ctx: &AppContext) {
