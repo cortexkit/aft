@@ -24,12 +24,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::callgraph::js_workspace_package_map;
 use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion};
 use crate::callgraph_store::facts::{FactPaths, ProjectFacts};
 use crate::callgraph_store::join::{
     rust_crate_key, rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies,
-    ViewBindingFacts, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_JS_WORKSPACES_DOMAIN,
-    VIEW_RUST_MODULE_DOMAIN,
+    ViewBindingFacts, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
 use crate::callgraph_store::{go_module_map, rust_crate_map};
 
@@ -686,12 +686,10 @@ impl LiveCheckout {
         // answers, which are asked again below. Adding or removing one
         // reaches the files that probed its path, by their recorded answers
         // and (for one they found) their recorded path, and the crate root
-        // answers that name it; only a JavaScript workspace member list,
-        // which globs for manifests, depends on manifests it never probed by
-        // path.
-        let workspace_members_changed = configs.intersection(&membership).any(|path: &String| {
-            is_config_named(path, "package.json") || is_config_named(path, "pnpm-workspace.yaml")
-        });
+        // answers that name it. A JavaScript workspace package lookup reads
+        // every member's manifest, so its readers record the looked-up name's
+        // key instead (see `js_package_key`), set below for each name whose
+        // member changed.
         // The Go module map and the Rust crate map are each built from a
         // walk of the checkout, and a reader records keys for the map, not
         // the walk. Build each map before and after whenever its inputs can
@@ -712,6 +710,45 @@ impl LiveCheckout {
                 facts: &CheckoutFacts { inputs },
             });
             (before, after)
+        };
+        // Each workspace package name whose resolved member changed: a
+        // manifest added, removed or edited (its name, or a root's member
+        // list) or a symlink changed. Every folder holding a manifest before
+        // or after is a candidate workspace root.
+        let changed_packages = if !links.is_empty()
+            || configs
+                .iter()
+                .any(|path| is_named(path, "package.json") || is_named(path, "pnpm-workspace.yaml"))
+        {
+            let candidates = old
+                .configs
+                .keys()
+                .chain(inputs.configs.keys())
+                .filter_map(|path| std::str::from_utf8(path).ok())
+                .filter_map(|path| {
+                    let name = if is_config_named(path, "package.json") {
+                        "package.json"
+                    } else if is_config_named(path, "pnpm-workspace.yaml") {
+                        "pnpm-workspace.yaml"
+                    } else {
+                        return None;
+                    };
+                    Some(
+                        std::path::Path::new("/")
+                            .join(path[..path.len() - name.len()].trim_end_matches('/')),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            let (before, after) =
+                maps(&|facts| js_workspace_package_map(facts, candidates.iter().cloned()));
+            before
+                .keys()
+                .chain(after.keys())
+                .filter(|key| before.get(*key) != after.get(*key))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
         };
         let go_modules_changed =
             (!links.is_empty() || configs.iter().any(|path| is_named(path, "go.mod"))) && {
@@ -754,9 +791,7 @@ impl LiveCheckout {
         // exist, and on configuration it read.
         let started = Instant::now();
         let mut binding_keys = membership.clone();
-        if workspace_members_changed {
-            binding_keys.insert(VIEW_JS_WORKSPACES_DOMAIN.to_string());
-        }
+        binding_keys.extend(changed_packages.iter().cloned());
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
@@ -858,9 +893,7 @@ impl LiveCheckout {
         // What a recorded answer can depend on that changed.
         let mut changed_keys = surfaces_changed.clone();
         changed_keys.extend(membership.iter().cloned());
-        if workspace_members_changed {
-            changed_keys.insert(VIEW_JS_WORKSPACES_DOMAIN.to_string());
-        }
+        changed_keys.extend(changed_packages);
         if module_tree_changed {
             changed_keys.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
         }

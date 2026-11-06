@@ -38,6 +38,12 @@ pub(crate) trait ProjectFacts {
     fn records_config_facts(&self) -> bool {
         false
     }
+    /// Whether every checkout read is recorded with its answer (the data
+    /// layer's recorder), so a reader can record the key of a repository-wide
+    /// structure in place of the reads that build it.
+    fn records_answers(&self) -> bool {
+        false
+    }
     fn config_fact(&self, _rel: &[u8], _name: &str) {}
     fn memo_start(&self, _path: &Path, _kind: &str, _name: &str) {}
     fn memo_finish(&self, _path: &Path, _kind: &str, _name: &str) {}

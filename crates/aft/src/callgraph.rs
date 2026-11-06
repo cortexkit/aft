@@ -3666,10 +3666,25 @@ fn resolve_workspace_package(
     facts
         .facts
         .memo_start(&workspace_root, "package", package_name);
-    let resolved = cached_workspace_member_dirs(&workspace_root, memo, facts)
-        .iter()
-        .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
-        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()));
+    // A recorder that keeps every read with its answer records the name's key
+    // instead of the member walk and the names it read: the walk is the same
+    // for every reader, and kept in each it was most of a monorepo's stored
+    // call graph. `js_workspace_package_map` sets the key when the name's
+    // member changes.
+    let keyed = facts.facts.records_answers();
+    if keyed {
+        facts
+            .facts
+            .record_domain(&crate::callgraph_store::join::js_package_key(
+                &checkout_relative(facts, &workspace_root),
+                package_name,
+            ));
+        facts.facts.pause_recording();
+    }
+    let resolved = workspace_package_member(&workspace_root, package_name, memo, facts);
+    if keyed {
+        facts.facts.resume_recording();
+    }
 
     facts
         .facts
@@ -3686,6 +3701,63 @@ fn resolve_workspace_package(
     }
 
     resolved
+}
+
+/// The member of the workspace at `workspace_root` whose `package.json` names
+/// `package_name`, resolved: the first in member order when several do.
+fn workspace_package_member(
+    workspace_root: &Path,
+    package_name: &str,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
+    cached_workspace_member_dirs(workspace_root, memo, facts)
+        .iter()
+        .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
+        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()))
+}
+
+/// `path` relative to the checkout root of `facts`, with `/` separators.
+fn checkout_relative(facts: &FactPaths<'_>, path: &Path) -> String {
+    path.strip_prefix(facts.root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Each JavaScript workspace package's resolved member folder, by the key a
+/// reader records for looking its name up ([`js_package_key`]), for each of
+/// `candidates` that is a workspace root. A name several members share maps
+/// to the member [`resolve_workspace_package`] finds. Read through `facts`
+/// without a memo, so a map built before and after a change compares what
+/// the resolver would find in each.
+///
+/// [`js_package_key`]: crate::callgraph_store::join::js_package_key
+pub(crate) fn js_workspace_package_map(
+    facts: &FactPaths<'_>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for candidate in candidates {
+        if !is_workspace_root(&candidate, None, facts) {
+            continue;
+        }
+        let root = facts
+            .canonical(&candidate)
+            .unwrap_or_else(|| candidate.clone());
+        let relative = checkout_relative(facts, &root);
+        for dir in workspace_member_dirs(&root, None, facts) {
+            let Some(name) = package_json_name(&dir, None, facts) else {
+                continue;
+            };
+            let key = crate::callgraph_store::join::js_package_key(&relative, &name);
+            map.entry(key).or_insert_with(|| {
+                let resolved = facts.canonical(&dir).unwrap_or(dir);
+                resolved.to_string_lossy().into_owned()
+            });
+        }
+    }
+    map
 }
 
 /// The member list for a workspace root, walked at most once per cache

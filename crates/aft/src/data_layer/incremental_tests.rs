@@ -195,6 +195,124 @@ fn a_workspace_package_rename_resolves_like_a_cold_build() {
     );
 }
 
+/// A workspace whose `app` imports `@scope/lib`, among `members` other
+/// packages each in its own folder (`packages/m<i>`, named `m<i>`).
+fn js_workspace(members: usize, extra_files: &[(&str, &str)]) -> CheckoutInputs {
+    let mut owned = vec![
+        (
+            "package.json".to_string(),
+            r#"{"workspaces":["packages/*"]}"#.to_string(),
+        ),
+        (
+            "packages/app/package.json".to_string(),
+            r#"{"name":"app"}"#.to_string(),
+        ),
+        (
+            "packages/app/src/main.ts".to_string(),
+            "import { target } from '@scope/lib';\nexport function run(): string { return target(); }\n"
+                .to_string(),
+        ),
+        (
+            "packages/app/src/local.ts".to_string(),
+            "import { run } from './main';\nexport function again(): string { return run(); }\n"
+                .to_string(),
+        ),
+        (
+            "packages/lib/package.json".to_string(),
+            r#"{"name":"@scope/lib","main":"src/index.ts"}"#.to_string(),
+        ),
+        (
+            "packages/lib/src/index.ts".to_string(),
+            "export function target(): string { return 'ok'; }\n".to_string(),
+        ),
+    ];
+    for member in 0..members {
+        owned.push((
+            format!("packages/m{member}/package.json"),
+            format!(r#"{{"name":"m{member}"}}"#),
+        ));
+        owned.push((
+            format!("packages/m{member}/src/index.ts"),
+            format!("export function f{member}(): number {{ return {member}; }}\n"),
+        ));
+    }
+    let mut files = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    files.extend_from_slice(extra_files);
+    checkout(&files, &[])
+}
+
+#[test]
+fn a_workspace_package_lookup_records_its_name_not_every_member() {
+    // Finding `@scope/lib` reads every member's manifest. Recorded in the
+    // importing file, those reads grew with the workspace: in a monorepo of
+    // a few dozen packages, about 1,300 per file with a bare import. The
+    // importer records the looked-up name's key instead, so its stored
+    // resolution is the same size with 2 other members as with 40.
+    let recorded = |members: usize| {
+        let cold = resolve_checkout(&js_workspace(members, &[]), 1).unwrap();
+        assert!(
+            cold["packages/app/src/main.ts"].rows.iter().any(|row| row
+                .target_path
+                .as_deref()
+                .is_some_and(|path| path == b"packages/lib/src/index.ts")),
+            "the fixture must resolve the import"
+        );
+        super::fragment::encode(&cold["packages/app/src/main.ts"]).len()
+    };
+    assert_eq!(recorded(2), recorded(40));
+}
+
+#[test]
+fn a_new_workspace_package_nothing_imports_rebinds_only_its_own_files() {
+    // `main.ts` looks up `@scope/lib`, whose member does not change when a
+    // new package appears, so only the new package's file is bound. Keying
+    // the whole member list would rebind every file with a bare import.
+    let extra = [
+        ("packages/new/package.json", r#"{"name":"new"}"#),
+        (
+            "packages/new/src/index.ts",
+            "export function fresh(): number { return 1; }\n",
+        ),
+    ];
+    let (stats, _) = update_checked(
+        js_workspace(3, &[]),
+        js_workspace(3, &extra),
+        &["packages/new/package.json", "packages/new/src/index.ts"],
+    );
+    assert_eq!(stats.rebound, 1, "{stats:?}");
+}
+
+#[test]
+fn a_second_member_taking_a_package_name_rebinds_its_importer() {
+    // A member folder that sorts before `lib` and takes its name becomes the
+    // package the import resolves to: the name's key is set, and the
+    // importer resolves like a cold build.
+    let extra = [
+        (
+            "packages/alt/package.json",
+            r#"{"name":"@scope/lib","main":"src/index.ts"}"#,
+        ),
+        (
+            "packages/alt/src/index.ts",
+            "export function target(): string { return 'alt'; }\n",
+        ),
+    ];
+    let rows = update_matches_cold(
+        js_workspace(3, &[]),
+        js_workspace(3, &extra),
+        &["packages/alt/package.json", "packages/alt/src/index.ts"],
+        "packages/app/src/main.ts",
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, path, _)| path.as_deref() == Some("packages/alt/src/index.ts")),
+        "the fixture must move the import: {rows:?}"
+    );
+}
+
 #[test]
 fn a_go_module_rename_resolves_like_a_cold_build() {
     let caller = (

@@ -2534,16 +2534,17 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     fn records_config_facts(&self) -> bool {
         true
     }
+    fn records_answers(&self) -> bool {
+        self.typed
+    }
     fn config_fact(&self, rel: &[u8], name: &str) {
         self.record(rel);
-        if matches!(name, "workspaces" | "packages") {
+        if !self.typed && matches!(name, "workspaces" | "packages") {
             // The members a workspace list names depend on which package
-            // manifests exist under its globs, not only on this field.
-            self.record(if self.typed {
-                VIEW_JS_WORKSPACES_DOMAIN.as_bytes()
-            } else {
-                VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes()
-            });
+            // manifests exist under its globs, not only on this field. A
+            // typed recorder keys each package name a reader looked up
+            // instead ([`js_package_key`]).
+            self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
         }
         self.config_event(rel, Some(name));
         // The resolver records a field each time it uses one, though it reads
@@ -3435,12 +3436,24 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
 /// by every JavaScript workspace member list; set when any config file is
 /// added or removed.
 pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
-/// The data layer's key for a JavaScript workspace member list: set when a
-/// `package.json` or `pnpm-workspace.yaml` is added or removed, since either
-/// can change which members a list's globs name. The data layer keeps every
-/// other config probe as a path and a recorded answer, so it does not use
+/// The prefix of the data layer's JavaScript workspace package keys
+/// ([`js_package_key`]). The data layer keeps every other config probe as a
+/// path and a recorded answer, so it does not use
 /// [`VIEW_CONFIG_MEMBERSHIP_DOMAIN`].
 pub(crate) const VIEW_JS_WORKSPACES_DOMAIN: &str = "\0view:js-workspaces";
+
+/// The key a reader records for looking up the package `name` among the
+/// members of the JavaScript workspace at `root` (checkout-relative, `/`
+/// separators), found or not. Finding it walks the workspace's member folders
+/// and reads each member's `package.json` name; recording those reads in
+/// every file with a bare import cost a monorepo about 1,300 recorded reads
+/// per file. The key replaces them: a `package.json` or `pnpm-workspace.yaml`
+/// added, removed or edited, or a symlink changed, sets the key of each name
+/// whose resolved member changed, so only the files that looked that name up
+/// are bound again.
+pub(crate) fn js_package_key(root: &str, name: &str) -> String {
+    format!("{VIEW_JS_WORKSPACES_DOMAIN}\0{root}\0{name}")
+}
 /// The Rust module tree: which files exist and which modules each declares.
 /// `Parent` answers read it; a file whose module declarations change, or a
 /// Rust file added or removed, sets it.
