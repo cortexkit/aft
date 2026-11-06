@@ -111,6 +111,7 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
         // response, so its first tool call emits that session's one-shot warning.
         report_registration_downgrade,
         standard_edit_grammar: false,
+        head_catalog_key: None,
         // Standalone tool calls use the `disabled_tools` list configure resolved
         // when the session connected (the root config).
         disabled_tools: None,

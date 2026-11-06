@@ -20,7 +20,11 @@ import {
   createBashStatusTool,
   createBashTool,
 } from "./tools/bash.js";
-import { bashWatchDescription, createBashWatchTool } from "./tools/bash_watch.js";
+import {
+  bashWatchDescription,
+  createBashWatchTool,
+  WATCH_PATTERN_MODES_SENTENCE,
+} from "./tools/bash_watch.js";
 import { createBashWriteTool } from "./tools/bash_write.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
@@ -330,9 +334,10 @@ export const SUBC_BARE_TOOL_NAMES: readonly SubcBareToolName[] = BARE_TOOL_ORDER
 
 /**
  * Tool schemas the module catalog's `worker` preset serves in place of the
- * base ones, plus the tools only that preset serves. The `head` preset is the
- * base artifact unchanged, and the `reader` preset only narrows the tool list,
- * so neither needs entries here.
+ * base ones, plus the tools only that preset serves. The `reader` preset only
+ * narrows the tool list, so it needs no entries here, and the `head` preset is
+ * the base artifact unchanged except for a runner head (a head whose catalog
+ * request names its model), which is also served `head.bash_watch`.
  *
  * A worker is a delegated session: once its turn ends it has delivered its
  * result, and nothing (no completion reminder, no async notification) wakes
@@ -368,6 +373,12 @@ export function buildSubcToolPresets(
     { role: "worker", remoteRuns },
   );
   return {
+    head: {
+      bash_watch: headBashWatchSchema(
+        argsToJsonSchema(createBashWatchTool(ctx)),
+        bashWatchDescription("primary", statusRegistered, false),
+      ),
+    },
     worker: {
       bash,
       powershell: withWorkerTimeout(base.powershell),
@@ -405,6 +416,38 @@ function workerBashWatchSchema(
     ...properties.deliver,
     description:
       "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
+  };
+  return { ...clone, description };
+}
+
+/**
+ * A runner head's `bash_watch`: the OpenCode tool's schema and head wording
+ * without its async watches. The module always waits synchronously (see
+ * `workerBashWatchSchema`), so the async-only arguments are left out, and so
+ * is the `pattern` sentence that contrasts the sync and async modes.
+ */
+function headBashWatchSchema(
+  schema: Record<string, unknown>,
+  description: string,
+): Record<string, unknown> {
+  const clone = structuredClone(schema);
+  const properties = clone.properties as Record<string, Record<string, unknown>>;
+  for (const asyncOnly of ["background", "deliver", "once"]) {
+    if (!Object.hasOwn(properties, asyncOnly)) {
+      throw new Error(`bash_watch no longer has the async-only argument ${asyncOnly}`);
+    }
+    delete properties[asyncOnly];
+  }
+  const pattern = properties.pattern;
+  if (
+    typeof pattern?.description !== "string" ||
+    !pattern.description.includes(WATCH_PATTERN_MODES_SENTENCE)
+  ) {
+    throw new Error("bash_watch's pattern description no longer names its watch modes");
+  }
+  properties.pattern = {
+    ...pattern,
+    description: pattern.description.replace(WATCH_PATTERN_MODES_SENTENCE, ""),
   };
   return { ...clone, description };
 }

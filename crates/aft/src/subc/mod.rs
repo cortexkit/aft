@@ -4214,6 +4214,10 @@ async fn teardown_installed_route(
             .any(|route| route.root == identity.root && route.session == identity.session);
         if !session_still_routed {
             if let Some(ctx) = executor.actor_context(&identity.root) {
+                // The binding goes with the session's last route, but the edit
+                // mode its runner head's catalog recorded stays in aft.db: the
+                // head keeps that catalog when the route is reopened, and its
+                // next call installs the binding again.
                 ctx.hashline_bindings()
                     .teardown(identity.root.as_path(), &identity.session);
                 let _ = ctx.release_backup_session_in_background(identity.session.clone());
@@ -11233,6 +11237,7 @@ async fn handle_tool_call_with_capabilities(
         if carrier_read_only::restricted(&identity) {
             call.name = carrier_read_only::internal_name(&call.name).to_owned();
         }
+        tool_provider::route_head_call_name(&mut call, identity.scope.is_some());
         if let Err(error) =
             admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
         {
@@ -11266,6 +11271,7 @@ async fn handle_tool_call_with_capabilities(
             tool_provider::admission_trusted(&identity, &call),
             &identity.project_root,
             frame.header.channel,
+            tool_provider::head_catalog_key(&identity).is_some(),
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -11911,6 +11917,9 @@ async fn handle_tool_call_with_capabilities(
         edit_slot_survives: call.edit_slot_survives,
         report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
         standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
+        head_catalog_key: (role == tool_provider::CallerRole::Head)
+            .then(|| tool_provider::head_catalog_key(&identity))
+            .flatten(),
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
         worker_session: role.is_worker(),
         host_tool_names: format_context.host_tool_names.clone(),
