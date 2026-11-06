@@ -891,27 +891,23 @@ pub(crate) fn resolve_checkout_into(
                 encoded.heap_bytes(&mut seen),
             ));
         }
-        // Pass 4 runs once over every file: its resolvers keep memos per
-        // chunk of files, and smaller runs start more of them cold. Its
-        // sites are small beside the resolutions they join.
-        let mut reached = calls
-            .resolve_sites(inputs, &NoResolutions, &refs(&paths))
-            .into_iter()
-            .map(|(path, sites, dependencies)| (path, (sites, dependencies)))
-            .collect::<HashMap<_, _>>();
-        drop(calls);
-        lap(&mut memory, "sites");
+        // Pass 4 runs a batch at a time: run over every file at once, its
+        // sites and their dependencies held about 1 GB on aft's checkout.
+        // Each batch's resolutions are decoded in parallel and handed to the
+        // sink, which builds their fragments in parallel too.
+        let mut sites_ms = 0u128;
         for batch in paths.chunks(BATCH) {
+            let started = std::time::Instant::now();
+            let reached = calls.resolve_sites(inputs, &NoResolutions, &refs(batch));
+            sites_ms += started.elapsed().as_millis();
             let parses = &inputs.parses;
-            let files = batch
-                .iter()
-                .map(|path| {
+            let files = reached
+                .into_iter()
+                .map(|(path, sites, dependencies)| {
                     let bytes = encoded
-                        .remove(path)
+                        .remove(&path)
                         .expect("every parsed file was resolved");
-                    let (sites, dependencies) =
-                        reached.remove(path).expect("pass 4 ran on every file");
-                    (path.clone(), bytes, sites, dependencies)
+                    (path, bytes, sites, dependencies)
                 })
                 .collect::<Vec<_>>();
             let files = files
@@ -928,8 +924,15 @@ pub(crate) fn resolve_checkout_into(
             sink(&*inputs, files)?;
             inputs.parses.release_decoded();
         }
+        drop(calls);
         relieve_allocator();
-        lap(&mut memory, "fragments");
+        if let Some(memory) = memory.as_deref_mut() {
+            memory.push((
+                "ms.sites".to_string(),
+                usize::try_from(sites_ms).unwrap_or(usize::MAX),
+            ));
+        }
+        lap(&mut memory, "sites_and_fragments");
         Ok(())
     })
 }
