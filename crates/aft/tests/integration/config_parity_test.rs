@@ -109,7 +109,14 @@ fn assert_case(dir: &Path) -> Option<String> {
     // Build the ordered tier list exactly as the plugin will: user first, then
     // project. Absent files contribute no tier.
     let mut tiers = Vec::new();
-    if let Some(user) = read_tier(dir, "user.jsonc", "user") {
+    if let Some(mut user) = read_tier(dir, "user.jsonc", "user") {
+        // The engine rewrites the user file to current keys before it resolves
+        // it, and the plugins translate the user file in memory for that one
+        // start, so feed the resolver the rewritten text. A file the rewrite
+        // cannot parse is passed through unchanged for the resolver to reject.
+        if let Ok(migration) = aft::config_fix::migrate_user_config_text(&user.doc) {
+            user.doc = migration.text;
+        }
         tiers.push(user);
     }
     if let Some(project) = read_tier(dir, "project.jsonc", "project") {
@@ -118,7 +125,9 @@ fn assert_case(dir: &Path) -> Option<String> {
 
     let harness = read_harness(dir);
     // The fixtures include retired keys such as `search_index`, `gh_read` and
-    // `idle.lsp_ttl_minutes`; both languages translate them in memory.
+    // `idle.lsp_ttl_minutes`. In the user file both languages apply their
+    // current equivalents; in a project file the names retired in 0.62 or
+    // earlier are refused with `removed_config_key`.
     let result = resolve_config_for_harness(&tiers, Some(&harness));
 
     let golden: Value = serde_json::from_str(&platform_fixture_text(
