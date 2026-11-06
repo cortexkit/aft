@@ -1339,8 +1339,8 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// module, which hosts OpenCode for Alfonso: `opencode` for OpenCode 1 and
 /// `opencode2` for sessions on its OpenCode 2 server (a runner session; see
 /// `Harness::from_str`). It also hosts headless Claude Code sessions as
-/// `claude-code`, whose tools run in the same tool lane and reach AFT over
-/// the same scoped routes as its OpenCode 2 sessions, so they are runner
+/// `claude-code`, whose tools reach AFT over the same scoped routes as its
+/// OpenCode 2 sessions, with consent answered by core, so they are runner
 /// sessions too. `thalamus-pi` is its counterpart for Pi: it binds
 /// its Pi sessions with harness `pi`, on routes core opens under each
 /// session's scope, and a call that needs the user's permission is held
