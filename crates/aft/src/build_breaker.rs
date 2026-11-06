@@ -25,15 +25,15 @@ pub const BREAKER_CONFIGURATION_VERSION: &str = "v1";
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 // Thread-local, not process-global: libtest runs sibling tests in parallel and
-// they open breakers of their own, so a shared counter cannot support the exact
-// open-count assertions the health rollup test makes about its own thread.
+// they open and read breakers of their own, so a shared counter cannot support
+// the exact open-count assertions the health rollup test makes about its own
+// thread, and a shared injected read failure would be consumed by whichever
+// test's health rollup reads a breaker first.
 #[cfg(test)]
 thread_local! {
     static OPEN_CALLS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-#[cfg(test)]
-static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Every expensive background build must choose one explicit domain. The enum is
 /// intentionally exhaustive so new schedulers cannot silently bypass the breaker.
@@ -426,7 +426,7 @@ impl BuildDeathBreaker {
         now_ms: u64,
     ) -> Result<Vec<BuildSuspension>> {
         #[cfg(test)]
-        if FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.swap(false, Ordering::SeqCst) {
+        if FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.with(|fail| fail.replace(false)) {
             return Err(BuildBreakerError::Sqlite(rusqlite::Error::InvalidQuery));
         }
         self.with_connection(|conn| {
@@ -482,7 +482,7 @@ impl BuildDeathBreaker {
 
     #[cfg(test)]
     pub(crate) fn fail_next_active_suspensions_for_test() {
-        FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.store(true, Ordering::SeqCst);
+        FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.with(|fail| fail.set(true));
     }
 
     fn with_connection<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
