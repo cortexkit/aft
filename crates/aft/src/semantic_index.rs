@@ -1169,6 +1169,13 @@ fn probe_remote_backend(base_url: &str) -> Result<(), String> {
     }))
 }
 
+/// Records that a fill of the data layer's meaning plane for the root at
+/// `project_root` could not reach the embedding backend, as a cold build's
+/// failure is recorded, so status and aft_search name the outage.
+pub(crate) fn note_embedding_backend_build_failure(project_root: &Path, error: &str) {
+    record_embedding_backend_build_failure(project_root, error);
+}
+
 /// Called on every exit path of a cold-build retry loop so a parked status
 /// never outlives the loop that would have retried it.
 pub(crate) fn clear_embedding_backend_retry_status(project_root: &Path) {

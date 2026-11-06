@@ -6445,6 +6445,25 @@ fn schedule_artifact_loads_admitted(
         });
     }
 
+    // With the data layer on, its meaning plane serves this root's semantic
+    // search and its checkout fills it (see `data_layer::meaning`); neither
+    // today's index nor a views lane is built or loaded, so no chunk is
+    // embedded twice.
+    let load_semantic = if load_semantic && ctx.data_layer_serves_meaning() {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: crate::data_layer::tools::search::DATA_LAYER_BUILD_STAGE.to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        // No legacy build will finish to release work held for it.
+        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
+        false
+    } else {
+        load_semantic
+    };
     // With views enabled, this checkout's own view serves semantic search
     // (see `views::semantic_runtime`); the legacy index is not built, so
     // identical content in sibling worktrees is embedded once per family.
@@ -6460,24 +6479,6 @@ fn schedule_artifact_loads_admitted(
         } else {
             load_semantic
         };
-    // With the data layer on, its meaning plane serves this root's semantic
-    // search and its checkout fills it (see `data_layer::meaning`); today's
-    // index is not built or loaded, so no chunk is embedded twice.
-    let load_semantic = if load_semantic && !views_enabled && ctx.data_layer_serves_meaning() {
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: crate::data_layer::tools::search::DATA_LAYER_BUILD_STAGE.to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        // No legacy build will finish to release work held for it.
-        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
-        false
-    } else {
-        load_semantic
-    };
 
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.
@@ -14798,156 +14799,6 @@ mod tests {
     }
 
     #[test]
-    fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
-        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
-        // Holds the process environment lock for the whole test, like the
-        // other lexical views tests above.
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        struct Refused(String);
-        impl crate::views::trigram::LexicalSnapshotSource for Refused {
-            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
-                Err(self.0.clone())
-            }
-            fn record_change(&self, _: &Path) {}
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
-        init_git_fixture(&root);
-        std::fs::write(
-            root.join("visible.ts"),
-            "export function outlined() { return \"needle\"; }\n",
-        )
-        .unwrap();
-        let ctx = test_context();
-        assert!(
-            handle_configure_for_test(
-                &configure_lexical_views(&root, &temp.path().join("storage")),
-                &ctx
-            )
-            .success
-        );
-        let degraded = || {
-            ctx.degraded_reasons()
-                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string())
-        };
-        assert!(!degraded());
-        // Keep the working source: recovery reinstalls it, proving the next
-        // successful load clears the degraded flag.
-        let initialized = ctx
-            .lexical_view_snapshot("bind")
-            .expect("bind loads a snapshot");
-        assert!(initialized.is_ok(), "{:?}", initialized.err());
-        let working = ctx.lexical_source_for_test();
-        let failed_file = root.join("visible.ts");
-        let load_error = format!(
-            "view I/O failed reading {}: Permission denied",
-            failed_file.display()
-        );
-        ctx.install_lexical_source_for_test(Arc::new(Refused(load_error.clone())));
-
-        // Every lexical lane fails with the view error, never an empty
-        // success and never a fallback walk.
-        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
-        assert!(
-            !grep.success
-                && grep.data["message"].as_str().is_some_and(|message| {
-                    message.contains(&load_error) && message.ends_with(reporting_suffix)
-                }),
-            "{:?}",
-            grep.data
-        );
-        let search = crate::commands::semantic_search::handle_semantic_search(
-            &semantic_search_request("needle"),
-            &ctx,
-        );
-        assert!(
-            !search.success
-                && search.data["message"].as_str().is_some_and(|message| {
-                    message.contains(&load_error) && message.ends_with(reporting_suffix)
-                }),
-            "{:?}",
-            search.data
-        );
-        let glob = crate::commands::glob::handle_glob(
-            &RawRequest {
-                id: "lexical-refused-glob-health".into(),
-                command: "glob".into(),
-                lsp_hints: None,
-                session_id: None,
-                params: json!({"pattern":"**/*.ts"}),
-            },
-            &ctx,
-        );
-        assert!(
-            !glob.success
-                && glob.data["message"].as_str().is_some_and(|message| {
-                    message.contains(&load_error) && message.ends_with(reporting_suffix)
-                }),
-            "{:?}",
-            glob.data
-        );
-
-        let missing_path = crate::commands::glob::handle_glob(
-            &RawRequest {
-                id: "lexical-refused-glob-missing-path".into(),
-                command: "glob".into(),
-                lsp_hints: None,
-                session_id: None,
-                params: json!({"pattern":"**/*.ts", "path":root.join("missing")}),
-            },
-            &ctx,
-        );
-        assert!(!missing_path.success, "{:?}", missing_path.data);
-        assert_eq!(missing_path.data["code"], "path_not_found");
-        assert!(!missing_path.data["message"]
-            .as_str()
-            .unwrap()
-            .contains(reporting_suffix.trim_start_matches('\n')));
-
-        // Outline parses the file itself and never loads the view.
-        let outline = crate::commands::outline::handle_outline(
-            &serde_json::from_value(json!({
-                "id": "lexical-refused-outline",
-                "command": "outline",
-                "file": root.join("visible.ts"),
-            }))
-            .unwrap(),
-            &ctx,
-        );
-        assert!(outline.success, "{:?}", outline.data);
-        assert!(
-            outline.data["text"].as_str().unwrap().contains("outlined"),
-            "{:?}",
-            outline.data
-        );
-
-        // Health counts every failed load by plane and cause, keeps the last
-        // error, and marks the project degraded.
-        let health = ctx.try_health_snapshot(&root);
-        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
-        let last = health.view_load_failure_last.expect("last failure kept");
-        assert_eq!(
-            (last.plane.as_str(), last.cause.as_str()),
-            ("trigram", "io")
-        );
-        assert_eq!((last.count, last.total), (3, 3));
-        assert_eq!(last.error, load_error);
-        assert!(degraded());
-
-        // Recovery: the next successful load clears the degraded flag but
-        // keeps the history count.
-        ctx.install_lexical_source_for_test(working);
-        let recovered = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
-        assert!(recovered.success, "{:?}", recovered.data);
-        assert!(!degraded());
-        let health = ctx.try_health_snapshot(&root);
-        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
-        assert!(health
-            .view_load_failure_last
-            .is_some_and(|last| last.error == load_error));
-    }
-
-    #[test]
     fn lexical_views_public_search_pins_one_snapshot_for_all_lexical_lanes() {
         // Holds the process environment lock for the whole test. These views
         // resolve their storage root and verify the Git conversion policy on
@@ -21456,59 +21307,6 @@ mod tests {
         crate::runtime_drain::drain_build_completions(ctx);
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.semantic_index().read().unwrap().is_some());
-    }
-
-    #[test]
-    fn evicted_semantic_view_reload_completes_under_bound_generation() {
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let mut config = Config {
-            project_root: Some(root.path().to_path_buf()),
-            storage_dir: Some(storage.path().to_path_buf()),
-            ..Config::default()
-        };
-        config.indexes.semantic = true;
-        config.views.enabled = true;
-        config.semantic.backend = SemanticBackend::OpenAiCompatible;
-        config.semantic.base_url = Some("http://127.0.0.1:1/v1".into());
-        let ctx = std::sync::Arc::new(AppContext::from_app(App::default_shared(), config));
-        ctx.set_canonical_cache_root(root.path().to_path_buf());
-        ctx.set_heavy_root_work_allowed(true);
-        // The fixture stands for a root an interactive session has open; only
-        // such a root starts a semantic view fill (see `semantic_admission`).
-        crate::semantic_admission::note_opened("ses_evicted_view_reload", root.path());
-        *ctx.semantic_index().write().unwrap() =
-            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
-        *ctx.semantic_index_status().write().unwrap() =
-            crate::context::SemanticIndexStatus::ready();
-        // Idle eviction leaves a ready status but no resident index or receiver.
-        *ctx.semantic_index().write().unwrap() = None;
-        let generation = ctx.configure_generation();
-        let worker_ctx = std::sync::Arc::clone(&ctx);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::trigger_semantic_index_reload_if_evicted(&worker_ctx)
-            }));
-            let _ = tx.send(outcome);
-        });
-        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
-        // Only join a finished call: the deadline must also fail safely if the
-        // debug lock guard is disabled and the reload really parks forever.
-        assert!(
-            outcome.is_ok(),
-            "semantic view reload exceeded its two-second deadline"
-        );
-        worker.join().unwrap();
-        assert!(outcome
-            .unwrap()
-            .expect("reload recursively acquired lifecycle admission"));
-        assert!(
-            ctx.checkout_semantic().active(),
-            "views-enabled reload must enter the checkout semantic lane"
-        );
-        ctx.checkout_semantic().clear();
-        assert_eq!(ctx.configure_generation(), generation);
     }
 
     #[test]

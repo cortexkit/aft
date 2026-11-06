@@ -849,8 +849,29 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
+        let meaning = meaning.status_json();
+        // An embedding backend that is paused or cannot be reached is
+        // reported as today's status reports it, whichever store embeds:
+        // its object keeps its words, and gains the plane's counts.
+        let backend_down = matches!(
+            payload["semantic_index"]["status"].as_str(),
+            Some("paused" | "backend_unavailable")
+        );
+        let mut semantic = if backend_down {
+            let mut semantic = payload["semantic_index"].clone();
+            if let (Some(semantic), Some(meaning)) = (semantic.as_object_mut(), meaning.as_object())
+            {
+                for (key, value) in meaning {
+                    if !matches!(key.as_str(), "status" | "state" | "reason" | "error") {
+                        semantic.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            semantic
+        } else {
+            meaning
+        };
         // The model and backend labels still come from the configuration.
-        let mut semantic = meaning.status_json();
         for label in ["backend", "model"] {
             if let Some(value) = payload["semantic_index"].get(label).cloned() {
                 semantic[label] = value;

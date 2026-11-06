@@ -525,7 +525,7 @@ impl Work {
                     );
                 }
                 Round::Idle => {}
-                Round::Failed(error) => work.retry_fill_later(&error),
+                Round::Failed(failure) => work.retry_fill_later(failure.message()),
             }
         });
     }
@@ -666,7 +666,7 @@ impl DataCheckout {
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
-            meaning: Meaning::default(),
+            meaning: Meaning::new(storage),
             filling: Arc::new(AtomicBool::new(false)),
             fill_retry: std::sync::Mutex::default(),
         });
@@ -1050,31 +1050,28 @@ impl DataCheckout {
     /// How meaning search stands for the current view. `config` works out
     /// the root's semantic configuration if no configure has given one yet.
     /// Starts a fill when files wait for vectors and none is running, or
-    /// none has learned the model yet. `None` before anything is published.
+    /// none has learned the model yet.
     pub(crate) fn meaning(
         &self,
         config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
-    ) -> Option<(CheckoutView, MeaningState)> {
+    ) -> MeaningState {
         self.work.meaning.configure_once(config);
-        let view = self.view()?;
-        let state = self.work.meaning.state(&view);
+        let state = self.meaning_status();
         let wanted = match &state {
-            MeaningState::Off => false,
-            MeaningState::Starting | MeaningState::Failed(_) => true,
+            MeaningState::Off | MeaningState::Unpublished => false,
+            MeaningState::Starting | MeaningState::Blocked(_) => true,
             MeaningState::Serving { snapshot, .. } => super::meaning::waiting(snapshot.coverage()),
         };
         if wanted {
             self.work.start_fill();
         }
-        Some((view, state))
+        state
     }
 
     /// How meaning search stands for the current view, for status reads:
-    /// starts nothing. `None` before anything is published.
-    pub(crate) fn meaning_status(&self) -> Option<(CheckoutView, MeaningState)> {
-        let view = self.view()?;
-        let state = self.work.meaning.state(&view);
-        Some((view, state))
+    /// starts nothing.
+    pub(crate) fn meaning_status(&self) -> MeaningState {
+        self.work.meaning.state(self.view().as_ref())
     }
 
     /// Whether a fill round is queued or running.

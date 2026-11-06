@@ -11439,21 +11439,45 @@ mod tests {
         handle.join().expect("embedding server thread");
     }
 
+    /// A context whose meaning plane is served for `semantic`, a fake
+    /// Synapse whose model lane refuses embeddings. The project holds no file
+    /// meaning search applies to (a `.txt` note), so the plane is complete
+    /// once made; it is made without loading the model, since the fake
+    /// serves one session and the query must have it. Returns the project,
+    /// its storage and the context.
+    fn served_over_fake_synapse(
+        mut semantic: SemanticBackendConfig,
+    ) -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("remix-panel.txt"),
+            "// where remix panel mounted option switching handled\nexport const panel = true;\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        semantic.route_project_root = Some(root.clone());
+        ctx.update_config(|config| {
+            config.semantic = semantic.clone();
+            config.storage_dir = Some(storage.path().to_path_buf());
+        });
+        ctx.set_canonical_cache_root(root.clone());
+        crate::semantic_admission::note_opened("data-layer-synapse-test", &root);
+        let _model_free = crate::data_layer::meaning::fill_without_model_for_test(&root, 2);
+        wait_for_data_semantic(&ctx, |data| {
+            data.serving().is_some_and(|meaning| meaning.complete())
+        });
+        (project, storage, ctx)
+    }
+
     #[test]
     fn lane_paused_query_returns_lexical_results_with_approved_gap() {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
-            with_fake_synapse(clock.clone(), None, |mut semantic, requests| {
-                let project = tempfile::tempdir().unwrap();
-                std::fs::write(project.path().join("remix-panel.ts"),
-                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
-                let ctx = test_context(project.path());
-                semantic.route_project_root = Some(project.path().to_path_buf());
-                ctx.update_config(|config| config.semantic = semantic.clone());
-                ctx.set_canonical_cache_root(project.path().to_path_buf());
-                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-                *ctx.semantic_index().write().unwrap() =
-                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+            with_fake_synapse(clock.clone(), None, |semantic, requests| {
+                let (_project, _storage, ctx) = served_over_fake_synapse(semantic);
+                let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
                     &ctx,
@@ -11473,7 +11497,7 @@ mod tests {
                 assert!(!text.contains("semantic.query_timeout_ms"));
                 assert!(!text.contains("scheduled maintenance"));
                 assert_eq!(clock.load(Ordering::SeqCst), START);
-                assert_eq!(requests.lock().unwrap().len(), 2);
+                assert_eq!(requests.lock().unwrap().len() - before, 2);
                 let health = ctx.semantic_backend_health_snapshot();
                 assert!(!health.available);
                 assert_eq!(health.paused_until_ms, Some(START + PAUSE_MS));
@@ -11492,17 +11516,9 @@ mod tests {
     fn shape_compiling_query_falls_back_at_once_and_names_the_warm_up() {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
-            with_compiling_synapse(clock.clone(), 90_000, |mut semantic, requests| {
-                let project = tempfile::tempdir().unwrap();
-                std::fs::write(project.path().join("remix-panel.ts"),
-                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
-                let ctx = test_context(project.path());
-                semantic.route_project_root = Some(project.path().to_path_buf());
-                ctx.update_config(|config| config.semantic = semantic.clone());
-                ctx.set_canonical_cache_root(project.path().to_path_buf());
-                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-                *ctx.semantic_index().write().unwrap() =
-                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+            with_compiling_synapse(clock.clone(), 90_000, |semantic, requests| {
+                let (_project, _storage, ctx) = served_over_fake_synapse(semantic);
+                let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
                     &ctx,
@@ -11520,7 +11536,7 @@ mod tests {
                 assert!(!text.contains("shape_compiling"), "{text}");
                 // The query never waits for the compile.
                 assert_eq!(clock.load(Ordering::SeqCst), START);
-                assert_eq!(requests.lock().unwrap().len(), 2);
+                assert_eq!(requests.lock().unwrap().len() - before, 2);
                 let status = ctx.build_status_snapshot();
                 assert_eq!(status["semantic_index"]["state"], "paused", "{status}");
                 assert_eq!(status["semantic_index"]["paused_until_ms"], START + 90_000);
@@ -12147,16 +12163,54 @@ mod tests {
         );
     }
 
+    /// A context over `project` whose root is open in a session, so the data
+    /// layer's meaning plane serves its semantic search, with its own storage
+    /// and a ready trigram index. Today's semantic status is left `ready`,
+    /// so an answer that discloses a failure can only have it from the plane.
+    fn data_layer_context(project: &Path, storage: &Path) -> (PathBuf, AppContext) {
+        let root = std::fs::canonicalize(project).expect("canonical root");
+        let ctx = lexical_ready_context_with_semantic(&root, SemanticIndexStatus::ready());
+        ctx.update_config(|config| config.storage_dir = Some(storage.to_path_buf()));
+        crate::semantic_admission::note_opened("data-layer-semantic-test", &root);
+        (root, ctx)
+    }
+
+    /// Asks the data layer's meaning plane of `ctx` (binding its checkout and
+    /// starting its fill) until `done` holds for how it stands.
+    fn wait_for_data_semantic(
+        ctx: &AppContext,
+        done: impl Fn(&crate::data_layer::tools::search::DataSemantic) -> bool,
+    ) -> crate::data_layer::tools::search::DataSemantic {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(found) = crate::data_layer::tools::search::DataSemantic::current(ctx)
+                .filter(|data| done(data))
+            {
+                return found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the meaning plane never reached the state: {:?}",
+                crate::data_layer::tools::search::DataSemantic::current(ctx)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A fill whose embedding model cannot load leaves the meaning plane
+    /// failed, and the reply says why, as today's failed index does.
     #[test]
     fn failed_semantic_lane_is_disclosed_in_the_reply_text() {
         let project = tempfile::tempdir().expect("create project dir");
-        let ctx = lexical_ready_context_with_semantic(
-            project.path(),
-            SemanticIndexStatus::Failed(
-                "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it."
-                    .to_string(),
-            ),
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
+            &root,
+            "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it.",
         );
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Failed(_))
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("where is the needle symbol implemented", 5),
@@ -12175,13 +12229,30 @@ mod tests {
         assert_eq!(response["semantic_status"], "unavailable");
     }
 
+    /// A fill that finds ONNX Runtime missing while the plugin is still
+    /// downloading it waits for the download, and the reply says so rather
+    /// than calling the runtime missing.
     #[test]
     fn waiting_for_the_onnx_runtime_download_is_disclosed_as_waiting() {
         let project = tempfile::tempdir().expect("create project dir");
-        let ctx = lexical_ready_context_with_semantic(
-            project.path(),
-            building(crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE),
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        // The plugin's installer holds this lock, with its pid, while it
+        // downloads.
+        let lock = storage
+            .path()
+            .join("onnxruntime")
+            .join(".aft-onnx-installing");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
+            &root,
+            "ONNX Runtime not found. dlopen('libonnxruntime.so') failed: no such file.",
         );
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Building { stage, .. }
+                if stage == crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE)
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("where is the needle symbol implemented", 5),
@@ -13299,73 +13370,26 @@ mod tests {
         );
     }
 
-    /// A reload is the right answer for an evicted shared snapshot: the artifact
-    /// is on disk and re-opening it works. The sibling test below pins the case
-    /// it is wrong for, so neither can pass by turning reloads off entirely.
+    /// No retry can install an ONNX Runtime that is not on the machine, so a
+    /// fill that finds it missing (with no download running) leaves the
+    /// semantic lane labelled with the missing runtime, not a retryable
+    /// state.
     #[test]
-    fn read_only_failed_snapshot_retries_on_semantic_query() {
+    fn missing_runtime_labels_the_semantic_lane_with_the_runtime() {
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| {
-            config.indexes.semantic = true;
-            config.storage_dir = Some(storage.path().to_path_buf());
-        });
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        ctx.set_cache_writer_capabilities(false, true);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SemanticIndexStatus::Failed("shared snapshot absent".to_string());
-
-        // aft_search refuses when no index lane is ready; this test
-        // exercises query routing over a ready trigram lane.
-        install_ready_search_index(&ctx, project.path());
-        let response = response_value(handle_semantic_search(
-            &semantic_request_with_hint("retry snapshot", 5, "semantic"),
-            &ctx,
-        ));
-
-        // The trigram lane answers; the query also schedules the shared
-        // snapshot reload and labels the semantic lane as building.
-        assert_eq!(response["success"], true);
-        assert_eq!(
-            response["lanes"]["semantic"],
-            serde_json::json!({"status": "building", "reason": null})
-        );
-        assert_eq!(response["omitted_lanes"], serde_json::json!(["semantic"]));
-        assert!(ctx.semantic_index_rx().lock().is_some());
-        ctx.mark_subc_unbound();
-        ctx.cancel_unbound_artifact_work();
-    }
-
-    /// Same read-only root, different failure: no reload can install an ONNX
-    /// Runtime that is not on the machine, so the reply must name what is
-    /// missing instead of asking for another attempt.
-    #[test]
-    fn read_only_missing_runtime_reports_the_runtime_instead_of_a_reload() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| {
-            config.indexes.semantic = true;
-            config.storage_dir = Some(storage.path().to_path_buf());
-        });
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        ctx.set_cache_writer_capabilities(false, true);
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
         // The message the embedding init actually produces, so the test cannot
         // drift from the wording the daemon puts in the status.
         let missing_runtime = crate::semantic_index::format_embedding_init_error(
             "Failed to load ONNX Runtime shared library libonnxruntime.dylib via dlopen: no such file",
         );
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SemanticIndexStatus::Failed(missing_runtime);
+        let _failing =
+            crate::data_layer::meaning::fail_model_loads_for_test(&root, &missing_runtime);
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Failed(_))
+        });
 
-        // aft_search refuses when no index lane is ready; this test
-        // exercises query routing over a ready trigram lane.
-        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("retry snapshot", 5, "semantic"),
             &ctx,
@@ -13381,11 +13405,8 @@ mod tests {
             "semantic_platform_unsupported"
         };
         assert_eq!(response["lanes"]["semantic"]["reason"], expected_cause);
-        // The reload was not merely reported differently, it was never started:
-        // the receiver a scheduled reload installs is still absent.
+        // No reload of today's index was started for it.
         assert!(ctx.semantic_index_rx().lock().is_none());
-        ctx.mark_subc_unbound();
-        ctx.cancel_unbound_artifact_work();
     }
 
     #[test]

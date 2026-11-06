@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::context::{AppContext, SemanticIndexStatus};
-use crate::data_layer::checkout::CheckoutView;
-use crate::data_layer::meaning::{self, MeaningState};
+use crate::data_layer::meaning::{self, FillFailure, MeaningState};
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
 use crate::semantic_index::{SemanticIndex, SemanticResult, SemanticSkipReason};
 
@@ -34,7 +33,7 @@ pub(crate) const DATA_LAYER_BUILD_STAGE: &str = "data_layer_build";
 pub(crate) struct DataMeaning {
     snapshot: MeaningSnapshot,
     /// The last fill's failure, kept until a fill succeeds.
-    failure: Option<String>,
+    failure: Option<FillFailure>,
 }
 
 impl DataMeaning {
@@ -73,7 +72,7 @@ impl DataMeaning {
 
     /// Why the last fill stopped, while files still wait for vectors.
     pub(crate) fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+        self.failure.as_ref().map(FillFailure::message)
     }
 
     /// The vector length a query needs, once the plane holds any vector;
@@ -169,31 +168,22 @@ impl DataSemantic {
         Self::from_state(checkout.meaning_status())
     }
 
-    fn from_state(found: Option<(CheckoutView, MeaningState)>) -> Option<Self> {
-        let building = |stage: &str, coverage: Option<&Coverage>| {
-            Self::NotServing(SemanticIndexStatus::Building {
-                stage: stage.to_string(),
-                files: coverage.map(|coverage| coverage.files),
-                entries_done: coverage.map(files_accounted),
-                entries_total: coverage
-                    .map(|coverage| coverage.files.saturating_sub(coverage.past_cap)),
-            })
-        };
-        Some(match found {
-            None => building(DATA_LAYER_BUILD_STAGE, None),
-            Some((_, MeaningState::Off)) => return None,
-            Some((_, MeaningState::Starting)) => building(meaning::STARTING_STAGE, None),
-            Some((_, MeaningState::Failed(error))) => {
-                Self::NotServing(SemanticIndexStatus::Failed(error))
-            }
-            Some((_, MeaningState::Serving { snapshot, failure })) => {
+    fn from_state(state: MeaningState) -> Option<Self> {
+        Some(match state {
+            MeaningState::Off => return None,
+            MeaningState::Unpublished => Self::NotServing(building(DATA_LAYER_BUILD_STAGE, None)),
+            MeaningState::Starting => Self::NotServing(building(meaning::STARTING_STAGE, None)),
+            MeaningState::Blocked(failure) => Self::NotServing(blocked(&failure, None)),
+            MeaningState::Serving { snapshot, failure } => {
                 let meaning = DataMeaning { snapshot, failure };
                 if meaning.complete() || meaning.snapshot.chunks() > 0 {
                     Self::Serving(Arc::new(meaning))
-                } else if let Some(error) = meaning.failure {
-                    Self::NotServing(SemanticIndexStatus::Failed(error))
                 } else {
-                    building(meaning::FILLING_STAGE, Some(meaning.snapshot.coverage()))
+                    let coverage = Some(meaning.snapshot.coverage());
+                    Self::NotServing(match &meaning.failure {
+                        Some(failure) => blocked(failure, coverage),
+                        None => building(meaning::FILLING_STAGE, coverage),
+                    })
                 }
             }
         })
@@ -213,6 +203,33 @@ impl DataSemantic {
             Self::Serving(meaning) => Some(meaning),
             Self::NotServing(_) => None,
         }
+    }
+}
+
+/// A plane that is building at `stage`, with how far it has come when known.
+fn building(stage: &str, coverage: Option<&Coverage>) -> SemanticIndexStatus {
+    SemanticIndexStatus::Building {
+        stage: stage.to_string(),
+        files: coverage.map(|coverage| coverage.files),
+        entries_done: coverage.map(files_accounted),
+        entries_total: coverage.map(|coverage| coverage.files.saturating_sub(coverage.past_cap)),
+    }
+}
+
+/// A plane with nothing to serve after `failure`, in the status today's
+/// semantic build reports for the same failure: building while it waits for
+/// the backend or for ONNX Runtime (it is retried), failed otherwise.
+fn blocked(failure: &FillFailure, coverage: Option<&Coverage>) -> SemanticIndexStatus {
+    match failure {
+        FillFailure::Unreachable(reason) => building(
+            &format!("waiting_for_embedding_backend: {reason}"),
+            coverage,
+        ),
+        FillFailure::WaitingForRuntime => building(
+            crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE,
+            coverage,
+        ),
+        FillFailure::Failed(message) => SemanticIndexStatus::Failed(message.clone()),
     }
 }
 
@@ -296,6 +313,8 @@ mod tests {
         open: Mutex<bool>,
         opened: Condvar,
         held: AtomicUsize,
+        /// Texts embedded, the fingerprint probe aside.
+        texts: AtomicUsize,
     }
 
     impl Gate {
@@ -327,6 +346,7 @@ mod tests {
             open: Mutex::new(false),
             opened: Condvar::new(),
             held: AtomicUsize::new(0),
+            texts: AtomicUsize::new(0),
         });
         let served = Arc::clone(&gate);
         std::thread::spawn(move || {
@@ -374,6 +394,13 @@ mod tests {
                             .collect(),
                         _ => Vec::new(),
                     };
+                    gate.texts.fetch_add(
+                        texts
+                            .iter()
+                            .filter(|text| *text != "semantic index fingerprint probe")
+                            .count(),
+                        Ordering::SeqCst,
+                    );
                     gate.wait_if_held(&texts);
                     let data: Vec<Value> = texts
                         .iter()
@@ -525,6 +552,98 @@ mod tests {
             reply["structuredContent"]["plan"]["snapshot_generation"], partial_generation,
             "a fill that lands changes the generation cached lists are keyed by"
         );
+    }
+
+    /// After an idle release drops the checkout, the next search binds it
+    /// again from its stored publication and reports meaning search as not
+    /// ready, with the lexical fallback, while the plane is read back (its
+    /// model loaded and asked for its vector length); once it is back,
+    /// searches are ready again and nothing was embedded again.
+    #[test]
+    fn a_search_after_an_idle_release_reports_the_plane_loading_until_it_is_back() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        write(
+            &root,
+            "src/config.rs",
+            "/// Reads a configuration file from disk.\npub fn read_config(path: &str) -> String {\n    std::fs::read_to_string(path).unwrap_or_default()\n}\n",
+        );
+        let (base_url, gate) = serve("never-held");
+        gate.open();
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            indexes: crate::config::IndexesConfig {
+                trigram: true,
+                semantic: true,
+                callgraph: false,
+            },
+            semantic: SemanticBackendConfig {
+                backend: SemanticBackend::OpenAiCompatible,
+                model: "test-hashed".to_string(),
+                base_url: Some(base_url),
+                timeout_ms: 120_000,
+                query_timeout_ms: 30_000,
+                ..SemanticBackendConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::semantic_admission::note_opened("data-layer-meaning-release-test", &root);
+        wait_for("the first fill", || {
+            DataSemantic::current(&ctx)
+                .and_then(|data| data.serving().cloned())
+                .filter(|meaning| meaning.complete())
+        });
+        let embedded = gate.texts.load(Ordering::SeqCst);
+        assert!(embedded > 0);
+
+        let held = crate::data_layer::meaning::hold_model_loads_for_test(&root);
+        assert!(
+            ctx.try_release_idle_checkout_views(),
+            "the root must be idle"
+        );
+        let reply = search(
+            &ctx,
+            "meaning-after-release",
+            "read a configuration file from disk",
+        );
+        eprintln!("reply while the plane is read back: {}", reply["text"]);
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(reply["semantic_status"], "building", "{reply}");
+        assert_eq!(reply["complete"], false, "{reply}");
+        assert_eq!(reply["lexical_only_fallback"], true, "{reply}");
+        assert!(
+            reply["note"].as_str().is_some_and(|note| !note.is_empty()),
+            "the reply must disclose the lexical fallback: {reply}"
+        );
+        let text = reply["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.lines().any(|line| line == "semantic: ready"),
+            "the reply must not claim a ready semantic lane: {text}"
+        );
+
+        drop(held);
+        wait_for("the plane to be back", || {
+            DataSemantic::current(&ctx)
+                .and_then(|data| data.serving().cloned())
+                .filter(|meaning| meaning.complete())
+        });
+        assert_eq!(
+            gate.texts.load(Ordering::SeqCst),
+            embedded,
+            "reading the plane back embedded files again"
+        );
+        let reply = search(
+            &ctx,
+            "meaning-after-reload",
+            "read a configuration file from disk",
+        );
+        assert_eq!(reply["semantic_status"], "ready", "{reply}");
+        assert_eq!(reply["complete"], true, "{reply}");
     }
 
     /// A deterministic stand-in for an embedding model: each word of the

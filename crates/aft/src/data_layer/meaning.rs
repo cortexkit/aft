@@ -14,13 +14,17 @@
 //! `semantic.max_files` has its vectors or a recorded reason it has none.
 //! Before that it serves the files filled so far, and the search says its
 //! answer is partial; while nothing is filled it reports itself building.
+//!
+//! A round that fails is told apart as today's semantic build tells its
+//! failures apart ([`FillFailure`]), so aft_search words each as it does
+//! today: an embedding backend that cannot be reached for now, ONNX Runtime
+//! still being downloaded, or a failure waiting will not fix.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::checkout::{Checkout, CheckoutView, DataError};
-use super::vectors::{
-    Coverage, FillBudget, FillProgress, FillReport, MeaningSnapshot, Producer, VectorPlane,
-};
+use super::vectors::{Coverage, FillBudget, FillProgress, MeaningSnapshot, Producer, VectorPlane};
 use crate::config::SemanticBackendConfig;
 use crate::semantic_index::SemanticEmbeddingModel;
 
@@ -48,22 +52,56 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// How a checkout's meaning search stands for one view.
+/// Why the last fill round stopped, told apart as today's semantic build
+/// tells its failures apart. Each is retried; only the wording differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FillFailure {
+    /// The embedding backend could not be reached, or refused for a while
+    /// (a paused model lane, a transient error); its health records why.
+    Unreachable(String),
+    /// ONNX Runtime is missing while the plugin is still downloading it.
+    WaitingForRuntime,
+    /// Anything else, with the message today's index status would carry.
+    Failed(String),
+}
+
+impl FillFailure {
+    /// The message status and replies carry.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Unreachable(reason) | Self::Failed(reason) => reason,
+            Self::WaitingForRuntime => "waiting for the ONNX Runtime download to finish",
+        }
+    }
+}
+
+impl aft_store::heap::HeapBytes for FillFailure {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Unreachable(reason) | Self::Failed(reason) => reason.heap_bytes(seen),
+            Self::WaitingForRuntime => 0,
+        }
+    }
+}
+
+/// How a checkout's meaning search stands.
 #[derive(Debug, Clone)]
 pub(crate) enum MeaningState {
     /// Semantic search is off or not admitted for the root.
     Off,
+    /// The checkout has published nothing yet, so there is nothing to fill.
+    Unpublished,
     /// No fill has learned the model's identity yet, so nothing can be
     /// searched: the first round is queued or loading the model.
     Starting,
     /// The last fill failed before any plane could be read, with why.
-    Failed(String),
+    Blocked(FillFailure),
     /// The plane at the generation it read last, paired with the view.
     Serving {
         snapshot: MeaningSnapshot,
         /// The last fill's failure, kept until a fill succeeds: the files it
         /// did not reach stay pending.
-        failure: Option<String>,
+        failure: Option<FillFailure>,
     },
 }
 
@@ -77,7 +115,7 @@ pub(crate) enum Round {
     /// Semantic search is off, or the checkout has nothing published yet.
     Idle,
     /// The round failed; the fill is tried again later.
-    Failed(String),
+    Failed(FillFailure),
 }
 
 /// The configuration a plane was made for, and the plane.
@@ -90,6 +128,8 @@ struct Configured {
 /// has made it, and the fill's last outcome.
 #[derive(Default)]
 pub(crate) struct Meaning {
+    /// AFT's storage folder, where the plugin downloads ONNX Runtime.
+    storage: PathBuf,
     /// The root's semantic configuration as the last configure (or, before
     /// any, the first search) gave it: `Some(None)` while semantic search
     /// is off or not admitted for the root, `None` before anything gave one.
@@ -102,7 +142,7 @@ pub(crate) struct Meaning {
     /// takes it, for the whole round.
     model: Mutex<Option<(SemanticBackendConfig, SemanticEmbeddingModel)>>,
     /// The last fill failure, until a fill round succeeds.
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<FillFailure>>,
     /// The last round's progress through its fill.
     progress: Mutex<Option<FillProgress>>,
     /// When the fill under way started and when a fill last stored what
@@ -125,6 +165,15 @@ pub(crate) struct FillTimes {
 }
 
 impl Meaning {
+    /// Meaning search for a checkout of a store under `storage`, AFT's
+    /// storage folder.
+    pub(crate) fn new(storage: &Path) -> Self {
+        Self {
+            storage: storage.to_path_buf(),
+            ..Self::default()
+        }
+    }
+
     /// Takes `config` as the root's semantic configuration (`None` when
     /// semantic search is off for it). A different configuration drops the
     /// plane, so the next fill round loads the new model and embeds with it.
@@ -166,24 +215,28 @@ impl Meaning {
         lock(&self.config).clone().flatten()
     }
 
-    /// How meaning search stands for `view`.
-    pub(crate) fn state(&self, view: &CheckoutView) -> MeaningState {
+    /// How meaning search stands for `view`, the checkout's current view
+    /// (`None` before anything is published).
+    pub(crate) fn state(&self, view: Option<&CheckoutView>) -> MeaningState {
         if !self.enabled() {
             return MeaningState::Off;
         }
+        let Some(view) = view else {
+            return MeaningState::Unpublished;
+        };
         let plane = lock(&self.plane)
             .as_ref()
             .map(|configured| Arc::clone(&configured.plane));
         let failure = lock(&self.failure).clone();
         let Some(plane) = plane else {
             return match failure {
-                Some(failure) => MeaningState::Failed(failure),
+                Some(failure) => MeaningState::Blocked(failure),
                 None => MeaningState::Starting,
             };
         };
         match plane.snapshot(view) {
             Ok(snapshot) => MeaningState::Serving { snapshot, failure },
-            Err(error) => MeaningState::Failed(error.to_string()),
+            Err(error) => MeaningState::Blocked(FillFailure::Failed(error.to_string())),
         }
     }
 
@@ -266,19 +319,49 @@ impl Meaning {
         let mut model = lock(&self.model);
         let outcome = self.fill_round(checkout, &config, &mut model);
         match &outcome {
-            Round::More => {}
+            Round::More => {
+                *lock(&self.failure) = None;
+                crate::semantic_index::clear_embedding_backend_retry_status(checkout.root());
+            }
             Round::Done | Round::Idle => {
                 *model = None;
                 *lock(&self.failure) = None;
+                crate::semantic_index::clear_embedding_backend_retry_status(checkout.root());
             }
-            Round::Failed(error) => {
+            Round::Failed(failure) => {
                 // A failed embedder may recover; load it again next time.
                 *model = None;
-                *lock(&self.failure) = Some(error.clone());
+                *lock(&self.failure) = Some(failure.clone());
             }
         }
         self.note_round_ended(&outcome);
         outcome
+    }
+
+    /// Tells `error` apart as today's semantic build does, and records an
+    /// unreachable backend in its health, which aft_search and status read
+    /// for the root at `root`. `loading` is true for an error loading the
+    /// model, which is where a missing ONNX Runtime shows.
+    fn failure(&self, root: &Path, error: String, loading: bool) -> FillFailure {
+        if loading
+            && error.starts_with(crate::semantic_index::ONNX_RUNTIME_MISSING_PREFIX)
+            && matches!(
+                crate::semantic_index::late_onnx_runtime(&self.storage),
+                crate::semantic_index::LateOnnxRuntime::Downloading
+            )
+        {
+            return FillFailure::WaitingForRuntime;
+        }
+        let clean = crate::semantic_index::strip_transient_embedding_marker(&error);
+        // A paused model lane is recorded by the client that met it.
+        if crate::synapse_embed::LanePause::from_error(&error).is_some() {
+            return FillFailure::Unreachable(clean);
+        }
+        if crate::semantic_index::embedding_failure_is_transient(&error) {
+            crate::semantic_index::note_embedding_backend_build_failure(root, &error);
+            return FillFailure::Unreachable(clean);
+        }
+        FillFailure::Failed(clean)
     }
 
     fn fill_round(
@@ -292,15 +375,27 @@ impl Meaning {
             .is_none_or(|(made_for, _)| made_for != config)
         {
             *model = None;
+            #[cfg(test)]
+            while lock(model_holds_for_test()).contains(checkout.root()) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            #[cfg(test)]
+            if let Some(error) = model_failure_for_test(checkout.root()) {
+                return Round::Failed(self.failure(checkout.root(), error, true));
+            }
+            #[cfg(test)]
+            if let Some(dimensions) = model_free_dimensions_for_test(checkout.root()) {
+                return self.fill_without_model_for_test(checkout, config, dimensions);
+            }
             match SemanticEmbeddingModel::from_config(config) {
                 Ok(loaded) => *model = Some((config.clone(), loaded)),
-                Err(error) => return Round::Failed(format!("embedding model: {error}")),
+                Err(error) => return Round::Failed(self.failure(checkout.root(), error, true)),
             }
         }
         let (_, model) = model.as_mut().expect("loaded above");
-        let plane = match self.plane_for(checkout, config, model) {
+        let plane = match self.plane_for(checkout, config, || model.fingerprint(config)) {
             Ok(plane) => plane,
-            Err(error) => return Round::Failed(error),
+            Err(error) => return Round::Failed(self.failure(checkout.root(), error, false)),
         };
         let budget = FillBudget {
             max_batch: model.max_batch_size(),
@@ -311,18 +406,22 @@ impl Meaning {
         });
         match filled {
             Err(DataError::Cancelled) => Round::Idle,
-            Err(error) => Round::Failed(error.to_string()),
-            Ok(report) => outcome(&report),
+            Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
+            Ok(report) => match report.error {
+                Some(error) => Round::Failed(self.failure(checkout.root(), error, false)),
+                None if report.files_left > 0 => Round::More,
+                None => Round::Done,
+            },
         }
     }
 
     /// The plane for `config`, made now if no round under it has: its
-    /// producer is the model's fingerprint, as today's index records it.
+    /// producer is the model's `fingerprint`, as today's index records it.
     fn plane_for(
         &self,
         checkout: &Arc<Checkout>,
         config: &SemanticBackendConfig,
-        model: &mut SemanticEmbeddingModel,
+        fingerprint: impl FnOnce() -> Result<crate::semantic_index::SemanticIndexFingerprint, String>,
     ) -> Result<Arc<VectorPlane>, String> {
         let mut slot = lock(&self.plane);
         if let Some(configured) = slot
@@ -331,9 +430,7 @@ impl Meaning {
         {
             return Ok(Arc::clone(&configured.plane));
         }
-        let fingerprint = model
-            .fingerprint(config)
-            .map_err(|error| format!("embedding model: {error}"))?;
+        let fingerprint = fingerprint()?;
         let plane = Arc::new(VectorPlane::new(
             Arc::clone(checkout),
             Producer::from_fingerprint(&fingerprint),
@@ -347,15 +444,119 @@ impl Meaning {
     }
 }
 
-/// What a round's report leaves to do.
-fn outcome(report: &FillReport) -> Round {
-    if let Some(error) = &report.error {
-        Round::Failed(format!("embedding: {error}"))
-    } else if report.files_left > 0 {
-        Round::More
-    } else {
-        Round::Done
+/// A fill round with no model, for a test whose checkout holds no file
+/// meaning search applies to: the plane is made for `dimensions` and the
+/// round finds nothing to embed.
+#[cfg(test)]
+impl Meaning {
+    fn fill_without_model_for_test(
+        &self,
+        checkout: &Arc<Checkout>,
+        config: &SemanticBackendConfig,
+        dimensions: usize,
+    ) -> Round {
+        let plane = match self.plane_for(checkout, config, || {
+            Ok(
+                crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(
+                    config, dimensions,
+                ),
+            )
+        }) {
+            Ok(plane) => plane,
+            Err(error) => return Round::Failed(FillFailure::Failed(error)),
+        };
+        let budget = FillBudget {
+            max_batch: 64,
+            files_per_round: FILES_PER_ROUND,
+        };
+        match plane.fill_rounds(
+            &mut |_| Err("this test fills with no model".to_string()),
+            budget,
+            1,
+            &mut |_| {},
+        ) {
+            Ok(report) if report.error.is_none() && report.files_left == 0 => Round::Done,
+            Ok(report) => Round::Failed(FillFailure::Failed(format!("{report:?}"))),
+            Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
+        }
     }
+}
+
+#[cfg(test)]
+fn model_free_planes_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static PLANES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    PLANES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn model_free_dimensions_for_test(root: &Path) -> Option<usize> {
+    lock(model_free_planes_for_test()).get(root).copied()
+}
+
+/// Makes fills under `root` make their plane for `dimensions` without
+/// loading the model, until the returned guard drops: for a test whose
+/// embedding backend serves one session only, which its query must have.
+#[cfg(test)]
+pub(crate) fn fill_without_model_for_test(root: &Path, dimensions: usize) -> impl Drop {
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            lock(model_free_planes_for_test()).remove(&self.0);
+        }
+    }
+    lock(model_free_planes_for_test()).insert(root.to_path_buf(), dimensions);
+    Release(root.to_path_buf())
+}
+
+#[cfg(test)]
+fn model_holds_for_test() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static HOLDS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    HOLDS.get_or_init(Default::default)
+}
+
+/// Holds every model load of a fill under `root` until the returned guard
+/// drops, so a test can look at a plane that is being read back.
+#[cfg(test)]
+pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            lock(model_holds_for_test()).remove(&self.0);
+        }
+    }
+    lock(model_holds_for_test()).insert(root.to_path_buf());
+    Release(root.to_path_buf())
+}
+
+/// Errors the next model load under a root fails with, for tests of how a
+/// failed fill is reported (a missing ONNX Runtime cannot be staged on
+/// every machine).
+#[cfg(test)]
+fn model_failures_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, String>> {
+    static FAILURES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn model_failure_for_test(root: &Path) -> Option<String> {
+    lock(model_failures_for_test()).get(root).cloned()
+}
+
+/// Makes every model load of a fill under `root` fail with `error`, until
+/// the returned guard drops.
+#[cfg(test)]
+pub(crate) fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            lock(model_failures_for_test()).remove(&self.0);
+        }
+    }
+    lock(model_failures_for_test()).insert(root.to_path_buf(), error.to_string());
+    Release(root.to_path_buf())
 }
 
 /// Whether `coverage` leaves files waiting for vectors that a fill would

@@ -271,6 +271,15 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
+    // With the data layer on, a bound checkout's text plane serves the
+    // lexical lanes, whatever today's index is doing.
+    if let Some(report) = crate::data_layer::surfaces::report(ctx) {
+        match report.text.status {
+            crate::data_layer::surfaces::READY => return IndexObservation::ready(),
+            crate::data_layer::surfaces::BUILDING => return IndexObservation::building(),
+            _ => {}
+        }
+    }
     if ctx.lexical_views_enabled() {
         return if ctx.lexical_view_is_ready() {
             IndexObservation::ready()

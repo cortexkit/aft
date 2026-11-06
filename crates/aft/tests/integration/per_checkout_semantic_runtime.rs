@@ -1,12 +1,13 @@
-//! Views-on semantic search through the real configure and search entry
-//! points: the per-checkout semantic view is registered, loaded and filled
-//! by the root's worker, and `aft_search` scores it.
+//! Semantic search on the data layer through the real configure and search
+//! entry points: a root's checkout fills its meaning plane in the
+//! background, and `aft_search` scores it.
 //!
 //! The embedding backend is a local HTTP mock that counts every text it is
 //! asked to embed, so the tests measure real model traffic: identical content
 //! in two worktrees of one repository is embedded once, a later session on
-//! the same worktrees embeds nothing, and views-on answers rank exactly like
-//! views-off answers on the same content.
+//! the same worktrees embeds nothing, two processes never embed one chunk
+//! twice, and the data layer's answers rank exactly like today's index on the
+//! same content.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -18,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::config::Config;
-use aft::context::{AppContext, SemanticIndexStatus};
+use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
 use aft::watcher_filter::WatcherDispatchEvent;
@@ -376,67 +377,6 @@ fn drain(ctx: &AppContext) {
     aft::runtime_drain::drain_semantic_refresh_events(ctx);
 }
 
-/// Waits until the views-on lane is loaded and every semantic file of the
-/// checkout has current vectors, and the lexical lane answers from the
-/// checkout's lexical view.
-fn wait_views_filled(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        drain(ctx);
-        let complete = ctx.checkout_semantic_runtime().is_some_and(|runtime| {
-            runtime
-                .search(&vector("probe"), 1, &|_| true)
-                .is_ok_and(|answer| answer.complete())
-        });
-        if complete && lexical_view_serves(ctx) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "views-on semantic view never filled: status={:?}",
-            ctx.semantic_index_status().read().unwrap()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// With views on, the legacy search index is never loaded: the lexical lane
-/// is the checkout's lexical view, bound on demand by each query. A grep that
-/// succeeds and counts as a lexical-view route shows that lane is ready.
-fn lexical_view_serves(ctx: &AppContext) -> bool {
-    let before = ctx.lexical_view_route_counts()[0];
-    let answer = aft::commands::grep::handle_grep(
-        &request(json!({"id": "lexical-ready", "command": "grep", "pattern": "fn"})),
-        ctx,
-    );
-    answer.success && ctx.lexical_view_route_counts()[0] > before
-}
-
-fn wait_legacy_ready(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        drain(ctx);
-        let semantic = matches!(
-            &*ctx.semantic_index_status().read().unwrap(),
-            SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
-        );
-        let lexical = ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready);
-        if semantic && lexical {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "legacy indexes never became ready"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn search(ctx: &AppContext, query: &str) -> Value {
     let started = Instant::now();
     let answer = serde_json::to_value(aft::commands::semantic_search::handle_semantic_search(
@@ -455,73 +395,6 @@ fn search(ctx: &AppContext, query: &str) -> Value {
         eprintln!("incomplete semantic search reply: {answer:#}");
     }
     answer
-}
-
-#[test]
-fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let _serial = crate::helpers::watcher_serial_lock();
-    let _audit = EnvGuard(
-        "AFT_SEARCH_RECALL_AUDIT",
-        std::env::var_os("AFT_SEARCH_RECALL_AUDIT"),
-    );
-    // SAFETY: environment changes in this module hold watcher_serial_lock.
-    unsafe { std::env::set_var("AFT_SEARCH_RECALL_AUDIT", "1") };
-    let server = MockEmbedder::start();
-    let repo = repository();
-    write(&repo.main, "src/watchdog.rs",
-        "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n");
-    let storage = tempfile::tempdir().unwrap();
-    let ctx = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&ctx);
-    let runtime = ctx.checkout_semantic_runtime().unwrap();
-    let query = "how does the bash watchdog kill a background task that exceeded its timeout";
-    let query_vector = vector(&format!("views-semantic-mock\u{0}{query}"));
-    let vectors = runtime.index().unwrap().len();
-    let raw = runtime.search(&query_vector, 100, &|_| true).unwrap();
-    let answer = search(&ctx, query);
-    let audit = &answer["recall_audit"]["semantic_preview"];
-    let mut diagnostics = format!(
-        "repository root={:?}, configured root={:?}, cache root={:?}\n",
-        repo.main,
-        ctx.config().project_root,
-        ctx.canonical_cache_root_opt()
-    );
-    for section in ["metadata", "symbol_metadata", "ranked_page"] {
-        diagnostics.push_str(&format!("semantic preview {section}:\n"));
-        if let Some(rows) = audit[section].as_array() {
-            for row in rows {
-                diagnostics.push_str(&format!(
-                    "  path={} details={}\n",
-                    row["path_debug"].as_str().unwrap_or("<missing Debug path>"),
-                    row
-                ));
-            }
-        } else {
-            diagnostics.push_str("  <missing audit section>\n");
-        }
-    }
-    diagnostics.push_str(&format!("raw semantic hits: {:#?}\n", raw.results));
-    eprintln!("watchdog reproduction: vectors={vectors}, raw_semantic_hits={}, pending={}, failed={}, complete={}\n{}", raw.results.len(), raw.pending.len(), raw.failed.len(), raw.complete(), answer["text"]);
-    assert!(
-        audit["metadata"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty()),
-        "missing semantic metadata diagnostics\n{diagnostics}\n{answer:#}"
-    );
-    assert_eq!(
-        audit["ranked_page"].as_array().map(Vec::len),
-        answer["results"].as_array().map(Vec::len),
-        "missing ranked-path diagnostics\n{diagnostics}\n{answer:#}"
-    );
-    assert!(vectors > 0 && !raw.results.is_empty(), "{diagnostics}");
-    assert_eq!(answer["complete"], true, "{answer:#}");
-    let text = answer["text"].as_str().unwrap();
-    assert!(
-        text.contains("kill_expired_task [function] lines 3-5"),
-        "{text}\n{diagnostics}"
-    );
-    assert!(text.contains("terminate_child();"), "{text}\n{diagnostics}");
 }
 
 /// The ranked rows of a search answer, relative to `root`.
@@ -560,215 +433,6 @@ fn unique_chunks(root: &Path) -> usize {
     )
     .unwrap();
     texts
-}
-
-#[test]
-fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let server = MockEmbedder::start();
-    let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
-    let chunks = unique_chunks(&repo.main);
-    assert!(chunks > 0);
-
-    // Session 1: both worktrees, sharing one storage root.
-    {
-        let main = configure(&repo.main, storage.path(), &server, true);
-        wait_views_filled(&main);
-        let linked = configure(&repo.linked, storage.path(), &server, true);
-        wait_views_filled(&linked);
-        // `wait_views_filled` scores with a local vector, so the mock has
-        // counted fill texts only.
-        assert_eq!(
-            server.texts(),
-            chunks,
-            "two worktrees with identical content must embed each chunk once"
-        );
-        assert!(
-            main.semantic_index().read().unwrap().is_none(),
-            "a views-on root must not build the legacy semantic index"
-        );
-    }
-
-    // Session 2 on the same worktrees, after the first one ended.
-    let embedded = server.texts();
-    let main = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&main);
-    let linked = configure(&repo.linked, storage.path(), &server, true);
-    wait_views_filled(&linked);
-    assert_eq!(
-        server.texts(),
-        embedded,
-        "a later session re-embedded content its family already holds"
-    );
-}
-
-/// Holds the owner's response until the other process acknowledges contention.
-/// A second provider arrival is a failure, never a condition for releasing it.
-#[test]
-fn views_on_two_processes_single_flight_checkout_chunk() {
-    two_process_single_flight(false, false);
-}
-
-#[test]
-fn views_on_two_processes_single_flight_separate_base_scopes() {
-    two_process_single_flight(true, true);
-}
-
-#[test]
-fn views_on_two_processes_single_flight_inherited_and_checkout_chunk() {
-    two_process_single_flight(true, false);
-}
-
-fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
-    let _settings = crate::test_helpers::without_storage_override();
-    let gate = Arc::new(EmbeddingGate::default());
-    let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
-    let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
-    let chunks = unique_chunks(&repo.main);
-    {
-        let warm = configure(&repo.main, storage.path(), &server, true);
-        wait_views_filled(&warm);
-        assert_eq!(server.texts(), chunks);
-    }
-    // Keep the new files uncommitted by default. The scenarios below optionally
-    // commit one or both, testing the same chunk in uncommitted and committed files.
-    for root in [&repo.main, &repo.linked] {
-        write(
-            root,
-            "src/concurrent.rs",
-            "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
-        );
-    }
-    if commit_main {
-        git(&repo.main, &["add", "src/concurrent.rs"]);
-        git(&repo.main, &["commit", "-m", "new inherited chunk"]);
-    }
-    if commit_linked {
-        // Different commit trees get independent base-build ownership, but the
-        // new function is identical. Both fills must coordinate on that shared
-        // chunk instead of embedding it twice.
-        write(&repo.linked, ".gitignore", "# distinct base tree\n");
-        git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
-        git(
-            &repo.linked,
-            &["commit", "-m", "different base with shared chunk"],
-        );
-    }
-    let mut main = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
-        "AFT_STORAGE_DIR",
-        storage.path().as_os_str(),
-    )]);
-    let mut linked = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
-        "AFT_STORAGE_DIR",
-        storage.path().as_os_str(),
-    )]);
-    let _release = ReleaseEmbeddingGate(Arc::clone(&gate));
-    eprintln!(
-        "two-process fill: main_pid={} linked_pid={} storage={}",
-        main.pid(),
-        linked.pid(),
-        storage.path().display()
-    );
-    let configured = main.send(
-        &configure_payload(&repo.main, storage.path(), &server, true, MODEL, 120_000).to_string(),
-    );
-    assert_eq!(configured["success"], true, "{configured:?}");
-    let requests = gate.wait_for_first();
-    assert_eq!(requests[0].len(), 1, "one new function is one chunk");
-    let configured = linked.send(
-        &configure_payload(&repo.linked, storage.path(), &server, true, MODEL, 120_000).to_string(),
-    );
-    assert_eq!(configured["success"], true, "{configured:?}");
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let status = linked.send(r#"{"id":"contention","command":"status"}"#);
-        assert_eq!(
-            server.texts() - chunks,
-            1,
-            "contender duplicated provider work"
-        );
-        // An unusable coordinator is not acknowledgement of a live owner.
-        if status["semantic_index"]["pending_reason"]
-            .as_str()
-            .is_some_and(|reason| !reason.is_empty())
-            && status["semantic_index"]["coordination_error"].is_null()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no positive contention acknowledgement: {status}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(gate.state.lock().unwrap().0.len(), 1);
-    // Contention is not a backend outage: completed base vectors still serve,
-    // while the new file remains an explicitly incomplete path.
-    let pending = linked.send(&json!({"id":"pending-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
-    assert_eq!(pending["complete"], false, "{pending}");
-    assert!(
-        pending["results"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty()),
-        "saved base vectors disappeared during contention: {pending}"
-    );
-    gate.release();
-    for process in [&mut main, &mut linked] {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            let answer = process.send(&json!({"id":"ready-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
-            if answer["complete"] == true {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "semantic worker never became ready: {answer}"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-    drop(main);
-    drop(linked);
-    let reopened_main = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&reopened_main);
-    let reopened_linked = configure(&repo.linked, storage.path(), &server, true);
-    wait_views_filled(&reopened_linked);
-    let query = vector(&format!("{MODEL}\u{0}{}", requests[0][0]));
-    let left = reopened_main
-        .checkout_semantic_runtime()
-        .unwrap()
-        .search(&query, 100, &|_| true)
-        .unwrap();
-    let right = reopened_linked
-        .checkout_semantic_runtime()
-        .unwrap()
-        .search(&query, 100, &|_| true)
-        .unwrap();
-    assert!(left.complete() && right.complete());
-    let rows = |root: &Path, results: Vec<aft::semantic_index::SemanticResult>| {
-        results
-            .into_iter()
-            .map(|row| {
-                (
-                    row.file.strip_prefix(root).unwrap().to_path_buf(),
-                    row.name,
-                    row.start_line,
-                    row.score,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        rows(&repo.main, left.results),
-        rows(&repo.linked, right.results)
-    );
-    assert_eq!(
-        server.texts() - chunks,
-        1,
-        "reopen must reuse durable chunks"
-    );
 }
 
 /// The same three scenarios on the data layer (`AFT_DATA_LAYER=1`), whose
@@ -985,147 +649,6 @@ fn data_layer_two_process_single_flight(commit_main: bool, commit_linked: bool) 
     );
 }
 
-/// The model fingerprint of the root's served semantic view, if any.
-fn served_model(ctx: &AppContext) -> Option<String> {
-    ctx.checkout_semantic_runtime().map(|runtime| {
-        runtime
-            .plane()
-            .semantic_producer()
-            .model_fingerprint
-            .clone()
-    })
-}
-
-/// Waits until exactly one lane worker is left for the root and no other
-/// starts within a short settle time.
-fn wait_single_worker(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    while ctx.checkout_semantic().workers() != 1 {
-        assert!(
-            Instant::now() < deadline,
-            "lane workers never settled to one: {}",
-            ctx.checkout_semantic().workers()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(ctx.checkout_semantic().workers(), 1);
-}
-
-/// Reconfiguring a views-on root with another embedding model restarts its
-/// semantic lane with the new producer: every chunk is embedded again under
-/// that model, one worker is left, and the answers rank exactly like a
-/// views-off root on the new model (the mock's vectors depend on the model,
-/// so any vector of the old model would change them).
-#[test]
-fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let server = MockEmbedder::start();
-    let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
-    let chunks = unique_chunks(&repo.main);
-    let ctx = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&ctx);
-    let old_model = served_model(&ctx).unwrap();
-    assert_eq!(server.texts(), chunks);
-
-    send_configure(
-        &ctx,
-        &repo.main,
-        storage.path(),
-        &server,
-        true,
-        "views-semantic-mock-2",
-    );
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    let started = Instant::now();
-    let deadline = started + DEADLINE;
-    while served_model(&ctx).is_none_or(|model| model == old_model) {
-        drain(&ctx);
-        assert!(
-            Instant::now() < deadline,
-            "the lane never restarted after {:?}: lane={} status={:?}",
-            started.elapsed(),
-            ctx.checkout_semantic().describe(),
-            ctx.semantic_index_status().read().unwrap()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    wait_views_filled(&ctx);
-    wait_single_worker(&ctx);
-    assert_eq!(
-        server.texts(),
-        2 * chunks,
-        "the new model must embed every chunk once, reusing nothing of the old one"
-    );
-
-    let legacy_storage = tempfile::tempdir().unwrap();
-    let legacy = Arc::new(
-        AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config::default()),
-        )
-        .with_test_checkpoint_store(),
-    );
-    send_configure(
-        &legacy,
-        &repo.main,
-        legacy_storage.path(),
-        &server,
-        false,
-        "views-semantic-mock-2",
-    );
-    aft::runtime_drain::drain_deferred_configure_maintenance(&legacy);
-    wait_legacy_ready(&legacy);
-    for query in [
-        "evict the oldest cache entry",
-        "exponential backoff between retries",
-    ] {
-        let expected = ranked(&repo.main, &search(&legacy, query));
-        let actual = search(&ctx, query);
-        assert_eq!(actual["complete"], true, "{actual:#}");
-        assert_eq!(
-            ranked(&repo.main, &actual),
-            expected,
-            "views-on after a model change ranks differently for {query:?}"
-        );
-    }
-}
-
-#[test]
-fn views_on_search_ranks_like_views_off_on_the_same_content() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let server = MockEmbedder::start();
-    let repo = repository();
-    let legacy_storage = tempfile::tempdir().unwrap();
-    let views_storage = tempfile::tempdir().unwrap();
-
-    let legacy = configure(&repo.main, legacy_storage.path(), &server, false);
-    wait_legacy_ready(&legacy);
-    let views = configure(&repo.main, views_storage.path(), &server, true);
-    wait_views_filled(&views);
-
-    for query in [
-        "evict the oldest cache entry",
-        "read a configuration file from disk",
-        "exponential backoff between retries",
-    ] {
-        let expected = search(&legacy, query);
-        let actual = search(&views, query);
-        assert_eq!(actual["complete"], true, "views-on incomplete: {actual:#}");
-        let expected_rows = ranked(&repo.main, &expected);
-        assert!(
-            !expected_rows.is_empty(),
-            "views-off found nothing for {query}"
-        );
-        assert_eq!(
-            ranked(&repo.main, &actual),
-            expected_rows,
-            "views-on ranking differs for {query:?}"
-        );
-    }
-}
-
 /// Restores an environment variable when dropped.
 struct EnvGuard(&'static str, Option<std::ffi::OsString>);
 
@@ -1141,58 +664,301 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Waits until the root's views-on semantic view scores a chunk named
-/// `name` with nothing missing, and no longer scores `gone`. The mock's
-/// vectors carry no meaning, so this asks for every chunk rather than for a
-/// rank. It scores with a local query vector, so the mock's text count covers
-/// fills only.
-fn wait_for_row(ctx: &AppContext, name: &str, gone: &str) {
+/// `ctx`'s status, after draining what its background work sent.
+fn status(ctx: &AppContext) -> Value {
+    drain(ctx);
+    ctx.build_status_snapshot()
+}
+
+/// Waits until `ctx`'s data layer serves text and meaning search: its
+/// status reports the text index and the meaning plane ready (every file
+/// filled). Status never embeds, so the mock counts fill texts only.
+fn wait_data_layer_ready(ctx: &AppContext) -> Value {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        drain(ctx);
-        let answer = ctx
-            .checkout_semantic_runtime()
-            .expect("views-on semantic view")
-            .search(&vector("any query"), 1_000, &|_| true)
-            .unwrap();
-        let names = answer
-            .results
-            .iter()
-            .map(|result| result.name.as_str())
-            .collect::<Vec<_>>();
-        if answer.complete() && names.contains(&name) && !names.contains(&gone) {
+        let status = status(ctx);
+        if status["search_index"]["status"] == "ready"
+            && status["semantic_index"]["status"] == "ready"
+        {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the data layer never filled: search_index={} semantic_index={}",
+            status["search_index"],
+            status["semantic_index"]
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A prose query on a filled checkout answers complete, with the matching
+/// symbol's preview, and the recall audit's semantic diagnostics.
+#[test]
+fn prose_watchdog_query_reports_coverage_and_keeps_symbol_previews() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let _serial = crate::helpers::watcher_serial_lock();
+    let _audit = EnvGuard(
+        "AFT_SEARCH_RECALL_AUDIT",
+        std::env::var_os("AFT_SEARCH_RECALL_AUDIT"),
+    );
+    // SAFETY: environment changes in this module hold watcher_serial_lock.
+    unsafe { std::env::set_var("AFT_SEARCH_RECALL_AUDIT", "1") };
+    let server = MockEmbedder::start();
+    let repo = repository();
+    write(&repo.main, "src/watchdog.rs",
+        "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n");
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure(&repo.main, storage.path(), &server, false);
+    let ready = wait_data_layer_ready(&ctx);
+    assert!(
+        ready["semantic_index"]["chunks_embedded"].as_u64() > Some(0),
+        "{}",
+        ready["semantic_index"]
+    );
+    let query = "how does the bash watchdog kill a background task that exceeded its timeout";
+    let answer = search(&ctx, query);
+    let audit = &answer["recall_audit"]["semantic_preview"];
+    assert!(
+        audit["metadata"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "missing semantic metadata diagnostics\n{answer:#}"
+    );
+    assert_eq!(
+        audit["ranked_page"].as_array().map(Vec::len),
+        answer["results"].as_array().map(Vec::len),
+        "missing ranked-path diagnostics\n{answer:#}"
+    );
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    let text = answer["text"].as_str().unwrap();
+    assert!(
+        text.contains("kill_expired_task [function] lines 3-5"),
+        "{text}"
+    );
+    assert!(text.contains("terminate_child();"), "{text}");
+}
+
+/// Two worktrees of one repository, sharing one storage root, embed each
+/// chunk once, and a later session on them embeds nothing. Today's index is
+/// not built beside the plane.
+#[test]
+fn data_layer_worktrees_and_sessions_embed_each_chunk_once() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    assert!(chunks > 0);
+    {
+        let main = configure(&repo.main, storage.path(), &server, false);
+        wait_data_layer_ready(&main);
+        let linked = configure(&repo.linked, storage.path(), &server, false);
+        wait_data_layer_ready(&linked);
+        assert_eq!(
+            server.texts(),
+            chunks,
+            "two worktrees with identical content must embed each chunk once"
+        );
+        assert!(
+            main.semantic_index().read().unwrap().is_none(),
+            "the data layer serves meaning search: today's index must not be built"
+        );
+    }
+    let embedded = server.texts();
+    let main = configure(&repo.main, storage.path(), &server, false);
+    wait_data_layer_ready(&main);
+    let linked = configure(&repo.linked, storage.path(), &server, false);
+    wait_data_layer_ready(&linked);
+    assert_eq!(
+        server.texts(),
+        embedded,
+        "a later session re-embedded content its repository already holds"
+    );
+}
+
+/// Reconfiguring a root with another embedding model fills its plane again
+/// under that model: every chunk is embedded once more, and the answers rank
+/// exactly like a root configured with the new model from the start (the
+/// mock's vectors depend on the model, so any vector of the old model would
+/// change them).
+#[test]
+fn data_layer_model_change_fills_again_with_the_new_model() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    let ctx = configure(&repo.main, storage.path(), &server, false);
+    wait_data_layer_ready(&ctx);
+    assert_eq!(server.texts(), chunks);
+
+    send_configure(
+        &ctx,
+        &repo.main,
+        storage.path(),
+        &server,
+        false,
+        "views-semantic-mock-2",
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    let deadline = Instant::now() + DEADLINE;
+    while server.texts() < 2 * chunks {
+        assert!(
+            Instant::now() < deadline,
+            "the new model never embedded the checkout: {} texts",
+            server.texts()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    wait_data_layer_ready(&ctx);
+    assert_eq!(
+        server.texts(),
+        2 * chunks,
+        "the new model must embed every chunk once, reusing nothing of the old one"
+    );
+
+    let fresh_storage = tempfile::tempdir().unwrap();
+    let fresh = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
+    send_configure(
+        &fresh,
+        &repo.main,
+        fresh_storage.path(),
+        &server,
+        false,
+        "views-semantic-mock-2",
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&fresh);
+    wait_data_layer_ready(&fresh);
+    for query in [
+        "evict the oldest cache entry",
+        "exponential backoff between retries",
+    ] {
+        let expected = ranked(&repo.main, &search(&fresh, query));
+        let actual = search(&ctx, query);
+        assert_eq!(actual["complete"], true, "{actual:#}");
+        assert!(!expected.is_empty(), "nothing found for {query:?}");
+        assert_eq!(
+            ranked(&repo.main, &actual),
+            expected,
+            "after a model change the answer ranks differently for {query:?}"
+        );
+    }
+}
+
+/// A standalone AFT process over `storage` on today's route
+/// (`AFT_DATA_LAYER=0`), with semantic search left at the product default.
+fn todays_route_process(storage: &Path) -> crate::helpers::AftProcess {
+    crate::helpers::AftProcess::spawn_with_semantic_env(&[
+        ("AFT_STORAGE_DIR", storage.as_os_str()),
+        ("AFT_DATA_LAYER", std::ffi::OsStr::new("0")),
+    ])
+}
+
+/// The data layer's answers rank exactly like today's index on the same
+/// content, with the same embedder.
+#[test]
+fn data_layer_search_ranks_like_todays_index_on_the_same_content() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let today_storage = tempfile::tempdir().unwrap();
+    let data_storage = tempfile::tempdir().unwrap();
+    let mut today = todays_route_process(today_storage.path());
+    configure_data_layer(&mut today, &repo.main, today_storage.path(), &server);
+    wait_data_layer_filled(&mut today);
+    let mut data = data_layer_process(data_storage.path());
+    configure_data_layer(&mut data, &repo.main, data_storage.path(), &server);
+    wait_data_layer_filled(&mut data);
+
+    for (index, query) in [
+        "evict the oldest cache entry",
+        "read a configuration file from disk",
+        "exponential backoff between retries",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A reply can still name watcher changes the process has not applied
+        // yet (the `watcher_pending` gap), which also makes it incomplete;
+        // ask again until it is complete.
+        let ask = |process: &mut crate::helpers::AftProcess| {
+            let deadline = Instant::now() + DEADLINE;
+            loop {
+                let answer = process.send(
+                    &json!({"id": format!("rank-{index}"), "command": "semantic_search", "query": query, "top_k": 10})
+                        .to_string(),
+                );
+                if answer["complete"] == true || Instant::now() >= deadline {
+                    return answer;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let expected = ask(&mut today);
+        let actual = ask(&mut data);
+        assert_eq!(
+            actual["complete"], true,
+            "data layer incomplete: {actual:#}"
+        );
+        let expected_rows = ranked(&repo.main, &expected);
+        assert!(
+            !expected_rows.is_empty(),
+            "today's index found nothing for {query}"
+        );
+        assert_eq!(
+            ranked(&repo.main, &actual),
+            expected_rows,
+            "the data layer ranks differently for {query:?}"
+        );
+    }
+}
+
+/// Searches `ctx` (which starts a fill when files wait for vectors) until
+/// the mock has embedded more than `before` texts and status reports the
+/// meaning plane filled again.
+fn wait_for_fill_after(ctx: &AppContext, server: &MockEmbedder, before: usize, query: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        search(ctx, query);
+        let status = status(ctx);
+        if server.texts() > before && status["semantic_index"]["status"] == "ready" {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{name} never replaced {gone}: {answer:?}"
+            "the edit was never embedded: {} texts, semantic_index={}",
+            server.texts(),
+            status["semantic_index"]
         );
         thread::sleep(Duration::from_millis(50));
     }
 }
 
+/// An edit through AFT's own write command and an edit made outside AFT,
+/// delivered by the watcher, both reach the fill: their new chunks are
+/// embedded and the plane is filled again.
 #[test]
-fn views_on_aft_and_outside_edits_reach_the_fill() {
+fn data_layer_aft_and_outside_edits_reach_the_fill() {
     let _settings = crate::test_helpers::without_storage_override();
     let _serial = crate::helpers::watcher_serial_lock();
-    let _quiet = EnvGuard(
-        "AFT_SEMANTIC_QUIET_WINDOW_MS",
-        std::env::var_os("AFT_SEMANTIC_QUIET_WINDOW_MS"),
-    );
-    // SAFETY: changed only while `watcher_serial_lock` is held; restored by
-    // the guard above.
-    unsafe { std::env::set_var("AFT_SEMANTIC_QUIET_WINDOW_MS", "50") };
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
-    let ctx = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&ctx);
+    let ctx = configure(&repo.main, storage.path(), &server, false);
+    wait_data_layer_ready(&ctx);
 
     // An edit through AFT's own write command.
     let before = server.texts();
     let written = aft::commands::write::handle_write(
         &request(json!({
-            "id": "views-semantic-write",
+            "id": "data-layer-semantic-write",
             "command": "write",
             "file": repo.main.join("src/retry.rs"),
             "content": "pub fn jittered_sleep_between_attempts(attempt: u32) -> u64 {\n    u64::from(attempt) * 10\n}\n"
@@ -1200,12 +966,7 @@ fn views_on_aft_and_outside_edits_reach_the_fill() {
         &ctx,
     );
     assert!(written.success, "write failed: {written:?}");
-    wait_for_row(
-        &ctx,
-        "jittered_sleep_between_attempts",
-        "retry_with_backoff",
-    );
-    assert!(server.texts() > before, "the AFT write was never embedded");
+    wait_for_fill_after(&ctx, &server, before, "jittered sleep between attempts");
 
     // An edit made outside AFT, delivered by the watcher.
     let before = server.texts();
@@ -1218,163 +979,5 @@ fn views_on_aft_and_outside_edits_reach_the_fill() {
     let (tx, rx) = crossbeam_channel::unbounded();
     *ctx.watcher_rx().lock() = Some(rx);
     tx.send(WatcherDispatchEvent::Paths(vec![outside])).unwrap();
-    wait_for_row(&ctx, "tokenize_shell_arguments", "parse_config_file");
-    assert!(
-        server.texts() > before,
-        "the outside edit was never embedded"
-    );
-}
-
-/// The fields of a search answered while the semantic lane is reloading after
-/// an idle eviction: building, incomplete, lexical results with the lane's
-/// disclosure, and never a ready lane.
-fn assert_reloading_after_eviction(answer: &Value) {
-    assert_eq!(answer["semantic_status"], "building", "{answer:#}");
-    assert_eq!(answer["complete"], false, "{answer:#}");
-    assert_eq!(answer["lexical_only_fallback"], true, "{answer:#}");
-    assert!(
-        answer["note"].as_str().is_some_and(|note| !note.is_empty()),
-        "the reply must disclose the lexical fallback: {answer:#}"
-    );
-    let text = answer["text"].as_str().unwrap_or_default();
-    assert!(
-        !text.lines().any(|line| line == "semantic: ready"),
-        "the reply must not claim a ready semantic lane: {text}"
-    );
-}
-
-/// Evicts the root's artifacts as the idle reaper does until its views-on
-/// semantic lane is released. Eviction does not wait for a lane whose locks
-/// are held (its worker can still be publishing the fill the test waited
-/// for): it leaves that lane loaded, and the reaper releases it on a later
-/// pass. This repeats the eviction the same way.
-fn evict_until_lane_released(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        assert!(ctx.evict_idle_artifacts(), "the root must be idle");
-        if !ctx.checkout_semantic().active() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "idle eviction never released the lane: {}",
-            ctx.checkout_semantic().describe()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-/// Evicts the root's artifacts once it is idle. Readiness can be reported
-/// while background work that settled it is still finishing, and eviction
-/// refuses a root that is not idle yet, so retry until it accepts.
-fn evict_once_idle(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    while !ctx.evict_idle_artifacts() {
-        assert!(Instant::now() < deadline, "the root never became idle");
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-/// Idle eviction drops the lexical lane too, and both lanes reload by design.
-/// Reloads the lexical lane through a grep, which reloads only that lane, and
-/// waits until grep answers from a ready index, so the next search has a
-/// ready lexical lane however long the reload takes on this machine while the
-/// semantic lane is still released. With views on, that lane is the
-/// checkout's v3 lexical view, which the grep binds again; with views off it
-/// is the legacy trigram index.
-fn reload_trigram_after_eviction(ctx: &AppContext) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let grep = aft::commands::grep::handle_grep(
-            &request(json!({
-                "id": "views-semantic-grep",
-                "command": "grep",
-                "pattern": "parse_config_file",
-                "max_results": 1
-            })),
-            ctx,
-        );
-        assert!(grep.success, "grep failed: {grep:?}");
-        aft::runtime_drain::drain_search_index_events(ctx);
-        let ready = if ctx.config().views.enabled {
-            grep.data["index_status"] == "Ready"
-        } else {
-            ctx.search_index()
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| index.ready)
-        };
-        if ready {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the lexical lane never reloaded after eviction: {:?}",
-            grep.data
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// After an idle eviction releases a views-on root's semantic lane, the next
-/// search restarts the lane (the reload a views-off root's evicted index gets
-/// too) and that same search reports the lane as building with the
-/// lexical-fallback disclosure, not as ready. Once the view is back, searches
-/// are ready again.
-#[test]
-fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let server = MockEmbedder::start();
-    let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
-    let ctx = configure(&repo.main, storage.path(), &server, true);
-    wait_views_filled(&ctx);
-    evict_until_lane_released(&ctx);
-    reload_trigram_after_eviction(&ctx);
-    assert!(
-        !ctx.checkout_semantic().active(),
-        "reloading the trigram index must not restart the semantic lane: {}",
-        ctx.checkout_semantic().describe()
-    );
-
-    let query = "read a configuration file from disk";
-    assert_reloading_after_eviction(&search(&ctx, query));
-    assert!(
-        ctx.checkout_semantic().active(),
-        "the search must restart the lane: {}",
-        ctx.checkout_semantic().describe()
-    );
-    wait_views_filled(&ctx);
-    let deadline = Instant::now() + DEADLINE;
-    while !matches!(
-        &*ctx.semantic_index_status().read().unwrap(),
-        SemanticIndexStatus::Ready { .. }
-    ) {
-        assert!(
-            Instant::now() < deadline,
-            "the reloaded lane never became ready"
-        );
-        drain(&ctx);
-        thread::sleep(Duration::from_millis(20));
-    }
-    let answer = search(&ctx, query);
-    assert_eq!(answer["semantic_status"], "ready", "{answer:#}");
-    assert_eq!(answer["complete"], true, "{answer:#}");
-}
-
-/// A views-off root reloads its evicted semantic index on the next search,
-/// and that same search reports the lane as building with the lexical-fallback
-/// disclosure, not as the ready its evicted index left behind.
-#[test]
-fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
-    let _settings = crate::test_helpers::without_storage_override();
-    let server = MockEmbedder::start();
-    let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
-    let ctx = configure(&repo.main, storage.path(), &server, false);
-    wait_legacy_ready(&ctx);
-    evict_once_idle(&ctx);
-    // As in the views-on test: a search would refuse while the text index is
-    // still reloading too, so reload it first and keep the check on semantic.
-    reload_trigram_after_eviction(&ctx);
-    assert_reloading_after_eviction(&search(&ctx, "read a configuration file from disk"));
+    wait_for_fill_after(&ctx, &server, before, "tokenize shell arguments");
 }
