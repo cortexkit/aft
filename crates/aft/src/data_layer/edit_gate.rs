@@ -373,7 +373,7 @@ pub fn bench_file(root: &Path, file: &str, iterations: usize) -> Result<(), Stri
         files.set(&path, &text)?;
     }
     let inputs = files.inputs();
-    let error = |error: ManifestJoinError| error.to_string();
+    let error = |error: crate::callgraph_store::join::ManifestJoinError| error.to_string();
     super::callgraph::pool(1).map_err(error)?.install(|| {
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let bound = super::callgraph::BindCache::default();
