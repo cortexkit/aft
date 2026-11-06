@@ -146,8 +146,8 @@ class Process:
                    HOME=str(cache / 'home'), USERPROFILE=str(cache / 'home'),
                    AFT_CALLGRAPH_BUILD_WAIT_MS=str(TIMEOUT * 1000), AFT_TEST_DISABLE_FILE_WATCHER='1',
                    RUST_LOG=env.get('RUST_LOG', 'info'))
-        if data_layer:
-            env['AFT_DATA_LAYER'] = '1'
+        # The data layer is on by default, so today's run turns it off.
+        env['AFT_DATA_LAYER'] = '1' if data_layer else '0'
         self.stderr_path = out / 'stderr.txt'
         self.stderr = self.stderr_path.open('wb')
         self.process = subprocess.Popen([str(binary)], cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -212,7 +212,20 @@ class Process:
     def log(self):
         return self.stderr_path.read_text(errors='replace')
 
+    def peak_mib(self):
+        """The process's peak resident memory so far, in MiB (Linux only)."""
+        try:
+            status = pathlib.Path(f'/proc/{self.process.pid}/status').read_text()
+        except OSError:
+            return None
+        match = re.search(r'^VmHWM:\s+(\d+) kB', status, re.M)
+        return int(match.group(1)) // 1024 if match else None
+
     def close(self):
+        # Read before the process exits, while /proc still has it.
+        peak = self.peak_mib()
+        if peak is not None:
+            print(f'peak resident {peak} MiB: {self.out.name}', file=sys.stderr, flush=True)
         try:
             self.process.stdin.close()
             self.process.wait(timeout=60)
