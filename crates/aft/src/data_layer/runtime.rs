@@ -198,6 +198,13 @@ impl Pool {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
                     job();
+                    if matches!(self, Pool::Build) {
+                        // A build frees most of what it allocated when it
+                        // ends. Hand those pages back now, as dead code does
+                        // after a run, rather than holding them until the
+                        // daemon's periodic relief comes round.
+                        let _ = crate::memory::relieve_allocator_pressure();
+                    }
                     let mut state = self.state().lock();
                     next = state.queue.pop_front();
                     if next.is_none() {
