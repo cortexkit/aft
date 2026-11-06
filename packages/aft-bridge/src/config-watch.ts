@@ -95,7 +95,7 @@ function pathKey<C>(name: string): LiveConfigKey<C> {
 
 /**
  * Bash keys are read through the host's `resolveBashConfig`, because `bash`
- * may be a boolean, an object or the legacy `experimental.bash` block. A write
+ * may be a boolean or an object. A write
  * turns `bash` into the equivalent object form, so every other bash setting
  * (for example `compress` or `background`, which are not live) resolves to
  * the same value as before.

@@ -518,8 +518,7 @@ export interface AftConfig {
   /**
    * Bash runtime configuration (runtime gate + rewrite + compress +
    * background). Registration is controlled by `disabled_tools` only.
-   * Graduated from `experimental.bash.*` in v0.27.2; the legacy nested
-   * form is still accepted for backward compat.
+   * Graduated from `experimental.bash.*` in v0.27.2.
    *
    * - `true`  — runtime on, all sub-features on (the default)
    * - `false` — runtime gate off; bash operations report `bash_disabled`
@@ -616,25 +615,17 @@ export function clampBashWatchSyncMaxMs(value: number | undefined): number {
  *   2. Top-level `bash: true`  → fully enabled (sub-features all true)
  *   3. Top-level `bash: { ... }` → runtime gate from `enabled` (default
  *      true); each sub-feature defaults true when not specified
- *   4. Top-level `bash` absent + any `experimental.bash.*` set → legacy
- *      fallback; sub-features take their explicit values (default false
- *      to preserve pre-v0.27.2 behavior — that block was opt-in); the
- *      runtime gate stays on
- *   5. Top-level `bash` absent + no experimental → everything on
+ *   4. Top-level `bash` absent → everything on
  *
- * Mirrors OpenCode's resolver exactly. Reminder tuning rides through from
- * whichever surface specified it (top-level wins, legacy fills the gap).
+ * Mirrors OpenCode's resolver exactly.
  */
 export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const top = config.bash;
-  const legacy = config.experimental?.bash;
 
   const reminderEnabled =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined) ??
-    legacy?.long_running_reminder_enabled;
+    typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined;
   const reminderInterval =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
-    legacy?.long_running_reminder_interval_ms;
+    typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined;
 
   // Foreground wait-window: only the object form can set it; clamp to the
   // 5000ms floor and default to 15000ms when unset.
@@ -691,23 +682,6 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       subagent_background: top.subagent_background ?? true,
       detach_on_user_message: topDetachOnUserMessage,
     };
-  }
-
-  // Top-level absent. Honor legacy experimental.bash.* if any sub-flag was
-  // explicitly set — preserves pre-v0.27.2 opt-in semantics. An empty
-  // `experimental.bash: {}` (object present but feature keys absent) falls
-  // through to surface default; this avoids accidentally disabling bash for
-  // users who wrote an empty experimental block while migrating.
-  const hasLegacyFeatureFlag =
-    legacy &&
-    (legacy.rewrite !== undefined ||
-      legacy.compress !== undefined ||
-      legacy.background !== undefined);
-  if (hasLegacyFeatureFlag) {
-    const rewrite = legacy.rewrite === true;
-    const compress = legacy.compress === true;
-    const background = legacy.background === true;
-    return { ...base, enabled: true, rewrite, compress, background };
   }
 
   return { ...base, enabled: true, rewrite: true, compress: true, background: true };
@@ -870,21 +844,6 @@ const LspConfigSchema = z.object({
 });
 
 const ExperimentalConfigSchema = z.object({
-  /**
-   * @deprecated The bash family graduated from experimental in v0.27.2. Use
-   * the top-level `bash` key instead. Still accepted for backward compat —
-   * when present and top-level `bash` is absent, its values seed the
-   * resolved bash config. Will be removed in v0.28.
-   */
-  bash: z
-    .object({
-      rewrite: z.boolean().optional(),
-      compress: z.boolean().optional(),
-      background: z.boolean().optional(),
-      long_running_reminder_enabled: z.boolean().optional(),
-      long_running_reminder_interval_ms: z.number().int().positive().optional(),
-    })
-    .optional(),
   lsp_ty: z.boolean().optional(),
 });
 
@@ -1165,7 +1124,7 @@ const AftConfigFieldsSchema = z.object({
   /**
    * Bash runtime configuration. Three shapes: `true`, `false` (runtime gate
    * off), or `{ enabled?, rewrite?, compress?, background?, ... }`.
-   * Replaces `experimental.bash.*` (still accepted for backward compat).
+   * Replaces `experimental.bash.*`.
    */
   bash: BashConfigSchema.optional(),
   experimental: ExperimentalConfigSchema.optional(),
@@ -1414,8 +1373,8 @@ export function resolveExperimentalConfigForConfigure(
   const overrides: ConfigureExperimentalOverrides = {};
 
   // Bash sub-features always flow through `resolveBashConfig` now — that's
-  // the single source of truth across top-level `bash`, legacy
-  // `experimental.bash.*`, and surface defaults. See the resolver above.
+  // the single source of truth across top-level `bash` and surface
+  // defaults. See the resolver above.
   const bash = resolveBashConfig(config);
   overrides.experimental_bash_rewrite = bash.rewrite;
   overrides.experimental_bash_compress = bash.compress;
@@ -1607,8 +1566,12 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod and never fail the load.
-  const removed = removedConfigKeyErrors(cleanConfig);
+  // validation, so they never reach Zod. Names retired in 0.62 or earlier
+  // are refused in a project file. The user file is the exception: the AFT
+  // binary rewrites it to current keys when it loads the file (with a backup
+  // and a notice), so the plugin translates it in memory for this one start
+  // instead of refusing a file that is about to be fixed.
+  const removed = removedConfigKeyErrors(cleanConfig, undefined, tier === "project");
   if (removed.length) {
     throw new ConfigRejectedError(removed);
   }
@@ -1979,20 +1942,10 @@ function mergeExperimentalConfig(
   base?: ExperimentalConfig,
   override?: ExperimentalConfig,
 ): ExperimentalConfig | undefined {
-  const bash: Record<string, unknown> = {
-    ...base?.bash,
-    ...override?.bash,
-  };
   const experimental: Record<string, unknown> = {
     ...base,
     ...override,
   };
-
-  if (Object.values(bash).some((value) => value !== undefined)) {
-    experimental.bash = bash;
-  } else {
-    delete experimental.bash;
-  }
   if (Object.values(experimental).every((value) => value === undefined)) return undefined;
 
   return Object.fromEntries(
@@ -2339,7 +2292,8 @@ export function buildConfigTierConfigureParams(
 /**
  * Load and resolve the user and project config for one project. The result
  * always carries a sorted `disabled_tools` list and fully resolved `indexes`.
- * Retired keys are translated, never refused. Throws {@link ConfigRejectedError}
+ * Retired keys are translated, except that a project file naming one retired
+ * in 0.62 or earlier is refused. Throws {@link ConfigRejectedError}
  * when a document or security setting is invalid, or the resolved configuration
  * is incomplete. A rejected reload must keep the last-good configuration.
  */

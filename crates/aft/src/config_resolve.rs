@@ -5605,7 +5605,7 @@ mod tests {
                 "user",
                 r#"{
                   "sandbox": {
-                    "enabled": true,
+                    "profile": { "worker": "strict", "head": "strict" },
                     "write_allow": ["/user/write"],
                     "read_deny": ["/user/secret"]
                   }
@@ -5615,7 +5615,7 @@ mod tests {
                 "project",
                 r#"{
                   "sandbox": {
-                    "enabled": false,
+                    "profile": { "worker": "relaxed", "head": "off" },
                     "write_allow": ["/project/write"],
                     "read_deny": ["/project/secret", "/user/secret"]
                   }

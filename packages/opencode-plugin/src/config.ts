@@ -287,21 +287,6 @@ const LspConfigSchema = z.object({
 });
 
 const ExperimentalConfigSchema = z.object({
-  /**
-   * @deprecated The bash family graduated from experimental in v0.27.2. Use the
-   * top-level `bash` key instead. This nested form is still accepted for
-   * backward compatibility — when present and top-level `bash` is absent,
-   * its values seed the resolved bash config. Will be removed in v0.28.
-   */
-  bash: z
-    .object({
-      rewrite: z.boolean().optional(),
-      compress: z.boolean().optional(),
-      background: z.boolean().optional(),
-      long_running_reminder_enabled: z.boolean().optional(),
-      long_running_reminder_interval_ms: z.number().int().positive().optional(),
-    })
-    .optional(),
   lsp_ty: z.boolean().optional(),
 });
 
@@ -727,7 +712,7 @@ const AftConfigFieldsSchema = z.object({
    *   - `{ enabled?, rewrite?, compress?, background?, ... }` — partial
    *     override; missing sub-keys default to `true`
    *
-   * Replaces `experimental.bash.*` (still accepted for backward compat).
+   * Replaces `experimental.bash.*`.
    */
   bash: BashConfigSchema.optional(),
   /** Experimental opt-in features. Default: all false. */
@@ -1089,8 +1074,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 }
 
 /**
- * Resolved bash configuration after merging top-level `bash` and the
- * legacy `experimental.bash.*` fallback. Everything downstream —
+ * Resolved bash configuration from top-level `bash`. Everything downstream —
  * configure-override emission, runtime gating, workflow-hints — reads from
  * this single shape.
  *
@@ -1162,32 +1146,22 @@ export function clampBashWatchSyncMaxMs(value: number | undefined): number {
  *   2. Top-level `bash: true`  → fully enabled (sub-features all true)
  *   3. Top-level `bash: { ... }` → runtime gate from `enabled` (default
  *      true); each sub-feature defaults true when not specified
- *   4. Top-level `bash` absent + any `experimental.bash.*` set → legacy
- *      fallback; sub-features take their explicit values (default false
- *      to preserve pre-v0.27.2 behavior — that block was opt-in); the
- *      runtime gate stays on
- *   5. Top-level `bash` absent + no experimental → everything on
+ *   4. Top-level `bash` absent → everything on
  *
- * The long_running_reminder_* tuning fields are passed through from
- * whichever surface specified them; they live alongside the feature
- * flags because they're emitted to Rust through the same configure
- * call shape.
+ * The long_running_reminder_* tuning fields are passed through from the
+ * object form; they live alongside the feature flags because they're
+ * emitted to Rust through the same configure call shape.
  */
 export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const top = config.bash;
-  const legacy = config.experimental?.bash;
 
-  // Reminder tuning rides along from whichever surface set it — top-level
-  // wins, legacy fills in the gap.
   const reminderEnabled =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined) ??
-    legacy?.long_running_reminder_enabled;
+    typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined;
   const reminderInterval =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
-    legacy?.long_running_reminder_interval_ms;
+    typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined;
 
-  // subagent_background defaults true everywhere (object form, legacy form,
-  // surface default). Top-level wins; only the object form can set it.
+  // subagent_background defaults true everywhere (object form and surface
+  // default). Top-level wins; only the object form can set it.
   const topSubagentBg =
     typeof top === "object" && top !== null ? top.subagent_background !== false : true;
   const topDetachOnUserMessage =
@@ -1229,7 +1203,6 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     env: typeof top === "object" && top !== null ? { ...(top.env ?? {}) } : {},
   };
 
-  // Top-level wins over legacy when both are present.
   if (top === false) {
     return base; // hard disable
   }
@@ -1251,30 +1224,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     };
   }
 
-  // Top-level absent. Honor legacy experimental.bash.* if any sub-flag was
-  // explicitly set — preserves pre-v0.27.2 opt-in semantics. We treat
-  // `experimental.bash: {}` (object present but all keys absent) the same as
-  // legacy entirely absent so we don't accidentally disable bash for users
-  // who wrote an empty experimental block while migrating.
-  const hasLegacyFeatureFlag =
-    legacy &&
-    (legacy.rewrite !== undefined ||
-      legacy.compress !== undefined ||
-      legacy.background !== undefined);
-  if (hasLegacyFeatureFlag) {
-    const rewrite = legacy.rewrite === true;
-    const compress = legacy.compress === true;
-    const background = legacy.background === true;
-    return {
-      ...base,
-      enabled: true,
-      rewrite,
-      compress,
-      background,
-    };
-  }
-
-  // No top-level, no legacy → everything on.
+  // No top-level `bash` → everything on.
   return { ...base, enabled: true, rewrite: true, compress: true, background: true };
 }
 
@@ -1283,8 +1233,7 @@ export function resolveExperimentalConfigForConfigure(
 ): ConfigureExperimentalOverrides {
   const overrides: ConfigureExperimentalOverrides = {};
   // Bash sub-features always flow through `resolveBashConfig` now — that
-  // function handles the graduated top-level surface and the legacy
-  // experimental fallback in one place. We
+  // function handles the graduated top-level surface in one place. We
   // still emit the three flat `experimental_bash_*` wire keys because the
   // Rust configure protocol hasn't been renamed; renaming there too would
   // require a coordinated binary bump.
@@ -1544,8 +1493,12 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod and never fail the load.
-  const removed = removedConfigKeyErrors(cleanConfig);
+  // validation, so they never reach Zod. Names retired in 0.62 or earlier
+  // are refused in a project file. The user file is the exception: the AFT
+  // binary rewrites it to current keys when it loads the file (with a backup
+  // and a notice), so the plugin translates it in memory for this one start
+  // instead of refusing a file that is about to be fixed.
+  const removed = removedConfigKeyErrors(cleanConfig, undefined, tier === "project");
   if (removed.length) {
     throw new ConfigRejectedError(removed);
   }
@@ -1916,20 +1869,10 @@ function mergeExperimentalConfig(
   baseExperimental: AftConfig["experimental"],
   overrideExperimental: AftConfig["experimental"],
 ): AftConfig["experimental"] {
-  const bash: Record<string, unknown> = {
-    ...baseExperimental?.bash,
-    ...overrideExperimental?.bash,
-  };
   const experimental: Record<string, unknown> = {
     ...baseExperimental,
     ...overrideExperimental,
   };
-
-  if (Object.values(bash).some((value) => value !== undefined)) {
-    experimental.bash = bash;
-  } else {
-    delete experimental.bash;
-  }
   if (Object.values(experimental).every((value) => value === undefined)) {
     return undefined;
   }
@@ -2294,7 +2237,8 @@ export function buildConfigTierConfigureParams(
  *
  * The result always carries a sorted `disabled_tools` list (absent user base
  * defaults to aft_move/aft_delete) and fully resolved `indexes`. Retired keys
- * are translated, never refused. Throws {@link ConfigRejectedError} when the
+ * are translated, except that a project file naming one retired in 0.62 or
+ * earlier is refused. Throws {@link ConfigRejectedError} when the
  * document or security settings are invalid, or the resolved configuration is
  * incomplete; callers must then publish nothing
  * (startup) or keep their last-good config (reload).

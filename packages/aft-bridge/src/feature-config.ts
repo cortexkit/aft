@@ -4,8 +4,8 @@
  * Mirrors `crates/aft/src/feature_config.rs`: the literal tool inventory, the
  * table of retired keys, the per-block translation of those keys into
  * canonical `disabled_tools` / `indexes` / `github` / `lsp` / `idle` leaves
- * (retired keys are not refused, except the data-layer keys from
- * `DATA_LAYER_KEYS_REFUSED_FROM` on),
+ * (the names retired in 0.62 or earlier, and the data-layer keys from
+ * `DATA_LAYER_KEYS_REFUSED_FROM` on, are refused by `removedConfigKeyErrors`),
  * validation of a resolved configuration, and the migration-notice projection
  * digest. The config parity fixtures and the shared notice-projection fixture
  * (`crates/aft/tests/fixtures/feature_config/notice_projection.json`) keep the
@@ -192,18 +192,24 @@ function refusedFromVersion(): string {
 /**
  * Removed settings fail only in the base and first-level harness blocks. The
  * data-layer keys fail only from `DATA_LAYER_KEYS_REFUSED_FROM`, judged by
- * `release` (this package's own release unless a test names one).
+ * `release` (this package's own release unless a test names one). The names
+ * retired in 0.62 or earlier (`REFUSED_RETIRED_PATHS` and the prefixed tool
+ * names) fail only when `refuseRetired` is true. The plugins pass false for
+ * the user file because the AFT binary rewrites that file to current keys
+ * when it loads it. Mirrors `removed_config_key_errors` in
+ * `crates/aft/src/feature_config.rs`, which always refuses them.
  */
 export function removedConfigKeyErrors(
   value: unknown,
   release: readonly [number, number] = getRunningRelease(),
+  refuseRetired = true,
 ): string[] {
   if (!isRecord(value)) return [];
-  const errors = removedBlockKeyErrors(value, release);
+  const errors = removedBlockKeyErrors(value, release, refuseRetired);
   if (isRecord(value.harnesses)) {
     for (const [name, block] of Object.entries(value.harnesses)) {
       if (!isRecord(block)) continue;
-      for (const error of removedBlockKeyErrors(block, release)) {
+      for (const error of removedBlockKeyErrors(block, release, refuseRetired)) {
         errors.push(error.replace("removed_config_key:", `removed_config_key:harnesses.${name}.`));
       }
     }
@@ -214,13 +220,62 @@ export function removedConfigKeyErrors(
 function removedBlockKeyErrors(
   value: Record<string, unknown>,
   release: readonly [number, number],
+  refuseRetired: boolean,
 ): string[] {
-  const paths: string[] = [...REMOVED_OPENCODE_PATHS];
+  const paths: string[] = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path));
+  if (refuseRetired) paths.push(...refusedRetiredNames(value));
   if (releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
-    paths.push(...DATA_LAYER_RETIRED_PATHS);
-  return paths
-    .filter((path) => hasPath(value, path))
-    .map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
+    paths.push(...DATA_LAYER_RETIRED_PATHS.filter((path) => hasPath(value, path)));
+  return paths.map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
+}
+
+/**
+ * Names retired in 0.62 or earlier, refused from 0.64, in the order a refusal
+ * lists them. A config that still sets one is refused with
+ * `removed_config_key`; `doctor --fix` (or the automatic rewrite of the user
+ * file) replaces it with its current equivalent or deletes it. Names retired
+ * more recently (`bridge.hang_threshold` and the data-layer keys) are not
+ * listed: they are still translated, with a notice. Mirrors
+ * `REFUSED_RETIRED_PATHS` in `crates/aft/src/feature_config.rs`.
+ */
+export const REFUSED_RETIRED_PATHS = [
+  "sandbox.enabled",
+  "tool_surface",
+  "hoist_builtin_tools",
+  "enabled",
+  "search_index",
+  "experimental_search_index",
+  "semantic_search",
+  "experimental_semantic_search",
+  "callgraph_store",
+  "github.enabled",
+  "gh_read",
+  "gh_shim.enabled",
+  "experimental_lsp_ty",
+  "experimental_bash_rewrite",
+  "experimental_bash_compress",
+  "experimental_bash_background",
+  "experimental.bash",
+  "idle.lsp_ttl_minutes",
+  "inspect.tier2_soft_deadline_ms",
+  "inspect.max_drill_down_items",
+] as const;
+
+/**
+ * The refused retired names one block sets: the paths in
+ * `REFUSED_RETIRED_PATHS`, then each prefixed tool name (`LEGACY_TOOL_ALIASES`)
+ * its `disabled_tools` list contains, once each and by its bare name, as the
+ * retired-key notices list it.
+ */
+function refusedRetiredNames(block: Record<string, unknown>): string[] {
+  const names: string[] = REFUSED_RETIRED_PATHS.filter((path) => hasPath(block, path));
+  if (Array.isArray(block.disabled_tools)) {
+    for (const name of block.disabled_tools) {
+      if (typeof name !== "string" || !Object.hasOwn(LEGACY_TOOL_ALIASES, name)) continue;
+      if (!names.includes(name)) names.push(name);
+    }
+  }
+  return names;
 }
 
 /** Retired config paths and their replacement. */
@@ -547,9 +602,10 @@ export function dropRemovedDataLayerKeys(map: JsonRecord): void {
 }
 
 /**
- * Translate flat experimental aliases to nested settings. Graduating
- * experimental.bash explicitly sets omitted feature flags to false;
- * otherwise the current default-on bash settings would silently enable them.
+ * Translate flat experimental aliases to nested settings and move the
+ * `experimental.bash` block to top-level `bash`. Graduating a block that sets
+ * a feature flag explicitly sets its omitted flags to false; otherwise the
+ * current default-on bash settings would silently enable them.
  */
 function translateExperimentalPaths(
   map: JsonRecord,
@@ -588,7 +644,7 @@ function translateExperimentalPaths(
   const experimental = map.experimental;
   const legacy = experimental.bash;
   if (isRecord(legacy)) {
-    if (!["rewrite", "compress", "background"].some((leaf) => Object.hasOwn(legacy, leaf))) return;
+    if (Object.keys(legacy).length === 0) recordRetired(out, prefix, "experimental.bash");
     for (const leaf of Object.keys(legacy)) recordRetired(out, prefix, `experimental.bash.${leaf}`);
     if (Object.hasOwn(map, "bash")) {
       superseded(
@@ -597,15 +653,19 @@ function translateExperimentalPaths(
         'experimental.bash is ignored because top-level "bash" is already set',
       );
     } else {
-      const bash: JsonRecord = {
-        rewrite: legacy.rewrite === true,
-        compress: legacy.compress === true,
-        background: legacy.background === true,
-      };
+      const bash: JsonRecord = {};
+      // A block with only reminder settings never opted into the feature
+      // flags, so they keep their current defaults instead of being written
+      // as false.
+      if (["rewrite", "compress", "background"].some((leaf) => Object.hasOwn(legacy, leaf))) {
+        bash.rewrite = legacy.rewrite === true;
+        bash.compress = legacy.compress === true;
+        bash.background = legacy.background === true;
+      }
       for (const leaf of ["long_running_reminder_enabled", "long_running_reminder_interval_ms"]) {
         if (Object.hasOwn(legacy, leaf)) bash[leaf] = legacy[leaf];
       }
-      map.bash = bash;
+      if (Object.keys(bash).length > 0) map.bash = bash;
     }
   } else {
     recordRetired(out, prefix, "experimental.bash");
@@ -674,10 +734,9 @@ function translateBlock(
     });
   }
 
+  // `experimental.bash` was already recorded, leaf by leaf, and removed by
+  // `translateExperimentalPaths`.
   for (const [path] of RETIRED_PATHS) {
-    // A block with only reminder settings never opted into experimental
-    // bash features. Leave it unchanged instead of adding false flags.
-    if (path === "experimental.bash") continue;
     if (hasPath(map, path)) recordRetired(out, prefix, path);
   }
   const gates = falseRuntimeGates(map);
@@ -960,8 +1019,9 @@ export function legacyConfigNoticeMessage(
  * Translate every block (base plus each `harnesses.<id>`) in place. Retired
  * keys are not refused here: their current equivalents then pass through the
  * normal user/project trust rules, exactly as if the file had spelled them
- * out. (`removedConfigKeyErrors` refuses the data-layer keys from
- * `DATA_LAYER_KEYS_REFUSED_FROM`, before translation runs.)
+ * out. (`removedConfigKeyErrors` refuses the names retired in 0.62 or earlier
+ * and the data-layer keys from `DATA_LAYER_KEYS_REFUSED_FROM`, before
+ * translation runs; `doctor --fix` still uses this translation for them.)
  *
  * Only the user file's base block receives the absent-base default
  * (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
