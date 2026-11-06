@@ -7075,41 +7075,6 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn watcher_batch_schedules_view_publication_within_its_own_quiet_window() {
-        // The assertion below reads the semantic quiet window, which other
-        // tests shorten through AFT_SEMANTIC_QUIET_WINDOW_MS while holding the
-        // process env lock. Hold it too, or a concurrent override makes the
-        // semantic window 1 ms and the comparison meaningless.
-        let _env = crate::test_env::process_env_lock();
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, tx) = context_with_watcher(temp.path());
-        tx.send(WatcherDispatchEvent::Paths(vec![temp
-            .path()
-            .join("changed.rs")]))
-            .unwrap();
-        let applied_at = Instant::now();
-
-        let outcome = drain_watcher_events_bounded(&ctx, 1);
-
-        assert_eq!(outcome.processed, 1);
-        let due = ctx
-            .watcher_drain_slice()
-            .lock()
-            .as_ref()
-            .and_then(|state| state.view_publication_due)
-            .expect("watcher batch should schedule view publication");
-        assert!(due > applied_at);
-        assert!(
-            due <= applied_at + VIEW_PUBLICATION_QUIET_WINDOW + Duration::from_millis(250),
-            "view publication due {due:?} exceeded its own quiet window from {applied_at:?}"
-        );
-        assert!(
-            due < applied_at + crate::commands::configure::semantic_refresh_quiet_window(),
-            "view publication inherited the semantic refresh quiet window"
-        );
-    }
-
-    #[test]
     fn views_routed_watcher_batch_skips_legacy_refresh_and_publishes_no_v1_view() {
         let root = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());

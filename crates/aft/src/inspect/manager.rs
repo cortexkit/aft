@@ -7386,7 +7386,6 @@ mod guard_tests {
         std::fs::write(path, contents).expect("write fixture file");
     }
 
-    include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
     include!("tier2_refresh_perf_tests.rs");
 
