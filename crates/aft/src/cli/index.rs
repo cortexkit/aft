@@ -81,6 +81,15 @@ type DataLayerBuild = fn(
     aft::data_layer::checkout::Planes,
 ) -> Result<aft::data_layer::surfaces::IndexOutcome, String>;
 
+/// Fills the data layer's meaning plane of the checkout at a root (the first
+/// path), with its family store under a storage folder (the second), with an
+/// embedding model's configuration, in the foreground.
+type DataLayerFill = fn(
+    &Path,
+    &Path,
+    &aft::config::SemanticBackendConfig,
+) -> Result<aft::data_layer::surfaces::MeaningOutcome, String>;
+
 struct SnapshotUnit {
     entry: StandingRootEntry,
     kind: IndexKind,
@@ -96,6 +105,9 @@ enum UnitWriter {
     /// The data layer, whose family store orders publications with its own
     /// writer.
     DataLayer(DataLayerBuild),
+    /// The data layer's meaning plane, filled through the family store's
+    /// fill lock, which one fill of the repository holds at a time.
+    DataLayerFill(DataLayerFill),
 }
 
 struct LeasedWriter {
@@ -232,6 +244,7 @@ fn run_snapshot(
             UnitWriter::DataLayer(build) => {
                 build_data_layer_unit(&plan.config, unit, *build, &mut data_layer_builds)
             }
+            UnitWriter::DataLayerFill(fill) => fill_data_layer_unit(&plan.config, unit, *fill),
             UnitWriter::Leased(writer) => match &writer.admission {
                 UnitAdmission::Suspended(reason) => UnitResult::gap(reason.clone()),
                 UnitAdmission::Admitted { .. } => build_unit(&plan.config, unit, writer),
@@ -338,20 +351,24 @@ fn prepare_snapshot(
         })?;
     }
 
-    // The data layer builds a kind when it is on and builds that kind;
-    // today's stores build the rest.
+    // The data layer builds a kind when it is on and builds that kind, and
+    // fills the meaning (`semantic`) kind; today's stores build the rest.
     let data_layer_for =
         |kind: IndexKind| data_layer.filter(|_| aft::data_layer::standing::builds(kind));
+    let data_layer_fill = data_layer
+        .is_some()
+        .then_some(aft::data_layer::surfaces::fill_root as DataLayerFill);
+    let data_layer_handles = |kind: IndexKind| {
+        data_layer_for(kind).is_some() || (kind == IndexKind::Semantic && data_layer_fill.is_some())
+    };
     let mut semantic_files = BTreeMap::new();
     for entry in &report.active_entries {
         // The write capability only today's writer leases need.
-        if entry
-            .indexes
-            .iter()
-            .any(|kind| data_layer_for(*kind).is_none())
-        {
+        if entry.indexes.iter().any(|kind| !data_layer_handles(*kind)) {
             configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
         }
+        // Also a validation: a root with more files than `semantic.max_files`
+        // refuses the whole snapshot, whichever store embeds it.
         if entry.indexes.contains(&IndexKind::Semantic) {
             semantic_files.insert(
                 entry.literal_path.clone(),
@@ -363,6 +380,15 @@ fn prepare_snapshot(
     let mut units = Vec::new();
     for entry in report.active_entries {
         for kind in &entry.indexes {
+            if let (IndexKind::Semantic, Some(fill)) = (*kind, data_layer_fill) {
+                units.push(SnapshotUnit {
+                    entry: entry.clone(),
+                    kind: *kind,
+                    writer: UnitWriter::DataLayerFill(fill),
+                    semantic_files: None,
+                });
+                continue;
+            }
             if let Some(build) = data_layer_for(*kind) {
                 units.push(SnapshotUnit {
                     entry: entry.clone(),
@@ -550,6 +576,27 @@ fn build_data_layer_unit(
         }
         (Ok(outcome), IndexKind::Callgraph) => UnitResult::success(outcome.parsed_files),
         (Ok(outcome), _) => UnitResult::success(outcome.files),
+    }
+}
+
+/// The semantic kind of `unit`, filled by the data layer with `fill`: the
+/// checkout's text plane, published if it is not current, and vectors for
+/// every file meaning search applies to that no checkout of the repository
+/// has embedded yet. Counts chunks, as today's semantic snapshot does.
+fn fill_data_layer_unit(config: &Config, unit: &SnapshotUnit, fill: DataLayerFill) -> UnitResult {
+    let root = std::fs::canonicalize(&unit.entry.resolved_target)
+        .unwrap_or_else(|_| unit.entry.resolved_target.clone());
+    let storage = aft::bash_background::storage_dir(config.storage_dir.as_deref());
+    match fill(&root, &storage, &config.semantic) {
+        Err(error) => UnitResult::gap(error),
+        Ok(outcome) if outcome.files_past_cap > 0 => UnitResult::usable_gap(
+            outcome.chunks,
+            format!(
+                "semantic left {} file(s) past semantic.max_files without vectors",
+                outcome.files_past_cap
+            ),
+        ),
+        Ok(outcome) => UnitResult::success(outcome.chunks),
     }
 }
 

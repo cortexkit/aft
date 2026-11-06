@@ -584,6 +584,17 @@ fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
     if !ctx.config().indexes.semantic {
         return SubsystemState::Disabled;
     }
+    // With the data layer serving this root's semantic search, its meaning
+    // plane is filled instead of today's index, which is never built.
+    if let Some(state) = aft::data_layer::surfaces::warm_meaning(ctx) {
+        return match state {
+            aft::data_layer::surfaces::WarmState::Pending(detail) => {
+                SubsystemState::Pending(detail)
+            }
+            aft::data_layer::surfaces::WarmState::Ready => SubsystemState::Ready,
+            aft::data_layer::surfaces::WarmState::Failed(error) => SubsystemState::Failed(error),
+        };
+    }
     match ctx
         .semantic_index_status()
         .read()

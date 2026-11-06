@@ -518,6 +518,13 @@ mod tests {
         let status = ctx.build_status_snapshot();
         assert_eq!(status["semantic_index"]["status"], "building", "{status}");
         assert_eq!(status["semantic_index"]["files_pending"], 45, "{status}");
+        // `aft warmup` keeps waiting while files wait for vectors.
+        assert_eq!(
+            crate::data_layer::surfaces::warm_meaning(&ctx),
+            Some(crate::data_layer::surfaces::WarmState::Pending(
+                "filling, files=256/301".to_string()
+            ))
+        );
 
         let reply = search(&ctx, "meaning-partial", "count the widgets of a batch");
         assert_eq!(reply["success"], true, "{reply}");
@@ -541,6 +548,10 @@ mod tests {
         let status = ctx.build_status_snapshot();
         assert_eq!(status["semantic_index"]["status"], "ready", "{status}");
         assert_eq!(status["semantic_index"]["files_embedded"], 301, "{status}");
+        assert_eq!(
+            crate::data_layer::surfaces::warm_meaning(&ctx),
+            Some(crate::data_layer::surfaces::WarmState::Ready)
+        );
 
         let reply = search(&ctx, "meaning-ready", "count the widgets of a batch");
         assert_eq!(reply["success"], true, "{reply}");
@@ -644,6 +655,55 @@ mod tests {
         );
         assert_eq!(reply["semantic_status"], "ready", "{reply}");
         assert_eq!(reply["complete"], true, "{reply}");
+    }
+
+    /// `aft index` fills a checkout's meaning plane in the foreground: every
+    /// file gets its vectors before it returns, and a second fill of the same
+    /// files embeds nothing, since the plane reuses what it stored.
+    #[test]
+    fn a_foreground_fill_embeds_every_file_and_a_second_one_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // More files than one fill round takes, so the fill runs rounds
+        // until none waits.
+        for index in 0..300 {
+            write(
+                &root,
+                &format!("src/f{index:03}.rs"),
+                &format!("/// Counts the widgets of batch {index}.\npub fn widget_count_{index}(items: &[u32]) -> usize {{\n    items.len() + {index}\n}}\n"),
+            );
+        }
+        let (base_url, gate) = serve("never-held");
+        gate.open();
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-hashed".to_string(),
+            base_url: Some(base_url),
+            timeout_ms: 120_000,
+            query_timeout_ms: 30_000,
+            ..SemanticBackendConfig::default()
+        };
+
+        let filled = crate::data_layer::surfaces::fill_root(&root, storage.path(), &config)
+            .expect("the fill");
+        assert_eq!(
+            (filled.files, filled.files_embedded, filled.files_past_cap),
+            (300, 300, 0),
+            "{filled:?}"
+        );
+        assert!(filled.chunks >= 300, "{filled:?}");
+        let embedded = gate.texts.load(Ordering::SeqCst);
+        assert!(embedded >= 300, "{embedded} texts embedded");
+
+        let again = crate::data_layer::surfaces::fill_root(&root, storage.path(), &config)
+            .expect("the second fill");
+        assert_eq!(again, filled);
+        assert_eq!(
+            gate.texts.load(Ordering::SeqCst),
+            embedded,
+            "the second fill embedded files again"
+        );
     }
 
     /// A deterministic stand-in for an embedding model: each word of the

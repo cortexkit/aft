@@ -24,8 +24,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::checkout::{
-    refusal_message, CheckoutMemory, CheckoutStatus, DataError, EngineMemory, PlaneStatus,
-    INDEX_STORE,
+    refusal_message, CheckoutMemory, CheckoutStatus, CheckoutView, DataError, EngineMemory,
+    PlaneStatus, INDEX_STORE,
 };
 use super::runtime::{DataCheckout, DataFailure};
 use crate::context::{AppContext, SemanticFillHealth, SemanticHealthComponentSnapshot};
@@ -1002,11 +1002,34 @@ pub fn index_root(
     storage: &Path,
     planes: super::checkout::Planes,
 ) -> Result<IndexOutcome, String> {
+    let checkout = super::runtime::bind_foreground(root, storage, planes)
+        .map_err(|error| error.to_string())?;
+    let (view, published) = publish_current(&checkout, planes)?;
+    let state = view.state();
+    Ok(IndexOutcome {
+        files: state.paths().len(),
+        parsed_files: (0..state.paths().len())
+            .filter(|index| state.fragment(*index).is_some())
+            .count(),
+        unparsed_files: view.status().unparsed,
+        published,
+    })
+}
+
+/// Builds and publishes `planes` of `checkout` until its view holds exactly
+/// the files on disk; returns that view and whether this call published.
+///
+/// # Errors
+///
+/// When a build fails, or other AFT processes kept publishing the checkout
+/// first.
+fn publish_current(
+    checkout: &super::checkout::Checkout,
+    planes: super::checkout::Planes,
+) -> Result<(CheckoutView, bool), String> {
     /// Builds that may stand down for another process's publication before
     /// this one gives up.
     const ATTEMPTS: usize = 3;
-    let checkout = super::runtime::bind_foreground(root, storage, planes)
-        .map_err(|error| error.to_string())?;
     // Binding compares the files on disk with the publication and records
     // any difference, so a current store has a view with nothing changed.
     let current = |checkout: &super::checkout::Checkout| {
@@ -1022,7 +1045,7 @@ pub fn index_root(
     };
     let mut published = false;
     for _ in 0..ATTEMPTS {
-        if current(&checkout) {
+        if current(checkout) {
             break;
         }
         let report = checkout.build().map_err(|error| error.to_string())?;
@@ -1030,18 +1053,135 @@ pub fn index_root(
     }
     let view = checkout
         .view()
-        .filter(|_| current(&checkout))
+        .filter(|_| current(checkout))
         .ok_or_else(|| {
             "other AFT processes kept publishing this checkout while it was built".to_string()
         })?;
-    let state = view.state();
-    Ok(IndexOutcome {
-        files: state.paths().len(),
-        parsed_files: (0..state.paths().len())
-            .filter(|index| state.fragment(*index).is_some())
-            .count(),
-        unparsed_files: view.status().unparsed,
-        published,
+    Ok((view, published))
+}
+
+/// What `aft index` left filled in a checkout's meaning plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeaningOutcome {
+    /// Files meaning search applies to, past `semantic.max_files` included.
+    pub files: usize,
+    /// Files with vectors.
+    pub files_embedded: usize,
+    /// Files too large to embed, which have none by design.
+    pub files_too_large: usize,
+    /// Files that could not be cut into chunks, with none.
+    pub files_failed: usize,
+    /// Files past `semantic.max_files`, left unfilled.
+    pub files_past_cap: usize,
+    /// Chunks with vectors.
+    pub chunks: usize,
+}
+
+/// Publishes the text plane of the checkout at `root`, with its family store
+/// under `storage`, as [`index_root`] does, then fills its meaning plane with
+/// `config`'s embedding model in the foreground until every file meaning
+/// search applies to has vectors or a recorded reason it has none. Vectors
+/// another checkout of the repository embedded are reused, not embedded
+/// again; a fill of the repository running in another process is waited
+/// for, as the plane's fill lock makes every fill wait.
+///
+/// # Errors
+///
+/// When the store cannot be opened, the build fails, or a fill round fails
+/// (the embedding model cannot load, or the backend refuses or cannot be
+/// reached), with the message status would give.
+pub fn fill_root(
+    root: &Path,
+    storage: &Path,
+    config: &crate::config::SemanticBackendConfig,
+) -> Result<MeaningOutcome, String> {
+    use super::meaning::{Meaning, MeaningState, Round};
+    let planes = super::checkout::Planes {
+        text: true,
+        callgraph: false,
+    };
+    let checkout = Arc::new(
+        super::runtime::bind_foreground(root, storage, planes)
+            .map_err(|error| error.to_string())?,
+    );
+    publish_current(&checkout, planes)?;
+    let meaning = Meaning::new(storage);
+    meaning.configure(Some(config));
+    loop {
+        match meaning.round(&checkout) {
+            Round::More => {}
+            Round::Done => break,
+            Round::Idle => return Err("the checkout has nothing published to fill".to_string()),
+            Round::Failed(failure) => return Err(failure.message().to_string()),
+        }
+    }
+    match meaning.state(checkout.view().as_ref()) {
+        MeaningState::Serving { snapshot, .. } => {
+            let coverage = snapshot.coverage();
+            Ok(MeaningOutcome {
+                files: coverage.files,
+                files_embedded: coverage.files_embedded,
+                files_too_large: coverage.files_too_large,
+                files_failed: coverage.files_failed.len(),
+                files_past_cap: coverage.past_cap,
+                chunks: coverage.chunks_embedded,
+            })
+        }
+        MeaningState::Blocked(failure) => Err(failure.message().to_string()),
+        MeaningState::Off | MeaningState::Unpublished | MeaningState::Starting => {
+            Err("the meaning plane could not be read after its fill".to_string())
+        }
+    }
+}
+
+/// The meaning plane of `ctx`'s root, for `aft warmup`, when it serves the
+/// root's semantic search (the data layer binds the root, and semantic
+/// search is on and admitted for it); `None` otherwise, and today's semantic
+/// index status applies. Asking binds
+/// the checkout and starts its fill. Ready only once every file meaning
+/// search applies to is filled: a partial plane is still pending.
+pub fn warm_meaning(ctx: &AppContext) -> Option<WarmState> {
+    use crate::context::SemanticIndexStatus;
+    use crate::data_layer::tools::search::DataSemantic;
+    if !ctx.data_layer_serves_meaning() {
+        return None;
+    }
+    let Some(data) = DataSemantic::current(ctx) else {
+        // The checkout is not bound yet, or its store cannot be opened; the
+        // text plane's warm state names a failure to open it.
+        return Some(WarmState::Pending("binding".to_string()));
+    };
+    Some(match data {
+        DataSemantic::Serving(meaning) if meaning.complete() => WarmState::Ready,
+        DataSemantic::Serving(meaning) => {
+            let coverage = meaning.coverage();
+            let accounted = coverage.files_embedded
+                + coverage.files_too_large
+                + coverage.files_failed.len();
+            let total = coverage.files.saturating_sub(coverage.past_cap);
+            let mut detail = format!("filling, files={accounted}/{total}");
+            if let Some(failure) = meaning.failure() {
+                detail.push_str(&format!(", last failure: {failure}"));
+            }
+            WarmState::Pending(detail)
+        }
+        DataSemantic::NotServing(SemanticIndexStatus::Failed(error)) => WarmState::Failed(error),
+        DataSemantic::NotServing(SemanticIndexStatus::Building {
+            stage,
+            files,
+            entries_done,
+            entries_total,
+        }) => {
+            let mut detail = stage;
+            if let Some(files) = files {
+                detail.push_str(&format!(", files={files}"));
+            }
+            if let (Some(done), Some(total)) = (entries_done, entries_total) {
+                detail.push_str(&format!(", entries={done}/{total}"));
+            }
+            WarmState::Pending(detail)
+        }
+        DataSemantic::NotServing(status) => WarmState::Pending(format!("{status:?}")),
     })
 }
 

@@ -3,8 +3,10 @@
 //! With the data layer on, the text (`search`) and call-graph (`callgraph`)
 //! kinds of a configured standing root are the root's checkout in the data
 //! layer: one build publishes both, through the family store's own writer,
-//! and nothing is written to today's search cache or call-graph store. The
-//! meaning (`semantic`) kind keeps today's semantic index until it moves.
+//! and nothing is written to today's search cache or call-graph store. For
+//! the meaning (`semantic`) kind, `aft index` fills the checkout's meaning
+//! plane (`surfaces::fill_root`); a running AFT's standing passes still
+//! build today's semantic index for it.
 //!
 //! A standing root has no watcher, so each standing pass binds its checkout
 //! again: the bind's scan compares every file with the publication, and the
