@@ -523,6 +523,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
         ));
         let doc = json!({
             "indexes": {"trigram": true, "semantic": true, "callgraph": false},
+            "views": {"enabled": true},
             "semantic": {
                 "backend": "openai_compatible",
                 "model": "test-hashed",
