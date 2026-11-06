@@ -195,7 +195,8 @@ class Process:
             self.replies[request_id] = line
             self.timings[request_id] = {'ms': round(elapsed, 1), 'attempts': attempts,
                                         'total_ms': round((time.monotonic() - started_all) * 1000, 1),
-                                        'settled': not unsettled(value)}
+                                        'settled': not unsettled(value),
+                                        'peak_mib': self.peak_mib(), 'resident_mib': self.peak_mib('VmRSS')}
             (self.out / f'{request_id}.reply').write_bytes(line)
             return value
 
@@ -212,13 +213,14 @@ class Process:
     def log(self):
         return self.stderr_path.read_text(errors='replace')
 
-    def peak_mib(self):
-        """The process's peak resident memory so far, in MiB (Linux only)."""
+    def peak_mib(self, field='VmHWM'):
+        """The process's peak resident memory so far, in MiB, or with
+        `field='VmRSS'` its resident memory now (Linux only)."""
         try:
             status = pathlib.Path(f'/proc/{self.process.pid}/status').read_text()
         except OSError:
             return None
-        match = re.search(r'^VmHWM:\s+(\d+) kB', status, re.M)
+        match = re.search(rf'^{field}:\s+(\d+) kB', status, re.M)
         return int(match.group(1)) // 1024 if match else None
 
     def close(self):
@@ -388,6 +390,13 @@ def gate_case(binary, name, source, work, modes, control):
         results.append(result)
         print(json.dumps({key: result[key] for key in ('case', 'mode', 'replies_compared', 'exercised')}
                          | {'differing': sorted(differing)}), flush=True)
+        print(json.dumps({'case': name, 'mode': mode, 'data_layer_checks': {
+            key: value for key, value in checks.items() if not key.endswith('_ms')},
+            'memory': {label: {request_id: (timing['peak_mib'], timing['resident_mib'])
+                               for request_id, timing in run_[1].items()}
+                       for label, run_ in runs.items()}}), flush=True)
+        for request_id, paths in sorted(result.get('unexplained', differing).items()):
+            print(f'  {request_id}: {len(paths)} differences; first: {paths[:4]}', flush=True)
     return results
 
 
