@@ -770,8 +770,9 @@ fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
             // matches the store, as the views-off render does
             // (callgraph_regression_tests). A v1 view used to fail that check
             // because it records each file's call-graph blob key, not its
-            // content hash, which hid the row.
-            "1 affected site (1 by callback reference) · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)\n  fn checks() { spawn(transform); }",
+            // content hash, which hid the row. `checks` is a test nothing
+            // calls, so it is a test root.
+            "1 affected site (1 by callback reference) · 1 file\nReaches 1 test\nsrc/lib.rs:3\n  ↳ checks [root: test] (callback reference)\n  fn checks() { spawn(transform); }",
         ),
         (
             "callers",
