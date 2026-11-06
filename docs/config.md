@@ -617,7 +617,7 @@ The user-only `github` block controls the complete GitHub surface. `shim` defaul
 
 `github.write: true` implies read: with `github.read` absent or `false`, read is still enabled and a warning names both keys. This prevents edits from addressing a comment ordinal the agent cannot inspect. Untrusted MCP and forced-restrict binds treat every GitHub integration as disabled regardless of user configuration.
 
-AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image; a `gh_shim` block containing only `binary_path` loads normally. The retired `gh_read` block and the `gh_shim.enabled` leaf are rejected immediately with `removed_config_key:gh_read:use:github.read` and `removed_config_key:gh_shim:use:github.shim`; the whole configuration is then not used until `npx @cortexkit/aft doctor --fix` rewrites them.
+AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image; a `gh_shim` block containing only `binary_path` loads normally. The retired `gh_read` block and the `gh_shim.enabled` leaf are refused with `removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix` and `removed_config_key:gh_shim.enabled; run npx @cortexkit/aft doctor --fix`; the whole configuration is then not used until `npx @cortexkit/aft doctor --fix` rewrites them to `github.read` and `github.shim`.
 
 When reads are enabled, `read`, `aft_outline`, and `aft_zoom` accept `issue://NUMBER` and `pr://NUMBER`, including `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`. When writes are enabled, `write` on a base resource publishes a conversation comment after the host's edit-class permission prompt displays the exact body. `edit` accepts only an `edits[]` find/replace request on `issue://.../comments/K` or `pr://.../comments/K`; it fetches the live body, applies the normal matcher, and then attempts an id-addressed edit through the governed shim. Review-thread comments are not supported. GitHub comment mutations do not create aft_safety snapshots and cannot be undone through aft_safety.
 
@@ -746,7 +746,7 @@ Windows has no OS sandbox backend. `relaxed` runs with full user rights and repo
 
 ### Retired `sandbox.enabled`
 
-Loading translates this retired key in memory, and `doctor --fix` uses the same translation while preserving JSONC comments and unrelated keys. User config can be automatically migrated with a backup; shared project config is not rewritten automatically.
+From v0.64 a config file that still sets this key is refused with `removed_config_key:sandbox.enabled; run npx @cortexkit/aft doctor --fix`. `doctor --fix` rewrites it as below while preserving JSONC comments and unrelated keys. AFT rewrites the user file the same way, with a backup, when it loads it; shared project config is not rewritten automatically.
 
 - `true` becomes `{ "worker": "strict", "head": "strict" }`.
 - `false` (or an absent key) uses the new defaults, `{ "worker": "relaxed", "head": "off" }`.
@@ -783,25 +783,29 @@ folder. `semantic.max_files` stays as a limit on embedding cost.
 v0.58 replaces surface levels with one rule — a tool is registered unless it is
 in `disabled_tools` — and makes the background indexes first-class
 (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`, all default on).
-Retired keys are never refused. On every load AFT translates them into their
-current equivalents, and those then follow the usual user/project rules:
+From v0.64 AFT no longer reads the retired keys in the table below except
+`bridge.hang_threshold`: they were retired in v0.62 or earlier, and a config
+file that still sets one, in its base or in a `harnesses` block, is refused with
+`removed_config_key:<key>; run npx @cortexkit/aft doctor --fix` (for an
+`aft_`-prefixed name in `disabled_tools`, `<key>` is that name, for example
+`aft_read`). `npx @cortexkit/aft doctor --fix` rewrites each one to its
+current equivalent:
 
 - **User file** (`~/.config/cortexkit/aft.jsonc`): AFT rewrites the file to the
   current keys the first time it reads it, with the same comment-preserving
   migration `npx @cortexkit/aft doctor --fix` performs. The previous text is
   kept beside it as `aft.jsonc.bak-<unix seconds>`, and one notice says the
-  file was updated. A read-only file, or one AFT cannot write, is left alone:
-  the keys are translated in memory and the notice says why the file was not
-  updated.
+  file was updated. A read-only file, or one AFT cannot write, is left alone
+  and refused.
 - **Project file** (`<project>/.cortexkit/aft.jsonc`, including its
   `harnesses` blocks): it is shared through the repository, so AFT never
-  writes it. The keys are translated in memory with the same limits a project
-  config has for the current key (for example, a project's `gh_read` becomes
-  `github.read`, which a project cannot set, so it is ignored), and one notice
-  names the file and its retired keys. Run `npx @cortexkit/aft doctor --fix`
-  in the project to update the file.
+  writes it, and it is refused until you run `npx @cortexkit/aft doctor --fix`
+  in the project.
 
-| Retired input | Replacement |
+`bridge.hang_threshold`, retired in v0.63, is still read: AFT drops it with a
+notice, and `doctor --fix` deletes it.
+
+| Retired input | What `doctor --fix` writes |
 | --- | --- |
 | `tool_surface`, `hoist_builtin_tools`, `enabled` | `disabled_tools` |
 | `search_index`, `experimental_search_index` | `indexes.trigram` |
@@ -814,7 +818,7 @@ current equivalents, and those then follow the usual user/project rules:
 | `bridge.hang_threshold` | removed (no effect: see [Bridge request timeouts](#bridge-request-timeouts)) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
-Translation rules: an explicit `tool_surface` in the user base is a complete
+Rewrite rules: an explicit `tool_surface` in the user base is a complete
 registration choice (`"all"` → `[]`, `"recommended"` → `["aft_callgraph",
 "aft_delete", "aft_move"]`, `"minimal"` → everything except `aft_outline`,
 `aft_zoom` and `aft_safety`); without one, the default `["aft_move",
@@ -873,10 +877,18 @@ The original file is rewritten in place (both `.jsonc` and `.json` candidates ar
 JSONC comments are preserved. Both user-level and project-level configs are migrated
 independently. The migration is idempotent — running again is a no-op.
 
-**v0.27.2** further graduated the bash flags out of `experimental`. A config still using
-`experimental.bash.{rewrite,compress,background}` is read transparently as a fallback, but the
-canonical shape is the top-level `bash` block shown above. `experimental` now holds only
-`lsp_ty`.
+**v0.27.2** further graduated the bash flags out of `experimental`. The canonical shape is the
+top-level `bash` block shown above, and `experimental` now holds only `lsp_ty`.
+
+From v0.64 a config that still sets one of the flat `experimental_*` keys or an
+`experimental.bash` block is refused like the keys in
+[Feature-based configuration](#feature-based-configuration-v058).
+`npx @cortexkit/aft doctor --fix` moves them to `experimental.lsp_ty`,
+`indexes` and top-level `bash`. A block that sets any of `rewrite`, `compress`
+or `background` becomes a `bash` block with the flags it left out set to
+`false`, as the old block treated them; a block with only the
+`long_running_reminder_*` settings moves them to `bash` and leaves the flags at
+their defaults.
 
 ## Language servers (LSP)
 
@@ -911,13 +923,11 @@ changes apply live; work already admitted retains its pinned configuration.
 `idle.lsp_ttl_minutes` is replaced by `lsp.idle_minutes`.
 `inspect.tier2_soft_deadline_ms` and `inspect.max_drill_down_items` were inert and
 are removed (`inspect.tier2_pass_timeout_ms` and `aft_inspect.topK` are what they
-used to approximate). These old keys are retired like the ones in
+used to approximate). These old keys are refused like the ones in
 [Feature-based configuration](#feature-based-configuration-v058), including inside
-harness blocks: loading moves the old idle value to `lsp.idle_minutes`, clamped
-to the new range (an existing canonical value wins, and a project file may still
-only shorten the window), and drops the two inert inspect keys. The user file is
-rewritten that way automatically; `npx @cortexkit/aft doctor --fix` rewrites a
-project file.
+harness blocks. `npx @cortexkit/aft doctor --fix`, and the automatic rewrite of
+the user file, move the old idle value to `lsp.idle_minutes`, clamped to the new
+range (an existing canonical value wins), and drop the two inert inspect keys.
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
@@ -1077,10 +1087,9 @@ tool (`read`, `outline`, `zoom`, `grep`, `glob`, `search`, `callgraph`,
 `inspect`) cut off by that restart is retried once, unless it was cancelled.
 
 `bridge.hang_threshold` used to count timeouts toward that restart and no longer
-does anything. It is retired like the keys in
-[Feature-based configuration](#feature-based-configuration-v058): loading drops
-it with a one-line notice, the user file is rewritten automatically, and
-`npx @cortexkit/aft doctor --fix` removes it from a project file.
+does anything. It is retired: loading drops it with a one-line notice, the
+user file is rewritten automatically, and `npx @cortexkit/aft doctor --fix`
+removes it from a project file.
 
 ## Durable logs and performance ticks
 

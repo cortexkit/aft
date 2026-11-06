@@ -523,51 +523,12 @@ function buildSchema(): Record<string, unknown> {
           },
         ],
         description:
-          "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*` (still accepted for backward compat).",
+          "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*`.",
       },
 
       experimental: {
         type: "object",
         properties: {
-          bash: {
-            type: "object",
-            properties: {
-              rewrite: {
-                type: "boolean",
-                default: false,
-                description:
-                  "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
-              },
-              compress: {
-                type: "boolean",
-                default: false,
-                description:
-                  "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, vitest, biome) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
-              },
-              background: {
-                type: "boolean",
-                default: false,
-                description:
-                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag.",
-              },
-              long_running_reminder_enabled: {
-                type: "boolean",
-                default: true,
-                description:
-                  "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
-              },
-              long_running_reminder_interval_ms: {
-                type: "integer",
-                minimum: 1,
-                default: 600000,
-                description:
-                  "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
-              },
-            },
-            additionalProperties: false,
-            description:
-              "Experimental bash hoisting / rewrite / compression / background features.",
-          },
           lsp_ty: {
             type: "boolean",
             default: false,

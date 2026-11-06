@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use aft::config::{Config, UserServerDef};
 use aft::config_resolve::{resolve_config_for_harness, ConfigTier};
-use aft::feature_config::validate_resolved_config;
+use aft::feature_config::{validate_resolved_config, REMOVED_OPENCODE_PATHS};
 use aft::harness::Harness;
 use serde_json::Value;
 use std::str::FromStr;
@@ -103,6 +103,21 @@ fn read_harness(dir: &Path) -> Harness {
         .unwrap_or_else(|error| panic!("invalid fixture harness {value:?}: {error}"))
 }
 
+/// Whether the plugins refuse this user file before the engine sees it: they
+/// refuse the removed OpenCode prompt-server keys in every tier, while the
+/// names retired in 0.62 or earlier are translated in a user file.
+fn plugins_refuse_user_file(user: &ConfigTier) -> bool {
+    resolve_config_for_harness(std::slice::from_ref(user), None)
+        .errors
+        .iter()
+        .any(|error| {
+            error.starts_with("removed_config_key:")
+                && REMOVED_OPENCODE_PATHS
+                    .iter()
+                    .any(|(path, _)| error.contains(path))
+        })
+}
+
 fn assert_case(dir: &Path) -> Option<String> {
     let case = dir.file_name().unwrap().to_string_lossy().to_string();
 
@@ -112,10 +127,15 @@ fn assert_case(dir: &Path) -> Option<String> {
     if let Some(mut user) = read_tier(dir, "user.jsonc", "user") {
         // The engine rewrites the user file to current keys before it resolves
         // it, and the plugins translate the user file in memory for that one
-        // start, so feed the resolver the rewritten text. A file the rewrite
-        // cannot parse is passed through unchanged for the resolver to reject.
-        if let Ok(migration) = aft::config_fix::migrate_user_config_text(&user.doc) {
-            user.doc = migration.text;
+        // start, so feed the resolver the rewritten text. The exception is a
+        // user file the plugins refuse outright (the removed OpenCode
+        // prompt-server keys): it never reaches the engine, so it stays as
+        // written and both sides report its own refusal. A file the rewrite
+        // cannot parse is also passed through for the resolver to reject.
+        if !plugins_refuse_user_file(&user) {
+            if let Ok(migration) = aft::config_fix::migrate_user_config_text(&user.doc) {
+                user.doc = migration.text;
+            }
         }
         tiers.push(user);
     }
