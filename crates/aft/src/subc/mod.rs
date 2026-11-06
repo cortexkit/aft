@@ -1338,7 +1338,10 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// `thalamus-harness` (binary `ck-thalamus-harness`) is CortexKit's harness
 /// module, which hosts OpenCode for Alfonso: `opencode` for OpenCode 1 and
 /// `opencode2` for sessions on its OpenCode 2 server (a runner session; see
-/// `Harness::from_str`). `thalamus-pi` is its counterpart for Pi: it binds
+/// `Harness::from_str`). It also hosts headless Claude Code sessions as
+/// `claude-code`, whose tools run in the same tool lane and reach AFT over
+/// the same scoped routes as its OpenCode 2 sessions, so they are runner
+/// sessions too. `thalamus-pi` is its counterpart for Pi: it binds
 /// its Pi sessions with harness `pi`, on routes core opens under each
 /// session's scope, and a call that needs the user's permission is held
 /// and answered by core (the `held-reply/v1` capability), as on the
@@ -1346,6 +1349,7 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[
     ("thalamus-harness", "opencode"),
     ("thalamus-harness", "opencode2"),
+    ("thalamus-harness", "claude-code"),
     ("thalamus-pi", "pi"),
 ];
 
@@ -20231,6 +20235,36 @@ mod tests {
             trust_for_bind("opencode2", &reserved("some-other-module")),
             BindTrust::Untrusted
         );
+    }
+
+    #[test]
+    fn thalamus_harness_on_claude_code_is_first_party_and_no_lookalike_is() {
+        let principal = reserved("thalamus-harness");
+        assert_eq!(
+            trust_for_bind("claude-code", &principal),
+            BindTrust::FirstParty
+        );
+        for harness in [
+            "Claude-Code",
+            "claude-code ",
+            "claude",
+            "claude_code",
+            "fed:claude-code",
+        ] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-harness must stay untrusted on harness {harness:?}"
+            );
+        }
+        // Another reserved module binding for Claude Code stays untrusted.
+        for module in ["thalamus-pi", "some-other-module"] {
+            assert_eq!(
+                trust_for_bind("claude-code", &reserved(module)),
+                BindTrust::Untrusted,
+                "{module} must stay untrusted on claude-code"
+            );
+        }
     }
 
     #[test]
