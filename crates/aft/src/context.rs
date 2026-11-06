@@ -4884,6 +4884,12 @@ pub struct AppContext {
     /// checkouts in the data layer; empty otherwise (see
     /// `data_layer::parent`).
     data_children: crate::data_layer::parent::ChildCheckouts,
+    /// Repositories outside this root that `aft_search` was asked about,
+    /// each answered from its own checkout in the data layer, by root (see
+    /// `data_layer::tools::search::ExternalSearch`). Released when idle.
+    data_external: parking_lot::Mutex<
+        std::collections::HashMap<PathBuf, Arc<crate::data_layer::tools::search::ExternalSearch>>,
+    >,
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
@@ -5875,6 +5881,7 @@ impl AppContext {
             data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
+            data_external: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
@@ -10069,6 +10076,24 @@ impl AppContext {
             };
         }
         slot.clone()
+    }
+
+    /// The search of the repository at `root`, outside this context's root,
+    /// on the data layer: the one this context holds, or `bind()`'s, kept
+    /// until the context's idle handles are released. A `None` from `bind`
+    /// is not kept, so the next query looks again.
+    pub(crate) fn external_data_search(
+        &self,
+        root: &Path,
+        bind: impl FnOnce() -> Option<crate::data_layer::tools::search::ExternalSearch>,
+    ) -> Option<Arc<crate::data_layer::tools::search::ExternalSearch>> {
+        let mut external = self.data_external.lock();
+        if let Some(search) = external.get(root) {
+            return Some(Arc::clone(search));
+        }
+        let search = Arc::new(bind()?);
+        external.insert(root.to_path_buf(), Arc::clone(&search));
+        Some(search)
     }
 
     /// Makes `checkout` this context's checkout in the data layer, kept
@@ -16032,6 +16057,9 @@ impl AppContext {
         let Some(mut data_checkout) = self.data_checkout.try_lock() else {
             return false;
         };
+        let Some(mut data_external) = self.data_external.try_lock() else {
+            return false;
+        };
         if !self.search_exact_memo.try_clear_idle() {
             return false;
         }
@@ -16063,6 +16091,7 @@ impl AppContext {
             callgraph_view.take(),
             callgraph_borrow.take(),
             data_checkout.take(),
+            std::mem::take(&mut *data_external),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -16079,6 +16108,7 @@ impl AppContext {
             lexical_retry,
             callgraph_retry,
             data_checkout,
+            data_external,
         ));
         // Native session destruction can wait for ORT. Keep it, and worker
         // channel teardown, off the daemon's frame loop.

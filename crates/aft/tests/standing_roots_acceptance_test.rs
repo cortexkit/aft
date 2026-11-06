@@ -273,7 +273,6 @@ fn standing_search_root(standing_root: &Path, config_home: &Path) -> PathBuf {
 /// `aft_search` given that root as its path must answer from that store. It
 /// answers from the bounded walk of a root with no index instead.
 #[test]
-#[ignore = "data-layer defect: external-root aft_search does not read the root's data-layer store"]
 fn daemonless_query_reads_the_data_layer_store_aft_index_wrote() {
     let standing_root = tempfile::tempdir().expect("standing root");
     let session_root = tempfile::tempdir().expect("session root");
@@ -305,7 +304,6 @@ fn daemonless_query_reads_the_data_layer_store_aft_index_wrote() {
 }
 
 #[test]
-#[ignore = "data-layer defect: external-root aft_search does not read the root's data-layer store"]
 fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
     let standing_root = tempfile::tempdir().expect("standing root");
     let session_root = tempfile::tempdir().expect("session root");

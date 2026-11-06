@@ -859,6 +859,46 @@ pub(crate) fn search_cancellation_requested() -> bool {
     crate::executor::current_job_cancelled()
 }
 
+/// `req` answered from `external`, the data-layer checkout of the repository
+/// at `root` outside the configured root, with what today's external replies
+/// carry: `external_root`, and, for a daemonless query of a standing root,
+/// the stale CLI snapshot warning when the root still owes a strict
+/// verification or files changed since the snapshot the checkout holds; the
+/// answer is then partial.
+fn external_data_layer_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    root: &Path,
+    external: &crate::data_layer::tools::search::ExternalSearch,
+) -> Response {
+    let (mut response, drift) = external.search(req, ctx);
+    if !response.success {
+        return response;
+    }
+    let mut metadata = if ctx.daemonless_query_mode() {
+        standing_snapshot_metadata(root, Some(&ctx.storage_dir()))
+    } else {
+        ExternalBorrowMetadata::default()
+    };
+    metadata.record_drift(drift, false);
+    let stale = metadata.stale_cli_snapshot();
+    if let Some(body) = response.data.as_object_mut() {
+        body.insert(
+            "external_root".into(),
+            serde_json::json!(root.display().to_string()),
+        );
+        if stale {
+            let warnings = body
+                .entry("warnings")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(serde_json::json!(STALE_CLI_SNAPSHOT_WARNING));
+            }
+        }
+    }
+    stale_cli_snapshot_partial_response(response, stale)
+}
+
 fn cancelled_search_response(req: &RawRequest) -> Response {
     cancelled_search_response_from_id(&req.id)
 }
@@ -1040,6 +1080,13 @@ fn handle_semantic_search_with_disk_fallback(
     } else {
         None
     };
+    // With the data layer, a repository whose checkout `aft index` or another
+    // AFT published is answered from that checkout, as its own root would be.
+    if let Some(root) = external_root.as_deref() {
+        if let Some(external) = crate::data_layer::tools::search::ExternalSearch::of(ctx, root) {
+            return external_data_layer_search(req, ctx, root, &external);
+        }
+    }
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();

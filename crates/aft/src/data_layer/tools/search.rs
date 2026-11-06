@@ -831,6 +831,147 @@ fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
         .starts_with(crate::inspect::job::normalize_path(search_root))
 }
 
+/// A repository outside the configured root that `aft_search` was given as
+/// its `path`, answered from the repository's own checkout in the data
+/// layer once `aft index` or another AFT has published one. A context binds
+/// it once and releases it with its other idle handles.
+pub(crate) struct ExternalSearch {
+    checkout: std::sync::Arc<crate::data_layer::runtime::DataCheckout>,
+    /// A search context for the repository alone, answering from
+    /// `checkout` (see `AppContext::pin_data_checkout`).
+    engine: crate::context::AppContext,
+    /// Set until the first search: the bind has just compared the files on
+    /// disk with the publication, so that search need not again.
+    just_bound: std::sync::atomic::AtomicBool,
+}
+
+impl ExternalSearch {
+    /// The search of the repository at `root` for `ctx`, bound now if `ctx`
+    /// holds none: `None` when the data layer is off, or nothing has
+    /// published a checkout of `root`. Such a repository is walked, as
+    /// today, and a query never builds a store for it.
+    pub(crate) fn of(
+        ctx: &crate::context::AppContext,
+        root: &Path,
+    ) -> Option<std::sync::Arc<Self>> {
+        if !crate::data_layer::runtime::enabled() {
+            return None;
+        }
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        ctx.external_data_search(&root, || Self::bind(ctx, &root))
+    }
+
+    fn bind(ctx: &crate::context::AppContext, root: &Path) -> Option<Self> {
+        let storage = ctx.storage_dir();
+        let planes = crate::data_layer::checkout::Planes {
+            text: true,
+            callgraph: false,
+        };
+        // A checkout with no publication would start a build as it binds,
+        // and a repository with no store would get one, so a query of
+        // another repository looks first, with a foreground bind that
+        // starts nothing.
+        if !crate::data_layer::runtime::has_family_store(root, &storage) {
+            return None;
+        }
+        let published = crate::data_layer::runtime::bind_foreground(root, &storage, planes)
+            .ok()?
+            .view()
+            .is_some();
+        if !published {
+            return None;
+        }
+        let checkout =
+            crate::data_layer::runtime::DataCheckout::open_planes(root, &storage, None, planes)
+                .map_err(|error| {
+                    crate::slog_warn!("data layer could not bind {}: {error}", root.display());
+                })
+                .ok()?;
+        let session = ctx.config();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.to_path_buf());
+        config.storage_dir = Some(storage);
+        // The engine reads only the pinned checkout, never a view of its own.
+        config.views.enabled = false;
+        config.indexes.trigram = true;
+        config.indexes.semantic = session.indexes.semantic;
+        config.indexes.callgraph = false;
+        config.semantic = session.semantic.clone();
+        let engine = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        engine.pin_data_checkout(std::sync::Arc::clone(&checkout));
+        Some(Self {
+            checkout,
+            engine,
+            just_bound: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Answers `req` from the repository's checkout. Its files are compared
+    /// with the checkout's state first (a repository outside the root has
+    /// no watcher), so text answers read what changed from disk. Its meaning
+    /// plane reads the vectors the repository's store holds for `ctx`'s
+    /// model and never fills: semantic search is not admitted for a
+    /// repository no session opened. The query is embedded with `ctx`'s
+    /// model, lent to the engine for the call. Returns the reply and how many
+    /// paths differ from the publication the answer read.
+    pub(crate) fn search(
+        &self,
+        req: &crate::protocol::RawRequest,
+        ctx: &crate::context::AppContext,
+    ) -> (crate::protocol::Response, usize) {
+        if !self
+            .just_bound
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Err(error) = self.checkout.checkout().rescan() {
+                crate::slog_warn!(
+                    "data layer could not compare {} with its files: {error}",
+                    self.checkout.root().display()
+                );
+            }
+        }
+        let config = ctx.config();
+        let mut lent = ctx.semantic_embedding_model().lock().take();
+        if config.indexes.semantic {
+            if lent.is_none() {
+                lent =
+                    crate::semantic_index::EmbeddingModel::from_config_for_query(&config.semantic)
+                        .ok();
+            }
+            if let Some(fingerprint) = lent
+                .as_mut()
+                .and_then(|model| model.fingerprint(&config.semantic).ok())
+            {
+                if let Err(error) = self
+                    .checkout
+                    .read_meaning_only(&config.semantic, &fingerprint)
+                {
+                    crate::slog_warn!(
+                        "data layer cannot read the meaning plane of {}: {error}",
+                        self.checkout.root().display()
+                    );
+                }
+            }
+        }
+        *self.engine.semantic_embedding_model().lock() = lent;
+        let response =
+            crate::commands::semantic_search::handle_parent_child_search(req, &self.engine);
+        let returned = self.engine.semantic_embedding_model().lock().take();
+        let mut model = ctx.semantic_embedding_model().lock();
+        if model.is_none() {
+            *model = returned;
+        }
+        let drift = self
+            .checkout
+            .view()
+            .map_or(0, |view| view.changed_paths().len());
+        (response, drift)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
