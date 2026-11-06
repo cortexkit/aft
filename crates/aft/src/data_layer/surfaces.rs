@@ -1089,7 +1089,8 @@ pub struct MeaningOutcome {
 ///
 /// When the store cannot be opened, the build fails, or a fill round fails
 /// (the embedding model cannot load, or the backend refuses or cannot be
-/// reached), with the message status would give.
+/// reached), with the message the status tool's `semantic_index.error`
+/// would carry for that failure.
 pub fn fill_root(
     root: &Path,
     storage: &Path,

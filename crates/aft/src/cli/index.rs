@@ -81,9 +81,10 @@ type DataLayerBuild = fn(
     aft::data_layer::checkout::Planes,
 ) -> Result<aft::data_layer::surfaces::IndexOutcome, String>;
 
-/// Fills the data layer's meaning plane of the checkout at a root (the first
-/// path), with its family store under a storage folder (the second), with an
-/// embedding model's configuration, in the foreground.
+/// Fills the data layer's meaning plane (its semantic index) of the checkout
+/// at a root (the first path), with the repository's store under a storage
+/// folder (the second), with an embedding model's configuration, in the
+/// foreground.
 type DataLayerFill = fn(
     &Path,
     &Path,
@@ -105,8 +106,8 @@ enum UnitWriter {
     /// The data layer, whose family store orders publications with its own
     /// writer.
     DataLayer(DataLayerBuild),
-    /// The data layer's meaning plane, filled through the family store's
-    /// fill lock, which one fill of the repository holds at a time.
+    /// The data layer's meaning plane, filled under the lock in the
+    /// repository's data-layer store that one fill at a time holds.
     DataLayerFill(DataLayerFill),
 }
 

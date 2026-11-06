@@ -863,8 +863,9 @@ pub(crate) fn search_cancellation_requested() -> bool {
 /// at `root` outside the configured root, with what today's external replies
 /// carry: `external_root`, and, for a daemonless query of a standing root,
 /// the stale CLI snapshot warning when the root still owes a strict
-/// verification or files changed since the snapshot the checkout holds; the
-/// answer is then partial.
+/// verification (its durable flag that only a full `aft index` run clears)
+/// or files changed since the snapshot the checkout holds; the answer is then
+/// partial.
 fn external_data_layer_search(
     req: &RawRequest,
     ctx: &AppContext,
@@ -4463,9 +4464,9 @@ fn regex_route_collection(
         drop(guard);
         match legacy {
             Some(snapshot) => snapshot,
-            // With no index of today's, as for a repository outside the
-            // root answered from its data-layer checkout, the checkout's
-            // text plane names the candidate files, when it is ready.
+            // With no ready legacy search index (as for a repository outside
+            // the root, answered from its data-layer checkout), the
+            // checkout's text index names the candidate files, when ready.
             None => match data_layer_regex_candidates(ctx, compiled)? {
                 Ok(snapshot) => snapshot,
                 Err(error) => return Some(Err(error)),
@@ -4488,9 +4489,9 @@ fn regex_route_collection(
     Some(collection)
 }
 
-/// The files the data layer's text plane admits for `compiled`, as a
-/// snapshot the regex route verifies: `None` when this root's checkout has no
-/// ready text plane.
+/// The files the data layer's text index (its checkout's text plane) admits
+/// for `compiled`, as a snapshot the regex route verifies: `None` when this
+/// root's checkout has no ready text index.
 fn data_layer_regex_candidates(
     ctx: &AppContext,
     compiled: &pattern_compile::CompiledPattern,
@@ -12538,7 +12539,8 @@ mod tests {
     }
 
     /// A first fill against an embedding backend nothing listens on is retried
-    /// later with nothing filled, so the meaning plane reports itself waiting
+    /// later with nothing filled, so the meaning plane (the data layer's
+    /// semantic index) reports itself waiting
     /// for the backend. The search reply used to call that "rebuilding"; it
     /// must name the backend outage instead, with the configured URL and the
     /// engine's reason, and status must report the backend unavailable.

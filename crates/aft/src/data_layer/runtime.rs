@@ -1001,9 +1001,10 @@ pub(crate) fn bind_foreground(
     Checkout::bind_planes(layer(), &family_dir, family, root, planes)
 }
 
-/// Whether the repository of the checkout at `root` has a family store
-/// under `storage`: binding a checkout of a repository with none would make
-/// one. `false` when Git could not tell the repository's identity.
+/// Whether `storage` already holds the family store (the data layer's store
+/// shared by every checkout of one repository) of the repository at `root`:
+/// binding a checkout of a repository with none would make one. `false` when
+/// Git could not tell the repository's identity.
 pub(crate) fn has_family_store(root: &Path, storage: &Path) -> bool {
     family_of(root).is_ok_and(|family| {
         storage
