@@ -170,8 +170,9 @@ def without_process_noise(left: JsonObject, right: JsonObject) -> tuple[JsonObje
         if isinstance(text, str):
             text = STATUS_BAR.sub("", text)
             # The notice sits on its own line after a blank line, or ends the
-            # text after one.
-            text = re.sub(r"\n{1,2}" + re.escape(WATCHER_NOTICE), "", text)
+            # text after one. The tool-call formatter then adds the status line
+            # the notice's gap makes the reply incomplete with.
+            text = re.sub(r"\n{1,2}" + re.escape(WATCHER_NOTICE) + r"(\nSearch status: partial/incomplete\.)?", "", text)
             reply["text"] = text
         gaps = reply.get("gaps")
         if isinstance(gaps, list):
@@ -319,6 +320,9 @@ def replay(process: Process, rows: Sequence[JsonObject], send: Any, out: Path) -
                     # The client numbers its requests; this row's is the last.
                     "request_id": str(process.client._next_id),
                     "semantic_lane": semantic_lane_ran(response),
+                    # The route that answered: a regex, literal or lexical
+                    # route runs no semantic search whatever the plan lists.
+                    "interpreted_as": response.get("interpreted_as"),
                 }
             )
     return measures
@@ -476,7 +480,7 @@ def run_family(
             "latency": {mode: latency(measures[mode]) for mode in modes},
             "rows_measured": {
                 mode: [
-                    {key: measure[key] for key in ("view_reads", "meaning_reads", "semantic_lane")}
+                    {key: measure[key] for key in ("view_reads", "meaning_reads", "semantic_lane", "interpreted_as")}
                     | {"latency_ms": round(measure["latency_ms"], 1)}
                     for measure in measures[mode]
                 ]
