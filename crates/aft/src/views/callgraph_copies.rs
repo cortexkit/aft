@@ -311,5 +311,4 @@ mod tests {
             "the existing membership base must not cost another slot"
         );
     }
-
 }

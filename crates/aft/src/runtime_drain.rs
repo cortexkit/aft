@@ -1275,8 +1275,6 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         let _ = crate::commands::configure::ensure_ready_semantic_refresh_worker(ctx);
     }
 
-    
-
     if disconnected && !terminal {
         let committed =
             ctx.with_current_semantic_index_rx(receiver_generation, receiver_epoch, |receiver| {
@@ -2706,13 +2704,8 @@ impl Drop for FileMutationGuard<'_> {
         if !self.revisit.is_empty() {
             let mut budget = MutationRefreshBudget::new();
             let mut discovered = std::collections::BTreeSet::new();
-            let _ = collect_mutation_paths(
-                self.ctx,
-                &self.revisit,
-                &mut discovered,
-                None,
-                &mut budget,
-            );
+            let _ =
+                collect_mutation_paths(self.ctx, &self.revisit, &mut discovered, None, &mut budget);
             for path in discovered.difference(&self.paths) {
                 self.files_before.entry(path.clone()).or_insert(false);
             }
@@ -3120,7 +3113,6 @@ pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
 }
 
 pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
-    
     {
         return;
     }
@@ -3353,11 +3345,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     dispatch_events_received += 1;
                     // Earlier batches may still await sliced Tier-2 work. Record
                     // their intents now so the cookie cannot overtake them.
-                    for pending in &state.pending_paths {
-                    }
+                    for pending in &state.pending_paths {}
                     if let WatcherDrainPhase::Apply { paths, .. } = &state.phase {
-                        for pending in paths {
-                        }
+                        for pending in paths {}
                     }
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
@@ -3598,7 +3588,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_refresh_due = None;
             state.ignore_changed_paths.clear();
             state.ignore_changed_path_count = 0;
-            
         }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
@@ -3622,7 +3611,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_refresh_due = None;
                 state.ignore_changed_paths.clear();
                 state.ignore_changed_path_count = 0;
-                
             }
         }
 
@@ -7763,7 +7751,6 @@ mod watcher_slice_tests {
             "owner roots stay on the normal writer path even when the gate is on"
         );
     }
-
 }
 
 // Every test here spawns a real child process, so the module is Unix-only.

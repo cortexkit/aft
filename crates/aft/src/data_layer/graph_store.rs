@@ -396,6 +396,21 @@ impl<'i> SectionsWriter<'i> {
         Ok(())
     }
 
+    /// Leaves out of the segment the records and fragments `held` says the
+    /// family already stores elsewhere. Each file still gets its fragment's
+    /// key, so the checkout's state names it wherever it is stored. Returns
+    /// how many records and fragments were left out.
+    pub(crate) fn leave_out(
+        &mut self,
+        mut held_record: impl FnMut(RecordKey) -> bool,
+        mut held_fragment: impl FnMut(FragmentKey) -> bool,
+    ) -> (usize, usize) {
+        let (records, fragments) = (self.content.len(), self.graph.len());
+        self.content.retain(|key| !held_record(key));
+        self.graph.retain(|key| !held_fragment(key));
+        (records - self.content.len(), fragments - self.graph.len())
+    }
+
     /// Writes the content and graph sections into `writer`, adding to
     /// `memory`, when given, what the two held. Returns each file's fragment
     /// key.

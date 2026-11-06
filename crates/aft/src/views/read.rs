@@ -588,5 +588,4 @@ mod producer_tests {
         std::fs::write(&absolute, b"fn changed() {}").unwrap();
         assert!(!callgraph_paths_match_v2(&manifest, root.path(), &[absolute]).unwrap());
     }
-
 }

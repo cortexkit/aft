@@ -312,8 +312,6 @@ impl AppContext {
             semantic_index_info
         };
 
-        
-
         // Disk cache sizes — scoped to the **current project** only.
         //
         // Both trigram (`<storage_dir>/index/<key>/`) and semantic
@@ -599,7 +597,7 @@ impl AppContext {
                 "checkpoints": session_checkpoints,
             },
         });
-        
+
         // With the data layer on, its planes replace today's stores for text
         // and the call graph on every status surface.
         if let Some(report) = &data_store_report {

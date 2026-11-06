@@ -348,11 +348,15 @@ impl Work {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = BuildRetry::default();
                     crate::slog_info!(
-                        "data layer built {}: {} files, {} parsed, {} bytes",
+                        "data layer built {}: {} files, {} parsed, {} bytes; shared with other \
+                         checkouts: {} text units, {} records, {} fragments",
                         work.checkout.root().display(),
                         report.files,
                         report.parsed_files,
-                        report.segment_bytes
+                        report.segment_bytes,
+                        report.shared.text_units,
+                        report.shared.records,
+                        report.shared.fragments
                     );
                     // Changes recorded while the build ran stay laid over its
                     // publication and wait for the call graph.

@@ -66,4 +66,3 @@ fn call_with_drain(
     assert!(result.response.success, "{}", result.text);
     result
 }
-

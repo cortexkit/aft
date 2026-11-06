@@ -159,4 +159,3 @@ fn natural_language_without_identifier_token_does_not_select_symbol() {
     assert!(!facts.has_identifier_token);
     assert!(!plan.selected_lanes.contains(&SearchLaneKind::Symbol));
 }
-

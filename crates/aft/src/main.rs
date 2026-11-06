@@ -1160,10 +1160,7 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// Deadline-bounded EOF index flush, shared by the transport and its regression tests.
-fn flush_indexes_on_graceful_shutdown(
-    shutdown_started: Instant,
-    drained_at: Instant,
-) {
+fn flush_indexes_on_graceful_shutdown(shutdown_started: Instant, drained_at: Instant) {
     // Tests share the callgraph refresh worker, so one test must not drain another's job.
     #[cfg(test)]
     let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
@@ -2316,7 +2313,6 @@ fn input_queue_full_response(id: &str) -> Response {
 #[cfg(test)]
 mod mutation_index_membership_tests {
     use super::*;
-
 }
 
 #[cfg(test)]
@@ -3927,7 +3923,6 @@ mod graceful_shutdown_search_index_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-
 }
 
 #[cfg(test)]

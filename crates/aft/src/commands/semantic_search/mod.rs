@@ -696,8 +696,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some()
-        {
+        if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
             return extensions::ReadinessWait::Completed;
         }
         // A data-layer meaning plane that serves answers the search now;
@@ -8147,7 +8146,7 @@ fn search_index_ready_with_budget(
     if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
         return Ok(true);
     }
-    
+
     Ok(false)
 }
 

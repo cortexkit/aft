@@ -2911,7 +2911,6 @@ struct SymbolPrewarmStop {
 }
 
 impl SymbolPrewarmStop {
-
     #[cfg(test)]
     fn never() -> Self {
         Self {
@@ -5188,8 +5187,7 @@ fn schedule_missing_artifact_loads(
     request_search: bool,
     request_semantic: bool,
 ) -> ArtifactLoadStarts {
-    let semantic_view_work_allowed =
-        false;
+    let semantic_view_work_allowed = false;
     schedule_missing_artifact_loads_admitted(
         ctx,
         request_search,
@@ -5382,8 +5380,7 @@ fn schedule_artifact_loads(
     load_search: bool,
     load_semantic: bool,
 ) -> ArtifactLoadStarts {
-    let semantic_view_work_allowed =
-        false;
+    let semantic_view_work_allowed = false;
     schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
 }
 
@@ -5467,7 +5464,6 @@ fn schedule_artifact_loads_admitted(
     let legacy_symbol_prewarm = false;
     let mut search_artifact_load_start = None;
     let mut semantic_artifact_load_start = None;
-
 
     // With the data layer on, its meaning plane serves this root's semantic
     // search and its checkout fills it (see `data_layer::meaning`); neither
@@ -7241,7 +7237,6 @@ impl ConfigureMaintenanceContinuation {
             .or(self.lexical_bind_retry_at)
             .or(self.replay_retry_at)
     }
-
 }
 
 #[derive(Debug, Default)]
@@ -8289,7 +8284,6 @@ fn delay_configure_storage_sweeps_for_debug() {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     #[path = "disk_reserve_tests.rs"]
@@ -8442,9 +8436,9 @@ mod tests {
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
-        slow_configure_prefix_line, validate_storage_dir,
-        wait_for_semantic_artifact_start, ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS,
-        INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
+        slow_configure_prefix_line, validate_storage_dir, wait_for_semantic_artifact_start,
+        ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK,
+        INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
@@ -18715,7 +18709,10 @@ mod tests {
             assert!(!false);
             assert!(ctx.semantic_index_rx().lock().is_none());
             assert!(ctx.callgraph_store_rx().lock().is_none());
-            assert!(ctx.data_checkout().is_none(), "broad root must bind no checkout");
+            assert!(
+                ctx.data_checkout().is_none(),
+                "broad root must bind no checkout"
+            );
             assert!(true);
             assert!(crate::views::parent::session_for_root(root).is_none());
             assert!(!ctx.watcher_runtime_active());

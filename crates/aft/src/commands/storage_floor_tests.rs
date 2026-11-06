@@ -834,4 +834,3 @@ fn storage_floor_zoom_single_target_refuses_but_two_target_batch_continues() {
         );
     }
 }
-

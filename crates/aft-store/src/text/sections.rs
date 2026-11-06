@@ -153,6 +153,12 @@ impl TextSectionsBuilder {
         self.units.is_empty()
     }
 
+    /// Keeps only the contents `keep` accepts: a build leaves out those
+    /// another segment of the family already holds.
+    pub fn retain(&mut self, mut keep: impl FnMut(ContentKey) -> bool) {
+        self.units.retain(|key, _| keep(*key));
+    }
+
     /// Writes the four sections into `writer`.
     ///
     /// # Errors

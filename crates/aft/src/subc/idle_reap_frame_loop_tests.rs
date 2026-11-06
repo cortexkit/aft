@@ -12,7 +12,12 @@ use super::*;
 use crate::context::pending_restore_work;
 use std::collections::BTreeSet;
 
-type PendingSnapshot = (BTreeSet<PathBuf>, BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool);
+type PendingSnapshot = (
+    BTreeSet<PathBuf>,
+    BTreeSet<PathBuf>,
+    BTreeSet<PathBuf>,
+    bool,
+);
 
 /// A small deterministic generator, so a failing sequence replays from its
 /// seed.

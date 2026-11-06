@@ -1935,8 +1935,7 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
 }
 
 #[cfg(test)]
-mod keepalive_tests {
-}
+mod keepalive_tests {}
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
     let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());

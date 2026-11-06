@@ -924,24 +924,20 @@ fn handle_inspect_payload(
     let needs_ephemeral_view = (scope_was_provided || !ctx.inspect_writer()) && tier2_enabled;
     // Reuse the blocking request's inventory, or collect it once for a warm
     // request. Explaining an unavailable view must not walk the project again.
-    let checkout_view_files =
-        false.then(|| {
-            observed_stats
-                .map(|stats| {
-                    stats
-                        .0
-                        .iter()
-                        .map(|(path, _, _)| path.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    crate::callgraph::walk_project_files(&snapshot.project_root).collect()
-                })
-        });
-    let checkout_store =
-        {
-            checkout_store
-        };
+    let checkout_view_files = false.then(|| {
+        observed_stats
+            .map(|stats| {
+                stats
+                    .0
+                    .iter()
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                crate::callgraph::walk_project_files(&snapshot.project_root).collect()
+            })
+    });
+    let checkout_store = { checkout_store };
     let view_callgraph_observation = if checkout_store.is_none() {
         routed_observation
     } else {
@@ -951,8 +947,7 @@ fn handle_inspect_payload(
     // graph-backed categories report the gap below rather than running the
     // legacy reuse scanner.
     let use_checkout_view = false;
-    let checkout_view_unavailability = false
-    .then(|| {
+    let checkout_view_unavailability = false.then(|| {
         manager.checkout_view_unavailability(
             &snapshot,
             checkout_view_files.as_deref().unwrap_or_default(),
@@ -1642,7 +1637,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     return;
                 }
             };
-            
+
             // Queueing instead of sharing a response keeps request-specific scopes,
             // phase logs, and terminals independent while bounding expensive work to
             // one detached inspect body per root.

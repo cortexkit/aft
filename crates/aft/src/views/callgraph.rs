@@ -813,7 +813,6 @@ pub(crate) fn view_scope(root: &Path) -> String {
 }
 
 impl CallgraphView {
-
     #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,

@@ -99,7 +99,6 @@ impl LexicalViewSnapshot {
             Self::ImportBuilding => None,
         }
     }
-
 }
 
 /// Checkout-local lexical authority, independent of the semantic worker's
@@ -223,7 +222,6 @@ impl LexicalSnapshotSource for CheckoutLexicalSource {
 }
 
 impl LexicalView {
-
     #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
@@ -250,7 +248,6 @@ impl LexicalView {
     pub(crate) fn acquisitions_for_test(&self) -> usize {
         self.acquisitions.load(std::sync::atomic::Ordering::Relaxed)
     }
-
 }
 
 /// The query snapshot of a lexical view generation another session

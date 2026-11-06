@@ -288,9 +288,7 @@ struct DiskHasher {
     remaining: usize,
 }
 
-impl DiskHasher {
-
-}
+impl DiskHasher {}
 
 fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())

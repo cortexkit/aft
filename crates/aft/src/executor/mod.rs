@@ -1699,9 +1699,7 @@ impl Executor {
                     | "trace_to_symbol"
                     | "trace_data"
             )
-            && self
-                .actor_context(&root_id)
-                .is_some_and(|ctx| false)
+            && self.actor_context(&root_id).is_some_and(|ctx| false)
         {
             Lane::PureRead
         } else {

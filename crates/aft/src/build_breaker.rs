@@ -855,5 +855,4 @@ mod tests {
         assert_eq!(suspension.reason, "in_build_burn_limit");
         assert_eq!(suspension.domain, BuildDomain::Tier2Scan);
     }
-
 }

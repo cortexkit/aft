@@ -16,7 +16,6 @@ pub(crate) struct BackgroundImport {
 }
 
 impl BackgroundImport {
-
     pub(crate) fn is_building(&self) -> bool {
         !self.done.load(Ordering::Acquire)
     }
@@ -31,4 +30,3 @@ impl BackgroundImport {
         !self.is_building()
     }
 }
-

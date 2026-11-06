@@ -640,7 +640,7 @@ pub(crate) fn schedule_with_reason(
     // A root whose reads all go through its v3 checkout views has no reader
     // of the content-addressed v1 view, so nothing is assembled, put into
     // the v1 blob store or published for it.
-    
+
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
         if ctx

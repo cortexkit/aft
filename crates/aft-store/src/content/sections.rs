@@ -139,6 +139,12 @@ impl ContentSectionsBuilder {
         self.records.is_empty()
     }
 
+    /// Keeps only the records `keep` accepts: a build leaves out those
+    /// another segment of the family already holds.
+    pub fn retain(&mut self, mut keep: impl FnMut(RecordKey) -> bool) {
+        self.records.retain(|key, _| keep(*key));
+    }
+
     /// Writes the four sections into `writer`.
     ///
     /// # Errors

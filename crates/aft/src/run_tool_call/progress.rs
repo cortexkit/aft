@@ -120,9 +120,7 @@ pub(crate) struct BuildProgress {
     last: Vec<(u64, &'static str, u64, Option<u64>)>,
 }
 
-impl BuildProgress {
-
-}
+impl BuildProgress {}
 
 #[cfg(test)]
 mod tests {
@@ -205,5 +203,4 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
     }
-
 }

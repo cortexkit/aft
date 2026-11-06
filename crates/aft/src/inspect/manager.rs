@@ -180,7 +180,6 @@ pub(crate) struct DeadCodeSnapshotCensus {
 }
 
 impl ProjectionFleet {
-
     fn forget(&mut self, root: &Path) {
         if let Some(entry) = self.entries.remove(root) {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
@@ -1873,7 +1872,7 @@ impl InspectManager {
         if !snapshot.config.indexes.callgraph {
             return false;
         }
-        
+
         callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
             .into_iter()
             .any(|dir| {
@@ -4064,11 +4063,7 @@ impl InspectManager {
                         phases.projection = Some(verdict);
                         phases.projection_cost += projection_cost;
                     }
-                    None => {
-                        phases.projection_skip_reason = Some({
-                            "no_callgraph"
-                        })
-                    }
+                    None => phases.projection_skip_reason = Some({ "no_callgraph" }),
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -4200,11 +4195,7 @@ impl InspectManager {
                             phases.projection = Some(verdict);
                             phases.projection_cost += projection_cost;
                         }
-                        None => {
-                            phases.projection_skip_reason = Some({
-                                "no_callgraph"
-                            })
-                        }
+                        None => phases.projection_skip_reason = Some({ "no_callgraph" }),
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -4286,18 +4277,13 @@ impl InspectManager {
                     phases.projection = Some(verdict);
                     phases.projection_cost += projection_cost;
                 }
-                None => {
-                    phases.projection_skip_reason = Some({
-                        "no_callgraph"
-                    })
-                }
+                None => phases.projection_skip_reason = Some({ "no_callgraph" }),
             }
             phases.snapshot += snapshot_started.elapsed();
         }
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            
             if options.require_callgraph_snapshot {
                 if let Some(reason) = callgraph_path_identity_gap(job)? {
                     return Ok(InspectScanSuccess {
@@ -5272,7 +5258,6 @@ thread_local! {
 }
 
 fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallGraphStoreError> {
-    
     for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
     {
         let store = match CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone()) {

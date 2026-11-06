@@ -1420,4 +1420,3 @@ fn views_off_folder_is_not_a_parent_session() {
         .any(|kind| kind.starts_with("parent") || kind == "outside_child_repositories"));
     assert!(!Config::default().views.enabled);
 }
-

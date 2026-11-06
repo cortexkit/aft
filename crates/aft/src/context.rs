@@ -5659,9 +5659,7 @@ impl AppContext {
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
         let compression_aggregates = bash_background.compression_aggregate_cache();
-        let view_disk_limits_next_ms = AtomicU64::new({
-            VIEW_DISK_LIMITS_OFF
-        });
+        let view_disk_limits_next_ms = AtomicU64::new({ VIEW_DISK_LIMITS_OFF });
         let checkpoint_store = CheckpointStore::new();
         let checkpoint_namespace_request = checkpoint_store.namespace_request();
         let cache_leases = config.cache_lease.clone().into_iter().collect();
@@ -6107,9 +6105,7 @@ impl AppContext {
         };
         // Opens the view status store on disk, so it also stays ahead of the
         // guards.
-        let views = {
-            None
-        };
+        let views = { None };
         // With the data layer on, its checkout's planes stand in for the
         // search index and call-graph store below, and the views object is
         // left out. Read here, ahead of the guards: it takes the checkout's
@@ -6137,7 +6133,7 @@ impl AppContext {
         };
         // A parent folder's worker reads its children's views itself; their
         // failures are recorded under the parent root and reported here too.
-        
+
         let semantic_status = match self.semantic_index_status.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -7424,7 +7420,7 @@ impl AppContext {
         changes
             .store_paths
             .extend(store_paths.iter().map(|path| relative(path)));
-        
+
         QueryPendingChanges {
             watcher,
             callgraph: changes,
@@ -8966,7 +8962,6 @@ impl AppContext {
     pub fn note_request(&self) {
         *self.last_request_at.lock() = Instant::now();
         let config = self.config();
-        
     }
 
     pub fn last_request_at(&self) -> Instant {
@@ -10462,7 +10457,7 @@ impl AppContext {
         }
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
-        
+
         if self.retire_deleted_view_root() {
             return Err("view publication root was deleted".to_owned());
         }
@@ -10597,9 +10592,7 @@ impl AppContext {
         crate::views::assembly::AssemblyReport,
         crate::executor::view_publication::PublicationFailure,
     > {
-        if self.configure_content_generation() != prepared.content_generation
-            || true
-        {
+        if self.configure_content_generation() != prepared.content_generation || true {
             return Err("view publication configuration was superseded"
                 .to_owned()
                 .into());
@@ -11141,8 +11134,7 @@ impl AppContext {
             .watcher_counters()
             .checkout_watcher_gap_pending
             .swap(false, Ordering::AcqRel)
-        {
-        }
+        {}
     }
 
     pub(crate) fn view_publication_retry(
@@ -18513,10 +18505,7 @@ mod callgraph_store_for_ops_tests {
         drop(ctx);
         let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
         ctx.advance_configure_generation();
-        assert!(
-            !false,
-            "measurement must use the legacy store"
-        );
+        assert!(!false, "measurement must use the legacy store");
         println!(
             "startup measurement paths: store={} original={}",
             ctx.callgraph_store_dir().display(),
@@ -23250,7 +23239,6 @@ mod gitignore_tests {
 #[cfg(test)]
 mod verify_memo_watcher_tests {
     use super::*;
-
 }
 
 #[cfg(test)]

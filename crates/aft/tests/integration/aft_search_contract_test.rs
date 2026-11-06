@@ -2135,4 +2135,3 @@ fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
         "{rendered}"
     );
 }
-

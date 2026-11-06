@@ -598,5 +598,4 @@ pub(super) mod tests {
             |path| serde_json::json!({"query": "artifact", "path": path}),
         );
     }
-
 }

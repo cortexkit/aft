@@ -533,4 +533,3 @@ fn complete_fixture_from_disk_stays_byte_identical() {
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
     assert_eq!(formatted, "Found 4 result(s).");
 }
-

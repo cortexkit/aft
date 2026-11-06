@@ -399,7 +399,12 @@ const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many unchanged files' parses, and separately resolutions, the
 /// call-graph engine keeps decoded between updates (see `update_engine`).
-const ENGINE_DECODED_FILES: usize = 1024;
+/// A decoded resolution of a large repository's file is about half a
+/// megabyte: at 1,024 files each worktree an agent was editing held 0.5 to
+/// 3 GB, and four prefrontal worktrees took the daemon past 20 GB. The next
+/// update decodes again what it reads, at a fraction of a millisecond a
+/// file.
+const ENGINE_DECODED_FILES: usize = 64;
 
 /// One path changed since the publication.
 #[derive(Clone)]
@@ -447,6 +452,9 @@ pub struct DeltaReport {
 pub struct BuildReport {
     pub files: usize,
     pub text_units: usize,
+    /// What the new segment left out because a segment another checkout
+    /// reads already holds it.
+    pub shared: SharedUnits,
     pub parsed_files: usize,
     pub extract_failures: usize,
     pub scan_ms: f64,
@@ -1183,6 +1191,9 @@ impl Checkout {
             self.adopt_newest()?;
             return Ok(report);
         }
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        report.shared =
+            self.leave_out_shared(&snapshot, &mut collected.text, Some(&mut sections))?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected
             .text
@@ -1344,6 +1355,8 @@ impl Checkout {
             self.adopt_newest()?;
             return Ok(false);
         }
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        report.shared = self.leave_out_shared(&snapshot, &mut collected.text, None)?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
         collected
             .text
@@ -1457,31 +1470,16 @@ impl Checkout {
     /// since the build's new segment holds no vectors.
     fn unneeded(&self, own: &CheckoutState) -> Result<Unneeded, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        let mut states = Vec::new();
-        let mut gone = Vec::new();
-        for state_ref in snapshot.manifest().checkouts() {
-            if state_ref.checkout == self.checkout {
-                continue;
+        let (states, gone) = match self.other_states(&snapshot)? {
+            OtherStates::Read { states, gone } => (states, gone),
+            // A state this build cannot read could need any segment.
+            OtherStates::Unreadable { gone } => {
+                return Ok(Unneeded {
+                    segments: Vec::new(),
+                    checkouts: gone,
+                });
             }
-            match snapshot.checkout_state(state_ref.checkout) {
-                Ok(Some(state)) if state.root().is_some_and(folder_is_gone) => {
-                    gone.push(state_ref.checkout);
-                }
-                Ok(Some(state)) => states.push(state),
-                Ok(None) => {}
-                // A state this build cannot read (an older format version,
-                // or damaged) could need any segment. One a newer build
-                // wrote is not among them: it fails the build below with its
-                // refusal, so nothing is retired or reclaimed over it.
-                Err(error) if error.is_unusable_file() => {
-                    return Ok(Unneeded {
-                        segments: Vec::new(),
-                        checkouts: gone,
-                    });
-                }
-                Err(error) => return Err(DataError::store(error)),
-            }
-        }
+        };
         let others = states.iter().collect::<Vec<_>>();
         let read = self.segments_read_by(&snapshot, &others)?;
         let mut needed = read.needed;
@@ -1611,6 +1609,108 @@ impl Checkout {
             usable,
             needed,
         })
+    }
+
+    /// The states of the family's other checkouts in `snapshot`, apart from
+    /// those whose folder is gone, which are listed by id.
+    fn other_states(&self, snapshot: &Snapshot) -> Result<OtherStates, DataError> {
+        let mut states = Vec::new();
+        let mut gone = Vec::new();
+        for state_ref in snapshot.manifest().checkouts() {
+            if state_ref.checkout == self.checkout {
+                continue;
+            }
+            match snapshot.checkout_state(state_ref.checkout) {
+                Ok(Some(state)) if state.root().is_some_and(folder_is_gone) => {
+                    gone.push(state_ref.checkout);
+                }
+                Ok(Some(state)) => states.push(state),
+                Ok(None) => {}
+                // A state this build cannot read: an older format version,
+                // or damaged. One a newer build wrote is not among them: it
+                // fails the build with its refusal, so nothing is written,
+                // retired or reclaimed over it.
+                Err(error) if error.is_unusable_file() => {
+                    return Ok(OtherStates::Unreadable { gone });
+                }
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        Ok(OtherStates::Read { states, gone })
+    }
+
+    /// Leaves out of a build's new segment the text units, content records
+    /// and fragments that a segment another checkout reads already holds.
+    /// Worktrees of one repository hold mostly the same contents, which
+    /// each first build used to store again (about 155 MB for each
+    /// prefrontal worktree). Such a segment stays while that checkout reads
+    /// from it, and this checkout's state then reads from it too, so
+    /// retirement keeps it for either. Leaves nothing out when another
+    /// checkout's state cannot be read.
+    fn leave_out_shared(
+        &self,
+        snapshot: &Snapshot,
+        text: &mut TextSectionsBuilder,
+        sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
+    ) -> Result<SharedUnits, DataError> {
+        let OtherStates::Read { states, .. } = self.other_states(snapshot)? else {
+            return Ok(SharedUnits::default());
+        };
+        if states.is_empty() {
+            return Ok(SharedUnits::default());
+        }
+        let others = states.iter().collect::<Vec<_>>();
+        let read = self.segments_read_by(snapshot, &others)?;
+        let shared = read
+            .usable
+            .iter()
+            .filter(|&&index| read.needed[index])
+            .map(|&index| {
+                read.opened[index]
+                    .as_ref()
+                    .expect("usable segments are open")
+            })
+            .collect::<Vec<_>>();
+        let mut texts = Vec::new();
+        for segment in &shared {
+            if let Some(found) = TextSegment::open(segment).map_err(DataError::store)? {
+                texts.push(found);
+            }
+        }
+        let locator = TextLocator::build(&texts).map_err(DataError::store)?;
+        let contents = shared
+            .iter()
+            .map(|segment| ContentSegment::open(segment).map_err(DataError::store))
+            .collect::<Result<Vec<_>, _>>()?;
+        let graphs = shared
+            .iter()
+            .map(|segment| GraphSegment::open(segment).map_err(DataError::store))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut left = SharedUnits::default();
+        let before = text.len();
+        text.retain(|key| locator.get(key).is_none());
+        left.text_units = before - text.len();
+        if let Some(sections) = sections {
+            // A lookup that fails counts as not held: the unit is written
+            // again rather than named where it cannot be read.
+            let (records, fragments) = sections.leave_out(
+                |key| {
+                    contents
+                        .iter()
+                        .flatten()
+                        .any(|content| matches!(content.find(key), Ok(Some(_))))
+                },
+                |key| {
+                    graphs
+                        .iter()
+                        .flatten()
+                        .any(|graph| matches!(graph.find(key), Ok(Some(_))))
+                },
+            );
+            left.records = records;
+            left.fragments = fragments;
+        }
+        Ok(left)
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -2007,12 +2107,28 @@ impl Checkout {
         drop(session);
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let read = self.segments_read_by(&snapshot, &[&state])?;
+        // A segment another checkout reads too holds what this checkout
+        // shares with it; a build of this checkout leaves those units where
+        // they are, so it is not counted. When another checkout's state
+        // cannot be read, every segment this checkout reads is.
+        let others_read = match self.other_states(&snapshot)? {
+            OtherStates::Read { states, .. } if !states.is_empty() => {
+                let others = states.iter().collect::<Vec<_>>();
+                self.segments_read_by(&snapshot, &others)?.needed
+            }
+            _ => vec![false; read.needed.len()],
+        };
         let report = DeltaReport {
             paths: changes.len(),
             fragments: fragments.len(),
             records: records.len(),
             text_units: text_unit_count,
-            segments: read.needed.iter().filter(|needed| **needed).count(),
+            segments: read
+                .needed
+                .iter()
+                .zip(&others_read)
+                .filter(|(own, other)| **own && !**other)
+                .count(),
             ms: 0.0,
         };
         self.serve_new(snapshot, covered)?;
@@ -2962,6 +3078,25 @@ impl ContentSink for ChangeSink {
 }
 
 /// What a build leaves out of its publication.
+/// The family's other checkouts' states (see [`Checkout::other_states`]).
+enum OtherStates {
+    Read {
+        states: Vec<CheckoutState>,
+        gone: Vec<CheckoutId>,
+    },
+    /// One of them cannot be read: it could need any segment.
+    Unreadable { gone: Vec<CheckoutId> },
+}
+
+/// What a build left out of its new segment because a segment another
+/// checkout reads already holds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SharedUnits {
+    pub text_units: usize,
+    pub records: usize,
+    pub fragments: usize,
+}
+
 struct Unneeded {
     /// Segments no checkout reads any more.
     segments: Vec<SegmentId>,
@@ -4218,6 +4353,72 @@ pub fn other() { callee(); }
         let theirs = callers_of(&cold.view().unwrap(), "other/lib.ts", "run");
         assert!(theirs.contains("main"), "{theirs}");
         assert_eq!(ours, theirs);
+    }
+
+    /// A second worktree of a repository stores only what the first one's
+    /// segment does not already hold, and answers as a cold build does.
+    /// Once the first worktree's folder is gone, the second one's next build
+    /// stores everything again and retires the first one's segments.
+    #[test]
+    fn a_second_worktree_stores_only_what_no_sibling_holds() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(a.path());
+        demo(b.path());
+        write(
+            b.path(),
+            "src/util.rs",
+            "pub fn callee() {}\npub fn helper() { callee(); }\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let first = Checkout::bind(Arc::clone(&layer), store.path(), family(), a.path()).unwrap();
+        let built_first = first.build().unwrap();
+        assert_eq!(
+            built_first.shared,
+            SharedUnits::default(),
+            "nothing to share yet"
+        );
+
+        let second = Checkout::bind(Arc::clone(&layer), store.path(), family(), b.path()).unwrap();
+        let built = second.build().unwrap();
+        // `Cargo.toml`, `src/lib.rs` and `notes.txt` are the same in both
+        // worktrees, and so is how `src/lib.rs` resolves; `src/util.rs`
+        // differs.
+        assert_eq!(built.shared.text_units, 3, "{built:?}");
+        assert_eq!(built.shared.records, 2, "{built:?}");
+        assert_eq!(built.shared.fragments, 1, "{built:?}");
+        let view = second.view().unwrap();
+        let callers = callers_of(&view, "src/util.rs", "callee");
+        assert!(
+            callers.contains("caller") && callers.contains("helper"),
+            "{callers}"
+        );
+        assert_eq!(candidates_for(&view, "nothing to see"), ["notes.txt"]);
+        drop(view);
+
+        // As a cold build of the same folder answers.
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), b.path()).unwrap();
+        cold.build().unwrap();
+        for (file, symbol) in [("src/util.rs", "callee"), ("src/util.rs", "helper")] {
+            assert_eq!(
+                callers_of(&second.view().unwrap(), file, symbol),
+                callers_of(&cold.view().unwrap(), file, symbol),
+                "{file} {symbol}"
+            );
+        }
+
+        // The first worktree goes: the second one stores everything again,
+        // and the first one's segments go with its state.
+        drop(first);
+        drop(a);
+        let rebuilt = second.build().unwrap();
+        assert_eq!(rebuilt.shared, SharedUnits::default(), "{rebuilt:?}");
+        assert!(rebuilt.retired_segments >= 1, "{rebuilt:?}");
+        assert_eq!(rebuilt.retired_checkouts, 1, "{rebuilt:?}");
+        assert!(callers_of(&second.view().unwrap(), "src/util.rs", "callee").contains("caller"));
     }
 
     /// Publishing the changes since a publication: the checkout then

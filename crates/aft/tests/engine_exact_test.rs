@@ -677,4 +677,3 @@ fn bare_identifiers_rank_declarations_before_repeated_consumers() {
         assert_eq!(result.results[0].evidence.kind, EvidenceKind::Definition);
     }
 }
-

@@ -505,4 +505,3 @@ pub(crate) fn shared_range_fixture(root: &Path, data: &mut FileCallData) -> bool
     data.symbol_metadata.get_mut("other").unwrap().range = first;
     true
 }
-

@@ -227,6 +227,12 @@ impl GraphSectionsBuilder {
         self.fragments.is_empty()
     }
 
+    /// Keeps only the fragments `keep` accepts: a build leaves out those
+    /// another segment of the family already holds.
+    pub fn retain(&mut self, mut keep: impl FnMut(FragmentKey) -> bool) {
+        self.fragments.retain(|key, _| keep(*key));
+    }
+
     /// Writes the graph sections into `writer`.
     ///
     /// # Errors

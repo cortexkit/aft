@@ -389,7 +389,6 @@ pub const fn local_semantic_platform_supported() -> bool {
 }
 
 fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
-    
     let resident = match ctx.callgraph_store().try_read() {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),

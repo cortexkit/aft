@@ -40,7 +40,6 @@ impl CallgraphCatchUp {
         self.outstanding.fetch_add(1, Ordering::SeqCst);
         Arc::new(CallgraphCatchUpGuard(Arc::clone(self)))
     }
-
 }
 
 /// Marks one catch-up outstanding until dropped.

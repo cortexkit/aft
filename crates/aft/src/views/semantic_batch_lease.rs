@@ -50,7 +50,6 @@ impl LeaseError {
             retryable,
         }
     }
-
 }
 
 impl fmt::Display for LeaseError {

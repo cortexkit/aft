@@ -29,7 +29,6 @@ impl Drop for AcquisitionCompletion {
 }
 
 impl AcquisitionOwner {
-
     pub(super) fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
