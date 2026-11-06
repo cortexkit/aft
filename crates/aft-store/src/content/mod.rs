@@ -18,7 +18,9 @@
 pub mod codec;
 mod sections;
 
-pub use sections::{ContentReadError, ContentSectionsBuilder, ContentSegment, KNOWN};
+pub use sections::{
+    ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN,
+};
 
 use codec::{Decoder, Encoder};
 

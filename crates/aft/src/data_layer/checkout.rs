@@ -1095,8 +1095,6 @@ impl Checkout {
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
                 .with_root_of(&scanned.state);
-        let inputs = collected.inputs(&state);
-        report.parsed_files = inputs.parses.len();
         if measure {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -1115,32 +1113,27 @@ impl Checkout {
                         })
                         .sum(),
                 ),
+                ("scan.state".to_string(), state.heap_bytes(&mut seen)),
+            ]);
+        }
+        // The segment needs only each record's encoded bytes, a fifth of the
+        // decoded size, and the resolver decodes each parse from them when it
+        // reads it; the decoded records go before resolving.
+        let (mut inputs, encoded) = collected.take_inputs(&state);
+        report.parsed_files = inputs.parses.len();
+        if measure {
+            use aft_store::heap::HeapBytes as _;
+            let mut seen = aft_store::heap::Seen::new();
+            report.memory.extend([
                 (
-                    "scan.parses".to_string(),
-                    inputs.parses.heap_bytes(&mut seen),
+                    "scan.records_encoded".to_string(),
+                    encoded.heap_bytes(&mut seen),
                 ),
                 (
                     "scan.configs".to_string(),
                     inputs.configs.heap_bytes(&mut seen),
                 ),
-                ("scan.state".to_string(), state.heap_bytes(&mut seen)),
             ]);
-        }
-        // The resolver reads the decoded parses; the segment needs only each
-        // record's encoded bytes, a fifth of the decoded size, so encode them
-        // now and let the decoded records go before resolving. Every parse
-        // `inputs` holds came from one of these records.
-        let mut encoded = aft_store::content::ContentSectionsBuilder::new();
-        for (_, (record_key, record)) in std::mem::take(&mut collected.records) {
-            encoded.add(record_key, &record);
-        }
-        if measure {
-            use aft_store::heap::HeapBytes as _;
-            let mut seen = aft_store::heap::Seen::new();
-            report.memory.push((
-                "scan.records_encoded".to_string(),
-                encoded.heap_bytes(&mut seen),
-            ));
         }
         checkpoint()?;
 
@@ -1149,18 +1142,18 @@ impl Checkout {
         // `resolve_ms` covers building the fragments too.
         let started = Instant::now();
         let mut sections = super::graph_store::SectionsWriter::new(
-            &inputs,
+            &inputs.state,
             &collected.records,
             true,
             Some(encoded),
         );
         super::callgraph::resolve_checkout_into(
-            &inputs,
+            &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
-            &mut |path, resolution| {
+            &mut |inputs, path, resolution| {
                 sections
-                    .add(path, &resolution)
+                    .add(inputs, path, &resolution)
                     .map_err(crate::callgraph_store::join::ManifestJoinError::Parse)
             },
         )
@@ -3090,18 +3083,23 @@ impl ContentSink for BuildSink {
 
 impl Collected {
     /// What resolving `state` reads: every parsed path's parse and every
-    /// configuration file's bytes.
-    fn inputs(&self, state: &CheckoutState) -> CheckoutInputs {
-        let mut parses = BTreeMap::new();
+    /// configuration file's bytes. Takes the extracted records, which leave
+    /// as the returned builder's encoded ones: each parse is kept as its
+    /// encoded record and decoded when the resolver reads it (see
+    /// [`super::callgraph::Parses::encoded`]), so the build never holds the
+    /// decoded records and every decoded parse at once.
+    fn take_inputs(
+        &mut self,
+        state: &CheckoutState,
+    ) -> (CheckoutInputs, aft_store::content::ContentSectionsBuilder) {
         let mut configs = HashMap::new();
-        let mut decoded = HashMap::<String, Arc<ParseBlob>>::new();
+        // A record whose parse does not convert is left out, as reading it
+        // decoded would leave it out; checked once while it is at hand.
+        let mut converts = HashMap::<String, bool>::new();
         for record in state.paths() {
             if record.language.is_empty() {
                 continue;
             }
-            let Ok(path) = std::str::from_utf8(&record.path) else {
-                continue;
-            };
             let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
             let parse_key = record_key.digest().to_string();
             let Some((_, stored)) = self.records.get(&parse_key) else {
@@ -3112,25 +3110,39 @@ impl Collected {
                     configs.insert(record.path.clone(), Arc::from(source.as_slice()));
                 }
                 RecordBody::Parsed { .. } => {
-                    let parse = if let Some(parse) = decoded.get(&parse_key) {
-                        Arc::clone(parse)
-                    } else {
-                        let Ok(CallgraphBlob::Parse(parse)) = blob_from_record(stored) else {
-                            continue;
-                        };
-                        let parse = Arc::new(parse);
-                        decoded.insert(parse_key.clone(), Arc::clone(&parse));
-                        parse
-                    };
-                    parses.insert(path.to_string(), (parse_key, parse));
+                    converts.entry(parse_key).or_insert_with(|| {
+                        matches!(blob_from_record(stored), Ok(CallgraphBlob::Parse(_)))
+                    });
                 }
             }
         }
-        CheckoutInputs {
-            state: state.clone(),
-            parses: parses.into(),
-            configs,
+        let mut encoded = aft_store::content::ContentSectionsBuilder::new();
+        for (_, (record_key, record)) in std::mem::take(&mut self.records) {
+            encoded.add(record_key, &record);
         }
+        let mut parses = Vec::new();
+        for record in state.paths() {
+            let Ok(path) = std::str::from_utf8(&record.path) else {
+                continue;
+            };
+            let record_key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            let parse_key = record_key.digest().to_string();
+            if converts.get(&parse_key) != Some(&true) {
+                continue;
+            }
+            let Some(stored) = encoded.get(&record_key) else {
+                continue;
+            };
+            parses.push((path.to_string(), parse_key, Arc::clone(stored)));
+        }
+        (
+            CheckoutInputs {
+                state: state.clone(),
+                parses: super::callgraph::Parses::encoded(parses),
+                configs,
+            },
+            encoded,
+        )
     }
 }
 

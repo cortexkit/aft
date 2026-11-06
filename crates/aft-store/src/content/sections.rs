@@ -12,6 +12,7 @@
 //! only when its own file is resolved.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::{ContentRecord, DecodeError, RecordKey};
 use crate::ids::Digest128;
@@ -50,20 +51,56 @@ pub const KNOWN: [KnownSection; 4] = [
     },
 ];
 
+/// A record's two parts as the sections store them, before the body is
+/// compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedRecord {
+    pub surface: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
+impl crate::heap::HeapBytes for EncodedRecord {
+    fn heap_bytes(&self, _seen: &mut crate::heap::Seen) -> usize {
+        self.surface.capacity() + self.body.capacity()
+    }
+}
+
+impl EncodedRecord {
+    #[must_use]
+    pub fn of(record: &ContentRecord) -> Self {
+        let (surface, body) = record.encode();
+        Self { surface, body }
+    }
+
+    /// The record again.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not a record this build encodes.
+    pub fn decode(&self) -> Result<ContentRecord, DecodeError> {
+        ContentRecord::decode(&self.surface, &self.body)
+    }
+}
+
 /// Collects records for the content sections of one segment.
 #[derive(Debug, Default)]
 pub struct ContentSectionsBuilder {
-    records: BTreeMap<RecordKey, (Vec<u8>, Vec<u8>)>,
+    records: BTreeMap<RecordKey, Arc<EncodedRecord>>,
 }
 
 impl crate::heap::HeapBytes for ContentSectionsBuilder {
-    fn heap_bytes(&self, _seen: &mut crate::heap::Seen) -> usize {
-        let entry = std::mem::size_of::<RecordKey>() + std::mem::size_of::<(Vec<u8>, Vec<u8>)>();
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        let entry = std::mem::size_of::<RecordKey>() + std::mem::size_of::<Arc<EncodedRecord>>();
         crate::heap::btree_bytes(self.records.len(), entry)
             + self
                 .records
                 .values()
-                .map(|(surface, body)| surface.capacity() + body.capacity())
+                .filter(|record| seen.first(Arc::as_ptr(record)))
+                .map(|record| {
+                    std::mem::size_of::<EncodedRecord>()
+                        + record.surface.capacity()
+                        + record.body.capacity()
+                })
                 .sum::<usize>()
     }
 }
@@ -76,7 +113,20 @@ impl ContentSectionsBuilder {
 
     /// Adds a record under `key`. Adding a key twice keeps the first.
     pub fn add(&mut self, key: RecordKey, record: &ContentRecord) {
-        self.records.entry(key).or_insert_with(|| record.encode());
+        self.records
+            .entry(key)
+            .or_insert_with(|| Arc::new(EncodedRecord::of(record)));
+    }
+
+    /// Adds a record already encoded. Adding a key twice keeps the first.
+    pub fn add_encoded(&mut self, key: RecordKey, record: Arc<EncodedRecord>) {
+        self.records.entry(key).or_insert(record);
+    }
+
+    /// The encoded record under `key`, shared.
+    #[must_use]
+    pub fn get(&self, key: &RecordKey) -> Option<&Arc<EncodedRecord>> {
+        self.records.get(key)
     }
 
     #[must_use]
@@ -98,16 +148,16 @@ impl ContentSectionsBuilder {
         let mut table = UnitTableBuilder::new(Digest128::LEN);
         let mut surfaces = Vec::new();
         let mut bodies = PackedBuilder::with_capacity(self.records.len());
-        for (key, (surface, body)) in self.records {
+        for (key, record) in self.records {
             table.push(
                 key.digest().as_bytes(),
                 UnitLocation {
                     offset: surfaces.len() as u64,
-                    len: u32::try_from(surface.len()).expect("a surface is under 4 GiB"),
+                    len: u32::try_from(record.surface.len()).expect("a surface is under 4 GiB"),
                 },
             );
-            surfaces.extend_from_slice(&surface);
-            bodies.push(&body);
+            surfaces.extend_from_slice(&record.surface);
+            bodies.push(&record.body);
         }
         let (bodies, index) = bodies.finish();
         let (table, units) = table.finish();

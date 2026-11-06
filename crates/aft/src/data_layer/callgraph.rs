@@ -64,6 +64,11 @@ pub(crate) struct CheckoutInputs {
 /// an entry is decoded the first time it is read. A read that fails is
 /// recorded in the publication's failures and reads as an empty parse;
 /// whoever reads through a publication fails on any recorded failure.
+///
+/// A cold build keeps each entry as its encoded content record and decodes
+/// it the first time it is read; [`Self::release_decoded`] lets the decoded
+/// parses go between the build's stages, so a build never holds every
+/// file's parse decoded at once.
 #[derive(Clone, Default)]
 pub(crate) struct Parses {
     map: BTreeMap<String, Arc<ParseSlot>>,
@@ -72,6 +77,31 @@ pub(crate) struct Parses {
 pub(crate) struct ParseSlot {
     value: std::sync::OnceLock<(BlobKey, Arc<ParseBlob>)>,
     stored: Option<Arc<StoredSlices>>,
+    /// The encoded content record the parse is decoded from, with its
+    /// parse key.
+    encoded: Option<(BlobKey, Arc<aft_store::content::EncodedRecord>)>,
+}
+
+impl ParseSlot {
+    fn decode(&self, path: &str) -> (BlobKey, Arc<ParseBlob>) {
+        if let Some((key, record)) = &self.encoded {
+            // The build checked that the record converts before keeping it
+            // encoded (see `Parses::encoded`), so a failure here is a defect
+            // in the codec; it reads as an empty parse like a failed read.
+            return record
+                .decode()
+                .ok()
+                .and_then(|record| match super::content::blob_from_record(&record) {
+                    Ok(crate::callgraph_store::join::CallgraphBlob::Parse(parse)) => Some(parse),
+                    _ => None,
+                })
+                .map_or_else(empty_parse, |parse| (key.clone(), Arc::new(parse)));
+        }
+        self.stored
+            .as_ref()
+            .and_then(|stored| stored.parse_of(path))
+            .unwrap_or_else(empty_parse)
+    }
 }
 
 /// A parse with nothing in it, for an entry whose stored read failed.
@@ -107,6 +137,7 @@ impl Parses {
                         Arc::new(ParseSlot {
                             value: std::sync::OnceLock::new(),
                             stored: Some(Arc::clone(stored)),
+                            encoded: None,
                         }),
                     )
                 })
@@ -114,10 +145,45 @@ impl Parses {
         }
     }
 
+    /// Entries kept as encoded content records, each decoded on first read.
+    pub(crate) fn encoded(
+        entries: impl IntoIterator<Item = (String, BlobKey, Arc<aft_store::content::EncodedRecord>)>,
+    ) -> Self {
+        Self {
+            map: entries
+                .into_iter()
+                .map(|(path, key, record)| {
+                    (
+                        path,
+                        Arc::new(ParseSlot {
+                            value: std::sync::OnceLock::new(),
+                            stored: None,
+                            encoded: Some((key, record)),
+                        }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Lets go of every decoded parse that can be decoded again, from its
+    /// encoded record or the publication. An entry another copy of these
+    /// parses shares stays decoded.
+    pub(crate) fn release_decoded(&mut self) {
+        for slot in self.map.values_mut() {
+            if let Some(slot) = Arc::get_mut(slot) {
+                if slot.encoded.is_some() || slot.stored.is_some() {
+                    slot.value.take();
+                }
+            }
+        }
+    }
+
     pub(crate) fn insert(&mut self, path: String, value: (BlobKey, Arc<ParseBlob>)) {
         let slot = ParseSlot {
             value: std::sync::OnceLock::from(value),
             stored: None,
+            encoded: None,
         };
         self.map.insert(path, Arc::new(slot));
     }
@@ -128,12 +194,7 @@ impl Parses {
 
     pub(crate) fn get(&self, path: &str) -> Option<&(BlobKey, Arc<ParseBlob>)> {
         let slot = self.map.get(path)?;
-        Some(slot.value.get_or_init(|| {
-            slot.stored
-                .as_ref()
-                .and_then(|stored| stored.parse_of(path))
-                .unwrap_or_else(empty_parse)
-        }))
+        Some(slot.value.get_or_init(|| slot.decode(path)))
     }
 
     pub(crate) fn contains_key(&self, path: &str) -> bool {
@@ -654,17 +715,21 @@ pub(crate) fn resolve_checkout(
     inputs: &CheckoutInputs,
     threads: usize,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    // A copy shares every parse with `inputs`, so the stream below lets
+    // none of them go.
+    let mut copy = inputs.clone();
     let mut resolved = BTreeMap::new();
-    resolve_checkout_into(inputs, threads, None, &mut |path, resolution| {
+    resolve_checkout_into(&mut copy, threads, None, &mut |_, path, resolution| {
         resolved.insert(path.clone(), resolution);
         Ok(())
     })?;
     Ok(resolved)
 }
 
-/// How many files pass 4 resolves before their resolutions go to the sink.
-/// Each batch's method-call sites are held until the batch is done.
-const SINK_BATCH: usize = 1024;
+/// How many files each stage of [`resolve_checkout_into`] takes before it
+/// lets the parses they decoded go. Pass 4 also holds each batch's
+/// method-call sites until the batch reaches the sink.
+const BATCH: usize = 1024;
 
 /// [`resolve_checkout`], handing each file's finished resolution to `sink`
 /// in path order instead of keeping them all, and adding to `memory`, when
@@ -676,24 +741,46 @@ const SINK_BATCH: usize = 1024;
 /// fraction of its decoded size, and decoded again only to add its sites
 /// and go to the sink.
 ///
+/// Parses kept encoded (see [`Parses::encoded`]) are decoded when a stage
+/// reads them and let go after each batch, so no stage holds every file's
+/// parse decoded beyond binding, which reads them all.
+///
 /// # Errors
 ///
 /// When the resolver fails on a file, or the sink does.
 pub(crate) fn resolve_checkout_into(
-    inputs: &CheckoutInputs,
+    inputs: &mut CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
-    sink: &mut (dyn FnMut(&String, FileResolution) -> Result<(), ManifestJoinError> + Send),
+    sink: &mut (dyn FnMut(&CheckoutInputs, &String, FileResolution) -> Result<(), ManifestJoinError>
+              + Send),
 ) -> Result<(), ManifestJoinError> {
+    fn refs(batch: &[String]) -> Vec<&String> {
+        batch.iter().collect()
+    }
     pool(threads)?.install(|| {
-        let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
-        bound.bind_missing(inputs, &paths)?;
-        let resolved = resolve_files_with(inputs, &bound, &paths, &|path, resolution| {
-            let (_, parse) = &inputs.parses[path];
-            let site = Arc::new(SiteFile::new(path, parse, &resolution));
-            (site, super::fragment::encode(&resolution))
-        })?;
+        bound.bind_missing(inputs, &refs(&paths))?;
+        // The whole-checkout lists read every parse; build them while all
+        // are decoded.
+        bound.lists(inputs);
+        inputs.parses.release_decoded();
+        let mut resolved = Vec::with_capacity(paths.len());
+        for batch in paths.chunks(BATCH) {
+            let parses = &inputs.parses;
+            resolved.extend(resolve_files_with(
+                inputs,
+                &bound,
+                &refs(batch),
+                &|path, resolution| {
+                    let (_, parse) = &parses[path];
+                    let site = Arc::new(SiteFile::new(path, parse, &resolution));
+                    (site, super::fragment::encode(&resolution))
+                },
+            )?);
+            inputs.parses.release_decoded();
+        }
         if let Some(memory) = memory.as_deref_mut() {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -725,8 +812,9 @@ pub(crate) fn resolve_checkout_into(
                 encoded.heap_bytes(&mut seen),
             ));
         }
-        for batch in paths.chunks(SINK_BATCH) {
-            for (path, sites, dependencies) in calls.resolve_sites(inputs, &NoResolutions, batch) {
+        for batch in paths.chunks(BATCH) {
+            let reached = calls.resolve_sites(inputs, &NoResolutions, &refs(batch));
+            for (path, sites, dependencies) in reached {
                 let bytes = encoded
                     .remove(&path)
                     .expect("every parsed file was resolved");
@@ -735,8 +823,9 @@ pub(crate) fn resolve_checkout_into(
                     .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                 file.sites = sites;
                 file.site_dependencies = dependencies;
-                sink(&path, file)?;
+                sink(&*inputs, &path, file)?;
             }
+            inputs.parses.release_decoded();
         }
         Ok(())
     })
@@ -1541,7 +1630,11 @@ aft_store::heap_bytes_of_fields!(CheckoutInputs {
     configs,
 });
 aft_store::heap_bytes_of_fields!(Parses { map });
-aft_store::heap_bytes_of_fields!(ParseSlot { value, stored });
+aft_store::heap_bytes_of_fields!(ParseSlot {
+    value,
+    stored,
+    encoded
+});
 aft_store::heap_bytes_of_fields!(Resolutions { map });
 aft_store::heap_bytes_of_fields!(ResolutionSlot { value, stored });
 aft_store::heap_bytes_of_fields!(FileResolution {

@@ -212,9 +212,9 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
     encoded: Option<ContentSectionsBuilder>,
     memory: Option<&mut Vec<(String, usize)>>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
-    let mut sections = SectionsWriter::new(inputs, records, all_records, encoded);
+    let mut sections = SectionsWriter::new(&inputs.state, records, all_records, encoded);
     for (file, resolution) in resolved {
-        sections.add(file, std::borrow::Borrow::borrow(resolution))?;
+        sections.add(inputs, file, std::borrow::Borrow::borrow(resolution))?;
     }
     sections.finish(writer, memory)
 }
@@ -223,7 +223,6 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
 /// its resolution arrives, so the caller can let the resolution go at once
 /// rather than hold every file's until the segment is written.
 pub(crate) struct SectionsWriter<'i> {
-    inputs: &'i CheckoutInputs,
     records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     all_records: bool,
     /// Whether `content` came with every record already in it.
@@ -231,16 +230,15 @@ pub(crate) struct SectionsWriter<'i> {
     content: ContentSectionsBuilder,
     graph: GraphSectionsBuilder,
     keys: BTreeMap<String, FragmentKey>,
-    facts: super::callgraph::CheckoutFacts<'i>,
     subjects: HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
 }
 
 impl<'i> SectionsWriter<'i> {
-    /// A writer for the files of `inputs`, taking their content records
-    /// from `records`, or from `encoded` when given (see
+    /// A writer for the files of a checkout in `state`, taking their content
+    /// records from `records`, or from `encoded` when given (see
     /// [`write_sections`]).
     pub(crate) fn new(
-        inputs: &'i CheckoutInputs,
+        state: &aft_store::checkout::CheckoutState,
         records: &'i HashMap<String, (RecordKey, Arc<ContentRecord>)>,
         all_records: bool,
         encoded: Option<ContentSectionsBuilder>,
@@ -249,7 +247,7 @@ impl<'i> SectionsWriter<'i> {
         let mut content = encoded.unwrap_or_default();
         // Configuration files' records too, so a reader of the segment can
         // give the resolver the same configuration bytes the build read.
-        for record in inputs.state.paths() {
+        for record in state.paths() {
             if prebuilt || record.language != "config" {
                 continue;
             }
@@ -263,25 +261,30 @@ impl<'i> SectionsWriter<'i> {
             }
         }
         Self {
-            inputs,
             records,
             all_records,
             prebuilt,
             content,
             graph: GraphSectionsBuilder::new(),
             keys: BTreeMap::new(),
-            facts: super::callgraph::CheckoutFacts { inputs },
             subjects: HashMap::new(),
         }
     }
 
-    /// Adds `file`'s record and fragment.
+    /// Adds `file`'s record and fragment, reading its parse and the
+    /// checkout's facts from `inputs`.
     ///
     /// # Errors
     ///
     /// When the file has no content record and the writer needs one.
-    pub(crate) fn add(&mut self, file: &String, resolution: &FileResolution) -> Result<(), String> {
-        let (key, parse) = &self.inputs.parses[file];
+    pub(crate) fn add(
+        &mut self,
+        inputs: &CheckoutInputs,
+        file: &String,
+        resolution: &FileResolution,
+    ) -> Result<(), String> {
+        let facts = super::callgraph::CheckoutFacts { inputs };
+        let (key, parse) = &inputs.parses[file];
         // A segment holding only what changed since a publication writes
         // the records of changed contents; an unchanged one stays where the
         // publication stored it.
@@ -293,7 +296,7 @@ impl<'i> SectionsWriter<'i> {
         }
         let slice = FileSlice::build(file, key, parse, resolution);
         let mut terms = slice_terms(&slice);
-        terms.extend(input_terms(resolution, &self.facts, &mut self.subjects));
+        terms.extend(input_terms(resolution, &facts, &mut self.subjects));
         terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
         // A test stores a fragment that does not decode, as a damaged one
