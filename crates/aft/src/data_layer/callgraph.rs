@@ -683,7 +683,7 @@ pub(crate) fn resolve_checkout_into(
     inputs: &CheckoutInputs,
     threads: usize,
     mut memory: Option<&mut Vec<(String, usize)>>,
-    sink: &mut dyn FnMut(&String, FileResolution) -> Result<(), ManifestJoinError>,
+    sink: &mut (dyn FnMut(&String, FileResolution) -> Result<(), ManifestJoinError> + Send),
 ) -> Result<(), ManifestJoinError> {
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().collect::<Vec<_>>();
