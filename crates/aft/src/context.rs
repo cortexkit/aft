@@ -9293,13 +9293,9 @@ impl AppContext {
     /// timestamp or configuration lock is contended, defer release.
     pub(crate) fn try_views_idle_request(&self) -> Option<(Instant, u32)> {
         let config = try_read_unpoisoned(&self.config)?;
-        (config.views.enabled || crate::data_layer::runtime::enabled())
-            .then(|| {
-                self.last_request_at
-                    .try_lock()
-                    .map(|stamp| (*stamp, config.idle.checkout_hours))
-            })
-            .flatten()
+        self.last_request_at
+            .try_lock()
+            .map(|stamp| (*stamp, config.idle.checkout_hours))
     }
 
     #[cfg(test)]
@@ -10012,14 +10008,10 @@ impl AppContext {
         self.canonical_cache_root.lock().clone()
     }
 
-    /// This root's checkout in the data layer, bound on first use, when
-    /// the process runs it (`AFT_DATA_LAYER=1`); `None` otherwise, or when
-    /// no root is configured, the root is a parent folder of repositories,
+    /// This root's checkout in the data layer, bound on first use; `None`
+    /// when no root is configured, the root is a parent folder of repositories,
     /// or its store cannot be opened.
     pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
-        if !crate::data_layer::runtime::enabled() {
-            return None;
-        }
         if self.data_checkout_pinned.load(Ordering::Acquire) {
             return self.data_checkout.lock().clone();
         }
@@ -10123,9 +10115,6 @@ impl AppContext {
         &self,
     ) -> Option<crate::data_layer::surfaces::DataCheckoutProbe> {
         use crate::data_layer::surfaces::DataCheckoutProbe;
-        if !crate::data_layer::runtime::enabled() {
-            return None;
-        }
         if self.data_checkout_pinned.load(Ordering::Acquire) {
             if let Some(checkout) = self.data_checkout.try_lock().and_then(|slot| slot.clone()) {
                 return Some(DataCheckoutProbe::Bound(checkout));
@@ -10189,13 +10178,11 @@ impl AppContext {
     }
 
     /// Whether the data layer's meaning plane serves this root's semantic
-    /// search: the data layer runs, binds this root (it is not withheld,
-    /// nor a parent folder of repositories), and semantic search is on and
-    /// admitted for it. Today's semantic index is then not built, so each
-    /// chunk is embedded once per repository rather than once per index.
+    /// search: the data layer binds this root (it is not withheld, nor a
+    /// parent folder of repositories), and semantic search is on and
+    /// admitted for it.
     pub(crate) fn data_layer_serves_meaning(&self) -> bool {
-        crate::data_layer::runtime::enabled()
-            && self.data_layer_withheld().is_none()
+        self.data_layer_withheld().is_none()
             && crate::views::parent::session_for(self).is_none()
             && self.data_meaning_config().is_some()
     }

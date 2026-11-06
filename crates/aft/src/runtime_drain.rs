@@ -519,17 +519,14 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::data_layer::outline::root_bound(ctx);
 }
 
-/// Once per configure of a standalone AFT: with the data layer on, the
-/// root's checkout binds and catches up, building and filling as it needs
+/// Once per configure of a standalone AFT: the root's checkout binds and
+/// catches up, building and filling as it needs
 /// ([`crate::data_layer::runtime::root_bound`]), as the daemon's configure
 /// tail has it do; otherwise nothing would until the first query. A
 /// checkout the idle reaper released since (it drops a checkout no tool has
 /// used for `idle.checkout_hours`, and the next use binds it again) is not
-/// bound again here. Does nothing with the data layer off.
+/// bound again here.
 pub fn follow_configure_with_data_layer(ctx: &AppContext) {
-    if !crate::data_layer::runtime::enabled() {
-        return;
-    }
     if ctx.note_data_layer_followed_configure() {
         crate::data_layer::runtime::root_bound(ctx);
     }
@@ -7149,7 +7146,6 @@ mod tests {
     /// calling thread and its storage folder (where the data layer keeps its
     /// index store) at `storage`.
     fn data_layer_context(root: &Path, storage: &Path) -> AppContext {
-        crate::data_layer::runtime::force_on_for_test();
         let ctx = AppContext::new(
             default_language_provider_factory(),
             Config {

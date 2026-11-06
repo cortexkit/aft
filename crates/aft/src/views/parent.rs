@@ -714,12 +714,9 @@ fn child_reserve_key(child: &str, plane: &str) -> String {
     format!("{plane}/{}", blake3::hash(child.as_bytes()).to_hex())
 }
 
-/// The parent session serving `ctx`'s root, when views are on.
+/// The parent session serving `ctx`'s root.
 pub fn session_for(ctx: &crate::context::AppContext) -> Option<Arc<ParentSession>> {
     let config = ctx.config();
-    if !config.views.enabled {
-        return None;
-    }
     session_for_root(config.project_root.as_deref()?)
 }
 

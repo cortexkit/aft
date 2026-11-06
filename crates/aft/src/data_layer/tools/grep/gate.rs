@@ -25,7 +25,7 @@
 //! it reuses no other profile's artifacts:
 //!
 //! ```text
-//! AFT_DATA_LAYER=1 AFT_GATE_ROOT=<checkout> AFT_GATE_REPORT=<report.json> \
+//! AFT_GATE_ROOT=<checkout> AFT_GATE_REPORT=<report.json> \
 //!   cargo test --config 'profile.gate.inherits="release"' \
 //!   --config 'profile.gate.lto=false' --config 'profile.gate.codegen-units=16' \
 //!   --config 'profile.gate.debug-assertions=true' --config 'profile.gate.strip=false' \
@@ -1084,10 +1084,6 @@ fn edit_checkout(ctx: &AppContext, root: &Path) -> (Vec<String>, Vec<Case>) {
 #[test]
 #[ignore = "replays real corpora over a real checkout; see the module docs"]
 fn grep_and_glob_answer_alike_from_the_data_layer() {
-    assert!(
-        crate::data_layer::runtime::enabled(),
-        "run the gate with AFT_DATA_LAYER=1"
-    );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source =
         std::env::var_os("AFT_GATE_ROOT").map_or_else(|| manifest.join("../.."), PathBuf::from);

@@ -8553,7 +8553,6 @@ mod tests {
 
     #[test]
     fn switched_off_callgraph_reports_off_not_building_in_a_contended_read() {
-        crate::data_layer::runtime::force_on_for_test();
         let executor = Executor::new();
         let (_dir, root) = test_root("health-callgraph-switched-off");
         std::fs::write(root.as_path().join("lib.rs"), "pub fn lib() {}\n").unwrap();

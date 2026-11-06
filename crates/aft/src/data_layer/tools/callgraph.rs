@@ -216,7 +216,6 @@ mod tests {
 
     #[test]
     fn callers_answers_from_the_data_layer_and_follows_an_edit() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

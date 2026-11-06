@@ -177,8 +177,7 @@ fn run_with_paths(
     paths: SnapshotPaths,
     output: &mut impl Write,
 ) -> Result<IndexExit, IndexError> {
-    let data_layer = aft::data_layer::surfaces::enabled()
-        .then_some(aft::data_layer::surfaces::index_root as DataLayerBuild);
+    let data_layer = Some(aft::data_layer::surfaces::index_root as DataLayerBuild);
     run_snapshot(args, paths, data_layer, output)
 }
 

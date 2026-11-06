@@ -318,7 +318,6 @@ fn data_layer_scenario(
     name: &str,
     files: &[(&str, &str)],
 ) -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
-    crate::data_layer::runtime::force_on_for_test();
     let root = tempfile::tempdir().expect("project root");
     let storage = tempfile::tempdir().expect("storage");
     for (rel, content) in files {

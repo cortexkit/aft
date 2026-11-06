@@ -647,9 +647,7 @@ impl StandingActor {
         snapshot: &Config,
     ) -> Option<tokio::sync::oneshot::Receiver<crate::protocol::Response>> {
         let root_id = self.ensure_actor(&entry, snapshot)?;
-        // Read here rather than in the job, so the whole pass follows one
-        // reading of the switch.
-        let data_layer = crate::data_layer::runtime::enabled();
+        let data_layer = true;
         let roots = self.roots.clone();
         let literal_path = entry.literal_path.clone();
         let executor_request_id = format!("subc-standing-pass-{}", entry.literal_path);
@@ -2180,7 +2178,6 @@ mod tests {
 
     #[test]
     fn with_the_data_layer_a_standing_pass_builds_and_verifies_without_cache_bin() {
-        crate::data_layer::runtime::force_on_for_test();
         let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
         assert!(fixture.strict(IndexKind::Search));
         assert!(fixture.strict(IndexKind::Callgraph));
@@ -2232,7 +2229,6 @@ mod tests {
 
     #[test]
     fn with_the_data_layer_a_failed_standing_build_keeps_the_strict_flag() {
-        crate::data_layer::runtime::force_on_for_test();
         let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
         // A file where the data layer's stores go: no family store opens.
         std::fs::write(fixture.storage.path().join("data"), "").unwrap();

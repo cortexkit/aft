@@ -2136,6 +2136,9 @@ pub enum CallGraphStoreError {
     CorpusSnapshotMissing(PathBuf),
     CorpusInventoryChanged(Option<PathBuf>),
     StaleFiles(Vec<String>),
+    /// The data layer's call graph is still building or catching up with
+    /// edits; a reader retries.
+    Building,
 }
 
 impl CallGraphStoreError {
@@ -2197,6 +2200,7 @@ impl fmt::Display for CallGraphStoreError {
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
             }
+            Self::Building => write!(formatter, "the call graph is still building"),
             Self::CorpusSnapshotMissing(path) => write!(
                 formatter,
                 "callgraph corpus snapshot lookup invariant failed: {} was not admitted",

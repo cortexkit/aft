@@ -288,7 +288,6 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
     }
     let failure = "AFT could not scan this checkout: the fixture's build failed".to_string();
 
-    crate::data_layer::runtime::force_on_for_test();
     let named = vec![
         child_gap("building", Plane::<()>::Loading.gap_reason("trigram")),
         child_gap(
@@ -443,7 +442,6 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     assert!(executor.register_actor(root_id, Arc::clone(&parent)));
     parent.mark_subc_unbound();
 
-    crate::data_layer::runtime::force_on_for_test();
     let loading = vec![
         child_gap("one", Plane::<()>::Loading.gap_reason("trigram")),
         child_gap("two", Plane::<()>::Loading.gap_reason("trigram")),
@@ -549,7 +547,6 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     };
     let session = parent_session(&parent);
     assert_eq!(session.children().len(), 2);
-    crate::data_layer::runtime::force_on_for_test();
 
     let search = request(json!({
         "id": "parent-meaning",

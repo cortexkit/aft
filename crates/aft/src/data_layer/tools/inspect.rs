@@ -1,24 +1,14 @@
 //! aft_inspect's dead-code analysis, read from the data layer.
 //!
 //! Dead code analyses a snapshot of the call graph: every file, exported
-//! symbol, outbound call and entry point (`CallgraphSnapshot`). Today that
-//! snapshot is projected from a call-graph database: the checkout's view
-//! database with views on, the legacy store with views off. When the process
-//! runs the data layer, views are on, and the root's checkout has published a
-//! call graph with no changes pending, the snapshot comes from the checkout's
-//! view instead. In every other case dead code projects it from the database
-//! as before, so a change the view has not resolved yet is never answered
-//! from the older publication.
+//! symbol, outbound call and entry point (`CallgraphSnapshot`). It comes
+//! from the root's checkout once its call graph is published with no
+//! changes pending; until then dead code reports the call graph as
+//! building, so a change not resolved yet is never answered from an older
+//! publication.
 //!
-//! The data layer stands in only for the views database, whose snapshot it
-//! reproduces. The legacy store answers differently on some checkouts, so
-//! with views off dead code keeps it, and no result computed from the data
-//! layer reaches the legacy store's caches.
-//!
-//! Only the snapshot's source changes. Unused exports and the Tier-1
-//! categories do not read the call graph. Cached results keep their keys: a
-//! cached result is keyed by the files it was computed from, and the view
-//! describes the same files as the database it stands in for.
+//! Unused exports and the Tier-1 categories do not read the call graph.
+//! Cached results are keyed by the files they were computed from.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,9 +22,18 @@ use crate::inspect::job::{canonicalize_normalized, CallgraphSnapshot};
 /// graph, as the call-graph commands do.
 const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What [`DeadCodeSources::snapshot`] found for a root.
+pub(crate) enum DeadCodeSnapshot {
+    Ready(Arc<CallgraphSnapshot>),
+    /// No checkout is bound for the root yet, or its call graph is building
+    /// or catching up with edits.
+    Building,
+    /// The call graph failed to build, refresh or read.
+    Failed(String),
+}
+
 /// The data-layer checkouts dead code reads, by the project root inspect
-/// analyses. Empty unless the process runs the data layer. Holds each
-/// checkout weakly: the request context owns it, and a root bound to another
+/// analyses. Holds each checkout weakly: the request context owns it, and a root bound to another
 /// checkout drops the old one.
 #[derive(Default)]
 pub(crate) struct DeadCodeSources {
@@ -61,40 +60,40 @@ impl DeadCodeSources {
     }
 
     /// The dead-code snapshot of `project_root` from its checkout's view,
-    /// when the view is published and its call graph has no changes
-    /// pending. `None` when no checkout is bound for the root, or the view
-    /// cannot answer; dead code then projects the snapshot from today's
-    /// database.
-    pub(crate) fn snapshot(&self, project_root: &Path) -> Option<Arc<CallgraphSnapshot>> {
-        let checkout = self
+    /// once the view is published and its call graph has no changes
+    /// pending.
+    pub(crate) fn snapshot(&self, project_root: &Path) -> DeadCodeSnapshot {
+        let Some(checkout) = self
             .checkouts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(project_root)
-            .and_then(Weak::upgrade)?;
+            .and_then(Weak::upgrade)
+        else {
+            return DeadCodeSnapshot::Building;
+        };
         // The call graph is refreshed lazily, so ask for the edits recorded
         // since the last refresh to be resolved, as any exact reader does.
         let view = match checkout.fresh_view(SNAPSHOT_WAIT) {
-            crate::data_layer::runtime::Fresh::Ready(view) => Some(view),
-            crate::data_layer::runtime::Fresh::Building => None,
+            crate::data_layer::runtime::Fresh::Ready(view) => view,
+            crate::data_layer::runtime::Fresh::Building => {
+                let state = checkout.view().map_or_else(
+                    || "nothing published yet".to_string(),
+                    |view| format!("call graph {:?}", view.status().callgraph),
+                );
+                crate::slog_info!(
+                    "tier2 dead_code: data layer still building for {}: {state}",
+                    project_root.display()
+                );
+                return DeadCodeSnapshot::Building;
+            }
             crate::data_layer::runtime::Fresh::Failed(reason) => {
                 crate::slog_warn!(
                     "tier2 dead_code: data layer call graph failed for {}: {reason}",
                     project_root.display()
                 );
-                None
+                return DeadCodeSnapshot::Failed(reason);
             }
-        };
-        let Some(view) = view else {
-            let state = checkout.view().map_or_else(
-                || "nothing published yet".to_string(),
-                |view| format!("call graph {:?}", view.status().callgraph),
-            );
-            crate::slog_info!(
-                "tier2 dead_code: data layer not used for {}: {state}",
-                project_root.display()
-            );
-            return None;
         };
         let started = Instant::now();
         match view.dead_code_snapshot_shared() {
@@ -112,14 +111,14 @@ impl DeadCodeSources {
                     snapshot.entry_points.len(),
                     started.elapsed().as_millis()
                 );
-                Some(snapshot)
+                DeadCodeSnapshot::Ready(snapshot)
             }
             Err(error) => {
                 crate::slog_warn!(
-                    "tier2 dead_code: data layer not used for {}: {error}",
+                    "tier2 dead_code: data layer snapshot failed for {}: {error}",
                     project_root.display()
                 );
-                None
+                DeadCodeSnapshot::Failed(error.to_string())
             }
         }
     }

@@ -237,7 +237,7 @@ fn child_texts(
 ) -> Vec<(Arc<Child>, Result<ChildText, String>)> {
     let children = overlapping(session, search_root);
     // A plane the user turned off is the worker's named gap either way.
-    if !(crate::data_layer::runtime::enabled() && session.planes.trigram) {
+    if !session.planes.trigram {
         return children
             .into_iter()
             .filter_map(|child| {
@@ -643,7 +643,7 @@ fn callgraph(
         );
         return gap_response(req, operation, gaps);
     };
-    if crate::data_layer::runtime::enabled() && session.planes.callgraph {
+    if session.planes.callgraph {
         return data_layer_callgraph(req, ctx, session, operation, &child, &file, symbol);
     }
     let plane = read(&child.callgraph).clone();

@@ -854,9 +854,6 @@ impl ExternalSearch {
         ctx: &crate::context::AppContext,
         root: &Path,
     ) -> Option<std::sync::Arc<Self>> {
-        if !crate::data_layer::runtime::enabled() {
-            return None;
-        }
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         ctx.external_data_search(&root, || Self::bind(ctx, &root))
     }

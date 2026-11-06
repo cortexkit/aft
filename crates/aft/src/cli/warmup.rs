@@ -76,12 +76,10 @@ fn run_with_storage(
     // background cold build. A configured-disabled store is terminal here, so a
     // HOME root reports disabled instead of entering a retry loop. `None` means
     // poll for readiness; `Some(_)` is a terminal state captured at trigger.
-    let callgraph_override = if args.areas.callgraph && aft::data_layer::surfaces::enabled() {
+    let callgraph_override = if args.areas.callgraph {
         // The data layer's call graph is built with its text plane once the
         // checkout binds; see `data_layer_states`.
         None
-    } else if args.areas.callgraph {
-        trigger_callgraph_warm(&ctx)
     } else {
         Some(SubsystemState::Disabled)
     };
@@ -362,19 +360,6 @@ fn wait_until_ready(
     loop {
         drain_search_index_events(ctx);
         drain_semantic_index_events(ctx);
-        if areas.callgraph && !aft::data_layer::surfaces::enabled() {
-            drain_callgraph_store_events(ctx);
-            if callgraph_override.is_none()
-                && ctx.callgraph_store_rx().lock().is_none()
-                && ctx
-                    .callgraph_store()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_none()
-            {
-                callgraph_override = trigger_callgraph_warm(ctx);
-            }
-        }
 
         let snapshot = WarmupSnapshot::from_context(ctx, &callgraph_override);
         if !quiet {
@@ -436,14 +421,7 @@ struct WarmupSnapshot {
 
 impl WarmupSnapshot {
     fn from_context(ctx: &AppContext, callgraph_override: &Option<SubsystemState>) -> Self {
-        let (search_index, callgraph_store) = if aft::data_layer::surfaces::enabled() {
-            data_layer_states(ctx, callgraph_override)
-        } else {
-            (
-                search_index_state(ctx),
-                callgraph_store_state(ctx, callgraph_override),
-            )
-        };
+        let (search_index, callgraph_store) = data_layer_states(ctx, callgraph_override);
         let semantic_index = semantic_index_state(ctx);
         let symbol_cache = symbol_cache_state(&search_index);
         Self {

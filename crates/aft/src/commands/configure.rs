@@ -4577,7 +4577,6 @@ fn handle_configure_inner(
     // The decision is a probe bounded by a short wall-clock budget; the full
     // walk for every child runs on the parent session's worker.
     let parent_folder = !root_too_broad
-        && next_config.views.enabled
         && crate::views::parent::prepare(
             &canonical_cache_root,
             crate::views::parent::RequestedPlanes {
@@ -5204,7 +5203,8 @@ fn handle_configure_inner(
             &canonical_cache_root,
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
-    let search_index = ctx.config().indexes.trigram && !ctx.config().views.enabled;
+    // The data layer's text plane serves search; today's index is not built.
+    let search_index = false;
     let semantic_search = ctx.config().indexes.semantic;
     let mut search_index_cache_reused = false;
 
@@ -5615,7 +5615,7 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = config.indexes.trigram && !config.views.enabled;
+    let search_enabled = false;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
     let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
@@ -6074,7 +6074,7 @@ fn schedule_artifact_loads_admitted(
     // With the data layer on, the symbol cache is pre-warmed from its
     // content records (`data_layer::outline`) and the disk symbol cache is
     // neither read nor written.
-    let legacy_symbol_prewarm = !crate::data_layer::runtime::enabled();
+    let legacy_symbol_prewarm = false;
     let mut search_artifact_load_start = None;
     let mut semantic_artifact_load_start = None;
 
@@ -8455,60 +8455,6 @@ pub(crate) fn drain_standalone_configure_unit(
     if !state.select_ready_job(ctx) {
         return false;
     }
-    let Some(continuation) = state.jobs.front_mut() else {
-        return false;
-    };
-    if continuation.stage == ConfigureMaintenanceStage::ViewLoad
-        && ctx.config().views.enabled
-        && !continuation.job.root_too_broad
-        && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
-    {
-        if ctx.views_route_root() {
-            // As on the attached path: every read of a routed root goes through
-            // its v3 checkout views, so the v1 view is neither opened nor
-            // published. Opening it ran `git ls-tree` and `git check-attr` over
-            // every tracked path twice and wrote a pending status row per path
-            // that no publication would ever settle. Skipping it loses
-            // nothing: the checkout's v3 text view, which grep and aft_search
-            // read, is opened and attached on the first query, as it already
-            // was on this transport.
-            ctx.drop_v1_view_runtime();
-            continuation.view_load = None;
-            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
-            return true;
-        }
-        if continuation.view_load.is_none() {
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            let job = continuation.job.clone();
-            let input = ConfigureViewInput::capture(ctx, &job);
-            continuation.view_load = Some(rx);
-            let spawn = thread::Builder::new()
-                .name("aft-view-open".to_owned())
-                .spawn(move || {
-                    log_ctx::with_session(Some(job.session_id.clone()), || {
-                        let _ = tx.send(prepare_configure_view(&input, &job));
-                    });
-                });
-            if let Err(error) = spawn {
-                slog_warn!("content-addressed view worker failed: {}", error);
-            }
-        }
-        match continuation
-            .view_load
-            .as_ref()
-            .expect("view load receiver")
-            .try_recv()
-        {
-            Ok(result) => finish_configure_view_load(ctx, result),
-            Err(crossbeam_channel::TryRecvError::Empty) => return true,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                finish_configure_view_load(ctx, Err("view load worker disconnected".to_owned()));
-            }
-        }
-        continuation.view_load = None;
-        continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
-        return true;
-    }
     drain_deferred_configure_maintenance_unit(ctx, state)
 }
 
@@ -9115,61 +9061,10 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
-            let retrying = continuation.lexical_bind_retry_at.take().is_some();
-            if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
-                // A parent folder owns no view; its session reads the children's.
-                ctx.clear_view_runtime();
-            } else if ctx.cache_unavailable_reason().is_none()
-                && ctx.config().views.enabled
-                && !job.root_too_broad
-            {
-                if ctx.views_route_root() {
-                    // Every read of this root goes through its v3 checkout
-                    // views; the v1 view is neither opened, imported into
-                    // nor published.
-                    ctx.drop_v1_view_runtime();
-                } else if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
-                    finish_configure_view_load(
-                        ctx,
-                        prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
-                    );
-                } else {
-                    ctx.clear_view_runtime();
-                }
-                match ctx.lexical_view_snapshot("bind") {
-                    Some(Err(error)) if crate::views::trigram::bind_is_busy(&error) => {
-                        if !retrying {
-                            slog_warn!(
-                                "lexical checkout view busy; configure maintenance will retry: {}",
-                                error
-                            );
-                        }
-                        // A parent only reads child publications; it cannot
-                        // recover a dropped child bind by querying that child.
-                        continuation.defer_lexical_bind(Instant::now());
-                        return ConfigureMaintenanceUnitResult::Continue;
-                    }
-                    Some(Err(error)) => {
-                        slog_warn!("lexical checkout view unavailable: {}", error);
-                    }
-                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
-                        continuation.defer_lexical_bind(Instant::now());
-                        return ConfigureMaintenanceUnitResult::Continue;
-                    }
-                    // The symbol prewarm follows the files the view verified;
-                    // with the data layer on, it reads the data layer's
-                    // records instead.
-                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)))
-                        if ctx.views_route_root() && !crate::data_layer::runtime::enabled() =>
-                    {
-                        spawn_symbol_view_prewarm(ctx, &snapshot);
-                    }
-                    _ => {}
-                }
-                continuation.lexical_bind_retry_delay = Duration::from_secs(1);
-            } else {
-                ctx.clear_view_runtime();
-            }
+            // The data layer serves every index, so today's checkout views are
+            // neither opened nor built; a parent folder's session reads its
+            // children's checkouts.
+            ctx.clear_view_runtime();
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
         }
         ConfigureMaintenanceStage::StorageSweeps => {
@@ -9217,75 +9112,8 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Callgraph;
         }
         ConfigureMaintenanceStage::Callgraph => {
-            // A queued upgrade has already identified obsolete data. A later
-            // metadata probe must not erase that intent while admission waits.
-            let retrying_upgrade = continuation.callgraph_upgrade_retry_at.take().is_some();
-            let upgrade_required = job.warm_callgraph_store
-                && !ctx.config().views.enabled
-                && (retrying_upgrade || callgraph_store_upgrade_required(ctx));
-            // Start semantic indexing only after the callgraph reports `build_started`.
-            // This preserves the intended start order without waiting for either build.
-            if job.warm_callgraph_store
-                && (upgrade_required || callgraph_configure_warm_allowed(ctx))
-            {
-                let (access, capacity_deferred) = ctx.schedule_callgraph_store_warm();
-                continuation.semantic_waits_for_callgraph_start = should_wait_for_callgraph_start(
-                    &access,
-                    ctx.callgraph_store_rx().lock().is_some(),
-                );
-                match access {
-                    CallgraphStoreAccess::Ready(_) => {
-                        slog_debug!("callgraph store ready at configure maintenance");
-                    }
-                    CallgraphStoreAccess::Building if capacity_deferred => {
-                        slog_debug!(
-                            "callgraph store configure warm waiting for cold-build capacity"
-                        );
-                    }
-                    CallgraphStoreAccess::Building => {
-                        slog_info!("callgraph store warm build scheduled by configure maintenance");
-                    }
-                    CallgraphStoreAccess::Suspended(suspension) => {
-                        slog_warn!(
-                            "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
-                            suspension.domain.as_str(),
-                            suspension.death_count
-                        );
-                    }
-                    CallgraphStoreAccess::Off => {
-                        slog_debug!(
-                            "callgraph index is off; configure maintenance starts no build"
-                        );
-                    }
-                    CallgraphStoreAccess::Unavailable => {
-                        slog_info!(
-                            "callgraph store unavailable at configure maintenance; dead_code will retry later"
-                        );
-                    }
-                    CallgraphStoreAccess::Error(error) => {
-                        slog_warn!("callgraph store configure warm failed: {}", error);
-                    }
-                }
-                if ctx.subc_unbound_quiesced() {
-                    return ConfigureMaintenanceUnitResult::CancelAll;
-                }
-                if ctx.configure_generation() != job.generation {
-                    forget_configure_job_binding(ctx, job);
-                    return ConfigureMaintenanceUnitResult::Complete;
-                }
-                if capacity_deferred && upgrade_required {
-                    // Retain the upgrade in this root's configure-maintenance
-                    // continuation. Maintenance retries it; unbinding cancels it.
-                    continuation.callgraph_upgrade_retry_at =
-                        Some(Instant::now() + Duration::from_secs(1));
-                    return ConfigureMaintenanceUnitResult::Continue;
-                }
-            } else if job.warm_callgraph_store {
-                // Non-git roots still build semantic and search indexes eagerly. Their
-                // first callgraph is intentionally on-demand; an obsolete published
-                // store instead uses the upgrade exception in the warm predicate.
-                slog_debug!("callgraph configure warm deferred for non-git root");
-            }
+            // The data layer builds the call graph with the root's checkout
+            // (`data_layer::runtime::root_bound`); today's store is not warmed.
             continuation.stage = ConfigureMaintenanceStage::SemanticRelease;
         }
         ConfigureMaintenanceStage::SemanticRelease => {

@@ -3079,7 +3079,6 @@ mod tests {
     /// candidates from the data layer's view. The call graph is switched off:
     /// grep never reads it, and building it for 10,000 files is slow.
     fn grep_io_data_layer_context(root: &Path, storage: &Path) -> AppContext {
-        crate::data_layer::runtime::force_on_for_test();
         let mut config = crate::config::Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),

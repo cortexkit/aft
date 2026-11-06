@@ -838,7 +838,7 @@ impl From<String> for Tier2RunError {
 
 impl From<CallGraphStoreError> for Tier2RunError {
     fn from(error: CallGraphStoreError) -> Self {
-        if error.is_transient_lock_contention() {
+        if error.is_transient_lock_contention() || matches!(error, CallGraphStoreError::Building) {
             Self::CallgraphBusy
         } else {
             Self::Failed(error.to_string())
@@ -3419,15 +3419,14 @@ impl InspectManager {
             .filter(|_| category == InspectCategory::DeadCode)
             .and_then(|store| {
                 // The data layer's view stands in for the pinned store's
-                // projection while its call graph is ready. It follows the
-                // views store, so it never answers with views off.
-                snapshot
-                    .config
-                    .views
-                    .enabled
-                    .then(|| self.data_layer_dead_code.snapshot(&snapshot.project_root))
-                    .flatten()
-                    .or_else(|| {
+                // projection while its call graph is ready.
+                match self.data_layer_dead_code.snapshot(&snapshot.project_root) {
+                    crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
+                        Some(snapshot)
+                    }
+                    _ => None,
+                }
+                .or_else(|| {
                         let started = Instant::now();
                         let projected =
                             crate::callgraph_store::project_dead_code_snapshot_from_view(store)
@@ -6045,9 +6044,9 @@ const DATA_LAYER_SNAPSHOT: ProjectionVerdict = ProjectionVerdict {
 
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
-    allow_cold_build: bool,
-    build_if_missing: bool,
-    refresh_paths: &[PathBuf],
+    _allow_cold_build: bool,
+    _build_if_missing: bool,
+    _refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
 ) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError> {
     let started = Instant::now();
@@ -6057,323 +6056,23 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         );
         return Ok(None);
     }
-
-    if job.config.views.enabled {
-        // With the data layer on, its view stands in for today's view while
-        // its call graph is ready. Only here: it follows the views store,
-        // and with views off the legacy store answers exactly as before.
-        if let Some(snapshot) = projection_cache
-            .and_then(|manager| manager.data_layer_dead_code.snapshot(&job.project_root))
-        {
-            return Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())));
-        }
-        return Ok(build_view_callgraph_snapshot(
-            job,
-            projection_cache,
-            refresh_paths,
-        ));
-    }
-
-    let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root);
-    if callgraph_dirs.is_empty() {
-        crate::slog_info!(
-            "tier2 dead_code: inspect_dir has no root-keyed storage parent ({}); reporting callgraph_unavailable",
-            job.inspect_dir.display()
-        );
-        return Ok(None);
+    // The root's checkout in the data layer answers. While its call graph
+    // builds or catches up with edits, dead code reports it as building and
+    // retries; it never answers from another store.
+    let Some(manager) = projection_cache else {
+        return Err(CallGraphStoreError::Building);
     };
-    for callgraph_dir in &callgraph_dirs {
-        match CallGraphStore::cold_build_suspension(callgraph_dir, &job.project_root) {
-            Ok(Some(suspension)) => {
-                // This is a durable admission refusal, not a failed scan attempt.
-                // Preserve it separately so blocking inspect reports the same
-                // breaker tuple that navigation and health expose.
-                if let Some(manager) = projection_cache {
-                    manager.record_tier2_build_suspension(&job.key, suspension.clone());
-                }
-                crate::slog_info!(
-                    "tier2 dead_code: callgraph build suspended for {} after {} deaths",
-                    suspension.domain.as_str(),
-                    suspension.death_count
-                );
-                return Ok(None);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to read callgraph breaker at {}: {}",
-                    callgraph_dir.display(),
-                    error
-                );
-            }
+    match manager.data_layer_dead_code.snapshot(&job.project_root) {
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
+            Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())))
+        }
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Building => {
+            Err(CallGraphStoreError::Building)
+        }
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Failed(reason) => {
+            Err(CallGraphStoreError::Unavailable(reason))
         }
     }
-
-    enum ProjectionStore {
-        ReadOnly(ReadonlyCallGraphStore),
-        Writable(CallGraphStore),
-    }
-
-    impl ProjectionStore {
-        fn sqlite_path(&self) -> &Path {
-            match self {
-                Self::ReadOnly(store) => store.sqlite_path(),
-                Self::Writable(store) => store.sqlite_path(),
-            }
-        }
-
-        fn projection_identity(
-            &self,
-            project_root: &Path,
-            write_revision: u64,
-        ) -> CallgraphProjectionIdentity {
-            let generation = match self {
-                Self::ReadOnly(store) => store.projection_generation(),
-                Self::Writable(store) => store.projection_generation(),
-            }
-            .map(str::to_owned);
-            let legacy_sqlite_path = generation
-                .is_none()
-                .then(|| self.sqlite_path().to_path_buf());
-            CallgraphProjectionIdentity {
-                project_root: project_root.to_path_buf(),
-                generation,
-                legacy_sqlite_path,
-                write_revision,
-            }
-        }
-
-        fn current_projection_identity(
-            &self,
-            project_root: &Path,
-        ) -> Result<Option<CallgraphProjectionIdentity>, CallGraphStoreError> {
-            let stale_files = match self {
-                Self::ReadOnly(store) => store.stale_files()?,
-                Self::Writable(store) => store.stale_files()?,
-            };
-            if !stale_files.is_empty() {
-                return Ok(None);
-            }
-            let write_revision = match self {
-                Self::ReadOnly(store) => store.projection_write_revision()?,
-                Self::Writable(store) => store.projection_write_revision()?,
-            };
-            Ok(write_revision.map(|revision| self.projection_identity(project_root, revision)))
-        }
-    }
-
-    for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
-        // Paths without an explicit refresh stay read-only unless the published
-        // store still has stale backend rows. The background refresh worker is
-        // the usual writer for those rows; when it never runs for this root,
-        // dead_code refreshes them inline so projection is not stuck forever.
-        let projection_store = if refresh_paths.is_empty() || !job.callgraph_writer {
-            let store = match CallGraphStore::open_readonly(
-                callgraph_dir.clone(),
-                job.project_root.clone(),
-            ) {
-                Ok(Some(store)) => store,
-                Ok(None) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                        callgraph_dir.display(),
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: failed to open callgraph store read-only at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-            let stale = job
-                .callgraph_writer
-                .then(|| store.stale_files().ok())
-                .flatten()
-                .unwrap_or_default();
-            if stale.is_empty() {
-                ProjectionStore::ReadOnly(store)
-            } else {
-                drop(store);
-                let refresh =
-                    merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
-                let store = match open_writable_dead_code_store(
-                    callgraph_dir.clone(),
-                    job.project_root.clone(),
-                    allow_cold_build,
-                    build_if_missing,
-                    &refresh,
-                ) {
-                    Ok(Some(store)) => store,
-                    Ok(None) => {
-                        crate::slog_info!(
-                            "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                            callgraph_dir.display(),
-                            index + 1 < callgraph_dirs.len()
-                        );
-                        continue;
-                    }
-                    Err(error) if error.is_transient_lock_contention() => return Err(error),
-                    Err(error) => {
-                        crate::slog_warn!(
-                            "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
-                            callgraph_dir.display(),
-                            error,
-                            index + 1 < callgraph_dirs.len()
-                        );
-                        continue;
-                    }
-                };
-                refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
-                ProjectionStore::Writable(store)
-            }
-        } else {
-            let store = match open_writable_dead_code_store(
-                callgraph_dir.clone(),
-                job.project_root.clone(),
-                allow_cold_build,
-                build_if_missing,
-                refresh_paths,
-            ) {
-                Ok(Some(store)) => store,
-                Ok(None) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                        callgraph_dir.display(),
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-            let stale = store.stale_files().unwrap_or_default();
-            let refresh = merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
-            refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
-            ProjectionStore::Writable(store)
-        };
-
-        let cache_identity = match projection_store.current_projection_identity(&job.project_root) {
-            Ok(identity) => identity,
-            Err(error) if error.is_transient_lock_contention() => return Err(error),
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to read callgraph projection identity at {}: {}; trying fallback={}",
-                    callgraph_dir.display(),
-                    error,
-                    index + 1 < callgraph_dirs.len()
-                );
-                continue;
-            }
-        };
-        if let (Some(cache), Some(identity)) = (projection_cache, cache_identity.as_ref()) {
-            // The pointer names immutable cold-build generations, while the durable
-            // revision advances in the same SQLite transaction as every in-place
-            // graph mutation. Equal identities therefore prove identical store
-            // bytes for dead-code projection: this cache is exact, not heuristic.
-            if let Some(snapshot) = cache.cached_callgraph_projection(identity) {
-                return Ok(Some((
-                    snapshot,
-                    ProjectionVerdict {
-                        kind: ProjectionKind::Reused,
-                        reason: None,
-                        journal_bytes: 0,
-                        changed_files: 0,
-                    },
-                    Duration::ZERO,
-                )));
-            }
-        } else if cache_identity.is_none() {
-            // Stores from older binaries lack a durable revision, so keeping an
-            // earlier snapshot would make an in-place refresh indistinguishable.
-            if let Some(cache) = projection_cache {
-                cache.clear_callgraph_projection();
-            }
-        }
-
-        let previous = projection_cache
-            .zip(cache_identity.as_ref())
-            .and_then(|(cache, identity)| cache.previous_callgraph_projection(identity));
-        let costs = projection_cache
-            .zip(cache_identity.as_ref())
-            .map(|(cache, identity)| cache.callgraph_projection_costs(identity))
-            .unwrap_or_default();
-        let (write_revision, snapshot, verdict, projection_cost) =
-            match project_dead_code_snapshot_incremental_with_costs(
-                projection_store.sqlite_path(),
-                previous
-                    .as_ref()
-                    .map(|(revision, snapshot)| (*revision, snapshot.as_ref())),
-                costs,
-            ) {
-                Ok(projected) => projected,
-                Err(CallGraphStoreError::Unavailable(message)) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
-                        callgraph_dir.display(),
-                        message,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-        let snapshot = Arc::new(snapshot);
-        if let (Some(cache), Some(write_revision)) = (projection_cache, write_revision) {
-            cache.cache_callgraph_projection(
-                projection_store.projection_identity(&job.project_root, write_revision),
-                Arc::clone(&snapshot),
-            );
-        }
-
-        if index > 0 {
-            crate::slog_info!(
-                "tier2 dead_code: using ready callgraph store fallback {} for inspect_dir {}",
-                callgraph_dir.display(),
-                job.inspect_dir.display()
-            );
-        }
-
-        crate::slog_info!(
-            "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
-            snapshot.files.len(),
-            snapshot.exported_symbols.len(),
-            snapshot.outbound_calls.len() + snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(),
-            snapshot.entry_points.len(),
-            started.elapsed().as_millis()
-        );
-
-        return Ok(Some((snapshot, verdict, projection_cost)));
-    }
-
-    crate::slog_info!(
-        "tier2 dead_code: no ready callgraph store found for inspect_dir {}; reporting callgraph_unavailable",
-        job.inspect_dir.display()
-    );
-    Ok(None)
 }
 
 fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {

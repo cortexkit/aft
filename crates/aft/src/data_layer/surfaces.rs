@@ -813,17 +813,13 @@ pub(crate) fn checkout_estimate(
 }
 
 /// The process's shared block cache as a census estimate, counted once for
-/// every checkout; `None` while the data layer is off or no checkout of
-/// this process has bound. Its bytes are measured as the
+/// every checkout; `None` while no checkout of this process has bound. Its bytes are measured as the
 /// [`aft_store::heap`] module describes: every cached block in its shared
 /// allocation and the cache's two lookup tables. `resident_bytes` is the
 /// block data alone, which the cache keeps within `budget_bytes`. While
 /// another thread holds the cache's lock the tables are left out and the
 /// figure is partial.
 pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
-    if !super::runtime::enabled() {
-        return None;
-    }
     let (stats, measured) = super::runtime::block_cache_memory()?;
     let resident = u64::try_from(stats.resident_bytes).unwrap_or(u64::MAX);
     let estimate = match measured {
@@ -916,12 +912,6 @@ pub(crate) fn zoom_callgraph_field(ctx: &AppContext) -> Option<Option<Value>> {
         "code": code,
         "index": { "status": plane.status, "reason": plane.reason },
     })))
-}
-
-/// Whether this process runs the data layer (`AFT_DATA_LAYER=1`).
-#[must_use]
-pub fn enabled() -> bool {
-    super::runtime::enabled()
 }
 
 /// A plane as `aft warmup` waits for it.
@@ -1234,7 +1224,6 @@ mod tests {
 
     #[test]
     fn an_idle_release_drops_the_checkout_and_its_next_use_serves_the_publication() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1257,7 +1246,6 @@ mod tests {
 
     #[test]
     fn roots_configure_leaves_unindexed_and_switched_off_indexes_bind_nothing() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1515,7 +1503,6 @@ mod tests {
 
     #[test]
     fn status_health_and_zoom_follow_the_checkout_through_each_state() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1648,7 +1635,6 @@ mod tests {
 
     #[test]
     fn a_store_that_cannot_open_reports_why_on_status_and_health() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1678,7 +1664,6 @@ mod tests {
 
     #[test]
     fn the_memory_census_counts_the_checkout_and_the_shared_block_cache() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -1847,7 +1832,6 @@ mod tests {
     /// as it is on the status tool.
     #[test]
     fn health_reports_the_meaning_plane_once_it_has_a_configuration() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -2112,7 +2096,7 @@ mod tests {
         );
 
         // `aft warmup` binds; the publication `aft index` left serves at once.
-        crate::data_layer::runtime::force_on_for_test();
+
         let started = Instant::now();
         loop {
             match warm(&ctx) {
@@ -2136,7 +2120,6 @@ mod tests {
     /// today's stores report theirs.
     #[test]
     fn a_store_file_a_newer_build_wrote_is_refused_on_every_status_surface() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

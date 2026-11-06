@@ -1,11 +1,7 @@
-//! The data layer inside a running AFT, while it is built beside the stores
-//! it replaces.
+//! The data layer inside a running AFT.
 //!
-//! It is on unless the process runs with `AFT_DATA_LAYER=0`, an undocumented
-//! switch that lasts only while the cutover removes today's stores: tools
-//! read from it where they have been wired to. When it is on, the first
-//! query of a root binds the root's checkout and, if the checkout has no
-//! publication yet, builds it on a thread of its own. AFT's own edits reach
+//! The first query of a root binds the root's checkout and, if the checkout
+//! has no publication yet, builds it on a thread of its own. AFT's own edits reach
 //! it through the edit-intent listener, and outside changes through the
 //! watcher's path batches.
 //!
@@ -33,30 +29,6 @@ use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, Planes};
 use super::meaning::{Meaning, MeaningState, Round};
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
-
-/// Whether this process runs the data layer.
-#[must_use]
-pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    if FORCED_ON.with(std::cell::Cell::get) {
-        return true;
-    }
-    // On by default while the cutover removes today's stores; `AFT_DATA_LAYER=0`
-    // runs today's route, so a test run can tell a new failure from an old one.
-    std::env::var_os("AFT_DATA_LAYER").is_none_or(|value| value != "0")
-}
-
-#[cfg(test)]
-thread_local! {
-    static FORCED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Turns the data layer on for the calling thread, so a test can run tools
-/// against it without setting the process-wide switch other tests read.
-#[cfg(test)]
-pub(crate) fn force_on_for_test() {
-    FORCED_ON.with(|forced| forced.set(true));
-}
 
 /// The process's data layer, once the first checkout binds.
 static LAYER: OnceLock<Arc<DataLayer>> = OnceLock::new();

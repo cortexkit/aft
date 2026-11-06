@@ -142,7 +142,7 @@ impl DataSemantic {
     /// otherwise (the root has no checkout in the data layer, or semantic
     /// search is off), and the caller keeps reading today's index.
     pub(crate) fn current(ctx: &AppContext) -> Option<Self> {
-        if !crate::data_layer::runtime::enabled() || !ctx.config().indexes.semantic {
+        if !ctx.config().indexes.semantic {
             return None;
         }
         let checkout = ctx.data_checkout()?;
@@ -153,7 +153,7 @@ impl DataSemantic {
     /// never starts a fill.
     pub(crate) fn probe(ctx: &AppContext) -> Option<Self> {
         use crate::data_layer::surfaces::DataCheckoutProbe;
-        if !crate::data_layer::runtime::enabled() || !ctx.config().indexes.semantic {
+        if !ctx.config().indexes.semantic {
             return None;
         }
         match ctx.probe_data_checkout()? {
@@ -456,7 +456,6 @@ pub(crate) mod tests {
     /// generation than the partial one.
     #[test]
     fn a_fill_under_way_is_reported_partial_and_ready_only_once_every_file_is_filled() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -572,7 +571,6 @@ pub(crate) mod tests {
     /// searches are ready again and nothing was embedded again.
     #[test]
     fn a_search_after_an_idle_release_reports_the_plane_loading_until_it_is_back() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

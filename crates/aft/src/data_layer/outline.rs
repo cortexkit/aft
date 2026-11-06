@@ -545,7 +545,6 @@ pub fn separator() -> char {
     /// parses every file does, without parsing.
     #[test]
     fn a_restart_fills_the_symbol_cache_from_records_with_todays_tables() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let sources = fixture(&root);
@@ -609,7 +608,6 @@ pub fn separator() -> char {
     /// the cache is reset.
     #[test]
     fn files_changed_since_their_record_are_left_to_a_parse() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let sources = fixture(&root);
@@ -687,7 +685,6 @@ pub fn separator() -> char {
     /// when it parses the file, and as today's store does.
     #[test]
     fn trace_data_looks_its_symbol_up_in_the_record_with_todays_answers() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         fixture(&root);
@@ -776,7 +773,6 @@ pub fn separator() -> char {
     /// call expressions withheld and every hop and caller approximate.
     #[test]
     fn impact_and_trace_data_see_fresh_and_edited_files_as_today() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         fixture(&root);
@@ -855,7 +851,6 @@ pub fn separator() -> char {
     /// once for the root and generation, and a later bind changes nothing.
     #[test]
     fn a_bind_prewarms_once_per_root_and_generation() {
-        crate::data_layer::runtime::force_on_for_test();
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let sources = fixture(&root);

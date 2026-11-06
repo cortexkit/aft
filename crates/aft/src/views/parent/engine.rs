@@ -153,7 +153,7 @@ fn data_layer_answers() -> bool {
     if crate::data_layer::tools::grep::test_hooks::today_only() {
         return false;
     }
-    crate::data_layer::runtime::enabled()
+    true
 }
 
 /// The page size `aft_search` uses when the request names none.

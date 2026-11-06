@@ -11,7 +11,7 @@ fn checkout_bound(ctx: &AppContext) -> bool {
 #[test]
 fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_reply() {
     let _env = crate::test_env::hermetic_git_env_guard();
-    crate::data_layer::runtime::force_on_for_test();
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("main");
     std::fs::create_dir_all(&root).unwrap();
