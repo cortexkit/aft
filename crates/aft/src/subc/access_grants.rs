@@ -1051,31 +1051,34 @@ pub(super) fn restore_launch_before(
     }
 }
 
+/// Validate a catalog request's `allow_paths` and, on a worker's own fetch, save
+/// them as the worker's launch grants. Returns the grants the request validated
+/// but this fetch did not save: a plan preflight's, such as a head checking a
+/// worker plan before the worker exists. A fetch that saved its grants returns
+/// none, so its callers read them from the session like any other saved grant.
 pub(super) fn catalog(
     raw: Option<&Value>,
     identity: &RouteIdentity,
     ctx: &AppContext,
     preset: &str,
-) -> Result<(), subc_protocol::ErrorBody> {
+) -> Result<Vec<AccessGrant>, subc_protocol::ErrorBody> {
     let head_key = head_scope(identity);
+    let validate_raw = |head: Option<&AccessPolicy>| match raw {
+        Some(raw) => validate(raw, head, head_key.as_ref()),
+        None => Ok(Vec::new()),
+    };
     if identity
         .scope
         .as_ref()
         .is_some_and(|stamp| !stamp.owner_authorized)
     {
-        if let Some(raw) = raw {
-            validate(raw, None, head_key.as_ref())?;
-        }
-        return Ok(());
+        return validate_raw(None);
     }
     if raw.is_none() && launch_key(identity, preset).is_none() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(db) = ctx.db() else {
-        if let Some(raw) = raw {
-            validate(raw, None, head_key.as_ref())?;
-        }
-        return Ok(());
+        return validate_raw(None);
     };
     let lock = || {
         db.lock()
@@ -1112,11 +1115,9 @@ pub(super) fn catalog(
     };
     loop {
         let head = snapshot.clone().map(|policy| policy.resolve(&storage));
-        if let Some(raw) = raw {
-            validate(raw, head.as_ref(), head_key.as_ref())?;
-        }
+        let validated = validate_raw(head.as_ref())?;
         let Some(key) = launch.as_ref() else {
-            return Ok(());
+            return Ok(validated);
         };
         let stored = {
             let conn = lock()?;
@@ -1182,7 +1183,7 @@ pub(super) fn catalog(
         }
         store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 }
 

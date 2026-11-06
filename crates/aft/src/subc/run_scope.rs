@@ -31,9 +31,10 @@ impl RunBudget {
 
     /// Fit a codemode program's shell call to its run. A PTY needs someone to
     /// drive it interactively, so it is refused. A background command is
-    /// allowed: it joins its owner route's session (the head agent's, or a
-    /// worker run's own worker's), so that owner can read it with `bash_status`, but it sends no completion wake, because the
-    /// program is the one waiting for it; the run's end kills it. A
+    /// allowed and belongs to its owner route (the head agent's, or a worker
+    /// run's own worker's): it joins that owner's session, so the owner can
+    /// read it with `bash_status`, it outlives the program and its run, and
+    /// its completion wakes the owner as the launch reply promises. A
     /// foreground command blocks until it completes, and its wait is cut at
     /// the run's deadline.
     pub(super) fn constrain_bash(
@@ -59,7 +60,6 @@ impl RunBudget {
             ));
         }
         if args.get("background").and_then(Value::as_bool) == Some(true) {
-            args.insert("notify_on_completion".into(), json!(false));
             return Ok(());
         }
         if let Some(remaining) = remaining {
@@ -98,16 +98,25 @@ mod tests {
         assert!(error.message.contains("codemode runs can't open a PTY"));
     }
 
+    /// A background command outlives the program that started it, so its
+    /// completion must reach the owner: the run leaves the caller's wake
+    /// setting, and its timeout, as they are.
     #[test]
-    fn run_background_launches_without_a_completion_wake() {
-        let mut args = json!({"background": true, "timeout": 60000, "notify_on_completion": true})
+    fn run_background_keeps_its_completion_wake_and_timeout() {
+        let mut args = json!({"background": true, "timeout": 60000})
             .as_object()
             .unwrap()
             .clone();
         budget(Some(5000)).constrain_bash(&mut args).unwrap();
-        assert_eq!(args["notify_on_completion"], false);
+        assert!(args.get("notify_on_completion").is_none());
         assert!(args.get("block_to_completion").is_none());
         assert_eq!(args["timeout"], 60000);
+        let mut quiet = json!({"background": true, "notify_on_completion": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        budget(Some(5000)).constrain_bash(&mut quiet).unwrap();
+        assert_eq!(quiet["notify_on_completion"], false);
     }
 
     #[test]

@@ -693,7 +693,16 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
         assert_eq!(reply.header.ty, FrameType::Error, "{}", body(&reply));
         let response = body(&reply);
         assert_eq!(response["code"], "detached", "{response}");
-        assert_eq!(response["message"], "call detached; command still running");
+        // The runner shows only the code and message, so the message itself
+        // names the task that keeps running across the restart.
+        let task = response["detail"]["task_id"].as_str().unwrap();
+        let message = response["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "call detached; command still running in the background as {task}. "
+            )) && message.contains(&format!("bash_status({{ taskId: \"{task}\" }})")),
+            "{response}"
+        );
         assert_eq!(response["detail"]["late_results"], late);
         tasks.push(response["detail"]["task_id"].as_str().unwrap().to_owned());
     }

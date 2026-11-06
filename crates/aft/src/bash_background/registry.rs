@@ -1526,6 +1526,9 @@ pub(crate) struct BashDrainReplyState {
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
+    /// A remote task's job ID and phase, so a reply formatted on the module
+    /// loop can name the build-server job without reading task state.
+    pub(crate) remote: Option<remote::RemoteProgress>,
     /// Artifact-free terminal diagnostics, published with the metadata before
     /// the full output renderer can finish the canonical response below.
     pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
@@ -1560,6 +1563,7 @@ impl BashDrainReplyCache {
         published.execution_note = note;
         published.deadline = deadline;
         published.inputs_captured = inputs_captured;
+        published.remote = metadata.remote.as_ref().map(remote::RemoteProgress::of);
         published.uncaptured_terminal_facts = terminal_facts;
         if inputs_captured != Some(false) || !metadata.is_terminal() {
             published.uncaptured_terminal = None;

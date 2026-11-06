@@ -254,8 +254,23 @@ fn catalog_inner(
             .with_detail(json!({"retryable": refusal.data["retryable"]})));
         }
     }
-    access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    let unsaved_grants =
+        access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    // Only the worker's own scope saves its routing policy; a head previewing
+    // a worker plan saves nothing.
+    let freeze_key = policy_key(identity, Some(&preset))
+        .ok()
+        .filter(|_| !head_scope(identity));
     if let Some(policy) = routing_policy.as_mut().filter(|p| !p.siblings.is_empty()) {
+        // A fetch that saves nothing may also count the grants its own
+        // allow_paths validated: the worker the plan launches will hold them.
+        // A fetch that saves its routing policy counts only saved grants, so a
+        // saved sibling is always one the session's file tools may read.
+        let preflight_grants: &[_] = if freeze_key.is_none() {
+            &unsaved_grants
+        } else {
+            &[]
+        };
         let _scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(identity)));
         let _grants =
@@ -267,10 +282,18 @@ fn catalog_inner(
                 once: vec![],
                 launch: access_grants::launch_key(identity, &preset),
             }));
+        let first = policy.siblings[0].clone();
         with_call_policy(ctx, identity, "tool.catalog", "read", json!({}), |_| {
-            policy.validate_siblings(ctx, "tool.catalog", &identity.session)
+            policy.validate_siblings(ctx, "tool.catalog", &identity.session, preflight_grants)
         })
-        .unwrap_or(Err(crate::exec_remote::SIBLINGS_REFUSAL))
+        // The session's call policy refused before any sibling could be
+        // resolved, so the first one is named as the plan gave it.
+        .unwrap_or_else(|_| {
+            Err(crate::exec_remote::sibling_refusal(
+                crate::exec_remote::SiblingRefusal::NotReadable,
+                std::path::Path::new(&first),
+            ))
+        })
         .map_err(|message| {
             cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
         })?;
@@ -305,10 +328,7 @@ fn catalog_inner(
     }
     // Head routes may preview a worker plan, but only the worker's own scope
     // can save its routing and confinement policy.
-    if let Some(key) = policy_key(identity, Some(&preset))
-        .ok()
-        .filter(|_| !head_scope(identity))
-    {
+    if let Some(key) = freeze_key {
         if let Some(policy) = routing_policy.as_ref() {
             let Some(db) = ctx.db() else {
                 return Err(cortexkit_role_tool_provider::errors::invalid_request(

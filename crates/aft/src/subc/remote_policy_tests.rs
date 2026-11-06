@@ -2299,6 +2299,149 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
     }
 }
 
+/// Answers one held server-completed call on `task` the way the module loop
+/// does once a drain's backstop is due, and returns the error body it sent.
+#[cfg(unix)]
+async fn drained_detached_body(
+    registry: &crate::bash_background::BgTaskRegistry,
+    root: &Path,
+    task: &str,
+    corr: u64,
+) -> Value {
+    let metrics = DispatchPathMetrics::new();
+    let route = route_key(41, 1);
+    metrics.held_bash_calls.insert(route, corr);
+    metrics.held_bash_calls.set_detach_target(
+        route,
+        corr,
+        drain::BashDetachTarget {
+            reply_cache: registry.drain_reply_cache(task, "session"),
+            run_scoped: false,
+            registry: registry.clone(),
+            task_id: task.into(),
+            session_id: "session".into(),
+            wait_mode: false,
+            worker_session: true,
+            server_completion: true,
+            late_results: false,
+            request_id: format!("remote-detach-{corr}"),
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            format_context: Default::default(),
+        },
+    );
+    metrics
+        .held_bash_calls
+        .set_phase(route, corr, drain::BashHoldPhase::Foreground);
+    let routes = HashMap::from([(route, identity(root, "session", 1, false))]);
+    let (writer, mut frames) = tokio::sync::mpsc::channel(4);
+    assert_eq!(
+        bash::answer_held_bash_calls_from_module_loop(&writer, &routes, &metrics, true)
+            .await
+            .unwrap(),
+        1
+    );
+    let frame = frames.recv().await.unwrap();
+    assert_eq!(frame.header.ty, FrameType::Error);
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+/// A build-server call held when AFT restarts is answered `detached`. The
+/// runner shows the agent only that error's code and message, so the message
+/// names the task and its remote job: before the runner accepts the job, that
+/// its inputs are still being captured; after, the job ID and phase.
+#[cfg(unix)]
+#[tokio::test]
+async fn drained_remote_call_names_its_task_and_remote_job() {
+    let daemon = crate::exec_remote::wire_tests::daemon(
+        crate::exec_remote::wire_tests::Script::GatedAcceptance,
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    init_remote_git_fixture(dir.path());
+    let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
+    let registry = ctx.bash_background().clone();
+    let task = registry
+        .spawn_remote(
+            crate::bash_background::RemoteLaunch {
+                explicit_runon: true,
+                params: Default::default(),
+                connection_file: Some(daemon.connection.clone()),
+                harness: "runner".into(),
+                session: "session".into(),
+                requested_platform: None,
+                requested_vcpus: None,
+                requested_memory_mib: None,
+                requested_network: false,
+                configured_env_names: Vec::new(),
+                return_paths: Vec::new(),
+            },
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "cargo test",
+            crate::bash_background::registry::resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    let capture_warning = crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING;
+
+    let submitting = drained_detached_body(&registry, dir.path(), &task, 1).await;
+    assert_eq!(submitting["code"], "detached", "{submitting}");
+    let message = submitting["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "call detached; command still running in the background as {task}. "
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "\nDetached because AFT is restarting. Remote job: not assigned yet. Phase: submitting to ck-motor (capturing inputs; not accepted yet).\n"
+        ),
+        "{message}"
+    );
+    assert!(message.contains(capture_warning), "{message}");
+
+    daemon.acceptance_gate.notify_one();
+    let progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(progress) = registry
+                .remote_progress(&task, "session")
+                .filter(|progress| progress.job_id.is_some())
+            {
+                return progress;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runner's Accepted record assigns a job ID");
+    let accepted = drained_detached_body(&registry, dir.path(), &task, 2).await;
+    let message = accepted["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!(
+            "\nDetached because AFT is restarting. Remote job: {}. Phase: {}.",
+            progress.job_id.unwrap(),
+            progress.phase.describe()
+        )),
+        "{message}"
+    );
+    assert!(!message.contains(capture_warning), "{message}");
+    tokio::task::spawn_blocking(move || registry.kill(&task, "session").unwrap())
+        .await
+        .unwrap();
+}
+
 #[cfg(unix)]
 fn init_remote_git_fixture(root: &Path) {
     std::fs::create_dir_all(root).unwrap();
@@ -2423,14 +2566,14 @@ fn siblings_catalog_refuses_outside_checkout_and_dotdot_escape() {
     ctx.update_config(|config| config.restrict_to_project_root = false);
     let worker = identity(&root, "siblings-outside", 7, true);
     for sibling in [outside.clone(), root.join("..").join("unrelated-checkout")] {
-        let error = catalog(
-            json!({"preset":"worker", "params":{"siblings":[sibling]}}),
-            &worker,
-            &ctx,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "invalid_request");
-        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+        assert_siblings_refused(
+            catalog(
+                json!({"preset":"worker", "params":{"siblings":[sibling]}}),
+                &worker,
+                &ctx,
+            ),
+            &not_readable(&crate::access_policy::policy_path(&outside)),
+        );
         assert!(lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).is_none());
     }
 }
@@ -2447,14 +2590,15 @@ fn siblings_catalog_refuses_symlink_to_outside_checkout() {
     let ctx = context(root.path(), storage.path(), None);
     let worker = identity(root.path(), "siblings-symlink", 7, true);
     ctx.update_config(|config| config.restrict_to_project_root = false);
-    let error = catalog(
-        json!({"preset":"worker", "params":{"siblings":[link]}}),
-        &worker,
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(error.code, "invalid_request");
-    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    // The link's target is named, as the path that was refused.
+    assert_siblings_refused(
+        catalog(
+            json!({"preset":"worker", "params":{"siblings":[link]}}),
+            &worker,
+            &ctx,
+        ),
+        &not_readable(&crate::access_policy::policy_path(outside.path())),
+    );
 }
 
 #[test]
@@ -2466,14 +2610,14 @@ fn siblings_catalog_requires_checkout_root_and_saves_canonical_workdir() {
     std::fs::create_dir(&folder).unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let worker = identity(root.path(), "siblings-workdir", 7, true);
-    let error = catalog(
-        json!({"preset":"worker", "params":{"siblings":[folder]}}),
-        &worker,
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(error.code, "invalid_request");
-    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    assert_siblings_refused(
+        catalog(
+            json!({"preset":"worker", "params":{"siblings":[folder]}}),
+            &worker,
+            &ctx,
+        ),
+        &not_checkout_root(&folder),
+    );
     catalog(
         json!({"preset":"worker", "params":{"siblings":[folder.join("..")]}}),
         &worker,
@@ -2523,8 +2667,10 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     let request =
         json!({"preset":"worker", "params":{"siblings":[outside.path().join("child/..")]}});
     for route in [&head, &worker] {
-        let error = catalog(request.clone(), route, &ctx).unwrap_err();
-        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+        assert_siblings_refused(
+            catalog(request.clone(), route, &ctx),
+            &not_readable(&crate::access_policy::policy_path(outside.path())),
+        );
     }
     let granted_path = crate::access_policy::policy_path(outside.path());
     crate::db::access_grants::insert(
@@ -2557,6 +2703,229 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     assert_eq!(
         saved.params.siblings,
         [outside.path().canonicalize().unwrap().to_str().unwrap()]
+    );
+}
+
+/// The head's checks of a worker plan arrive over the orchestrator's own
+/// connection (module `prefrontal-core`) rather than the head's session host,
+/// so the route's principal is not a session host. The head's saved grants
+/// then decide what it may delegate through allow_paths, but not what the
+/// route's own file tools may read.
+fn core_head(root: &Path, scope_ref: &str) -> RouteIdentity {
+    let mut head = identity(root, scope_ref, 7, true);
+    let data = Arc::get_mut(&mut head.0).unwrap();
+    let stamp = data.scope.as_mut().unwrap();
+    stamp.kind = subc_protocol::scope::ScopeKind::Head;
+    stamp.scope_ref = scope_ref.into();
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some("reserved:prefrontal-core".into());
+    }
+    head
+}
+
+/// A head (`head`) that holds a saved read grant on `granted`, a folder holding
+/// `granted/commons`, a checkout root, and `granted/plain`, which is not one.
+struct SiblingGrantFixture {
+    dir: tempfile::TempDir,
+    ctx: AppContext,
+    head: RouteIdentity,
+    head_grant: crate::access_policy::AccessGrant,
+}
+
+impl SiblingGrantFixture {
+    fn new(scope_ref: &str) -> Self {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("head");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(dir.path().join("granted/commons/.git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("granted/plain")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other/.git")).unwrap();
+        let ctx = context(&root, &dir.path().join("store"), None);
+        let head = core_head(&root, scope_ref);
+        access_grants::register(&head, &ctx).unwrap();
+        // Heads default to full access, which reads outside the project
+        // without asking; asking leaves the saved grant as the head's only
+        // access outside its project.
+        catalog(
+            json!({"preset":"head", "params":{"mode":"ask"}}),
+            &head,
+            &ctx,
+        )
+        .unwrap();
+        let head_grant = AccessGrant {
+            path: crate::access_policy::policy_path(&dir.path().join("granted")),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        crate::db::access_grants::insert(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(&head),
+            &head_grant,
+        )
+        .unwrap();
+        Self {
+            dir,
+            ctx,
+            head,
+            head_grant,
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+}
+
+/// The exact agent-visible refusal for a sibling that is not absolute, does not resolve,
+/// or has no `.git` at its top, naming the path as the plan gave it. Spelled out
+/// here so a wording change cannot pass unnoticed.
+fn not_checkout_root(given: &Path) -> String {
+    format!(
+        "sibling {} is not the root of a git checkout; the command was not run",
+        given.display()
+    )
+}
+
+/// The exact agent-visible refusal for a checkout root the session may not read, naming
+/// the resolved path.
+fn not_readable(resolved: &Path) -> String {
+    format!(
+        "this session's file tools may not read sibling {}; grant read access to it in allow_paths; the command was not run",
+        resolved.display()
+    )
+}
+
+#[track_caller]
+fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>, message: &str) {
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, message);
+    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+}
+
+/// A head checks a worker plan before the worker exists, so the plan's own
+/// allow_paths grants are not saved yet. A sibling those grants cover passes
+/// the check; the same plan without them is refused, and so is a sibling the
+/// grants do not cover or one that is not a checkout root.
+#[test]
+fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
+    use crate::access_policy::policy_path;
+    let fixture = SiblingGrantFixture::new("siblings-preflight-head");
+    let (ctx, head) = (&fixture.ctx, &fixture.head);
+    let commons = fixture.path("granted/commons");
+    let granted = fixture.path("granted");
+    let plan = |siblings: Value, allow_paths: Option<Value>| {
+        let mut request = json!({"preset":"worker", "params":{
+            "remote_exec":{"enabled":true}, "siblings":siblings,
+        }});
+        if let Some(allow_paths) = allow_paths {
+            request["params"]["allow_paths"] = allow_paths;
+        }
+        request
+    };
+    // The head's saved grant does not let this route's own file tools read
+    // the sibling, so without the plan's allow_paths it is refused.
+    assert_siblings_refused(
+        catalog(plan(json!([commons]), None), head, ctx),
+        &not_readable(&policy_path(&commons)),
+    );
+    // A `sibling: true` entry reaches the catalog as the sibling plus a read
+    // allow_paths entry for the same path.
+    catalog(
+        plan(
+            json!([commons]),
+            Some(json!([{"path":commons, "mode":"read"}])),
+        ),
+        head,
+        ctx,
+    )
+    .unwrap();
+    // A grant on a folder containing the sibling covers it too.
+    catalog(
+        plan(
+            json!([commons]),
+            Some(json!([{"path":granted, "mode":"read"}])),
+        ),
+        head,
+        ctx,
+    )
+    .unwrap();
+    let folder_grant = Some(json!([{"path":granted, "mode":"read"}]));
+    // Covered, but not a checkout root.
+    let plain = fixture.path("granted/plain");
+    assert_siblings_refused(
+        catalog(plan(json!([plain]), folder_grant.clone()), head, ctx),
+        &not_checkout_root(&plain),
+    );
+    // A checkout root that no grant covers.
+    let other = fixture.path("other");
+    assert_siblings_refused(
+        catalog(plan(json!([other]), folder_grant.clone()), head, ctx),
+        &not_readable(&policy_path(&other)),
+    );
+    // A link inside the granted folder that resolves to a checkout outside it.
+    #[cfg(unix)]
+    {
+        let link = granted.join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_siblings_refused(
+            catalog(plan(json!([link]), folder_grant), head, ctx),
+            &not_readable(&policy_path(&other)),
+        );
+    }
+    // The check saved nothing: the head holds only the grant it started with.
+    assert_eq!(
+        crate::db::access_grants::list(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(head),
+        )
+        .unwrap(),
+        [fixture.head_grant.clone()]
+    );
+}
+
+/// The worker's own fetch saves the plan's allow_paths grants and then checks
+/// its siblings against the session's saved grants only. Once the saved grant
+/// is revoked, a refetch of the same plan is refused even though its
+/// allow_paths entry still validates against the head.
+#[test]
+fn siblings_worker_fetch_counts_only_saved_grants() {
+    let fixture = SiblingGrantFixture::new("siblings-saved-head");
+    let ctx = &fixture.ctx;
+    let commons = fixture.path("granted/commons");
+    let mut worker = identity(&fixture.path("head"), "siblings-saved-worker", 7, true);
+    let stamp = Arc::get_mut(&mut worker.0).unwrap().scope.as_mut().unwrap();
+    stamp.scope_ref = "siblings-saved-worker".into();
+    stamp.parent = Some(
+        serde_json::from_value(json!({
+            "owner":fixture.head.scope.as_ref().unwrap().owner,
+            "ref":"siblings-saved-head", "scope_epoch":7
+        }))
+        .unwrap(),
+    );
+    let request = json!({"preset":"worker", "params":{
+        "remote_exec":{"enabled":true}, "siblings":[commons],
+        "allow_paths":[{"path":commons, "mode":"read"}],
+    }});
+    catalog(request.clone(), &worker, ctx).unwrap();
+    let saved = lookup(ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).unwrap();
+    assert_eq!(
+        saved.params.siblings,
+        [commons.canonicalize().unwrap().to_str().unwrap()]
+    );
+    assert_eq!(
+        crate::db::access_grants::revoke(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(&worker),
+            &crate::access_policy::policy_path(&commons),
+        )
+        .unwrap(),
+        1
+    );
+    assert_siblings_refused(
+        catalog(request, &worker, ctx),
+        &not_readable(&crate::access_policy::policy_path(&commons)),
     );
 }
 
@@ -2634,7 +3003,10 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     assert_eq!(read.data["code"], crate::access_policy::ACCESS_ASK_REQUIRED);
     let asks_before_submit = crate::context::confinement::ask_calls();
     crate::bash_background::registry::remote::assert_siblings_submit_refused_before_connect(
-        &ctx, launch, &daemon,
+        &ctx,
+        launch,
+        &daemon,
+        &format!("runon refused: {}", not_readable(&path)),
     );
     assert_eq!(
         crate::context::confinement::ask_calls(),
