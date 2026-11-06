@@ -34,10 +34,11 @@ process must have been asked the same before the replay. Every process then
 waits for the file watcher to go quiet before the replay.
 
 The ranking logs one line each time its lanes read the data layer's view, and
-one each time its semantic lane reads the meaning plane. Each replayed row
-records how many such lines its request added to that process's log
-(`view_reads`, `meaning_reads`), so a data-layer reply that the legacy index
-answered anyway is reported rather than passing silently.
+one each time its semantic lane reads the meaning plane, each naming the
+request. Each replayed row records how many such lines name its request in
+that process's log (`view_reads`, `meaning_reads`), so a data-layer reply
+that the legacy index answered anyway is reported rather than passing
+silently.
 
 Replies are written to one file per process as they arrive and compared in a
 stream afterwards; only the differing ones are kept, so a replay of the whole
@@ -100,6 +101,8 @@ JsonObject = dict[str, Any]
 VIEW_READ = "read the data layer view"
 # The semantic lane logs this line each time it reads the meaning plane.
 MEANING_READ = "read the data layer meaning plane"
+# Either line, with the id of the request that read.
+READ_LINE = re.compile(r"aft_search (\S+) read the data layer (view|meaning plane)")
 # The data layer logs this line when a build has published.
 BUILT = "data layer built"
 # Fields that differ between two processes whatever they read: the snapshot
@@ -207,29 +210,23 @@ class Process:
                 else:
                     os.environ[name] = value
         self.root = root
-        # Where `reads` stopped in the log, and its counts so far.
-        self._log_offset = 0
-        self._reads = {VIEW_READ: 0, MEANING_READ: 0}
-        self._partial_line = ""
 
     def log(self) -> str:
         return self.stderr_path.read_text(encoding="utf-8", errors="replace")
 
-    def reads(self) -> dict[str, int]:
-        """How many view and meaning-plane reads the log holds so far. Reads
-        only what was appended since the last call: the log grows with every
-        request, and reading it whole per row is quadratic over a long
-        replay."""
+    def reads_by_request(self) -> dict[tuple[str, str], int]:
+        """How many times each request read the view and the meaning plane,
+        by request id, from the whole log. The log lines name the request,
+        so a line the logger writes after the reply still counts for its
+        own row."""
+        counts: dict[tuple[str, str], int] = {}
         with self.stderr_path.open("r", encoding="utf-8", errors="replace") as handle:
-            handle.seek(self._log_offset)
-            text = handle.read()
-            self._log_offset = handle.tell()
-        lines = (self._partial_line + text).split("\n")
-        self._partial_line = lines.pop()
-        for line in lines:
-            for marker in self._reads:
-                self._reads[marker] += line.count(marker)
-        return dict(self._reads)
+            for line in handle:
+                match = READ_LINE.search(line)
+                if match:
+                    key = (match.group(1), match.group(2))
+                    counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def configure_without_semantic(self, timeout: float) -> None:
         doc = bench_rerank.apply_to_config(
@@ -307,25 +304,33 @@ def send_semantic_search(process: Process, arguments: JsonObject) -> JsonObject:
 
 def replay(process: Process, rows: Sequence[JsonObject], send: Any, out: Path) -> list[JsonObject]:
     """Sends every row, writing each masked reply to `out` (one JSON line per
-    row) as it arrives; returns each row's latency and read counts."""
+    row) as it arrives; returns each row's latency, request id and whether
+    the semantic lane ran (`count_reads` adds the read counts)."""
     measures = []
     with out.open("w", encoding="utf-8") as replies:
         for row in rows:
-            before = process.reads()
             started = time.perf_counter()
             response = send(process, row["request"])
             elapsed = (time.perf_counter() - started) * 1000.0
-            after = process.reads()
             replies.write(json.dumps(mask(response), sort_keys=True) + "\n")
             measures.append(
                 {
                     "latency_ms": elapsed,
-                    "view_reads": after[VIEW_READ] - before[VIEW_READ],
-                    "meaning_reads": after[MEANING_READ] - before[MEANING_READ],
+                    # The client numbers its requests; this row's is the last.
+                    "request_id": str(process.client._next_id),
                     "semantic_lane": semantic_lane_ran(response),
                 }
             )
     return measures
+
+
+def count_reads(process: Process, measures: list[JsonObject]) -> None:
+    """Adds to each row how many times its request read the view and the
+    meaning plane, once the process has written its whole log."""
+    counts = process.reads_by_request()
+    for measure in measures:
+        measure["view_reads"] = counts.get((measure["request_id"], "view"), 0)
+        measure["meaning_reads"] = counts.get((measure["request_id"], "meaning plane"), 0)
 
 
 def semantic_lane_ran(response: JsonObject) -> bool:
@@ -439,6 +444,7 @@ def run_family(
                 measures[mode] = replay(process, rows, send, replies[mode])
             finally:
                 process.close()
+            count_reads(process, measures[mode])
         report: JsonObject = {
             "rows": len(rows),
             "legacy_vs_data": compare(rows, read_replies(replies["legacy"]), read_replies(replies["data"])),
@@ -468,6 +474,14 @@ def run_family(
             "data_layer_first_build_seconds": round(build_wait.get("data", 0.0), 3),
             "ready_seconds": {mode: round(seconds, 3) for mode, seconds in ready_wait.items()},
             "latency": {mode: latency(measures[mode]) for mode in modes},
+            "rows_measured": {
+                mode: [
+                    {key: measure[key] for key in ("view_reads", "meaning_reads", "semantic_lane")}
+                    | {"latency_ms": round(measure["latency_ms"], 1)}
+                    for measure in measures[mode]
+                ]
+                for mode in modes
+            },
         }
     )
     return report
@@ -561,13 +575,14 @@ def exact(args: argparse.Namespace) -> JsonObject:
 class HashedEmbeddingServer(ThreadingHTTPServer):
     """A loopback OpenAI-compatible embedder that gives any text a
     deterministic vector: each word (identifiers split at case changes and
-    underscores, lowercased) adds a signed unit to one of `DIMENSIONS`
-    dimensions its digest picks. Texts sharing words point the same way, so
-    the semantic lane ranks as a weak model would, and every process gets
-    exactly the same vector for the same text."""
+    underscores, lowercased) adds weights its digest picks to two of
+    `DIMENSIONS` dimensions. Texts sharing words point the same way, so the
+    semantic lane ranks as a weak model would, every process gets exactly
+    the same vector for the same text, and, as with a real model, two chunks
+    score the same only when they hold the same words."""
 
     DIMENSIONS = 384
-    MODEL = "aft-search-hashed-v1"
+    MODEL = "aft-search-hashed-v2"
     WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+|[^\W_]+")
 
     def __init__(self) -> None:
@@ -578,9 +593,10 @@ class HashedEmbeddingServer(ThreadingHTTPServer):
     def vector(cls, text: str) -> list[float]:
         vector = [0.0] * cls.DIMENSIONS
         for word in cls.WORD.findall(text):
-            digest = hashlib.blake2b(word.lower().encode(), digest_size=4).digest()
-            slot = int.from_bytes(digest[:2], "little") % cls.DIMENSIONS
-            vector[slot] += 1.0 if digest[2] & 1 == 0 else -1.0
+            digest = hashlib.blake2b(word.lower().encode(), digest_size=8).digest()
+            for offset in (0, 4):
+                slot = int.from_bytes(digest[offset : offset + 2], "little") % cls.DIMENSIONS
+                vector[slot] += (digest[offset + 2] * 256 + digest[offset + 3]) / 32768.0 - 1.0
         return vector
 
 

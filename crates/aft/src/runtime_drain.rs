@@ -522,9 +522,10 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
 /// Once per configure of a standalone AFT: with the data layer on, the
 /// root's checkout binds and catches up, building and filling as it needs
 /// ([`crate::data_layer::runtime::root_bound`]), as the daemon's configure
-/// tail has it do; otherwise nothing would until the first query. Never
-/// binds again a checkout an idle release dropped since. Does nothing with
-/// the data layer off.
+/// tail has it do; otherwise nothing would until the first query. A
+/// checkout the idle reaper released since (it drops a checkout no tool has
+/// used for `idle.checkout_hours`, and the next use binds it again) is not
+/// bound again here. Does nothing with the data layer off.
 pub fn follow_configure_with_data_layer(ctx: &AppContext) {
     if !crate::data_layer::runtime::enabled() {
         return;

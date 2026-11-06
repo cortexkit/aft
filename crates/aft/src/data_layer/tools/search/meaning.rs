@@ -742,8 +742,9 @@ mod tests {
     /// from the same checkout with the same embedder, the semantic lane's
     /// question for each distinct query of a real query list, and writes
     /// what differs and what each costs. Answers that differ only in the
-    /// order of equal scores are counted apart (see [`Verdict::TiesOnly`]). The gate for wiring aft_search's
-    /// semantic lane onto the data layer runs it on aft's own checkout:
+    /// order of equal scores are counted apart (see [`Verdict::TiesOnly`]).
+    /// Run on aft's own checkout, it shows that the semantic lane answers
+    /// as today's index does before aft_search reads the plane instead:
     ///
     /// `AFT_MEANING_PARITY_ROOT=<checkout> AFT_MEANING_PARITY_QUERIES=<one
     /// query per line> AFT_MEANING_PARITY_OUT=<report.json> cargo test -p
