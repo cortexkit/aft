@@ -1,6 +1,75 @@
 use super::*;
 use crate::log_redact::SECRET_PLACEHOLDER;
 
+fn restart_placeholder_preview(command: &str, legacy: bool) -> BgCompletion {
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(
+        &original,
+        &fixture,
+        command,
+        "opaque-placeholder-result\n",
+        "",
+        false,
+    );
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.status = BgTaskStatus::Running;
+    metadata.finished_at = None;
+    metadata.duration_ms = None;
+    metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
+    let mut record = serde_json::to_value(&metadata).unwrap();
+    if legacy {
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_has_secret_placeholders");
+    }
+    std::fs::write(&task.paths.json, serde_json::to_vec(&record).unwrap()).unwrap();
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    drop(original);
+    let restarted = BgTaskRegistry::default();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let reloaded = restarted.task(&id).unwrap();
+    {
+        let mut state = reloaded.lock_state().unwrap();
+        assert_eq!(state.metadata.status, BgTaskStatus::Running);
+        // Simulate the child exiting after the new registry recovers the task.
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    }
+    let (matched, context) =
+        restarted.render_watch_preview(&id, b"opaque-placeholder-result\n", 0..6);
+    assert_eq!(matched, SECRET_PLACEHOLDER);
+    assert!(context.starts_with(completion_preview::RESTART_WATCH_PREVIEW_WITHHELD));
+    restarted.completion_snapshot_for_task(&reloaded).unwrap()
+}
+
+#[test]
+fn bash_background_restart_placeholder_task_withholds_completion_without_environment_secrets() {
+    let completion = restart_placeholder_preview("echo '{{ck-secret:test}}'", false);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
+    assert!(!completion
+        .output_preview
+        .contains("opaque-placeholder-result"));
+}
+
+#[test]
+fn bash_background_restart_record_without_placeholder_flag_withholds_completion() {
+    let completion = restart_placeholder_preview("echo plain-output", true);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
+    assert!(!completion
+        .output_preview
+        .contains("opaque-placeholder-result"));
+}
+
 #[test]
 fn bash_background_restart_hex_watch_redaction_is_bounded_and_unlocked() {
     const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
@@ -1020,7 +1089,12 @@ const RESTART_WATCH_LINE: &str = "09:37:38Z #1039 head 03b92ca085 failed: checks
 fn restarted_watch_match(
     environment: &[(&str, &str)],
     pattern: WatchPattern,
-) -> (BashPatternMatchFrame, BgTaskSnapshot, TaskPaths) {
+) -> (
+    BashPatternMatchFrame,
+    BgTaskSnapshot,
+    TaskPaths,
+    BgCompletion,
+) {
     let fixture = tempfile::tempdir().unwrap();
     let original = BgTaskRegistry::default();
     let (id, task) = tests::insert_terminal_piped_task(
@@ -1069,12 +1143,13 @@ fn restarted_watch_match(
     let status = restarted
         .status(&id, "session", None, None, RUNNING_OUTPUT_PREVIEW_BYTES)
         .unwrap();
-    (pushed[0].clone(), status, task.paths.clone())
+    let completion = restarted.completion_snapshot_for_task(&reloaded).unwrap();
+    (pushed[0].clone(), status, task.paths.clone(), completion)
 }
 
 #[test]
 fn bash_background_restart_watch_previews_a_task_launched_without_secrets() {
-    let (matched, status, _) =
+    let (matched, status, _, _) =
         restarted_watch_match(&[], WatchPattern::regex("failed: .*").unwrap());
     assert_eq!(matched.match_text, "failed: checks");
     assert!(
@@ -1100,7 +1175,7 @@ fn bash_background_restart_watch_previews_a_task_launched_without_secrets() {
 fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secrets() {
     const SECRET: &str = "opaque-deploy-credential";
     let environment = [("DEPLOY_TOKEN", SECRET)];
-    let (matched, status, paths) =
+    let (matched, status, paths, _) =
         restarted_watch_match(&environment, WatchPattern::regex("failed: .*").unwrap());
     // The secret values are gone after the restart, so output-derived text
     // stays withheld.
@@ -1124,7 +1199,7 @@ fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secret
 
     // A substring watch's match is the agent's own pattern, shown as given
     // even when the output around it is withheld.
-    let (matched, _, _) =
+    let (matched, _, _, _) =
         restarted_watch_match(&environment, WatchPattern::Substring("failed".into()));
     assert_eq!(matched.match_text, "failed");
     assert!(matched
@@ -1140,7 +1215,7 @@ fn bash_background_restart_watch_previews_a_task_launched_with_aft_co_author() {
         "AFT_GIT_CO_AUTHOR",
         "Co-Authored-By: Agent <agent@example.com>",
     )];
-    let (matched, status, _) =
+    let (matched, status, _, _) =
         restarted_watch_match(&environment, WatchPattern::regex("failed: .*").unwrap());
     assert_eq!(matched.match_text, "failed: checks");
     assert!(
@@ -1153,4 +1228,31 @@ fn bash_background_restart_watch_previews_a_task_launched_with_aft_co_author() {
     assert!(status
         .output_preview
         .contains(RESTART_WATCH_LINE.trim_end()));
+}
+
+#[test]
+fn bash_background_restart_ssh_agent_socket_keeps_status_watch_and_completion_preview() {
+    assert!(!crate::log_redact::is_secret_environment_key(
+        "SSH_AUTH_SOCK"
+    ));
+    assert!(crate::log_redact::is_secret_environment_key(
+        "SSH_AUTH_SOCK_TOKEN"
+    ));
+    assert!(crate::log_redact::is_secret_environment_key("XAUTHORITY"));
+    assert!(crate::log_redact::is_secret_environment_key(
+        "GOOGLE_APPLICATION_CREDENTIALS"
+    ));
+    let (matched, status, _, completion) = restarted_watch_match(
+        &[("SSH_AUTH_SOCK", "/private/ssh-agent.sock")],
+        WatchPattern::regex("failed: .*").unwrap(),
+    );
+    assert_eq!(matched.match_text, "failed: checks");
+    assert!(matched.context.contains(RESTART_WATCH_LINE.trim_end()));
+    assert!(status
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
+    assert!(completion
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
+    assert!(!completion.output_preview.contains("withheld"));
 }

@@ -2615,6 +2615,11 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
+        let completion_secrets = crate::sandbox_spawn::completion_secrets(&plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
+        metadata.completion_has_non_ticket_env_secrets =
+            Some(completion_secrets.has_non_ticket_secrets);
+        metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         metadata.default_hard_kill = hard_kill.renewable();
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
@@ -2701,6 +2706,10 @@ impl BgTaskRegistry {
             canonical_project_root,
         )?;
         let task = self.task(&task_id).unwrap();
+        *task
+            .completion_secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completion_secrets.values);
         task.holds_background_slot
             .store(slot.holds_slot(), Ordering::SeqCst);
         task.state

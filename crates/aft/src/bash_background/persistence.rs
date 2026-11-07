@@ -1932,6 +1932,10 @@ pub struct PersistedTask {
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
     pub compressed: bool,
+    /// Whether the launch command contained secret placeholders. Missing on older
+    /// records, which cannot prove that restart previews are safe to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_has_secret_placeholders: Option<bool>,
     /// Whether the child environment held any completion secret, including
     /// AFT's memory-only gh-shim ticket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2047,6 +2051,7 @@ impl PersistedTask {
         compressed: bool,
     ) -> Self {
         let call_key = Some(super::call_key_for_new_task(&task_id));
+        let completion_has_secret_placeholders = Some(!super::secrets::labels(&command).is_empty());
         let metadata = Self {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
@@ -2079,6 +2084,7 @@ impl PersistedTask {
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
+            completion_has_secret_placeholders,
             completion_has_env_secrets: None,
             completion_has_non_ticket_env_secrets: None,
             completion_ticket_digest: None,
@@ -2112,6 +2118,9 @@ impl PersistedTask {
     }
 
     pub(crate) fn has_safe_completion_redaction_after_restart(&self) -> bool {
+        if self.completion_has_secret_placeholders != Some(false) {
+            return false;
+        }
         if self.completion_has_non_ticket_env_secrets != Some(false) {
             return false;
         }
@@ -2246,6 +2255,7 @@ impl From<BashTaskRow> for PersistedTask {
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
+            completion_has_secret_placeholders: None,
             completion_has_env_secrets: None,
             completion_has_non_ticket_env_secrets: None,
             completion_ticket_digest: None,
