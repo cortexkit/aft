@@ -7096,12 +7096,27 @@ mod guard_tests {
             .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[undecodable])
             .expect("dead-code projection must be available");
         assert!(
-            snapshot
-                .exported_symbols
+            data_layer_snapshot_exports(&snapshot, &root)
                 .iter()
                 .any(|export| export.symbol == "neverCalled"),
             "dead-code inputs must include the decodable files"
         );
+    }
+
+    /// The exports a data-layer dead-code snapshot gives for its files: it
+    /// lists none itself, and its rollup reads them from the call graph it
+    /// carries.
+    fn data_layer_snapshot_exports(
+        snapshot: &CallgraphSnapshot,
+        root: &Path,
+    ) -> Vec<crate::inspect::job::CallgraphExport> {
+        assert!(snapshot.exported_symbols.is_empty(), "{snapshot:?}");
+        snapshot
+            .data_layer
+            .as_ref()
+            .expect("the snapshot carries the data layer's call graph")
+            .exported_symbols_of(root, &snapshot.files)
+            .expect("the call graph's exports")
     }
 
     /// Opens the index-store checkout of `root` under `storage`, waits until
@@ -8682,7 +8697,11 @@ export function bannerUnused() {}
                 .map(|index| root.join(format!("mod{index}.ts")))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(snapshot.exported_symbols.len(), 3, "{snapshot:?}");
+        assert_eq!(
+            data_layer_snapshot_exports(&snapshot, &root).len(),
+            3,
+            "{snapshot:?}"
+        );
 
         // A checkout of another folder never answers for a root.
         let other = InspectManager::new();
@@ -8707,7 +8726,7 @@ export function bannerUnused() {}
         checkout.note_paths(std::slice::from_ref(&edited));
         let (snapshot, verdict, _) = read(&manager).expect("the refreshed data layer answers");
         assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
-        let exports = format!("{:?}", snapshot.exported_symbols);
+        let exports = format!("{:?}", data_layer_snapshot_exports(&snapshot, &root));
         assert!(exports.contains("\"g0\""), "{exports}");
     }
 

@@ -774,13 +774,22 @@ impl FactSource<'_> {
             }
         };
         let mut analysis = facts.into_analysis(lang, file, relative_file, has_oxc_file);
-        // The facts are the content's the call graph read; nothing here
-        // reads the file again to hash it.
-        analysis.freshness = fs::metadata(file).ok().map(|metadata| FileFreshness {
-            mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
-            size: metadata.len(),
-            content_hash: cache_freshness::zero_hash(),
-        });
+        analysis.freshness = if has_oxc_file {
+            // The file's Oxc facts carry the hash of the content they were
+            // read from, and a contribution keeps its file's metadata only
+            // when its freshness has that same hash (else the file looks
+            // changed to every later pass, which then scans it again). So
+            // this file is hashed, as parsing it would have.
+            Some(collect_freshness(file))
+        } else {
+            // The facts are the content's the call graph read; nothing here
+            // reads the file again to hash it.
+            fs::metadata(file).ok().map(|metadata| FileFreshness {
+                mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+                size: metadata.len(),
+                content_hash: cache_freshness::zero_hash(),
+            })
+        };
         analysis
     }
 }
@@ -4154,8 +4163,7 @@ fn rust_children_cfg_test_gated<'t>(
         }
         match node.kind() {
             "attribute_item" => {
-                run_requires_test =
-                    run_requires_test || rust_attribute_requires_test(source, node);
+                run_requires_test = run_requires_test || rust_attribute_requires_test(source, node);
             }
             "line_comment" | "block_comment" => {}
             _ => run_requires_test = false,
