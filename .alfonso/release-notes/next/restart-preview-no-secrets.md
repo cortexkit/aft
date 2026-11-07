@@ -1,1 +1,1 @@
-- Background build-server tasks without secrets retain their output previews after AFT restarts.
+- Background commands without secrets, including build-server jobs and shells using an SSH agent, retain output previews after AFT restarts.

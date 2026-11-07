@@ -1019,6 +1019,10 @@ pub fn is_secret_environment_key(key: &str) -> bool {
     if key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
         return true;
     }
+    // The SSH agent's socket path is an address, not credential material.
+    if key.eq_ignore_ascii_case("SSH_AUTH_SOCK") {
+        return false;
+    }
     // Git's numbered config variables carry a setting NAME in GIT_CONFIG_KEY_<n>
     // (AFT itself injects core.hooksPath this way). The name is not a secret,
     // and dropping it alone while GIT_CONFIG_COUNT and GIT_CONFIG_VALUE_<n>

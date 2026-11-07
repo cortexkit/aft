@@ -3068,10 +3068,22 @@ async fn bash_background_remote_restart_without_secrets_keeps_status_watch_and_c
     assert_eq!(metadata.completion_has_secret_placeholders, Some(false));
     // Rebuild the completion from the task's captured output bytes, not a saved notice.
     metadata.completion_preview = None;
+    metadata.status = BgTaskStatus::Running;
+    metadata.finished_at = None;
+    metadata.duration_ms = None;
     let restarted = registry();
     restarted
         .insert_rehydrated_task(metadata, task.paths.clone(), true)
         .unwrap();
+    let reloaded = restarted.task(&id).unwrap();
+    {
+        let mut state = reloaded.lock_state().unwrap();
+        assert_eq!(state.metadata.status, BgTaskStatus::Running);
+        // Simulate the runner reporting completion after task recovery.
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    }
     let status = restarted
         .status(&id, "session", None, None, RUNNING_OUTPUT_PREVIEW_BYTES)
         .unwrap();
@@ -3080,9 +3092,7 @@ async fn bash_background_remote_restart_without_secrets_keeps_status_watch_and_c
     let (matched, context) = restarted.render_watch_preview(&id, "€\n".as_bytes(), 0..3);
     assert_eq!(matched, "€");
     assert!(!context.contains("withheld"));
-    let completion = restarted
-        .completion_snapshot_for_task(&restarted.task(&id).unwrap())
-        .unwrap();
+    let completion = restarted.completion_snapshot_for_task(&reloaded).unwrap();
     assert!(completion.output_preview.contains('€'));
     assert!(completion.output_preview.contains('😀'));
     assert!(!completion.output_preview.contains("withheld"));
