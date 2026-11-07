@@ -3206,6 +3206,27 @@ test_race_lock
 test_skew_log_query_fallback
 test_gh_query_retry
 
+# test_an_aborted_run_never_reports_success: macOS /bin/bash 3.2 exits 0 when
+# `set -eu` aborts on an unbound name while an EXIT trap is set. A copy of the
+# script with an unbound name planted right after its EXIT trap must still exit
+# nonzero. Under bash 5 that abort is nonzero anyway, so this row only bites
+# where `bash` is 3.2, as on a stock Mac.
+LAST_OUT=""
+aborted="$TMP_ROOT/train-push-aborted.sh"
+awk '{ print } /^trap train_push_on_exit EXIT$/ { print "echo \"${train_push_planted_unbound_name}\"" }' \
+  "$TRAIN_PUSH" > "$aborted"
+if ! grep -q train_push_planted_unbound_name "$aborted"; then
+  fail "the aborted-run row found no 'trap train_push_on_exit EXIT' line to plant after"
+else
+  aborted_rc=0
+  env -u TRAIN_PUSH_EXEC_COPY bash "$aborted" aborted >/dev/null 2>&1 || aborted_rc=$?
+  if [ "$aborted_rc" -ne 0 ]; then
+    ok "a run aborted by an unbound name exits nonzero ($aborted_rc)"
+  else
+    fail "a run aborted by an unbound name exited 0"
+  fi
+fi
+
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
   exit 1
