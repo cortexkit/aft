@@ -16,8 +16,6 @@ pub(crate) mod graph_store;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
-pub(crate) mod legacy_query;
-pub(crate) mod legacy_slice;
 pub(crate) mod meaning;
 pub mod old_index;
 pub(crate) mod outline;
@@ -30,7 +28,6 @@ pub mod reuse;
 pub(crate) mod runtime;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
-pub mod slice_form_gate;
 pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;

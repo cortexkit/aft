@@ -916,61 +916,6 @@ impl FileSlice {
         ]
     }
 
-    /// The string table's bytes by the first part that names each string,
-    /// for a measurement: which parts the text is spent on, and how many
-    /// strings there are.
-    #[doc(hidden)]
-    pub(crate) fn probe_strings(&self) -> Vec<(&'static str, usize)> {
-        let mut owner = vec![None; self.strings.len()];
-        let mut claim = |index: u32, part: &'static str| {
-            owner[index as usize].get_or_insert(part);
-        };
-        for node in self.nodes() {
-            claim(self.nodes.name.get32(node.index), "node names");
-            claim(self.nodes.scoped_name.get32(node.index), "node names");
-            claim(self.nodes.kind.get32(node.index), "node kinds");
-        }
-        for edge in self.edges() {
-            claim(self.edges.target_file.get32(edge.index), "target files");
-            claim(self.edges.target_symbol.get32(edge.index), "target symbols");
-        }
-        for at in 0..self.refs.target_at.len() {
-            claim(self.refs.target_file.get32(at), "target files");
-            claim(self.refs.target_symbol.get32(at), "target symbols");
-        }
-        for reference in self.references() {
-            if let Some(index) = reference.short_name_index() {
-                claim(index, "short names");
-            }
-        }
-        for node in self.nodes() {
-            if let Some(index) = self.nodes.entry_attribute.get_option(node.index) {
-                claim(index, "entry attributes");
-            }
-        }
-        for at in 0..self.refs.local_at.len() {
-            claim(self.refs.local_name.get32(at), "local names");
-        }
-        for at in 0..self.ordinary_name.len() {
-            claim(self.ordinary_name.get32(at), "linked names");
-        }
-        let mut bytes = BTreeMap::<&'static str, usize>::new();
-        for (index, part) in owner.iter().enumerate() {
-            *bytes.entry(part.unwrap_or("unclaimed")).or_default() +=
-                self.strings.get(index as u32).len();
-        }
-        let mut parts = bytes.into_iter().collect::<Vec<_>>();
-        parts.push(("string count", self.strings.len()));
-        parts.push(("front-coded table, stored", self.cold.bytes.len()));
-        parts.push((
-            "front-coded table, decoded",
-            (0..self.cold.len)
-                .map(|index| self.cold.get(index).len())
-                .sum(),
-        ));
-        parts
-    }
-
     /// A slice of `path` with no symbols, references or edges.
     #[cfg(test)]
     pub(crate) fn empty_for_test(path: &str) -> Self {
