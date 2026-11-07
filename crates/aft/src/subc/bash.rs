@@ -911,6 +911,36 @@ fn running_hold_route(identity: &RouteIdentity) -> bool {
                 .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Ephemeral))
 }
 
+/// The authenticated bind principals of Thalamus's runners, whose head
+/// agents get a `background` launch answered at once (see
+/// `submit_deferred_bash`). Matched exactly: a harness label or a module name
+/// that merely starts the same way never qualifies.
+const BACKGROUND_HANDBACK_CARRIERS: [&str; 2] =
+    ["reserved:thalamus-harness", "reserved:thalamus-pi"];
+
+/// Whether `identity` is a head agent's route on one of Thalamus's runners:
+/// a tool-provider v1 route bound under a head scope by one of
+/// [`BACKGROUND_HANDBACK_CARRIERS`]. The route must be first-party, because
+/// only first-party routes receive a task's completion notice; a codemode
+/// call acting for its owner has its own rule and never qualifies here.
+fn runner_head_route(identity: &RouteIdentity) -> bool {
+    let crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+        principal_id: Some(principal),
+        ..
+    } = &identity.spawn_principal
+    else {
+        return false;
+    };
+    identity.role == super::tool_provider::RouteRole::ToolProviderV1
+        && matches!(identity.trust, BindTrust::FirstParty)
+        && identity.run_owner.is_none()
+        && identity
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Head)
+        && BACKGROUND_HANDBACK_CARRIERS.contains(&principal.as_str())
+}
+
 async fn running_hold_frame(
     target: &drain::BashDetachTarget,
     route: RouteChannel,
@@ -2149,6 +2179,29 @@ pub(super) fn submit_deferred_bash(
             .and_then(crate::subc_translate::model_boolean)
             == Some(true)
     });
+    // A server-owned call normally owns its command until it ends. A head
+    // agent on one of Thalamus's runners is the exception for a `background`
+    // or `pty` launch: it gets the ordinary launch reply at once, and the
+    // task's completion reaches it later as a notice, which the runner turns
+    // into a message in the session. Its task is then an ordinary background
+    // task: a cancel or route close before the reply hands it off instead of
+    // killing it, and a slow startup hands back its task id. Workers, Broca's
+    // routes and every other carrier keep the hold.
+    let hands_back_launch = server_completion
+        && !run_scoped
+        && !worker_session
+        && !worker_preset
+        && !worker_jail
+        && secret_identity
+            .as_ref()
+            .is_some_and(|identity| identity.session == session_id && runner_head_route(identity))
+        && ["background", "pty"].iter().any(|key| {
+            raw_args
+                .get(*key)
+                .and_then(crate::subc_translate::model_boolean)
+                == Some(true)
+        });
+    let owns_command = server_completion && !hands_back_launch;
     let capture_wait_mode = raw_args
         .get("wait")
         .and_then(crate::subc_translate::model_boolean)
@@ -2614,8 +2667,9 @@ pub(super) fn submit_deferred_bash(
                     // A codemode program's background launch answers at once like
                     // a classic one; its task belongs to the program's owner
                     // (see `task_scope`), not to the run.
-                    let launch_answers_now =
-                        !server_completion || (run_scoped && settings.background);
+                    let launch_answers_now = !server_completion
+                        || (run_scoped && settings.background)
+                        || hands_back_launch;
                     if launch_answers_now && (is_pty || settings.background) {
                         let unanswered_deadline = unanswered_bash_reply_deadline(
                             received_at,
@@ -2786,7 +2840,7 @@ pub(super) fn submit_deferred_bash(
                 session_id: session_id.clone(),
                 wait_mode: capture_wait_mode,
                 worker_session,
-                server_completion,
+                server_completion: owns_command,
                 late_results: cancel.late_results,
                 registry: spawn_ctx.bash_background().clone(),
                 request_id: request_id.clone(),
@@ -2876,7 +2930,7 @@ pub(super) fn submit_deferred_bash(
                     }
                     #[cfg(not(test))]
                     tokio::time::timeout_at(reply_budget.cap(Instant::now() + INLINE_STARTUP_SETTLE).into(), &mut spawn_future).await.ok()
-                } else if !server_completion && matches!(outcome, crate::bash_background::StartupOutcome::Task(_)) && blocking_cap_ms.is_some() {
+                } else if !owns_command && matches!(outcome, crate::bash_background::StartupOutcome::Task(_)) && blocking_cap_ms.is_some() {
                     let wait_deadline = reply_budget.cap(received_at + Duration::from_millis(blocking_cap_ms.unwrap()));
                     tokio::time::timeout_at(wait_deadline.into(), &mut spawn_future).await.ok()
                 } else {
@@ -2886,14 +2940,14 @@ pub(super) fn submit_deferred_bash(
                     Some(response) => response,
                     None => {
                         let startup_steps = receipt.startup_step_snapshot();
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, &spawn_cancel, admitted.load(Ordering::Relaxed), startup_steps.current());
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, owns_command, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, &spawn_cancel, admitted.load(Ordering::Relaxed), startup_steps.current());
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
                                 tokio::time::timeout_at(reply_budget.deadline.into(), warn_if_runon_capture_missing(spawn_ctx.bash_background().clone(), task_id, session_id.clone(), copy_response(&response))).await.unwrap_or_else(|_| with_capture_warning(&response))
                             } else { response }
                         } else {
-                            let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(capture_reply_deadline), background_runon).await.unwrap_or(response);
+                            let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, owns_command, Some(capture_reply_deadline), background_runon).await.unwrap_or(response);
                             foreground_runon_reply(reply, foreground_runon_deadline, background_runon, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
                         };
                         // This task runs on the shared subc runtime outside any session scope.
@@ -2925,7 +2979,7 @@ pub(super) fn submit_deferred_bash(
                 capture_deadline,
                 &cancel,
                 &claim,
-                server_completion,
+                owns_command,
                 Some(capture_reply_deadline),
                 background_runon,
             )
