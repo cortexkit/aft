@@ -32,6 +32,10 @@
 #   rm -f "$DEPLOY" && cp "$STAGING/$CARD" "$DEPLOY"
 #   scripts/verify-placed-card.sh "$DEPLOY"
 #
+# Before building, the card's source must carry every change of the running
+# card's source (scripts/lib/card-source-gate.sh); STAGE_ACK_MISSING lists the
+# commits a card leaves out on purpose.
+#
 # Usage: scripts/stage-card.sh [--skip-build] [discriminator ...]
 #   discriminator  a string that must be present in the new card and
 #                  absent from the running daemon image; each one is
@@ -45,6 +49,8 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/scripts/lib/ck-aft-signature.sh"
 # shellcheck source=lib/storage-floor-check.sh
 source "$REPO_ROOT/scripts/lib/storage-floor-check.sh"
+# shellcheck source=lib/card-source-gate.sh
+source "$REPO_ROOT/scripts/lib/card-source-gate.sh"
 
 STAGING="${CK_STAGING_DIR:-$HOME/.local/share/cortexkit/staging}"
 DEPLOY="${CK_DEPLOY_PATH:-$HOME/.local/share/cortexkit/bin/ck-aft}"
@@ -64,6 +70,15 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 2
 fi
 SHA="$(git rev-parse --short=12 HEAD)"
+
+# A card built from a branch that lacks the running card's changes would undo
+# them on placement; refuse before spending a build on it. A --skip-build card
+# comes from a release download, not this checkout's HEAD, so there is nothing
+# to compare it against here.
+if [ "$SKIP_BUILD" -eq 0 ]; then
+  echo "==> running card's changes"
+  ck_aft_check_card_source "$DEPLOY" "$STAGING" stage-card || exit 2
+fi
 
 BUILD_START="$(date +%s)"
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -199,6 +214,11 @@ CARD="ck-aft.${HASH:0:16}"
 mv "$TMP" "$STAGING/$CARD"
 # The sidecar is written from the final name so `shasum -c` matches as-is.
 (cd "$STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256.postsign" && shasum -c "$CARD.sha256.postsign" >/dev/null)
+# The commit this card was built from, for the next card's source check
+# (lib/card-source-gate.sh) once this one is running.
+if [ "$SKIP_BUILD" -eq 0 ]; then
+  git rev-parse HEAD > "$STAGING/$CARD.source"
+fi
 # Owner declaration of the current card, so the placement gate reads it as
 # declared rather than inferring the newest card from mtimes. One shasum-shaped
 # line plus a UTC stamp; the gate treats it as inert if absent.
