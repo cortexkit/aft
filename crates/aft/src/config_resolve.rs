@@ -4156,28 +4156,49 @@ mod tests {
     /// prefixed tool name appears.
     fn refused_retired_documents() -> Vec<(&'static str, Value)> {
         let mut documents = vec![
-            ("sandbox.enabled", serde_json::json!({"sandbox": {"enabled": true}})),
-            ("tool_surface", serde_json::json!({"tool_surface": "minimal"})),
-            ("hoist_builtin_tools", serde_json::json!({"hoist_builtin_tools": false})),
+            (
+                "sandbox.enabled",
+                serde_json::json!({"sandbox": {"enabled": true}}),
+            ),
+            (
+                "tool_surface",
+                serde_json::json!({"tool_surface": "minimal"}),
+            ),
+            (
+                "hoist_builtin_tools",
+                serde_json::json!({"hoist_builtin_tools": false}),
+            ),
             ("enabled", serde_json::json!({"enabled": false})),
             ("search_index", serde_json::json!({"search_index": false})),
             (
                 "experimental_search_index",
                 serde_json::json!({"experimental_search_index": false}),
             ),
-            ("semantic_search", serde_json::json!({"semantic_search": false})),
+            (
+                "semantic_search",
+                serde_json::json!({"semantic_search": false}),
+            ),
             (
                 "experimental_semantic_search",
                 serde_json::json!({"experimental_semantic_search": false}),
             ),
-            ("callgraph_store", serde_json::json!({"callgraph_store": false})),
-            ("github.enabled", serde_json::json!({"github": {"enabled": false}})),
+            (
+                "callgraph_store",
+                serde_json::json!({"callgraph_store": false}),
+            ),
+            (
+                "github.enabled",
+                serde_json::json!({"github": {"enabled": false}}),
+            ),
             ("gh_read", serde_json::json!({"gh_read": {"enabled": true}})),
             (
                 "gh_shim.enabled",
                 serde_json::json!({"gh_shim": {"enabled": false, "binary_path": "/opt/aft/bin/aft"}}),
             ),
-            ("experimental_lsp_ty", serde_json::json!({"experimental_lsp_ty": true})),
+            (
+                "experimental_lsp_ty",
+                serde_json::json!({"experimental_lsp_ty": true}),
+            ),
             (
                 "experimental_bash_rewrite",
                 serde_json::json!({"experimental_bash_rewrite": true}),
@@ -4238,10 +4259,8 @@ mod tests {
             ] {
                 let text = document.to_string();
                 for tier_name in ["user", "project"] {
-                    let refused = resolve_config_for_harness(
-                        &[tier(tier_name, &text)],
-                        Some(&Harness::Pi),
-                    );
+                    let refused =
+                        resolve_config_for_harness(&[tier(tier_name, &text)], Some(&Harness::Pi));
                     assert_eq!(
                         refused.errors,
                         [format!(
@@ -4278,20 +4297,25 @@ mod tests {
     #[test]
     fn doctor_fix_carries_refused_values_to_their_replacements() {
         let fixed = |text: &str| {
-            let text = crate::config_fix::migrate_config_text(text, crate::config_fix::FixTier::User)
-                .unwrap()
-                .text;
+            let text =
+                crate::config_fix::migrate_config_text(text, crate::config_fix::FixTier::User)
+                    .unwrap()
+                    .text;
             let result = resolve_config(&[tier("user", &text)]);
             assert!(result.errors.is_empty(), "{text}: {:?}", result.errors);
             result.config
         };
-        let minutes = |config: &Config| serde_json::to_value(config).unwrap()["lsp_idle_minutes"].clone();
+        let minutes =
+            |config: &Config| serde_json::to_value(config).unwrap()["lsp_idle_minutes"].clone();
         assert_eq!(minutes(&fixed(r#"{"idle":{"lsp_ttl_minutes":10}}"#)), 10);
         assert!(!fixed(r#"{"search_index":false}"#).indexes.trigram);
         let reminder =
             fixed(r#"{"experimental":{"bash":{"long_running_reminder_interval_ms":5000}}}"#);
         assert_eq!(reminder.bash_long_running_reminder_interval_ms, 5000);
-        assert!(reminder.experimental_bash_rewrite, "the flags keep their defaults");
+        assert!(
+            reminder.experimental_bash_rewrite,
+            "the flags keep their defaults"
+        );
         let background = fixed(r#"{"experimental":{"bash":{"background":true}}}"#);
         assert!(background.experimental_bash_background);
         assert!(!background.experimental_bash_rewrite);
@@ -4307,11 +4331,13 @@ mod tests {
         for tier_name in ["user", "project"] {
             let hang = resolve_config(&[tier(tier_name, r#"{"bridge":{"hang_threshold":2}}"#)]);
             assert!(hang.errors.is_empty(), "{tier_name}: {:?}", hang.errors);
-            let checkout = resolve_config(&[tier(
-                tier_name,
-                r#"{"views":{"idle_checkout_hours":72}}"#,
-            )]);
-            assert!(checkout.errors.is_empty(), "{tier_name}: {:?}", checkout.errors);
+            let checkout =
+                resolve_config(&[tier(tier_name, r#"{"views":{"idle_checkout_hours":72}}"#)]);
+            assert!(
+                checkout.errors.is_empty(),
+                "{tier_name}: {:?}",
+                checkout.errors
+            );
             assert_eq!(checkout.config.idle.checkout_hours, 72);
         }
     }

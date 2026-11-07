@@ -832,28 +832,6 @@ fn retry_dead_code_store_read<T>(
     }
 }
 
-fn callgraph_store_ready_for_dead_code(
-    callgraph_dir: PathBuf,
-    project_root: PathBuf,
-) -> Result<bool, CallGraphStoreError> {
-    // Today's call-graph store is retired; dead code reads the index store.
-    let _ = (callgraph_dir, project_root);
-    Ok(false)
-}
-
-fn callgraph_store_busy_for_dead_code(inspect_dir: &Path, project_root: &Path) -> bool {
-    for dir in callgraph_store_dirs_from_inspect_dir(inspect_dir, project_root) {
-        match retry_dead_code_store_read(|| {
-            callgraph_store_ready_for_dead_code(dir.clone(), project_root.to_path_buf())
-        }) {
-            Ok(true) => return false,
-            Err(_) => return true,
-            Ok(false) => {}
-        }
-    }
-    false
-}
-
 /// Completes the builder registration and sends `Failed` to leftover waiters
 /// if a reuse worker returns, panics, or is cancelled without going through the
 /// completion router. Admission and exit must be paired; a leftover registration
@@ -1697,6 +1675,7 @@ impl InspectManager {
                     let age =
                         generated_at.map(|at| unix_now_secs().saturating_sub(at.max(0) as u64));
                     let cached = filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         None,
                         JobOutcome::Fresh { payload: cached },
                         snapshot,
@@ -1800,22 +1779,14 @@ impl InspectManager {
         self.try_tier2_any_in_flight()
     }
 
-    /// Whether a published callgraph store can back a dead_code snapshot.
-    ///
-    /// This is the same readiness predicate the builder uses before projection:
-    /// a store that opens but still has `backend_file_state='stale'` rows is
-    /// not ready, because `project_dead_code_snapshot` refuses those rows.
+    /// Whether the root has a published call graph a dead_code snapshot can be
+    /// built from. Edits pending on a published graph don't count against
+    /// it: the snapshot brings them in.
     pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
-        if !snapshot.config.indexes.callgraph {
-            return false;
-        }
-
-        callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
-            .into_iter()
-            .any(|dir| {
-                callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone())
-                    .unwrap_or(false)
-            })
+        snapshot.config.indexes.callgraph
+            && !self
+                .data_layer_dead_code
+                .callgraph_busy(&snapshot.project_root)
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -2995,6 +2966,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 Some(self),
                 outcome,
                 &snapshot,
@@ -3276,6 +3248,7 @@ impl InspectManager {
             // Scoped completions need the shared scan's revision-checked graph
             // and contribution-checked rollup, not a full projection per waiter.
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 Some(self),
                 outcome,
                 snapshot,
@@ -3374,6 +3347,7 @@ impl InspectManager {
             Ok(Some(payload)) => {
                 match self.tier2_cached_aggregate_is_fresh(snapshot, category, cache) {
                     Ok(true) => filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         // Only verified source inventories may reuse a rollup.
                         // Stale/last-complete reads still reconstruct it below.
                         Some(self),
@@ -3384,6 +3358,7 @@ impl InspectManager {
                         caller_scope,
                     ),
                     Ok(false) => filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         None,
                         JobOutcome::Stale {
                             cached: Some(payload),
@@ -3399,6 +3374,7 @@ impl InspectManager {
             }
             Ok(None) => match cache.latest_aggregate_any_hash(category) {
                 Ok(Some(payload)) => filter_outcome_for_scope_with_contributions(
+                    &self.data_layer_dead_code,
                     None,
                     JobOutcome::Stale {
                         cached: Some(payload),
@@ -3557,7 +3533,7 @@ impl InspectManager {
 
         if job.category == InspectCategory::DeadCode
             && job.config.indexes.callgraph
-            && callgraph_store_busy_for_dead_code(&job.inspect_dir, &job.project_root)
+            && self.data_layer_dead_code.callgraph_busy(&job.project_root)
         {
             return callgraph_pending_result(&job, started.elapsed());
         }
@@ -4518,6 +4494,7 @@ impl InspectManager {
                 recv(waiter_rx) -> outcome => {
                     return match outcome {
                         Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                            &self.data_layer_dead_code,
                             None,
                             outcome,
                             &snapshot,
@@ -4577,6 +4554,7 @@ impl InspectManager {
     ) -> JobOutcome {
         match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
             Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 None,
                 JobOutcome::Stale {
                     cached: Some(cached),
@@ -5261,31 +5239,6 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             Err(CallGraphStoreError::Unavailable(reason))
         }
     }
-}
-
-fn callgraph_store_dir_from_inspect_dir(
-    inspect_dir: &Path,
-    project_root: &Path,
-) -> Option<PathBuf> {
-    let scope_key = crate::path_identity::project_scope_key(project_root);
-    let storage_dir = if inspect_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == scope_key)
-    {
-        inspect_dir.parent()?.parent()?
-    } else {
-        inspect_dir.parent()?
-    };
-    let project_key =
-        crate::search_index::artifact_cache_key_read_only(project_root, storage_dir).ok()?;
-    Some(storage_dir.join("callgraph").join(project_key))
-}
-
-fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
-    callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
-        .into_iter()
-        .collect()
 }
 
 #[cfg(test)]
@@ -6370,6 +6323,7 @@ fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<Stri
 }
 
 fn filter_outcome_for_scope_with_contributions(
+    dead_code_sources: &crate::data_layer::tools::inspect::DeadCodeSources,
     manager: Option<&InspectManager>,
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
@@ -6377,10 +6331,11 @@ fn filter_outcome_for_scope_with_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
-    // Fresh source files do not establish graph liveness while its store is busy.
+    // Fresh source files do not establish graph liveness before the root has a
+    // call graph, so no answer, fresh or cached, is served until it has one.
     if category == InspectCategory::DeadCode
         && snapshot.config.indexes.callgraph
-        && callgraph_store_busy_for_dead_code(&snapshot.inspect_dir, &snapshot.project_root)
+        && dead_code_sources.callgraph_busy(&snapshot.project_root)
     {
         return JobOutcome::Fresh {
             payload: callgraph_pending_payload(),
@@ -7732,7 +7687,6 @@ mod guard_tests {
     }
 
     #[test]
-    #[ignore = "callgraph_store_busy_for_dead_code still reads the retired call-graph store, so a building index-store call graph neither stops a dead-code run before it opens the inspect cache nor stops a cached project-wide zero from being served"]
     fn inspect_dead_code_busy_callgraph_reports_pending() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -7778,6 +7732,7 @@ mod guard_tests {
         );
         let cache = manager.cache_for_snapshot(&snapshot).unwrap();
         let cached = filter_outcome_for_scope_with_contributions(
+            &manager.data_layer_dead_code,
             Some(&manager),
             JobOutcome::Fresh {
                 payload: json!({"count": 0, "items": [], "complete": true}),
@@ -7795,6 +7750,7 @@ mod guard_tests {
         assert!(cached.payload().unwrap().get("count").is_none());
         drop(hold);
         let scoped = filter_outcome_for_scope_with_contributions(
+            &manager.data_layer_dead_code,
             Some(&manager),
             outcome,
             &snapshot,

@@ -59,6 +59,22 @@ impl DeadCodeSources {
             .insert(project_root.to_path_buf(), Arc::downgrade(checkout));
     }
 
+    /// Whether `project_root` has no call graph to analyse yet: no checkout
+    /// is bound for it, or its first call graph is not published. Checked
+    /// without waiting, before a run opens the inspect cache and before a
+    /// cached result is served, so neither a run nor a cached answer stands
+    /// in for a graph that doesn't exist yet. A published graph with edits
+    /// pending is not busy: [`Self::snapshot`] brings it up to date.
+    pub(crate) fn callgraph_busy(&self, project_root: &Path) -> bool {
+        self.checkouts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(project_root)
+            .and_then(Weak::upgrade)
+            .and_then(|checkout| checkout.view())
+            .is_none_or(|view| !view.status().callgraph_published)
+    }
+
     /// The dead-code snapshot of `project_root` from its checkout's view,
     /// once the view is published and its call graph has no changes
     /// pending.

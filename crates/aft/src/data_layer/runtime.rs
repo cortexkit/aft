@@ -1154,6 +1154,14 @@ pub(crate) fn has_family_store(root: &Path, storage: &Path) -> bool {
     })
 }
 
+/// Whether today's SQLite call-graph store is retired, so the index store is
+/// the only call graph. Always so in this build. The old store's refresh,
+/// reconcile and pending queues check it and stand down instead of queuing
+/// work nothing applies; they go when that store's code is deleted.
+pub(crate) const fn retired_callgraph_store() -> bool {
+    true
+}
+
 /// The last failed build or call-graph refresh of a checkout.
 pub(crate) type DataFailure = super::checkout::Failure;
 

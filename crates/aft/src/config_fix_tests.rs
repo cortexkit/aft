@@ -582,7 +582,10 @@ fn migration_pre_rename_error_preserves_original_and_removes_backup() {
     })
     .expect("reported failure");
     assert!(matches!(outcome, UserConfigMigration::NotMigrated { .. }));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), TRANSLATED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert!(backups(dir.path()).is_empty());
 }
 
@@ -729,7 +732,10 @@ fn a_read_only_user_file_is_left_alone_with_a_notice() {
         "{notice}"
     );
     assert!(notice.contains("doctor --fix"), "{notice}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), TRANSLATED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert!(backups(dir.path()).is_empty());
 
     // Loading the same text still resolves, translated in memory.
@@ -859,7 +865,10 @@ fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
         notice.contains("applied their current equivalents"),
         "{notice}"
     );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), TRANSLATED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert_eq!(
         std::fs::metadata(&path).unwrap().modified().unwrap(),
         modified

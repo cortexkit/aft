@@ -7656,11 +7656,12 @@ mod tests {
         assert!(!refused.success, "{refused:?}");
         assert_eq!(refused.data["code"], "config_rejected", "{refused:?}");
         assert!(
-            refused.data["message"].as_str().is_some_and(|message| message.contains(
-                "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix"
-            ) && message.contains(
-                "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix"
-            )),
+            refused.data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(
+                    "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix"
+                ) && message
+                    .contains("removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix")),
             "{refused:?}"
         );
         assert_eq!(fs::read_to_string(&project_path).unwrap(), refused_text);

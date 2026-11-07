@@ -6726,15 +6726,21 @@ impl AppContext {
                 );
             }
         }
-        let mut store_paths: BTreeSet<PathBuf> = self.pending_callgraph_store_paths.lock().clone();
-        #[cfg(test)]
-        pending_capture_boundary_for_test(PendingCaptureBoundary::BeforeWorkerQueue);
-        if let Some(project_root) = project_root.as_deref() {
-            store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
-                project_root,
-            ));
+        // The retired store's queues describe nothing the index store
+        // answers from; the index store's own pending edits are waited for
+        // or disclosed by its query path.
+        let mut store_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        if !crate::data_layer::runtime::retired_callgraph_store() {
+            store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
+            #[cfg(test)]
+            pending_capture_boundary_for_test(PendingCaptureBoundary::BeforeWorkerQueue);
+            if let Some(project_root) = project_root.as_deref() {
+                store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
+                    project_root,
+                ));
+            }
+            store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
         }
-        store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
 
         let roots: Vec<PathBuf> = [project_root, self.config().project_root.clone()]
             .into_iter()
@@ -9256,6 +9262,12 @@ impl AppContext {
         if self.callgraph_reconcile.pending_reason().is_none() {
             return false;
         }
+        // The retired store has nothing to reconcile; see
+        // `enqueue_callgraph_store_refresh_with_keepalive`.
+        if crate::data_layer::runtime::retired_callgraph_store() {
+            self.callgraph_reconcile.clear_pending();
+            return false;
+        }
         if !self.callgraph_writer() || !self.config().indexes.callgraph {
             // Nothing here can apply a refresh: a read-only root reads the
             // owner's store, and a disabled index has no store.
@@ -9698,6 +9710,13 @@ impl AppContext {
     {
         let paths = paths.into_iter().collect::<Vec<_>>();
         if paths.is_empty() {
+            return true;
+        }
+        // Today's call-graph store is retired: the index store records every
+        // change through its own watcher path. Queuing here would start a
+        // refresh worker that nothing applies, and parked paths would read
+        // as pending call-graph changes on every later answer.
+        if crate::data_layer::runtime::retired_callgraph_store() {
             return true;
         }
         // A disabled or degraded root must not create a refresh worker merely

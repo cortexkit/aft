@@ -223,7 +223,6 @@ async fn rich_ui_samples_match_handlers() {
 }
 
 #[test]
-#[ignore = "the watcher drain still queues an edited file for the retired call-graph store's refresh, which nothing applies any more, so pending_changes_for_query keeps naming it as an unapplied call-graph change"]
 fn rich_ui_samples_wait_for_pending_watcher_application() {
     let f = sample_fixture();
     wait_for_capture_ready(&f.ctx, Duration::from_secs(60));
