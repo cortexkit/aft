@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
-        composition_digest, schema_digest, session_capabilities, system_text_digest, CatalogAnswer,
-        CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
+        check_model_param, composition_digest, schema_digest, session_capabilities,
+        system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use subc_protocol::ErrorBody;
 
 use super::manifest;
+use crate::hashline::integration::RegistrationRequest;
 
 #[cfg(test)]
 thread_local! {
@@ -193,6 +194,7 @@ pub(super) fn describe() -> Value {
         )
         .with_capabilities(vec![
             "tool-catalog-confine/v1".into(),
+            cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
         ]),
     )
@@ -299,6 +301,32 @@ pub(crate) const READER_TOOLS: &[&str] = &[
     "inspect",
 ];
 
+/// The settings a runner head's catalog follows, so it is offered what an
+/// OpenCode plugin head on the same settings registers. They are read from the
+/// project's resolved configuration when the catalog is fetched, and change
+/// nothing in a catalog whose request names no model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeadSettings {
+    /// `bash.background`: the plugin registers `bash_watch` only while it is on.
+    pub(crate) background_bash: bool,
+    /// `edit_mode: "hashline"`: `edit` takes a hashline patch and `read` mints
+    /// the tags it addresses.
+    pub(crate) hashline: bool,
+    /// `bash.rewrite`: rewritten `cat`/`head`/`tail` commands mint hashline
+    /// tags too, so the hashline wording names them only while it is on.
+    pub(crate) bash_rewrite: bool,
+}
+
+impl HeadSettings {
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            background_bash: config.experimental_bash_background,
+            hashline: config.hashline_enabled,
+            bash_rewrite: config.experimental_bash_rewrite,
+        }
+    }
+}
+
 /// Metadata for tools only a non-head preset serves. They are not in the
 /// module manifest (the HELLO surface and every legacy consumer stay as they
 /// were), so they are listed apart from [`METADATA`].
@@ -387,8 +415,17 @@ static ADMISSION_READY: LazyLock<()> = LazyLock::new(|| {
                     let _ = release.recv();
                 }
             }
+            let runner_head = [
+                &RUNNER_HEAD_TOOLS.bash_watch,
+                &RUNNER_HEAD_TOOLS.hashline_edit,
+            ];
             for preset in CatalogPreset::ALL {
-                for served in served_tools(preset) {
+                let extras: &[&ServedTool] = if preset == CatalogPreset::Head {
+                    &runner_head
+                } else {
+                    &[]
+                };
+                for served in served_tools(preset).iter().chain(extras.iter().copied()) {
                     served.validator.get_or_init(|| {
                         let tool = served
                             .with_runon
@@ -494,45 +531,14 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
     served
         .into_iter()
         .map(|(name, schema, description)| {
-            let (_, tag, restrict_replace) = METADATA
-                .iter()
-                .chain(PRESET_ONLY_METADATA)
-                .find(|(known, _, _)| *known == name)
-                .expect("every served tool has v1 metadata");
-            let entry = |mut schema: Value, description: Option<String>| {
-                schema
-                    .as_object_mut()
-                    .expect("tool schemas are objects")
-                    .remove("description");
-                let digest =
-                    schema_digest(&schema).expect("embedded schema has a structural digest");
-                let semantics = if name == "bash"
-                    || (preset == CatalogPreset::Worker && name == "bash_watch")
-                {
+            let semantics =
+                if name == "bash" || (preset == CatalogPreset::Worker && name == "bash_watch") {
                     2
                 } else {
                     1
                 };
-                let mut entry = CatalogTool::new(name.clone(), digest, semantics, schema);
-                let mut modes = vec![cortexkit_role_tool_provider::CallMode::Classic];
-                if name != "bash_watch" {
-                    modes.push(cortexkit_role_tool_provider::CallMode::Codemode);
-                }
-                if matches!(
-                    name.as_str(),
-                    "read" | "grep" | "glob" | "search" | "outline" | "zoom" | "callgraph"
-                ) {
-                    modes.push(cortexkit_role_tool_provider::CallMode::Flow);
-                }
-                entry.modes = Some(modes);
-                if !tag.is_empty() {
-                    entry.capabilities.push((*tag).into());
-                }
-                entry.description = description;
-                if *restrict_replace {
-                    entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
-                }
-                entry
+            let entry = |schema: Value, description: Option<String>| {
+                catalog_entry(&name, semantics, schema, description)
             };
             let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
             let with_runon = manifest::remote_tool(preset_name, &name)
@@ -544,44 +550,139 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
         .collect()
 }
 
+/// One catalog entry: `schema` without its root description, the call modes
+/// and capability tag `name` is served with, and `description`.
+fn catalog_entry(
+    name: &str,
+    semantics: u64,
+    mut schema: Value,
+    description: Option<String>,
+) -> CatalogTool {
+    let (_, tag, restrict_replace) = METADATA
+        .iter()
+        .chain(PRESET_ONLY_METADATA)
+        .find(|(known, _, _)| *known == name)
+        .expect("every served tool has v1 metadata");
+    schema
+        .as_object_mut()
+        .expect("tool schemas are objects")
+        .remove("description");
+    let digest = schema_digest(&schema).expect("embedded schema has a structural digest");
+    let mut entry = CatalogTool::new(name, digest, semantics, schema);
+    let mut modes = vec![cortexkit_role_tool_provider::CallMode::Classic];
+    if name != "bash_watch" {
+        modes.push(cortexkit_role_tool_provider::CallMode::Codemode);
+    }
+    if matches!(
+        name,
+        "read" | "grep" | "glob" | "search" | "outline" | "zoom" | "callgraph"
+    ) {
+        modes.push(cortexkit_role_tool_provider::CallMode::Flow);
+    }
+    entry.modes = Some(modes);
+    if !tag.is_empty() {
+        entry.capabilities.push((*tag).into());
+    }
+    entry.description = description;
+    if *restrict_replace {
+        entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
+    }
+    entry
+}
+
+/// The entries a runner head is served in place of, or beside, the `head`
+/// preset's own (see [`runner_head_keeps`] for what marks a runner head).
+/// Like the preset tables they are fixed at build time, so their digests and
+/// validators never need request-scoped rebuilding.
+struct RunnerHeadTools {
+    /// `bash_watch` with the OpenCode plugin's head wording and arguments, less
+    /// its async watches, which a catalog caller has no channel to receive.
+    bash_watch: ServedTool,
+    /// The hashline `edit` arm, served when the session's edit mode is
+    /// `hashline`. Its description is composed per catalog, because it names
+    /// only the tools that catalog serves.
+    hashline_edit: ServedTool,
+}
+
+static RUNNER_HEAD_TOOLS: LazyLock<RunnerHeadTools> = LazyLock::new(|| {
+    let served = |catalog: CatalogTool| ServedTool {
+        catalog,
+        with_runon: None,
+        with_ref: None,
+        validator: OnceLock::new(),
+    };
+    let (schema, description) = manifest::preset_tool(CatalogPreset::Head.name(), "bash_watch")
+        .expect("the head preset artifact carries bash_watch");
+    RunnerHeadTools {
+        bash_watch: served(catalog_entry("bash_watch", 1, schema, description)),
+        hashline_edit: served(catalog_entry(
+            "edit",
+            1,
+            crate::hashline::integration::hashline_edit_schema(),
+            None,
+        )),
+    }
+});
+
 /// The lines every preset's system text shares, one per served code tool.
-fn code_tool_lines(text: &mut String, has: impl Fn(&str) -> bool) {
-    if has("search") {
-        text.push_str(
-            "Use search to locate code by concept, identifier, or literal before reading it.\n",
-        );
+/// `spell` gives the name a bare catalog tool is served under, or `None` when
+/// the catalog does not serve it.
+fn code_tool_lines(text: &mut String, spell: &dyn Fn(&str) -> Option<String>) {
+    if let Some(search) = spell("search") {
+        text.push_str(&format!(
+            "Use {search} to locate code by concept, identifier, or literal before reading it.\n"
+        ));
     }
-    if has("outline") {
-        text.push_str("Use outline to map source structure before reading specific sections.\n");
+    if let Some(outline) = spell("outline") {
+        text.push_str(&format!(
+            "Use {outline} to map source structure before reading specific sections.\n"
+        ));
     }
-    if has("zoom") {
-        text.push_str(
-            "Use zoom to inspect named symbols, with callgraph: true for one-level calls.\n",
-        );
+    if let Some(zoom) = spell("zoom") {
+        text.push_str(&format!(
+            "Use {zoom} to inspect named symbols, with callgraph: true for one-level calls.\n"
+        ));
     }
-    if has("callgraph") {
-        text.push_str(
-            "Use callgraph for callers, impact, and multi-level execution or data-flow traces.\n",
-        );
+    if let Some(callgraph) = spell("callgraph") {
+        text.push_str(&format!(
+            "Use {callgraph} for callers, impact, and multi-level execution or data-flow traces.\n"
+        ));
     }
-    if has("inspect") {
-        text.push_str("Use inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\n");
+    if let Some(inspect) = spell("inspect") {
+        text.push_str(&format!("Use {inspect} after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\n"));
     }
-    if has("read") {
-        text.push_str(
-            "Use read for files and bounded line ranges, not shell commands to explore source.\n",
-        );
+    if let Some(read) = spell("read") {
+        text.push_str(&format!(
+            "Use {read} for files and bounded line ranges, not shell commands to explore source.\n"
+        ));
     }
+}
+
+/// `spell` for a catalog that serves every tool under its bare name.
+fn bare_spelling<'a>(names: &'a [&'a str]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |bare| names.contains(&bare).then(|| bare.to_string())
 }
 
 /// System instructions for the primary (`head`) session. The legacy `broca`
 /// text request can set `worker` to append a reminder to stay in scope.
 pub(super) fn broca_text(names: &[&str], worker: bool) -> String {
-    let has = |name: &str| names.contains(&name);
+    head_text(&bare_spelling(names), worker, None)
+}
+
+/// [`broca_text`] with each tool spelled by `spell`, and the line a hashline
+/// session is given about which calls mint the tags its patches address.
+fn head_text(
+    spell: &dyn Fn(&str) -> Option<String>,
+    worker: bool,
+    hashline_tags: Option<&str>,
+) -> String {
     let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, has);
-    if has("bash") {
+    code_tool_lines(&mut text, spell);
+    if spell("bash").is_some() {
         text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n");
+    }
+    if let Some(sentence) = hashline_tags {
+        text.push_str(&format!("**Hashline edit tags**: {sentence}\n"));
     }
     if worker {
         text.push_str(WORKER_SCOPE_LINE);
@@ -598,7 +699,7 @@ const WORKER_SCOPE_LINE: &str = "As a worker, keep changes within your assigned 
 pub(super) fn worker_text(names: &[&str]) -> String {
     let has = |name: &str| names.contains(&name);
     let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, has);
+    code_tool_lines(&mut text, &bare_spelling(names));
     if has("bash") {
         text.push_str("Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\n");
     }
@@ -612,10 +713,9 @@ pub(super) fn worker_text(names: &[&str]) -> String {
 /// The `reader` preset's system text: what the session can and cannot do,
 /// then the shared line for each code tool it has.
 pub(super) fn reader_text(names: &[&str]) -> String {
-    let has = |name: &str| names.contains(&name);
     let mut text = String::from("# Agent File Tools\n\n");
     text.push_str("This session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n");
-    code_tool_lines(&mut text, has);
+    code_tool_lines(&mut text, &bare_spelling(names));
     text
 }
 
@@ -651,16 +751,49 @@ pub(super) fn catalog_for_session(
     runon: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
+    catalog_for_session_with(
+        body,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+        HeadSettings::UNCONFIGURED,
+    )
+}
+
+/// [`catalog_for_session`] for a project whose settings are `head`.
+#[cfg(test)]
+pub(super) fn catalog_for_session_with(
+    body: Value,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+    head: HeadSettings,
+) -> Result<Value, ErrorBody> {
     let (request, preset) = validate_catalog_request(body)?;
-    catalog_for_request(
+    catalog_for_route(
         request,
         preset,
         disabled,
         powershell_available,
-        runon,
-        false,
+        (runon, false),
         worker_wait_max_ms,
+        false,
+        head,
     )
+    .map(|(answer, _)| answer)
+}
+
+#[cfg(test)]
+impl HeadSettings {
+    /// What a project with no AFT configuration resolves to: background bash
+    /// and bash rewriting on, the default edit mode.
+    pub(crate) const UNCONFIGURED: Self = Self {
+        background_bash: true,
+        hashline: false,
+        bash_rewrite: true,
+    };
 }
 
 pub(super) fn validate_catalog_request(
@@ -685,7 +818,15 @@ pub(super) fn validate_catalog_request(
         ));
     }
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
-    if let Some((key, _)) = request.params.iter().next() {
+    // `model` is the one parameter this validator accepts: AFT advertises
+    // `tool-catalog-model/v1`, and a `head` catalog picks its edit tools by
+    // it (see `runner_head_keeps`). A malformed selector is refused by name.
+    check_model_param(&request.params)?;
+    if let Some((key, _)) = request
+        .params
+        .iter()
+        .find(|(key, _)| key.as_str() != "model")
+    {
         return Err(errors::invalid_request(
             &format!("params.{key}"),
             "unsupported catalog parameter",
@@ -722,7 +863,9 @@ thread_local! {
 
 /// Render validated arguments under the session's resolved remote policy and
 /// blocking wait limit. Only remotely enabled sessions see bash's `runon`
-/// argument, and only sessions with `revision_reads` on see `ref`.
+/// argument, and only sessions with `revision_reads` on see `ref`. A runner
+/// head's catalog follows the settings of a default configuration here; a
+/// project route renders with its own through [`catalog_for_route`].
 pub(super) fn catalog_for_request(
     request: CatalogRequest,
     preset: CatalogPreset,
@@ -732,17 +875,20 @@ pub(super) fn catalog_for_request(
     revision_reads: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
-    render_catalog(
+    catalog_for_route(
         request,
         preset,
         disabled,
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        CatalogRestrictions::default(),
+        false,
+        HeadSettings::from_config(&crate::config::Config::default()),
     )
+    .map(|(answer, _)| answer)
 }
 
+#[cfg(test)]
 pub(super) fn catalog_for_confined_request(
     request: CatalogRequest,
     preset: CatalogPreset,
@@ -752,16 +898,44 @@ pub(super) fn catalog_for_confined_request(
     revision_reads: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
-    render_catalog(
+    catalog_for_route(
         request,
         preset,
         disabled,
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        CatalogRestrictions {
-            confined: true,
+        true,
+        HeadSettings::from_config(&crate::config::Config::default()),
+    )
+    .map(|(answer, _)| answer)
+}
+
+/// Render a project route's catalog under that project's `head` settings,
+/// confined to the project root when `confined`. For a runner head the reply
+/// also carries the hashline registration its edit and read tools need (see
+/// [`record_runner_head_edit_mode`]); any other catalog carries `None`.
+pub(super) fn catalog_for_route(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    offers: (bool, bool),
+    worker_wait_max_ms: u64,
+    confined: bool,
+    head: HeadSettings,
+) -> Result<(Value, Option<RegistrationRequest>), ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        offers,
+        worker_wait_max_ms,
+        RenderOptions {
+            confined,
             rich_ui: false,
+            head,
         },
     )
 }
@@ -773,6 +947,7 @@ pub(super) fn catalog_for_rich_ui_request(
     revision_reads: bool,
     worker_wait_max_ms: u64,
     confined: bool,
+    head: HeadSettings,
 ) -> Result<Value, ErrorBody> {
     render_catalog(
         request,
@@ -781,11 +956,13 @@ pub(super) fn catalog_for_rich_ui_request(
         false,
         (false, revision_reads),
         worker_wait_max_ms,
-        CatalogRestrictions {
+        RenderOptions {
             confined,
             rich_ui: true,
+            head,
         },
     )
+    .map(|(answer, _)| answer)
 }
 
 /// How a generated description spells a reference to another AFT tool. The
@@ -861,6 +1038,7 @@ fn tool_references(text: &str, served: &[String]) -> Vec<ToolReference> {
                         .find(|served| {
                             served.as_str() == *name
                                 || served.strip_prefix(TOOL_REFERENCE_PREFIX) == Some(*name)
+                                || same_tool(served, name)
                         })
                         .cloned(),
                 });
@@ -889,12 +1067,20 @@ fn tool_references(text: &str, served: &[String]) -> Vec<ToolReference> {
             end,
             served: served
                 .iter()
-                .find(|served| served.as_str() == name || served.as_str() == spelled)
+                .find(|served| {
+                    served.as_str() == name || served.as_str() == spelled || same_tool(served, name)
+                })
                 .cloned(),
         });
     }
     found.sort_by_key(|reference| reference.start);
     found
+}
+
+/// Whether the served name `served` is the catalog tool `bare` under the name
+/// the plugins register it as (`ast_grep_search` for `ast_search`).
+fn same_tool(served: &str, bare: &str) -> bool {
+    crate::tool_gate::canonical_tool_name(bare).is_some_and(|canonical| canonical == served)
 }
 
 fn names_absent_tool(text: &str, served: &[String]) -> bool {
@@ -1089,14 +1275,94 @@ fn rename_served_tools(text: &str, served: &[String]) -> String {
     out
 }
 
-#[derive(Default)]
-struct CatalogRestrictions {
+struct RenderOptions {
     confined: bool,
     rich_ui: bool,
+    /// What a runner head's catalog follows; unused for every other catalog.
+    head: HeadSettings,
+}
+
+/// Whether a model gets `apply_patch` in place of `edit` and `write`.
+///
+/// This is the rule OpenCode's host uses to choose its edit tools (`usePatch`
+/// in OpenCode's `packages/opencode/src/tool/registry.ts`): the model id
+/// contains `gpt-` and contains neither `oss` nor `gpt-4`. It is applied here
+/// without regard to case, so a runner head and an OpenCode head on the same
+/// model are offered the same edit tools.
+pub(crate) fn model_uses_apply_patch(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("gpt-") && !id.contains("oss") && !id.contains("gpt-4")
+}
+
+/// The model id a catalog request names in `params.model`, whose shape
+/// [`validate_catalog_request`] has already checked.
+fn requested_model_id(request: &CatalogRequest) -> Option<&str> {
+    request.params.get("model")?.get("model")?.as_str()
+}
+
+/// Whether a runner head's `head` catalog keeps `name`.
+///
+/// The model in the request is what marks a runner head. The OpenCode and Pi
+/// plugin heads never fetch this catalog (they register their own tools and
+/// only send calls), and Prefrontal core sends `params.model` only when it
+/// fetches the catalog for a runner head, never on a capability-filter
+/// request. A runner head gets the same AFT tools as an OpenCode head on the
+/// same model and settings: one edit-tool family, chosen by
+/// [`model_uses_apply_patch`]; no `status` tool, which the OpenCode plugin
+/// does not register; `bash_watch` while background bash is on; the hashline
+/// `edit` in hashline edit mode; and every tool under the name the plugin
+/// registers it as ([`crate::tool_gate::canonical_tool_name`]). A request
+/// without a model (an older core, a read-only display route) keeps every
+/// tool and name, as before.
+fn runner_head_keeps(name: &str, uses_patch: bool) -> bool {
+    match name {
+        "status" => false,
+        "apply_patch" => uses_patch,
+        "edit" | "write" => !uses_patch,
+        _ => true,
+    }
+}
+
+/// The hashline rule naming which calls mint the tags a patch addresses, worded
+/// as the OpenCode plugin words it (`hashlineTagSourceSentence` in
+/// `packages/opencode-plugin/src/hashline-tag-sources.ts`): the bash rewrite
+/// path only while bash rewrites `cat`/`head`/`tail`, and each navigation tool
+/// that looks like a tag source only when `serves` names it as served.
+fn hashline_tag_source_sentence(bash_rewrites: bool, serves: impl Fn(&str) -> bool) -> String {
+    let rewrites = if bash_rewrites {
+        " (and accepted AFT `cat`/`head`/`tail` rewrites)"
+    } else {
+        ""
+    };
+    let mut look_alikes: Vec<String> = ["aft_zoom", "aft_outline"]
+        .into_iter()
+        .filter(|name| serves(*name))
+        .chain(["grep"])
+        .chain(serves("aft_search").then_some("aft_search"))
+        .map(|name| format!("`{name}`"))
+        .collect();
+    look_alikes.push("conflict snippets".into());
+    let list = match look_alikes.split_last() {
+        Some((last, rest)) if rest.len() >= 2 => format!("{}, and {last}", rest.join(", ")),
+        _ => look_alikes.join(" and "),
+    };
+    format!(
+        "Only `read`{rewrites} mint hashline tags. {list} do not. After navigation, call `read` on every file and range the patch addresses."
+    )
+}
+
+/// The hashline `edit` description with `sentence` as its last rule: the patch
+/// grammar of AFT's hashline integration, then which calls mint tags.
+fn hashline_edit_description(sentence: &str) -> String {
+    let (grammar, _) = crate::hashline::integration::HASHLINE_EDIT_DESCRIPTION
+        .rsplit_once("\n- ")
+        .expect("the hashline description ends with its tag-source rule");
+    format!("{grammar}\n- {sentence}")
 }
 
 /// `offers` is the session's (`runon`, `revision_reads`) pair: which
-/// enabled-only arguments its catalog carries.
+/// enabled-only arguments its catalog carries. A runner head's catalog also
+/// returns the hashline registration that matches its edit tool.
 fn render_catalog(
     request: CatalogRequest,
     preset: CatalogPreset,
@@ -1104,8 +1370,8 @@ fn render_catalog(
     powershell_available: bool,
     offers: (bool, bool),
     worker_wait_max_ms: u64,
-    restrictions: CatalogRestrictions,
-) -> Result<Value, ErrorBody> {
+    options: RenderOptions,
+) -> Result<(Value, Option<RegistrationRequest>), ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
     let (runon, revision_reads) = offers;
@@ -1116,13 +1382,40 @@ fn render_catalog(
         runon,
         revision_reads,
     ));
+    // For a runner head, whether its model gets `apply_patch`.
+    let runner_head = (preset == CatalogPreset::Head)
+        .then(|| requested_model_id(&request).map(model_uses_apply_patch))
+        .flatten();
+    if let Some(uses_patch) = runner_head {
+        answer
+            .tools
+            .retain(|tool| runner_head_keeps(&tool.name, uses_patch));
+        // As in the worker preset, `bash_watch` waits on the task ids `bash`
+        // hands back, so it sits beside `bash_status` and is served only where
+        // its own disable key and `bash` both leave it reachable.
+        if options.head.background_bash
+            && answer.tools.iter().any(|tool| tool.name == "bash")
+            && crate::tool_gate::catalog_keeps("bash_watch", disabled)
+        {
+            let at = answer
+                .tools
+                .iter()
+                .position(|tool| tool.name == "bash_status")
+                .map_or(answer.tools.len(), |index| index + 1);
+            answer
+                .tools
+                .insert(at, RUNNER_HEAD_TOOLS.bash_watch.catalog.clone());
+        }
+    }
     if request.preset.is_none() {
         answer = answer.with_presets(CatalogPreset::ALL.map(CatalogPreset::name));
     }
-    if restrictions.rich_ui {
+    if options.rich_ui {
         // Head catalogs normally omit the worker-only watch tool. A UI may
         // observe an existing task without gaining permission to start one.
-        if preset == CatalogPreset::Head {
+        if preset == CatalogPreset::Head
+            && !answer.tools.iter().any(|tool| tool.name == "bash_watch")
+        {
             answer.tools.extend(
                 tools_for_session(
                     CatalogPreset::Worker,
@@ -1144,7 +1437,7 @@ fn render_catalog(
             }
         }
     }
-    if restrictions.confined {
+    if options.confined {
         answer.tools.retain(|tool| {
             matches!(
                 tool.name.as_str(),
@@ -1154,6 +1447,39 @@ fn render_catalog(
         for tool in &mut answer.tools {
             if tool.name == "outline" {
                 tool.name = "aft_outline".into();
+            }
+        }
+    }
+    // A runner head's edit mode follows the same rule as a plugin session's:
+    // hashline edits need the configured mode, an `edit` to take the patch
+    // and a tagged `read` to mint the tags it addresses.
+    let registration = runner_head.map(|_| RegistrationRequest {
+        configured_enabled: options.head.hashline,
+        edit_slot_survives: answer.tools.iter().any(|tool| tool.name == "edit"),
+        read_slot_survives: answer.tools.iter().any(|tool| tool.name == "read"),
+    });
+    let hashline_tags = registration
+        .filter(|registration| registration.effective())
+        .map(|_| {
+            let serves = |plugin_name: &str| {
+                answer.tools.iter().any(|tool| {
+                    crate::tool_gate::canonical_tool_name(&tool.name) == Some(plugin_name)
+                })
+            };
+            hashline_tag_source_sentence(serves("bash") && options.head.bash_rewrite, serves)
+        });
+    if let Some(sentence) = &hashline_tags {
+        for tool in &mut answer.tools {
+            if tool.name == "edit" {
+                *tool = RUNNER_HEAD_TOOLS.hashline_edit.catalog.clone();
+                tool.description = Some(hashline_edit_description(sentence));
+            }
+        }
+    }
+    if runner_head.is_some() {
+        for tool in &mut answer.tools {
+            if let Some(canonical) = crate::tool_gate::canonical_tool_name(&tool.name) {
+                tool.name = canonical.into();
             }
         }
     }
@@ -1197,7 +1523,18 @@ fn render_catalog(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let names: Vec<_> = answer.tools.iter().map(|tool| tool.name.as_str()).collect();
+        // A runner head is told about each tool by the name it is served
+        // under (`aft_search`), like an OpenCode head.
+        let served = |bare: &str| {
+            names
+                .iter()
+                .find(|name| **name == bare || same_tool(name, bare))
+                .map(|name| name.to_string())
+        };
         let text = match preset {
+            CatalogPreset::Head if runner_head.is_some() => {
+                head_text(&served, worker, hashline_tags.as_deref())
+            }
             CatalogPreset::Head => broca_text(&names, worker),
             CatalogPreset::Worker => worker_text(&names),
             CatalogPreset::Reader => reader_text(&names),
@@ -1234,9 +1571,15 @@ fn render_catalog(
     answer.generation = digest.clone();
     answer.catalog_digest = digest.clone();
     if request.digest_only == Some(true) {
-        return Ok(json!({"generation": digest, "catalog_digest": digest}));
+        return Ok((
+            json!({"generation": digest, "catalog_digest": digest}),
+            registration,
+        ));
     }
-    Ok(serde_json::to_value(answer).expect("catalog is JSON"))
+    Ok((
+        serde_json::to_value(answer).expect("catalog is JSON"),
+        registration,
+    ))
 }
 
 pub(super) fn declare_result_format(tools: &mut [CatalogTool], enabled: bool) {
@@ -1285,6 +1628,10 @@ pub(super) fn admit_call_mode(
     Err(error)
 }
 
+/// [`admit_for_session`] for a route whose catalog can only have served the
+/// standard `edit`, which takes find-and-replace and symbol arguments rather
+/// than a hashline patch.
+#[cfg(test)]
 pub(super) fn admit(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
     scoped_route: bool,
@@ -1293,9 +1640,41 @@ pub(super) fn admit(
     session: &str,
     trusted: bool,
 ) -> Result<CallerRole, ErrorBody> {
+    admit_for_session(
+        call,
+        scoped_route,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        false,
+    )
+}
+
+/// Admit a v1 `tool.call` and resolve the role it runs under. `hashline_route`
+/// says whether the route's head catalog may have served the hashline `edit`
+/// (it has a [`head_catalog_key`]); a head's `edit` call is then checked
+/// against the arm its arguments take (see [`admit_arguments_for`]).
+pub(super) fn admit_for_session(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    hashline_route: bool,
+) -> Result<CallerRole, ErrorBody> {
     check_call(call)?;
     let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
-    admit_as(call, disabled, powershell_available, session, trusted, role)?;
+    admit_as(
+        call,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        role,
+        hashline_route,
+    )?;
     Ok(role)
 }
 
@@ -1324,6 +1703,7 @@ pub(super) fn admit_on_route(
     trusted: bool,
     root: &Path,
     channel: u16,
+    hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     admit_on_route_at(
         call,
@@ -1335,6 +1715,7 @@ pub(super) fn admit_on_route(
         root,
         channel,
         Instant::now(),
+        hashline_route,
     )
 }
 
@@ -1348,14 +1729,16 @@ fn admit_on_route_at(
     root: &Path,
     channel: u16,
     now: Instant,
+    hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
-    let result = admit(
+    let result = admit_for_session(
         call,
         scoped_route,
         disabled,
         powershell_available,
         session,
         trusted,
+        hashline_route,
     );
     if scoped_route
         && call.preset.is_none()
@@ -2047,11 +2430,12 @@ impl LedgerEdge {
         {
             return Err(decoded);
         }
-        let Ok(call) = serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
-            copy_call_json(body, 0),
-        ) else {
+        let Ok(mut call) = serde_json::from_value::<
+            cortexkit_role_tool_provider::call::ToolCallRequest,
+        >(copy_call_json(body, 0)) else {
             return Err(decoded);
         };
+        route_head_call_name(&mut call, identity.scope.is_some());
         let Some(call_key) = call.call_key.as_deref() else {
             return Err(decoded);
         };
@@ -2064,13 +2448,14 @@ impl LedgerEdge {
         } else if super::occipital_route(&identity) {
             return Err(decoded);
         } else {
-            admit(
+            admit_for_session(
                 &call,
                 identity.scope.is_some(),
                 &identity.disabled_tools,
                 crate::bash_background::powershell_available(),
                 &identity.session,
                 admission_trusted(&identity, &call),
+                head_catalog_key(&identity).is_some(),
             )
             .and_then(|_| super::rich_ui::admission::reject_non_carrier(&call.arguments))
         };
@@ -2164,9 +2549,11 @@ impl LedgerEdge {
         );
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let sweep_due = self.sweep_due(&root, std::time::Instant::now());
+        // Admission only writes the ledger row, so it runs on the call-ledger
+        // lane rather than waiting for the root's reads to drain.
         let rx = executor.submit_async(
             root.clone(),
-            crate::executor::Lane::Mutating,
+            crate::executor::Lane::CallLedger,
             request_id.clone(),
             Box::new(move |ctx| {
                 let result = (|| {
@@ -2257,7 +2644,7 @@ impl LedgerEdge {
                     if !admitted {
                         // Drain answered before admission completed. No tool was
                         // dispatched, so leave a durable not-started result for repeats.
-                        drop(repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
+                        drop(repeat_executor.submit_async(root, Lane::CallLedger, "ledger-drained-admission".into(), Box::new(move |ctx| {
                             if let Some(db) = ctx.db() {
                                 if let Ok(conn) = db.lock() {
                                     let recorded = ledger::not_started(&response_key, "cancelled");
@@ -2303,7 +2690,7 @@ impl LedgerEdge {
                         let (row_tx, row_rx) = oneshot::channel();
                         let rx = repeat_executor.submit_async(
                             root.clone(),
-                            Lane::Mutating,
+                            Lane::CallLedger,
                             "ledger-attach".into(),
                             Box::new(move |ctx| {
                                 let row = ctx.db().and_then(|db| {
@@ -3073,9 +3460,12 @@ impl LedgerEdge {
                     body: copy_terminal_body(&outgoing.body),
                 };
                 let record_for_job = recorded;
+                // The reply is held until this settlement commits. On the
+                // call-ledger lane it does not wait for the root's reads,
+                // maintenance or a running writer.
                 let rx = executor.submit_async(
                     call.root.clone(),
-                    Lane::Mutating,
+                    Lane::CallLedger,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
                         if let Some(error) = projection_error {
@@ -3324,6 +3714,7 @@ fn admit_as(
     session: &str,
     trusted: bool,
     role: CallerRole,
+    hashline_route: bool,
 ) -> Result<(), ErrorBody> {
     admit_role_name(
         &call.name,
@@ -3333,7 +3724,7 @@ fn admit_as(
         trusted,
         role,
     )?;
-    admit_arguments(call, role, true)
+    admit_arguments_for(call, role, true, hashline_route)
 }
 
 /// Role admission is separate from served-argument validation because carrier
@@ -3386,12 +3777,37 @@ pub(super) fn admit_arguments(
     role: CallerRole,
     check_pin: bool,
 ) -> Result<(), ErrorBody> {
+    admit_arguments_for(call, role, check_pin, false)
+}
+
+/// [`admit_arguments`] for a route whose head catalog may have served the
+/// hashline `edit` when `hashline_route`. Which arm it served is recorded in
+/// aft.db (see [`record_runner_head_edit_mode`]), which admission runs too
+/// early to read, so a head's `edit` call is checked against the arm it
+/// takes: the hashline arm for a call pinned to that arm, or an unpinned call
+/// with a `patch`, and the standard arm otherwise. The call is decoded with
+/// the recorded grammar when it runs (see `run_tool_call::prepare_tool_call`),
+/// which refuses the other arm.
+fn admit_arguments_for(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    role: CallerRole,
+    check_pin: bool,
+    hashline_route: bool,
+) -> Result<(), ErrorBody> {
+    let hashline_edit = hashline_route
+        && role == CallerRole::Head
+        && call.name == "edit"
+        && takes_hashline_arm(call);
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
-    let served = served_tools(CatalogPreset::Worker)
-        .iter()
-        .find(|tool| tool.catalog.name == call.name)
-        .expect("admitted tool has a schema");
+    let served = if hashline_edit {
+        &RUNNER_HEAD_TOOLS.hashline_edit
+    } else {
+        served_tools(CatalogPreset::Worker)
+            .iter()
+            .find(|tool| tool.catalog.name == call.name)
+            .expect("admitted tool has a schema")
+    };
     // A bash call is checked against the schema with `runon`: whether the
     // session may run remotely is decided when the call runs, by name. A
     // read, outline or zoom call is checked against the schema with `ref` the
@@ -3404,7 +3820,7 @@ pub(super) fn admit_arguments(
     // Shared argument validation accepts both shell schemas. Check the behavior
     // version against the caller's preset so a worker wait change does not
     // invalidate calls pinned to the head's unchanged bash behavior.
-    let semantics = if role.is_worker() {
+    let semantics = if role.is_worker() || hashline_edit {
         tool.semantics
     } else {
         served_tools(CatalogPreset::Head)
@@ -3412,15 +3828,23 @@ pub(super) fn admit_arguments(
             .find(|entry| entry.catalog.name == call.name)
             .map_or(tool.semantics, |entry| entry.catalog.semantics)
     };
+    // A runner head is offered its own `bash_watch` (see `RunnerHeadTools`),
+    // whose arguments the worker schema checked below also accepts; a pin
+    // taken from that catalog carries its digest and behavior version.
+    let head_watch = (role == CallerRole::Head && call.name == "bash_watch")
+        .then_some(&RUNNER_HEAD_TOOLS.bash_watch.catalog);
     if let Some(encoded) = call.schema_pin.as_ref().filter(|_| check_pin) {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
+        let head_watch = head_watch.filter(|entry| entry.schema_digest == pin.schema_digest);
         if pin.schema_digest != tool.schema_digest
             && pin.schema_digest != served.catalog.schema_digest
             && !legacy_file_path_digests(&call.name).contains(&pin.schema_digest)
+            && head_watch.is_none()
         {
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
+        let semantics = head_watch.map_or(semantics, |entry| entry.semantics);
         if pin.semantics != semantics {
             return Err(
                 ErrorBody::new(errors::TOOL_SEMANTICS_CHANGED, "semantics pin is stale")
@@ -3498,6 +3922,19 @@ pub(super) fn admit_arguments(
     Ok(())
 }
 
+/// Whether an `edit` call takes the hashline arm: its schema pin names that
+/// arm's digest, or it carries no readable pin and passes a `patch`.
+fn takes_hashline_arm(call: &cortexkit_role_tool_provider::call::ToolCallRequest) -> bool {
+    match call
+        .schema_pin
+        .as_deref()
+        .and_then(|pin| SchemaPin::parse(pin).ok())
+    {
+        Some(pin) => pin.schema_digest == RUNNER_HEAD_TOOLS.hashline_edit.catalog.schema_digest,
+        None => call.arguments.get("patch").is_some(),
+    }
+}
+
 /// The role a tool call runs under. It decides everything the core words or
 /// bounds differently for a delegated worker: the worker wait cap on a
 /// blocking bash call, the hand-back and promotion wording, the repeat
@@ -3573,6 +4010,128 @@ pub(super) fn resolve_caller_role(
         None if plugin_worker_flag => Ok(CallerRole::Worker),
         None => Ok(CallerRole::from_preset(UNSCOPED_DEFAULT_PRESET)),
     }
+}
+
+/// The catalog tool a head's call reaches when it names the tool as a runner
+/// head's catalog serves it: the plugins' name (`aft_zoom` for `zoom`, see
+/// [`crate::tool_gate::canonical_tool_name`]). `None` for a catalog name, and
+/// for any name no catalog tool is served under.
+fn head_catalog_name(name: &str) -> Option<&'static str> {
+    METADATA
+        .iter()
+        .map(|(bare, _, _)| *bare)
+        .find(|bare| *bare != name && crate::tool_gate::canonical_tool_name(bare) == Some(name))
+}
+
+/// Give a head's call made by a runner-head name the catalog tool it names.
+///
+/// Every v1 call is passed through here where it is decoded, before anything
+/// admits, records or dispatches it, so the rest of the call path only sees
+/// catalog names. The call names no model, so a head's call is renamed
+/// whichever catalog its head fetched; worker and reader calls, whose
+/// catalogs keep the catalog names, are not. A schema pin names its tool
+/// too, so a pin naming the call's tool is renamed with it.
+pub(super) fn route_head_call_name(
+    call: &mut cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+) {
+    if !matches!(
+        resolve_caller_role(call.preset.as_deref(), scoped_route, false),
+        Ok(CallerRole::Head)
+    ) {
+        return;
+    }
+    let Some(catalog_name) = head_catalog_name(&call.name) else {
+        return;
+    };
+    let renamed_pin = call
+        .schema_pin
+        .as_deref()
+        .and_then(|pin| SchemaPin::parse(pin).ok())
+        .filter(|pin| pin.tool == call.name)
+        .and_then(|pin| {
+            SchemaPin::new(catalog_name, pin.schema_digest, pin.semantics)
+                .encode()
+                .ok()
+        });
+    if let Some(pin) = renamed_pin {
+        call.schema_pin = Some(pin);
+    }
+    call.name = catalog_name.into();
+}
+
+/// The key a runner head's catalog records its edit mode under: the bind
+/// identity, scope and preset key of the other per-preset catalog params (see
+/// `remote_policy::session_preset_key`), with the `head` preset. A call from a
+/// route with a run owner (a codemode program's call) is made with that
+/// owner's catalog, so it uses the owner route's key. `None` for a route that
+/// can hold no record: one that is not a v1 route, or has no scope or no
+/// authenticated principal.
+pub(super) fn head_catalog_key(
+    identity: &super::RouteIdentity,
+) -> Option<crate::db::rich_ui::PresetKey> {
+    let identity = identity
+        .run_owner
+        .as_ref()
+        .map_or(identity, |owner| &owner.owner_route);
+    if identity.role != RouteRole::ToolProviderV1 {
+        return None;
+    }
+    super::remote_policy::session_preset_key(identity, CatalogPreset::Head.name())
+}
+
+/// Record the edit mode a runner head's catalog was rendered for under the
+/// route's [`head_catalog_key`], and install the session's hashline binding to
+/// match, so its `read` mints the tags its hashline `edit` addresses.
+///
+/// The head keeps this catalog across AFT restarts, route closes and rebinds,
+/// so the record in aft.db, not this process, is what its later calls are
+/// decoded by (see `run_tool_call::resolve_head_edit_mode`). A catalog that is
+/// no longer hashline (a model without `edit`, a disabled `read`, a changed
+/// setting) turns off the binding an earlier hashline catalog installed; a
+/// binding that came from elsewhere is left as it is. An error means the
+/// record could not be written, and the catalog must not be acknowledged.
+pub(super) fn record_runner_head_edit_mode(
+    ctx: &crate::context::AppContext,
+    identity: &super::RouteIdentity,
+    registration: RegistrationRequest,
+) -> Result<(), ErrorBody> {
+    let hashline = registration.effective();
+    // Without a key or a database there is nothing to record, and
+    // `remote_policy::catalog_inner` renders such a catalog without the
+    // hashline arm, so it matches the standard grammar its calls get.
+    let (Some(key), Some(db)) = (head_catalog_key(identity), ctx.db()) else {
+        return Ok(());
+    };
+    let unavailable = || {
+        ErrorBody::new(
+            "database_unavailable",
+            "catalog edit mode persistence unavailable",
+        )
+    };
+    let prior = {
+        let conn = db.lock().map_err(|_| unavailable())?;
+        let prior =
+            crate::db::catalog_edit_modes::lookup(&conn, &key).map_err(|_| unavailable())?;
+        crate::db::catalog_edit_modes::record(
+            &conn,
+            &key,
+            hashline,
+            crate::bash_background::persistence::unix_millis() as i64,
+        )
+        .map_err(|_| unavailable())?;
+        prior
+    };
+    // Registering can wait for the session's in-flight edits to finish, so it
+    // runs after the database lock is released.
+    if hashline || prior == Some(true) {
+        ctx.hashline_bindings().register(
+            crate::run_tool_call::hashline_binding_root(ctx, &identity.project_root),
+            identity.session.clone(),
+            registration,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4070,8 +4629,9 @@ mod tests {
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
 
     /// The catalog goldens: the `head` file AFT pinned before presets existed,
-    /// and one file holding a fixture per non-head preset. Both are rewritten by
-    /// the one helper and checked by the one golden test.
+    /// and one file holding the fixtures whose request names a preset: each
+    /// non-head preset, and `head` with and without a model. Both are
+    /// rewritten by the one helper and checked by the one golden test.
     const CATALOG_FIXTURES: &[(&str, &str)] = &[
         (
             "tests/fixtures/tool_provider_catalog.json",
@@ -4093,12 +4653,13 @@ mod tests {
             for fixture in fixtures.as_array_mut().unwrap() {
                 let disabled: Vec<String> =
                     serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
-                fixture["reply"] = catalog_for_session(
+                fixture["reply"] = catalog_for_session_with(
                     fixture["request"].clone(),
                     &disabled,
                     fixture["powershell_available"].as_bool().unwrap(),
                     remote_runs(fixture),
                     crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                    head_settings(fixture),
                 )
                 .unwrap();
             }
@@ -4138,18 +4699,33 @@ mod tests {
         fixture["remote_runs"].as_bool().unwrap_or(false)
     }
 
+    /// The settings a golden's runner head follows: `head_settings` overrides
+    /// any of `background_bash`, `hashline` and `bash_rewrite`, and the rest
+    /// are those of a project with no AFT configuration.
+    fn head_settings(fixture: &Value) -> HeadSettings {
+        let flag =
+            |name: &str, default: bool| fixture["head_settings"][name].as_bool().unwrap_or(default);
+        let defaults = HeadSettings::UNCONFIGURED;
+        HeadSettings {
+            background_bash: flag("background_bash", defaults.background_bash),
+            hashline: flag("hashline", defaults.hashline),
+            bash_rewrite: flag("bash_rewrite", defaults.bash_rewrite),
+        }
+    }
+
     fn check_catalog_golden(fixture: &Value) {
         let disabled: Vec<String> =
             serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
         let available = fixture["powershell_available"].as_bool().unwrap();
         let runon = remote_runs(fixture);
         let catalog = |request: Value, disabled: &[String], available: bool| {
-            catalog_for_session(
+            catalog_for_session_with(
                 request,
                 disabled,
                 available,
                 runon,
                 crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                head_settings(fixture),
             )
         };
         let request = fixture["request"].clone();
@@ -4719,6 +5295,516 @@ mod tests {
         }
     }
 
+    /// The rule OpenCode's host uses to give a model `apply_patch` instead of
+    /// `edit` and `write`, checked on real model ids and without regard to case.
+    #[test]
+    fn apply_patch_goes_to_gpt_models_except_oss_and_gpt_4() {
+        for (model, uses_patch) in [
+            ("gpt-6.1-sol", true),
+            ("gpt-6", true),
+            ("gpt-5.5", true),
+            ("GPT-5.5", true),
+            ("gpt-4o", false),
+            ("GPT-4o", false),
+            ("gpt-oss-120b", false),
+            ("claude-opus-5-5", false),
+            ("gemini-3-pro", false),
+            ("kimi-k3", false),
+        ] {
+            assert_eq!(model_uses_apply_patch(model), uses_patch, "{model}");
+        }
+    }
+
+    /// A catalog request in the shape Prefrontal core sends for a runner head.
+    fn model_request(preset: &str, model: &str) -> Value {
+        json!({
+            "preset": preset,
+            "params": {"model": {"provider": "example", "model": model}},
+            "system_text": {"preset": preset},
+        })
+    }
+
+    /// The name a runner head's catalog serves a catalog tool under.
+    fn plugin_name(bare: &str) -> String {
+        crate::tool_gate::canonical_tool_name(bare)
+            .unwrap_or(bare)
+            .to_string()
+    }
+
+    /// A runner head gets one edit family chosen by its model, no `status`,
+    /// `bash_watch` beside `bash_status` while background bash is on, and every
+    /// tool under the plugins' name. Its descriptions and system text name
+    /// tools only by the names it is served them under, and never an edit tool
+    /// it was not offered.
+    #[test]
+    fn a_runner_head_gets_its_models_edit_tools_and_the_plugin_names() {
+        const EDIT_FAMILY: [&str; 3] = ["edit", "write", "apply_patch"];
+        for available in [false, true] {
+            let without = catalog(preset_request("head"), &[], available).unwrap();
+            assert!(names(&without).contains(&"status".to_string()));
+            for (model, served_edit_tools) in [
+                ("gpt-5.5", &["apply_patch"][..]),
+                ("gpt-6.1-sol", &["apply_patch"][..]),
+                ("claude-opus-5-5", &["write", "edit"][..]),
+                ("gpt-oss-120b", &["write", "edit"][..]),
+                ("kimi-k3", &["write", "edit"][..]),
+            ] {
+                let reply = catalog(model_request("head", model), &[], available).unwrap();
+                let mut expected: Vec<String> = names(&without)
+                    .into_iter()
+                    .filter(|name| {
+                        name != "status"
+                            && (!EDIT_FAMILY.contains(&name.as_str())
+                                || served_edit_tools.contains(&name.as_str()))
+                    })
+                    .map(|name| plugin_name(&name))
+                    .collect();
+                let at = expected
+                    .iter()
+                    .position(|name| name == "bash_status")
+                    .unwrap()
+                    + 1;
+                expected.insert(at, "bash_watch".into());
+                assert_eq!(names(&reply), expected, "{model} pwsh={available}");
+                for name in [
+                    "aft_callgraph",
+                    "aft_conflicts",
+                    "aft_import",
+                    "aft_inspect",
+                    "aft_outline",
+                    "aft_safety",
+                    "aft_search",
+                    "aft_zoom",
+                    "ast_grep_search",
+                    "ast_grep_replace",
+                    "aft_delete",
+                    "aft_move",
+                ] {
+                    assert!(expected.iter().any(|served| served == name), "{name}");
+                }
+                let absent: Vec<&str> = EDIT_FAMILY
+                    .into_iter()
+                    .filter(|name| !served_edit_tools.contains(name))
+                    .collect();
+                // Every catalog tool the head is served under another name.
+                let renamed: Vec<&str> = METADATA
+                    .iter()
+                    .map(|(bare, _, _)| *bare)
+                    .filter(|bare| plugin_name(bare) != *bare)
+                    .collect();
+                for tool in reply["tools"].as_array().unwrap() {
+                    let text = tool["description"].as_str().unwrap_or_default();
+                    for name in &absent {
+                        for spelled in [
+                            format!("`{name}` tool"),
+                            format!("aft_{name}"),
+                            format!("use `{name}`"),
+                        ] {
+                            assert!(
+                                !text.contains(&spelled),
+                                "{model}: {} names {spelled}",
+                                tool["name"]
+                            );
+                        }
+                        if *name == "apply_patch" {
+                            assert!(!text.contains(name), "{model}: {}", tool["name"]);
+                        }
+                    }
+                    for bare in &renamed {
+                        for (before, after) in BARE_TOOL_REFERENCE_FORMS {
+                            let spelled = format!("{before}{bare}{after}");
+                            assert!(
+                                !text.contains(&spelled),
+                                "{model}: {} names {spelled}",
+                                tool["name"]
+                            );
+                        }
+                    }
+                }
+                assert_eq!(unresolved_references(&reply), Vec::<String>::new());
+                let text = reply["system_text"]["text"].as_str().unwrap();
+                for line in [
+                    "Use aft_search to locate code",
+                    "Use aft_outline to map source structure",
+                    "Use aft_zoom to inspect named symbols, with callgraph: true",
+                    "Use aft_callgraph for callers",
+                    "Use aft_inspect after editing",
+                    "Use read for files",
+                    "Use bash with wait: true",
+                ] {
+                    assert!(text.contains(line), "{model}: {text}");
+                }
+                // Respelled tool names are all that differ from the model-less text.
+                let mut bare_text = text.to_string();
+                for bare in &renamed {
+                    bare_text = bare_text.replace(
+                        &format!("Use {} ", plugin_name(bare)),
+                        &format!("Use {bare} "),
+                    );
+                }
+                assert_eq!(bare_text, without["system_text"]["text"].as_str().unwrap());
+                let mut sorted = expected.clone();
+                sorted.sort();
+                assert_eq!(reply["system_text"]["tool_names"], json!(sorted));
+            }
+        }
+    }
+
+    /// `status` leaves only a runner head's catalog: a head without a model
+    /// (an older core, a read-only display route) and every worker keep it.
+    #[test]
+    fn only_a_runner_head_loses_the_status_tool() {
+        let has_status = |request: Value| {
+            names(&catalog(request, &[], true).unwrap()).contains(&"status".to_string())
+        };
+        assert!(has_status(json!({})));
+        assert!(has_status(preset_request("head")));
+        assert!(has_status(preset_request("worker")));
+        assert!(has_status(model_request("worker", "gpt-5.5")));
+        assert!(!has_status(model_request("head", "gpt-5.5")));
+        assert!(!has_status(model_request("head", "claude-opus-5-5")));
+        let mut presetless = model_request("head", "gemini-3-pro");
+        presetless.as_object_mut().unwrap().remove("preset");
+        presetless.as_object_mut().unwrap().remove("system_text");
+        assert!(!has_status(presetless));
+    }
+
+    /// The model is applied only to the `head` preset. A worker or reader
+    /// request may name one, and is answered byte for byte as without it.
+    #[test]
+    fn a_model_on_a_worker_or_reader_request_changes_nothing() {
+        for preset in ["worker", "reader"] {
+            assert_eq!(
+                catalog(model_request(preset, "gpt-5.5"), &[], true).unwrap(),
+                catalog(preset_request(preset), &[], true).unwrap(),
+                "{preset}"
+            );
+        }
+    }
+
+    /// The catalog digest follows the tool set: models served different tools
+    /// get different digests, and models served the same tools share one, so a
+    /// consumer never reuses one model's catalog for a model that needs
+    /// another.
+    #[test]
+    fn catalog_digests_differ_by_tool_set_and_agree_within_one() {
+        let full = |request: Value| catalog(request, &[], true).unwrap();
+        let digest = |request: &Value| {
+            let mut request = request.clone();
+            request["digest_only"] = json!(true);
+            catalog(request, &[], true).unwrap()["catalog_digest"].clone()
+        };
+        let gpt = model_request("head", "gpt-5.5");
+        let other_gpt = model_request("head", "gpt-6.1-sol");
+        let claude = model_request("head", "claude-opus-5-5");
+        let gemini = model_request("head", "gemini-3-pro");
+        let none = preset_request("head");
+        // Same set: the whole answer, digest included, is the same.
+        assert_eq!(full(gpt.clone()), full(other_gpt.clone()));
+        assert_eq!(full(claude.clone()), full(gemini.clone()));
+        let digests =
+            [&gpt, &claude, &none].map(|request| full(request.clone())["catalog_digest"].clone());
+        assert_ne!(digests[0], digests[1]);
+        assert_ne!(digests[0], digests[2]);
+        assert_ne!(digests[1], digests[2]);
+        for request in [&gpt, &other_gpt, &claude, &gemini, &none] {
+            assert_eq!(
+                digest(request),
+                full(request.clone())["catalog_digest"],
+                "{request}"
+            );
+        }
+    }
+
+    /// `params.model` is exactly `{provider, model}` with non-empty strings;
+    /// anything else is refused naming `params.model`, on every preset. Any
+    /// other param beside a valid model is still refused by its own name.
+    #[test]
+    fn malformed_models_and_other_params_are_refused_by_name() {
+        for preset in CatalogPreset::ALL {
+            for model in [
+                json!("gpt-5.5"),
+                json!({"model": "gpt-5.5"}),
+                json!({"provider": "openai", "model": ""}),
+                json!({"provider": "openai", "model": "gpt-5.5", "variant": "high"}),
+                json!(null),
+            ] {
+                let error = catalog(
+                    json!({"preset": preset.name(), "params": {"model": model}}),
+                    &[],
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    errors::invalid_request_field(&error),
+                    Some("params.model"),
+                    "{} {model}",
+                    preset.name()
+                );
+            }
+            let error = catalog(
+                json!({"preset": preset.name(), "params": {
+                    "model": {"provider": "openai", "model": "gpt-5.5"},
+                    "capabilities": [],
+                }}),
+                &[],
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                errors::invalid_request_field(&error),
+                Some("params.capabilities")
+            );
+        }
+    }
+
+    fn catalog_with(body: Value, head: HeadSettings) -> Value {
+        catalog_for_session_with(
+            body,
+            &[],
+            true,
+            false,
+            crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+            head,
+        )
+        .unwrap()
+    }
+
+    fn tool<'a>(reply: &'a Value, name: &str) -> &'a Value {
+        reply["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not served"))
+    }
+
+    /// A runner head is served `bash_watch` exactly while background bash is
+    /// on and `bash` is served, with the plugin's head wording and arguments
+    /// less the async watches the module never delivers.
+    #[test]
+    fn a_runner_head_gets_bash_watch_while_background_bash_is_on() {
+        let on = HeadSettings::UNCONFIGURED;
+        let off = HeadSettings {
+            background_bash: false,
+            ..on
+        };
+        let request = model_request("head", "claude-opus-5-5");
+        let reply = catalog_with(request.clone(), on);
+        let watch = tool(&reply, "bash_watch");
+        let properties = watch["input_schema"]["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                &"pattern".to_string(),
+                &"taskId".to_string(),
+                &"timeoutMs".to_string()
+            ])
+        );
+        let description = watch["description"].as_str().unwrap();
+        assert!(
+            description.starts_with(
+                "Watch a background bash task. Sync waits default to 30s in a main session"
+            ),
+            "{description}"
+        );
+        assert!(
+            description.contains("let the completion reminder wake you"),
+            "{description}"
+        );
+        for async_only in [
+            "async notification",
+            "Async (background:true",
+            "background:true +",
+        ] {
+            assert!(!description.contains(async_only), "{description}");
+        }
+        assert!(!properties["pattern"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("background:true"));
+        assert_eq!(watch["semantics"], 1);
+        let worker_watch = tool(&catalog_with(preset_request("worker"), on), "bash_watch").clone();
+        assert_eq!(watch.get("modes"), worker_watch.get("modes"));
+        assert!(watch["reply"].is_object(), "{watch}");
+        let names = names(&reply);
+        let at = names.iter().position(|name| name == "bash_status").unwrap();
+        assert_eq!(names[at + 1], "bash_watch");
+        assert!(!names_of(&catalog_with(request.clone(), off)).contains("bash_watch"));
+        for disabled in ["bash", "bash_watch"] {
+            let reply = catalog_for_session_with(
+                request.clone(),
+                &[disabled.into()],
+                true,
+                false,
+                crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                on,
+            )
+            .unwrap();
+            assert!(!names_of(&reply).contains("bash_watch"), "{disabled}");
+        }
+        // A head whose request names no model is not served it, whatever the settings.
+        assert!(!names_of(&catalog_with(preset_request("head"), on)).contains("bash_watch"));
+    }
+
+    fn names_of(reply: &Value) -> BTreeSet<String> {
+        names(reply).into_iter().collect()
+    }
+
+    /// A pin from a runner head's `bash_watch` is admitted for a head's call,
+    /// and the worker's own pin still is; a worker is never admitted the head's.
+    #[test]
+    fn runner_head_bash_watch_pins_are_admitted_for_head_calls() {
+        let head = &RUNNER_HEAD_TOOLS.bash_watch.catalog;
+        let pinned = |preset: &str, digest: &str, semantics: u64| {
+            let mut request = call("bash_watch", json!({"taskId": "task", "timeoutMs": 5}));
+            request.preset = Some(preset.into());
+            request.schema_pin = Some(
+                SchemaPin::new("bash_watch", digest, semantics)
+                    .encode()
+                    .unwrap(),
+            );
+            admit(&request, true, &[], true, "session", true)
+        };
+        assert!(pinned("head", &head.schema_digest, head.semantics).is_ok());
+        let worker = served_tools(CatalogPreset::Worker)
+            .iter()
+            .find(|tool| tool.catalog.name == "bash_watch")
+            .unwrap();
+        assert!(pinned(
+            "worker",
+            &worker.catalog.schema_digest,
+            worker.catalog.semantics
+        )
+        .is_ok());
+        assert!(pinned(
+            "head",
+            &worker.catalog.schema_digest,
+            worker.catalog.semantics
+        )
+        .is_ok());
+        assert_eq!(
+            pinned("worker", &head.schema_digest, head.semantics)
+                .unwrap_err()
+                .code,
+            errors::TOOL_SCHEMA_CHANGED
+        );
+        assert_eq!(
+            pinned("head", &head.schema_digest, 2).unwrap_err().code,
+            errors::TOOL_SEMANTICS_CHANGED
+        );
+    }
+
+    /// The hashline tag rule is worded as the plugin's `hashlineTagSourceSentence`
+    /// words it: the full rule ends AFT's hashline edit description, and the
+    /// bash rewrites and each navigation tool are named only when present.
+    #[test]
+    fn hashline_tag_rule_names_only_what_the_session_has() {
+        let all = |_: &str| true;
+        assert_eq!(
+            hashline_edit_description(&hashline_tag_source_sentence(true, all)),
+            crate::hashline::integration::HASHLINE_EDIT_DESCRIPTION
+        );
+        assert_eq!(
+            hashline_tag_source_sentence(false, |name| name == "aft_search"),
+            "Only `read` mint hashline tags. `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses."
+        );
+        assert_eq!(
+            hashline_tag_source_sentence(true, |_| false),
+            "Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `grep` and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses."
+        );
+    }
+
+    /// In hashline edit mode a runner head whose model gets `edit` is served
+    /// the hashline arm, and its system text carries the plugin's tag rule; a
+    /// GPT head (no `edit`), a head without a tagged `read` and a head without
+    /// a model keep the standard surface and register nothing that enables it.
+    #[test]
+    fn a_hashline_runner_head_gets_the_hashline_edit_and_tag_rule() {
+        let hashline = HeadSettings {
+            hashline: true,
+            ..HeadSettings::UNCONFIGURED
+        };
+        let body = model_request("head", "claude-opus-5-5");
+        let (request, preset) = validate_catalog_request(body.clone()).unwrap();
+        let (reply, registration) = catalog_for_route(
+            request,
+            preset,
+            &[],
+            true,
+            (false, false),
+            crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+            false,
+            hashline,
+        )
+        .unwrap();
+        assert!(registration.unwrap().effective());
+        let edit = tool(&reply, "edit");
+        assert_eq!(edit["input_schema"]["required"], json!(["patch"]));
+        assert_eq!(
+            edit["schema_digest"],
+            json!(RUNNER_HEAD_TOOLS.hashline_edit.catalog.schema_digest)
+        );
+        assert_eq!(
+            edit["description"],
+            json!(crate::hashline::integration::HASHLINE_EDIT_DESCRIPTION)
+        );
+        let text = reply["system_text"]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with(&format!(
+                "**Hashline edit tags**: {}\n",
+                hashline_tag_source_sentence(true, |_| true)
+            )),
+            "{text}"
+        );
+        // The rule names only the navigation tools and bash rewrites present.
+        let reply = catalog_for_session_with(
+            body.clone(),
+            &["aft_zoom".into()],
+            true,
+            false,
+            crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+            HeadSettings {
+                bash_rewrite: false,
+                ..hashline
+            },
+        )
+        .unwrap();
+        let rule = hashline_tag_source_sentence(false, |name| name != "aft_zoom");
+        assert!(tool(&reply, "edit")["description"]
+            .as_str()
+            .unwrap()
+            .ends_with(&rule));
+        assert!(reply["system_text"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&rule));
+        for (body, disabled) in [
+            (model_request("head", "gpt-5.5"), vec![]),
+            (body.clone(), vec!["read".to_string()]),
+            (preset_request("head"), vec![]),
+        ] {
+            let (request, preset) = validate_catalog_request(body.clone()).unwrap();
+            let (reply, registration) = catalog_for_route(
+                request,
+                preset,
+                &disabled,
+                true,
+                (false, false),
+                crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                false,
+                hashline,
+            )
+            .unwrap();
+            assert!(
+                !registration.is_some_and(|registration| registration.effective()),
+                "{body}"
+            );
+            let text = serde_json::to_string(&reply).unwrap();
+            assert!(!text.contains("hashline"), "{body}");
+        }
+    }
+
     #[test]
     fn unknown_presets_are_refused_by_name() {
         for preset in [
@@ -4925,6 +6011,7 @@ mod tests {
                     &root,
                     channel,
                     start + Duration::from_secs(second),
+                    false,
                 )
                 .unwrap_err();
                 assert_eq!(errors::invalid_request_field(&error), Some("preset"));
@@ -4939,6 +6026,7 @@ mod tests {
                 &root,
                 channel,
                 start + SCOPED_PRESET_REFUSAL_WINDOW,
+                false,
             )
             .unwrap_err();
             assert_eq!(errors::invalid_request_field(&error), Some("preset"));
@@ -4995,6 +6083,7 @@ mod tests {
                 "session",
                 true,
                 CallerRole::Reader,
+                false,
             )
         };
         for (name, arguments) in [
@@ -5012,7 +6101,16 @@ mod tests {
         assert!(admit_reader("grep", json!({"pattern": "x"})).is_ok());
         // The same tools stay admitted for every other role.
         for role in [CallerRole::Head, CallerRole::Worker] {
-            assert!(admit_as(&call("status", json!({})), &[], true, "session", true, role).is_ok());
+            assert!(admit_as(
+                &call("status", json!({})),
+                &[],
+                true,
+                "session",
+                true,
+                role,
+                false
+            )
+            .is_ok());
         }
     }
 
@@ -6206,6 +7304,113 @@ pub(in crate::subc) mod route_tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_notices_plain_dispatch_and_finalizer_keep_the_bound_caller() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::{BgTaskStatus, TaskIdentity};
+
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (dir, root) = test_support::test_root("task-notices-plain-dispatch");
+        let ctx = test_support::test_ctx();
+        let session = "moved-session";
+        let task_id = "bash-0123456789abcdef";
+        let storage = dir.path().join("tasks");
+        let task = create_task_layout(&storage, session, task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "printf owned-notice".into(),
+            root.as_path().into(),
+            Some(root.as_path().into()),
+            None,
+            true,
+            false,
+        );
+        metadata.launching_identity = Some(TaskIdentity {
+            principal: Some("reserved:thalamus-harness".into()),
+            harness: "opencode".into(),
+            session: session.into(),
+        });
+        metadata.harness = Some("opencode".into());
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).unwrap();
+        std::fs::write(&task.paths.stdout, "owned-notice\n").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
+        std::fs::write(&task.paths.exit, "0\n").unwrap();
+        ctx.bash_background()
+            .replay_session(&storage, session)
+            .unwrap();
+
+        for name in ["bash_drain_completions", "read"] {
+            for (principal, harness, owns) in [
+                ("direct", "opencode", false),
+                ("reserved:thalamus-harness", "pi", false),
+                ("reserved:thalamus-harness", "opencode", true),
+            ] {
+                let mut identity = test_support::route_identity_with_harness(
+                    &root,
+                    session,
+                    BindTrust::FirstParty,
+                    harness,
+                );
+                if let AuthenticatedPrincipal::RouteBind {
+                    principal_id,
+                    harness: bound_harness,
+                    ..
+                } = &mut Arc::get_mut(&mut identity.0).unwrap().spawn_principal
+                {
+                    *principal_id = Some(principal.into());
+                    *bound_harness = harness.into();
+                }
+                let arguments = if name == "read" {
+                    json!({"path":"plain-file.txt"})
+                } else {
+                    json!({})
+                };
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    ctx.clone(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, ctx| {
+                        let caller = TaskIdentity::current()
+                            .expect("ordinary dispatch retains its route identity");
+                        assert_eq!(caller.session, request.session());
+                        if request.command == "bash_drain_completions" {
+                            crate::commands::bash_drain_completions::handle(&request, ctx)
+                        } else {
+                            let mut response = Response::success(&request.id, json!({}));
+                            crate::response_finalize::attach_bg_completions(
+                                &mut response,
+                                ctx,
+                                request.session(),
+                                "read",
+                            );
+                            // Legacy replies carry rendered text, not metadata added
+                            // after rendering. Expose the finalizer's selection here.
+                            response.data = json!({"content": response.data.to_string()});
+                            response
+                        }
+                    },
+                )
+                .await;
+                assert_eq!(reply.header.ty, FrameType::Response);
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(
+                    body["isError"], false,
+                    "{name} {principal}/{harness}: {body}"
+                );
+                assert_eq!(
+                    body.to_string().contains(task_id),
+                    owns,
+                    "{name} {principal}/{harness}: {body}"
+                );
+            }
+        }
+    }
+
     fn task_poll_identity(root: &ProjectRootId, session: &str, carrier: bool) -> RouteIdentity {
         let mut identity = if carrier {
             occipital_identity(root, RouteRole::ToolProviderV1)
@@ -6449,13 +7654,13 @@ pub(in crate::subc) mod route_tests {
                 Some(&Ok(false))
             );
 
-            // Keep the keyed call in the ledger's mutating lane while an older
+            // Keep the keyed call in the call-ledger lane while an older
             // epoch saves a fence inherited by the later epoch with no row.
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let held = executor.submit_async(
                 root,
-                crate::executor::Lane::Mutating,
+                crate::executor::Lane::CallLedger,
                 "held-ledger-lane".into(),
                 Box::new(move |_| {
                     started_tx.send(()).unwrap();
@@ -6884,6 +8089,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: Some(Arc::default()),
                     worker_session: false,
                     host_tool_names: None,
@@ -6925,6 +8131,463 @@ pub(in crate::subc) mod route_tests {
                 ));
             }
         }
+    }
+
+    /// A v1 route for `root` bound under a head scope, as Broca opens one for a
+    /// runner head: with the runner's authenticated principal, so the head's
+    /// catalog can record its edit mode under the route's key.
+    fn head_route(root: &ProjectRootId, session: &str) -> RouteIdentity {
+        let scope = serde_json::from_value(json!({"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head-scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap();
+        RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "runner".into(),
+            session: session.into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: "runner".into(),
+                session_id: session.into(),
+                principal_id: Some("reserved:broca".into()),
+            },
+            consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
+            call_keepalive: false,
+            tool_result_body: false,
+            disabled_tools: Arc::new(vec![]),
+            scope: Some(scope),
+            run_scope: std::sync::OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            made_tool_call: AtomicBool::new(false),
+            run_owner: None,
+        }))
+    }
+
+    /// The catalog tools a runner head is served under another name, with
+    /// that name and arguments its schema admits.
+    fn renamed_head_tools() -> Vec<(&'static str, &'static str, Value)> {
+        let renamed: Vec<_> = METADATA
+            .iter()
+            .filter_map(|(bare, _, _)| {
+                crate::tool_gate::canonical_tool_name(bare)
+                    .filter(|plugin| plugin != bare)
+                    .map(|plugin| (*bare, plugin))
+            })
+            .collect();
+        let arguments = |bare: &str| match bare {
+            "callgraph" => json!({"op": "callers", "path": "a.rs", "symbol": "f"}),
+            "import" => json!({"op": "organize", "path": "a.rs"}),
+            "outline" => json!({"target": "a.rs"}),
+            "safety" => json!({"op": "list"}),
+            "search" => json!({"query": "f"}),
+            "zoom" => json!({"batch": [{"target": "a.rs", "symbols": "f"}]}),
+            "ast_search" => json!({"pattern": "f()", "lang": "rust"}),
+            "ast_replace" => json!({"pattern": "f()", "rewrite": "g()", "lang": "rust"}),
+            "delete" => json!({"files": ["a.rs"]}),
+            "move" => json!({"path": "a.rs", "destination": "b.rs"}),
+            _ => json!({}),
+        };
+        renamed
+            .into_iter()
+            .map(|(bare, plugin)| (bare, plugin, arguments(bare)))
+            .collect()
+    }
+
+    /// Every tool a runner head is served under the plugins' name is admitted
+    /// by that name, with a schema pin naming it, and translates to the native
+    /// command its catalog name reaches. A worker's catalog never offered
+    /// those names, so a worker's call by one is still refused.
+    #[test]
+    fn every_runner_head_name_admits_and_translates_as_its_catalog_tool() {
+        let (_dir, root) = test_support::test_root("runner-head-names");
+        let ctx = test_support::test_ctx();
+        let renamed = renamed_head_tools();
+        assert_eq!(
+            renamed
+                .iter()
+                .map(|(_, plugin, _)| *plugin)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "aft_callgraph",
+                "aft_conflicts",
+                "aft_delete",
+                "aft_import",
+                "aft_inspect",
+                "aft_move",
+                "aft_outline",
+                "aft_safety",
+                "aft_search",
+                "aft_zoom",
+                "ast_grep_replace",
+                "ast_grep_search",
+            ])
+        );
+        let call_context = ToolCallContext {
+            project_root: root.as_path().into(),
+            session_id: Some("session".into()),
+            request_id: "runner-head-name".into(),
+            diagnostics_on_edit: false,
+            preview: false,
+            edit_slot_survives: None,
+            report_registration_downgrade: false,
+            standard_edit_grammar: true,
+            head_catalog_key: None,
+            disabled_tools: Some(Arc::default()),
+            worker_session: false,
+            host_tool_names: None,
+        };
+        let command = |name: &str, arguments: &Value| {
+            prepare_tool_call(
+                name,
+                arguments.clone(),
+                &crate::subc_format::FormatContext::default(),
+                &call_context,
+                &ctx,
+                None,
+            )
+            .map(|prepared| prepared.request.command)
+            .map_err(|_| ())
+        };
+        for (bare, plugin, arguments) in renamed {
+            let served = &served_tools(CatalogPreset::Head)
+                .iter()
+                .find(|tool| tool.catalog.name == bare)
+                .unwrap()
+                .catalog;
+            let mut call: cortexkit_role_tool_provider::call::ToolCallRequest =
+                serde_json::from_value(json!({"name": plugin, "arguments": arguments})).unwrap();
+            call.preset = Some("head".into());
+            call.schema_pin = Some(
+                SchemaPin::new(plugin, &served.schema_digest, served.semantics)
+                    .encode()
+                    .unwrap(),
+            );
+            let mut worker_call = call.clone();
+            route_head_call_name(&mut call, true);
+            assert_eq!(call.name, bare);
+            assert_eq!(
+                SchemaPin::parse(call.schema_pin.as_deref().unwrap())
+                    .unwrap()
+                    .tool,
+                bare
+            );
+            admit(&call, true, &[], true, "session", true)
+                .unwrap_or_else(|error| panic!("{plugin}: {error:?}"));
+            assert_eq!(
+                command(&call.name, &arguments),
+                command(bare, &arguments),
+                "{plugin}"
+            );
+            assert!(command(&call.name, &arguments).is_ok(), "{plugin}");
+            worker_call.preset = Some("worker".into());
+            route_head_call_name(&mut worker_call, true);
+            assert_eq!(worker_call.name, plugin);
+            assert_eq!(
+                admit(&worker_call, true, &[], true, "session", true)
+                    .unwrap_err()
+                    .code,
+                errors::UNKNOWN_TOOL,
+                "{plugin}"
+            );
+        }
+    }
+
+    /// On a v1 route, a head's call by a runner-head name reaches the same
+    /// native command as its catalog name. (Inspect and delete answer through
+    /// their own deferred handlers, so the unit test above covers them.)
+    #[tokio::test]
+    async fn runner_head_names_route_on_a_v1_route() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for (bare, plugin, arguments) in renamed_head_tools() {
+            if matches!(bare, "inspect" | "delete") {
+                continue;
+            }
+            let mut outcomes = Vec::new();
+            for name in [bare, plugin] {
+                LAST_DISPATCH.lock().unwrap().take();
+                let reply = exchange(
+                    json!({"op": "tool.call", "preset": "head", "name": name, "arguments": arguments}),
+                    RouteRole::ToolProviderV1,
+                    "runner-head-names",
+                    vec![],
+                )
+                .await;
+                let text = String::from_utf8_lossy(&reply.body).to_string();
+                assert_eq!(reply.header.ty, FrameType::Response, "{name}: {text}");
+                assert!(!text.contains(errors::UNKNOWN_TOOL), "{name}: {text}");
+                // A call the command core answers without dispatching (an
+                // argument it refuses) is compared by its reply instead.
+                let outcome = match LAST_DISPATCH.lock().unwrap().take() {
+                    Some(dispatch) => dispatch["command"].clone(),
+                    None => json!({"reply": text}),
+                };
+                outcomes.push(outcome);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{plugin}");
+        }
+    }
+
+    /// A context for `root` with hashline edit mode on and its aft.db in
+    /// `storage`. A second context made the same way stands for AFT after a
+    /// restart: it shares nothing with the first but the database file.
+    fn runner_head_ctx(root: &ProjectRootId, storage: &std::path::Path) -> Arc<AppContext> {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().into());
+        config.storage_dir = Some(storage.into());
+        config.hashline_enabled = true;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.join("aft.db")).unwrap(),
+        )));
+        ctx
+    }
+
+    /// Runs the native `read` and hashline edit a runner head's calls reach,
+    /// and records every dispatched command in `LAST_DISPATCH`; any other
+    /// command is answered without running.
+    fn read_and_edit(request: RawRequest, ctx: &AppContext) -> Response {
+        *LAST_DISPATCH.lock().unwrap() = Some(json!({"command": request.command}));
+        match request.command.as_str() {
+            "read" => crate::commands::read::handle_read(&request, ctx),
+            "hashline_edit" => crate::commands::hashline::handle_edit(&request, ctx),
+            _ => Response::success(request.id, json!({})),
+        }
+    }
+
+    fn runner_head_fetch(model: &str) -> Value {
+        json!({"op": "tool.catalog", "preset": "head", "params": {"model": {"provider": "example", "model": model}}})
+    }
+
+    /// The `edit` tool of a catalog reply.
+    fn served_edit(reply: &WriterFrame) -> Value {
+        let answer: Value = serde_json::from_slice(&reply.body).unwrap();
+        answer["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{answer}"))
+            .iter()
+            .find(|tool| tool["name"] == "edit")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Read `a.rs` as the runner head on `identity`, and return the hashline
+    /// header (`[path#TAG]`) the read minted, or `None` for an untagged read.
+    async fn head_read_tag(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+    ) -> Option<String> {
+        let reply = exchange_with_actor(
+            json!({"op": "tool.call", "preset": "head", "name": "read", "arguments": {"path": "a.rs"}}),
+            identity.clone(),
+            ctx.clone(),
+            metrics,
+            read_and_edit,
+        )
+        .await;
+        let text = String::from_utf8_lossy(&reply.body).to_string();
+        assert_eq!(reply.header.ty, FrameType::Response, "{text}");
+        assert!(text.contains("one"), "{text}");
+        // Shown only when a test fails, to tell an untagged read from a
+        // header this helper could not find.
+        eprintln!("read reply: {text}");
+        let tag_at = text.find("a.rs#")?;
+        let start = text[..tag_at].rfind('[')?;
+        let end = tag_at + text[tag_at..].find(']')? + 1;
+        Some(text[start..end].to_string())
+    }
+
+    /// Send a hashline patch that replaces line 1 of `a.rs` under `header`
+    /// (`[path#TAG]`), and return the file's content afterwards.
+    async fn head_patch(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        root: &ProjectRootId,
+        header: &str,
+    ) -> String {
+        LAST_DISPATCH.lock().unwrap().take();
+        let patch = format!("{header}\nPUT 1:\n+changed\n");
+        let reply = exchange_with_actor(
+            json!({"op": "tool.call", "preset": "head", "name": "edit", "arguments": {"patch": patch}}),
+            identity.clone(),
+            ctx.clone(),
+            metrics,
+            read_and_edit,
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        std::fs::read_to_string(root.as_path().join("a.rs")).unwrap()
+    }
+
+    /// After a hashline catalog, AFT restarts: a fresh context on the same
+    /// aft.db, with no binding and no catalog refetch. The head's `read` still
+    /// mints a tag and its hashline patch still applies.
+    #[tokio::test]
+    async fn a_runner_heads_hashline_mode_survives_an_aft_restart() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-restart");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let identity = head_route(&root, "restarted-head");
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        {
+            let ctx = runner_head_ctx(&root, storage.path());
+            let reply = exchange_with_actor(
+                runner_head_fetch("claude-opus-5-5"),
+                identity.clone(),
+                ctx,
+                &metrics,
+                read_and_edit,
+            )
+            .await;
+            assert_eq!(
+                served_edit(&reply)["input_schema"]["required"],
+                json!(["patch"])
+            );
+        }
+        let ctx = runner_head_ctx(&root, storage.path());
+        assert!(ctx.hashline_bindings().is_empty());
+        let tag = head_read_tag(&identity, &ctx, &metrics)
+            .await
+            .expect("the first read after a restart mints a tag");
+        assert_eq!(
+            head_patch(&identity, &ctx, &metrics, &root, &tag).await,
+            "changed\ntwo\n"
+        );
+    }
+
+    /// Closing the session's last route tears its hashline binding down (see
+    /// `teardown_installed_route`); Broca reopens the route without fetching
+    /// the catalog again. The reopened route's `read` mints a tag again and
+    /// its hashline patch applies.
+    #[tokio::test]
+    async fn a_runner_heads_hashline_mode_survives_a_route_close_and_reopen() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-reopen");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let session = "reopened-head";
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let route = head_route(&root, session);
+        exchange_with_actor(
+            runner_head_fetch("claude-opus-5-5"),
+            route.clone(),
+            ctx.clone(),
+            &metrics,
+            read_and_edit,
+        )
+        .await;
+        assert!(head_read_tag(&route, &ctx, &metrics).await.is_some());
+        drop(route);
+        assert!(ctx.hashline_bindings().teardown(root.as_path(), session));
+        let reopened = head_route(&root, session);
+        let tag = head_read_tag(&reopened, &ctx, &metrics)
+            .await
+            .expect("the reopened route's read mints a tag");
+        assert_eq!(
+            head_patch(&reopened, &ctx, &metrics, &root, &tag).await,
+            "changed\ntwo\n"
+        );
+    }
+
+    /// A catalog fetched without the hashline arm after a hashline one (here,
+    /// for a GPT model, which is served no `edit`) records the standard mode:
+    /// the binding is turned off, `read` mints no tag, and a hashline patch is
+    /// refused, also after a restart.
+    #[tokio::test]
+    async fn a_catalog_without_hashline_after_a_hashline_one_turns_the_mode_off() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-mode-off");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let session = "switched-head";
+        let identity = head_route(&root, session);
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        for model in ["claude-opus-5-5", "gpt-5.5"] {
+            exchange_with_actor(
+                runner_head_fetch(model),
+                identity.clone(),
+                ctx.clone(),
+                &metrics,
+                read_and_edit,
+            )
+            .await;
+        }
+        assert!(!ctx
+            .hashline_bindings()
+            .peek(root.as_path(), session)
+            .unwrap()
+            .effective());
+        for ctx in [ctx, runner_head_ctx(&root, storage.path())] {
+            assert_eq!(head_read_tag(&identity, &ctx, &metrics).await, None);
+            assert_eq!(
+                head_patch(&identity, &ctx, &metrics, &root, "[a.rs#ABCD]").await,
+                "one\ntwo\n"
+            );
+            assert_eq!(
+                *LAST_DISPATCH.lock().unwrap(),
+                None,
+                "the patch reached dispatch"
+            );
+        }
+    }
+
+    /// A runner head whose catalog recorded no edit mode (one fetched before
+    /// modes were recorded, or never fetched) keeps the standard grammar:
+    /// `read` mints no tag, a hashline patch is refused before dispatch, and a
+    /// standard edit is dispatched as one.
+    #[tokio::test]
+    async fn a_runner_head_with_no_recorded_mode_uses_the_standard_grammar() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("runner-head-no-record");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("a.rs"), "one\ntwo\n").unwrap();
+        let identity = head_route(&root, "unrecorded-head");
+        let ctx = runner_head_ctx(&root, storage.path());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        assert_eq!(head_read_tag(&identity, &ctx, &metrics).await, None);
+        assert_eq!(
+            head_patch(&identity, &ctx, &metrics, &root, "[a.rs#ABCD]").await,
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            *LAST_DISPATCH.lock().unwrap(),
+            None,
+            "the patch reached dispatch"
+        );
+        let reply = exchange_with_actor(
+            json!({"op": "tool.call", "preset": "head", "name": "edit", "arguments": {"path": "a.rs", "edits": [{"oldString": "one", "newString": "uno"}]}}),
+            identity,
+            ctx.clone(),
+            &metrics,
+            read_and_edit,
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let dispatched = LAST_DISPATCH
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a standard edit is dispatched");
+        assert_ne!(dispatched["command"], "hashline_edit");
+        assert!(ctx.hashline_bindings().is_empty());
     }
 
     #[tokio::test]
@@ -7520,6 +9183,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: None,
                     worker_session: true,
                     host_tool_names: None,
@@ -7643,6 +9307,7 @@ pub(in crate::subc) mod route_tests {
                     edit_slot_survives: None,
                     report_registration_downgrade: false,
                     standard_edit_grammar: true,
+                    head_catalog_key: None,
                     disabled_tools: None,
                     worker_session: true,
                     host_tool_names: None,
@@ -8694,7 +10359,7 @@ mod ledger_terminal_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let held = executor.submit_async(
             root.clone(),
-            crate::executor::Lane::Mutating,
+            crate::executor::Lane::CallLedger,
             "held-admission-lane".into(),
             Box::new(move |_| {
                 started_tx.send(()).unwrap();

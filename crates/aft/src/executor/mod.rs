@@ -76,15 +76,35 @@ pub enum Lane {
     /// Provider discovery and policy-store operations. Serialized per root on
     /// reserved capacity, without an index epoch hold or writer-barrier wait.
     ProviderMetadata,
+    /// Call-ledger bookkeeping for keyed tool calls: the row a call writes
+    /// before it dispatches, the settlement its terminal reply waits for
+    /// before the transport writer may send it, the row reads a repeated call
+    /// makes while it waits for that settlement, and the ledger and grant
+    /// writes that end a scope. Each job is one short SQLite transaction
+    /// behind the database's own mutex and touches no index state, so it takes
+    /// no epoch gate and does not wait for readers, LSP or maintenance jobs,
+    /// or a running writer. On the Mutating lane it would wait until every
+    /// read on its root had drained, and each keyed reply would wait with it.
+    /// Running beside a writer such as a configure loses no protection:
+    /// `AppContext::open_db` returns the process-shared database handle and
+    /// replaces it only when the storage path changes, so ledger jobs of other
+    /// roots always ran beside any configure. Jobs run one at a time per actor
+    /// in submission order, so one root's ledger writes land in the order they
+    /// were queued; a scope end therefore settles every admission queued on
+    /// its root before it. Queued ProviderMetadata jobs are cancelled when the
+    /// root's last route unbinds; these are not, because a settlement records
+    /// a call that already ran.
+    CallLedger,
 }
 
-const ALL_LANES: [Lane; 6] = [
+const ALL_LANES: [Lane; 7] = [
     Lane::PureRead,
     Lane::SerialLspStatus,
     Lane::HeavyInit,
     Lane::Mutating,
     Lane::MaintenanceCommit,
     Lane::ProviderMetadata,
+    Lane::CallLedger,
 ];
 
 /// Scheduler class used to keep deferrable maintenance from occupying the
@@ -2015,6 +2035,13 @@ impl Executor {
                         });
                     }
                     let mut admission_error = None;
+                    if lane == Lane::CallLedger && job_class != JobClass::Interactive {
+                        admission_error = Some(Response::error(
+                            request_id.clone(),
+                            "invalid_lane",
+                            "call ledger work requires interactive admission",
+                        ));
+                    }
                     if lane == Lane::ProviderMetadata {
                         if job_class != JobClass::Interactive {
                             admission_error = Some(Response::error(
@@ -2220,6 +2247,30 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
+    /// The lane in which a job with this request id is queued on `root_id`,
+    /// for tests that hold a lane and must see the job wait behind it.
+    #[cfg(test)]
+    pub(crate) fn queued_lane_for_test(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> Option<Lane> {
+        let state = self.inner.state.lock();
+        let actor = state.actors.get(root_id)?;
+        for queues in [&actor.interactive, &actor.maintenance] {
+            for lane in ALL_LANES {
+                if queues
+                    .queue(lane)
+                    .iter()
+                    .any(|job| job.request_id == request_id)
+                {
+                    return Some(lane);
+                }
+            }
+        }
+        None
     }
 
     /// Snapshot RouteBind blockers, waiting for the scheduler lock if it is
@@ -2822,6 +2873,7 @@ struct ActorState {
     /// Only the internal callgraph acquisition bypasses interactive capacity.
     callgraph_acquisition_inflight: bool,
     provider_inflight: bool,
+    call_ledger_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
     deficit: isize,
@@ -2851,6 +2903,7 @@ impl ActorState {
             maintenance_commit_inflight: false,
             callgraph_acquisition_inflight: false,
             provider_inflight: false,
+            call_ledger_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
             deficit: 0,
@@ -2882,10 +2935,11 @@ impl ActorState {
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
         if job_class == JobClass::Interactive {
+            // Provider and call-ledger jobs are admitted by their own passes.
             self.interactive
                 .order
                 .iter()
-                .any(|lane| *lane != Lane::ProviderMetadata)
+                .any(|lane| !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger))
         } else {
             self.class_queues(job_class).has_queued_jobs()
         }
@@ -2982,6 +3036,7 @@ struct ClassQueues {
     mutating: VecDeque<QueuedJob>,
     maintenance_commit: VecDeque<QueuedJob>,
     provider_metadata: VecDeque<QueuedJob>,
+    call_ledger: VecDeque<QueuedJob>,
 }
 
 impl ClassQueues {
@@ -2994,6 +3049,7 @@ impl ClassQueues {
             mutating: VecDeque::new(),
             maintenance_commit: VecDeque::new(),
             provider_metadata: VecDeque::new(),
+            call_ledger: VecDeque::new(),
         }
     }
 
@@ -3069,10 +3125,12 @@ impl ClassQueues {
         if !self.pure_reads.is_empty() {
             return Some(Lane::PureRead);
         }
-        self.order
-            .iter()
-            .copied()
-            .find(|lane| !matches!(lane, Lane::PureRead | Lane::ProviderMetadata))
+        self.order.iter().copied().find(|lane| {
+            !matches!(
+                lane,
+                Lane::PureRead | Lane::ProviderMetadata | Lane::CallLedger
+            )
+        })
     }
 
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
@@ -3141,6 +3199,7 @@ impl ClassQueues {
         fail_queued_job_queue(&mut self.mutating);
         fail_queued_job_queue(&mut self.maintenance_commit);
         fail_queued_job_queue(&mut self.provider_metadata);
+        fail_queued_job_queue(&mut self.call_ledger);
     }
 
     fn cancel_queued_jobs(&mut self) -> usize {
@@ -3151,6 +3210,7 @@ impl ClassQueues {
             + cancel_queued_job_queue(&mut self.mutating)
             + cancel_queued_job_queue(&mut self.maintenance_commit)
             + cancel_queued_job_queue(&mut self.provider_metadata)
+            + cancel_queued_job_queue(&mut self.call_ledger)
     }
 
     fn cancel_queued_provider_jobs(&mut self) -> usize {
@@ -3256,6 +3316,7 @@ impl ClassQueues {
             Lane::Mutating => &self.mutating,
             Lane::MaintenanceCommit => &self.maintenance_commit,
             Lane::ProviderMetadata => &self.provider_metadata,
+            Lane::CallLedger => &self.call_ledger,
         }
     }
 
@@ -3267,6 +3328,7 @@ impl ClassQueues {
             Lane::Mutating => &mut self.mutating,
             Lane::MaintenanceCommit => &mut self.maintenance_commit,
             Lane::ProviderMetadata => &mut self.provider_metadata,
+            Lane::CallLedger => &mut self.call_ledger,
         }
     }
 }
@@ -3303,6 +3365,7 @@ fn lane_index(lane: Lane) -> usize {
         Lane::Mutating => 3,
         Lane::MaintenanceCommit => 4,
         Lane::ProviderMetadata => 5,
+        Lane::CallLedger => 6,
     }
 }
 
@@ -3679,6 +3742,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
                 actor.maintenance_commit_inflight = false;
             }
             Lane::ProviderMetadata => actor.provider_inflight = false,
+            Lane::CallLedger => actor.call_ledger_inflight = false,
         }
 
         if outcome == JobCompletionOutcome::Panicked && lane == Lane::Mutating {
@@ -3759,6 +3823,18 @@ fn dispatch_runnable(
         }
 
         made_progress |= dispatch_provider_metadata(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
+        made_progress |= dispatch_call_ledger(
             state,
             heavy,
             run_tx,
@@ -3984,6 +4060,48 @@ fn dispatch_provider_metadata(
     made_progress
 }
 
+/// Call-ledger jobs are admitted ahead of the interactive deficit round-robin
+/// (DRR) pass, on general workers, without the actor's read cap, epoch gate or
+/// writer barrier: a keyed reply cannot be written until its settlement
+/// commits, so it must not wait for the reads queued or running on its root.
+/// Each actor runs one at a time, in submission order.
+fn dispatch_call_ledger(
+    state: &mut SchedulerState,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut made_progress = false;
+    for _ in 0..state.actor_order.len() {
+        if !can_dispatch_class(state, JobClass::Interactive) {
+            break;
+        }
+        state.cursor %= state.actor_order.len();
+        let root_id = state.actor_order[state.cursor].clone();
+        state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let Some(actor) = state.actors.get_mut(&root_id).filter(|actor| !actor.fatal) else {
+            continue;
+        };
+        if let Some(run_job) = try_admit_actor(
+            &root_id,
+            actor,
+            AdmissionPass::CallLedger,
+            &state.config,
+            heavy,
+            None,
+        ) {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                break;
+            }
+        }
+    }
+    made_progress
+}
+
 /// Record an admitted job as running and hand it to a worker. Returns false
 /// when the worker channel is closed.
 fn launch_run_job(
@@ -4082,6 +4200,9 @@ enum AdmissionPass {
     /// Provider jobs bypass ordinary per-root deficit scheduling and do not
     /// acquire the index epoch gate.
     ProviderMetadata,
+    /// Call-ledger jobs: like provider jobs they bypass the deficit round-robin
+    /// pass and the epoch gate, but they use general workers.
+    CallLedger,
     /// The ordinary DRR pass for one job class.
     Class(JobClass),
 }
@@ -4096,7 +4217,9 @@ fn try_admit_actor(
 ) -> Option<RunJob> {
     let bind_pass = pass == AdmissionPass::Bind;
     let job_class = match pass {
-        AdmissionPass::Bind | AdmissionPass::ProviderMetadata => JobClass::Interactive,
+        AdmissionPass::Bind | AdmissionPass::ProviderMetadata | AdmissionPass::CallLedger => {
+            JobClass::Interactive
+        }
         AdmissionPass::Class(job_class) => job_class,
     };
     let lane = match pass {
@@ -4105,6 +4228,11 @@ fn try_admit_actor(
             .provider_metadata
             .front()
             .map(|_| Lane::ProviderMetadata)?,
+        AdmissionPass::CallLedger => actor
+            .interactive
+            .call_ledger
+            .front()
+            .map(|_| Lane::CallLedger)?,
         // Only the bind itself: an edit queued ahead of it waits for the
         // general pool (it is not admitted here, so it can never occupy a
         // reserved bind worker), and the bind runs first.
@@ -4132,7 +4260,7 @@ fn try_admit_actor(
             lane,
             Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
         );
-    if lane != Lane::ProviderMetadata
+    if !matches!(lane, Lane::ProviderMetadata | Lane::CallLedger)
         && ((actor.writer_inflight && !shared_bind_admits_lane)
             || actor.higher_priority_writer_barrier_blocks(job_class))
     {
@@ -4172,7 +4300,8 @@ fn try_admit_actor(
         .actor_total_inflight
         .saturating_sub(usize::from(actor.maintenance_commit_inflight))
         .saturating_sub(usize::from(actor.callgraph_acquisition_inflight))
-        .saturating_sub(usize::from(actor.provider_inflight));
+        .saturating_sub(usize::from(actor.provider_inflight))
+        .saturating_sub(usize::from(actor.call_ledger_inflight));
     let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
     let runnable = match lane {
         Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
@@ -4213,6 +4342,9 @@ fn try_admit_actor(
         // maintenance from stacking without consuming an interactive slot.
         Lane::MaintenanceCommit => !actor.maintenance_commit_inflight,
         Lane::ProviderMetadata => !actor.provider_inflight,
+        // Short database bookkeeping, outside the per-actor interactive cap:
+        // one at a time keeps each actor's ledger writes in submission order.
+        Lane::CallLedger => !actor.call_ledger_inflight,
     };
 
     if !runnable {
@@ -4271,6 +4403,10 @@ fn try_admit_actor(
         }
         Lane::ProviderMetadata => {
             actor.provider_inflight = true;
+            actor.actor_total_inflight += 1;
+        }
+        Lane::CallLedger => {
+            actor.call_ledger_inflight = true;
             actor.actor_total_inflight += 1;
         }
     }
@@ -4588,6 +4724,9 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             let _config = run_job.ctx.pin_config();
             run(job)
         }
+        // Call-ledger writes go through the database's own mutex and touch no
+        // index state, so they take no epoch gate.
+        Lane::CallLedger => run(job),
         Lane::Mutating if run_job.shared_bind_gate => {
             // A cancelled bind never touches the gate.
             if cancel_requested() {

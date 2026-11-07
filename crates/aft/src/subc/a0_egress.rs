@@ -707,9 +707,16 @@ mod tests {
         assert!(executor.register_actor(root.clone(), ctx));
         let (entered, entering) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
+        // Hold the lane the ledger job queues on: settlements run on the
+        // call-ledger lane, shell detaches on the mutating lane.
+        let held_lane = if settling {
+            Lane::CallLedger
+        } else {
+            Lane::Mutating
+        };
         let held = executor.submit_async(
             root.clone(),
-            Lane::Mutating,
+            held_lane,
             "held-egress-lane".into(),
             Box::new(move |_| {
                 entered.send(()).unwrap();
@@ -742,15 +749,12 @@ mod tests {
             .unwrap();
         let queued = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if executor.try_mutating_job_state_label(
-                    &root,
-                    if settling {
-                        "ledger-settle"
-                    } else {
-                        "ledger-detach"
-                    },
-                ) == Some("queued")
-                {
+                let queued = if settling {
+                    executor.queued_lane_for_test(&root, "ledger-settle") == Some(Lane::CallLedger)
+                } else {
+                    executor.try_mutating_job_state_label(&root, "ledger-detach") == Some("queued")
+                };
+                if queued {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -783,8 +787,8 @@ mod tests {
         let ack = tokio::time::timeout(Duration::from_secs(1), receiving.recv()).await;
         let _ = release.send(());
         let _ = held.await;
-        queued.expect("ledger-detach was never queued behind the holder");
-        let mut ack = ack.expect("A0 ACK waited on ledger-detach").unwrap();
+        queued.expect("the ledger job was never queued behind the holder");
+        let mut ack = ack.expect("A0 ACK waited on the ledger job").unwrap();
         assert_eq!(ack.header.corr, 891);
         assert!(ack.begin_ack_write());
         ack.finish_ack_write(true);

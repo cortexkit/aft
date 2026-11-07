@@ -1,0 +1,1 @@
+- Tool replies to runner calls (reads, greps, globs and edits) no longer sit for tens to hundreds of milliseconds after the work is done while other reads run on the same project.

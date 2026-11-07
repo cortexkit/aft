@@ -71,8 +71,12 @@ fn principal_label_for_identity(identity: &RouteIdentity) -> Option<&str> {
 // Core's scope_carriers and worker_runner_module identify these session hosts.
 // The stamp does not carry the recorded runner module: supporting another
 // runner requires adding its authenticated principal to this explicit list.
-const SAVED_GRANT_SESSION_HOSTS: &[&str] =
-    &["direct", "reserved:broca", "reserved:thalamus-harness"];
+const SAVED_GRANT_SESSION_HOSTS: &[&str] = &[
+    "direct",
+    "reserved:broca",
+    "reserved:thalamus-harness",
+    "reserved:thalamus-pi",
+];
 
 pub(super) fn scope_grants_denial(
     identity: &RouteIdentity,
@@ -133,6 +137,34 @@ pub(super) fn scope_grants_denial_for_parent(
                     });
             (!session_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
         }
+    }
+}
+
+/// Saved-grant eligibility for checking a worker plan's siblings at the
+/// worker's own catalog fetch. Core makes one such fetch over its own
+/// connection before the worker starts, so that route's principal is the
+/// scope's owner rather than one of the session hosts that later run the
+/// worker's file tools. The checked siblings are saved for those file tools,
+/// so the check counts the grants saved on the worker's scope as its session
+/// host would. Only the session-host denial is waived, and only when the
+/// route's principal is the owner named on an authorized Alfonso worker
+/// stamp: flow scopes, other scope kinds, codemode runs and every other
+/// carrier keep their denial. Tool calls on the owner's connection keep it
+/// too, because they read [`scope_grants_denial`].
+pub(super) fn worker_catalog_sibling_grants_denial(
+    identity: &RouteIdentity,
+    preset: &str,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    let denial = scope_grants_denial(identity);
+    let owner_carried = identity.run_owner.is_none()
+        && launch_key(identity, preset).is_some()
+        && identity.scope.as_ref().is_some_and(|stamp| {
+            principal_id(&Some(stamp.owner.clone())).as_deref()
+                == principal_label_for_identity(identity)
+        });
+    match denial {
+        Some(crate::access_policy::ScopeGrantsDenial::NotSessionHost) if owner_carried => None,
+        denial => denial,
     }
 }
 
@@ -1047,31 +1079,34 @@ pub(super) fn restore_launch_before(
     }
 }
 
+/// Validate a catalog request's `allow_paths` and, on a worker's own fetch, save
+/// them as the worker's launch grants. Returns the grants the request validated
+/// but this fetch did not save: a plan preflight's, such as a head checking a
+/// worker plan before the worker exists. A fetch that saved its grants returns
+/// none, so its callers read them from the session like any other saved grant.
 pub(super) fn catalog(
     raw: Option<&Value>,
     identity: &RouteIdentity,
     ctx: &AppContext,
     preset: &str,
-) -> Result<(), subc_protocol::ErrorBody> {
+) -> Result<Vec<AccessGrant>, subc_protocol::ErrorBody> {
     let head_key = head_scope(identity);
+    let validate_raw = |head: Option<&AccessPolicy>| match raw {
+        Some(raw) => validate(raw, head, head_key.as_ref()),
+        None => Ok(Vec::new()),
+    };
     if identity
         .scope
         .as_ref()
         .is_some_and(|stamp| !stamp.owner_authorized)
     {
-        if let Some(raw) = raw {
-            validate(raw, None, head_key.as_ref())?;
-        }
-        return Ok(());
+        return validate_raw(None);
     }
     if raw.is_none() && launch_key(identity, preset).is_none() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(db) = ctx.db() else {
-        if let Some(raw) = raw {
-            validate(raw, None, head_key.as_ref())?;
-        }
-        return Ok(());
+        return validate_raw(None);
     };
     let lock = || {
         db.lock()
@@ -1108,11 +1143,9 @@ pub(super) fn catalog(
     };
     loop {
         let head = snapshot.clone().map(|policy| policy.resolve(&storage));
-        if let Some(raw) = raw {
-            validate(raw, head.as_ref(), head_key.as_ref())?;
-        }
+        let validated = validate_raw(head.as_ref())?;
         let Some(key) = launch.as_ref() else {
-            return Ok(());
+            return Ok(validated);
         };
         let stored = {
             let conn = lock()?;
@@ -1178,7 +1211,7 @@ pub(super) fn catalog(
         }
         store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 }
 

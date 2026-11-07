@@ -231,6 +231,8 @@ mod health;
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
+#[cfg(test)]
+mod ledger_lane_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
@@ -1335,10 +1337,19 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// `thalamus-harness` (binary `ck-thalamus-harness`) is CortexKit's harness
 /// module, which hosts OpenCode for Alfonso: `opencode` for OpenCode 1 and
 /// `opencode2` for sessions on its OpenCode 2 server (a runner session; see
-/// `Harness::from_str`). Its Pi adapter is not ready, so no Pi pair is listed.
+/// `Harness::from_str`). It also hosts headless Claude Code sessions as
+/// `claude-code`, whose tools reach AFT over the same scoped routes as its
+/// OpenCode 2 sessions, with consent answered by core, so they are runner
+/// sessions too. `thalamus-pi` is its counterpart for Pi: it binds
+/// its Pi sessions with harness `pi`, on routes core opens under each
+/// session's scope, and a call that needs the user's permission is held
+/// and answered by core (the `held-reply/v1` capability), as on the
+/// OpenCode 2 server. No AFT plugin runs inside those sessions.
 const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[
     ("thalamus-harness", "opencode"),
     ("thalamus-harness", "opencode2"),
+    ("thalamus-harness", "claude-code"),
+    ("thalamus-pi", "pi"),
 ];
 
 fn reserved_module_is_first_party_on_harness(harness: &str, principal: &Option<Principal>) -> bool {
@@ -1613,6 +1624,18 @@ enum ManagementAdmission {
 }
 
 impl RouteIdentity {
+    fn task_identity(&self) -> crate::bash_background::TaskIdentity {
+        let principal = match &self.spawn_principal {
+            AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.clone(),
+            AuthenticatedPrincipal::FirstParty => None,
+        };
+        crate::bash_background::TaskIdentity {
+            principal,
+            harness: self.harness.clone(),
+            session: self.session.clone(),
+        }
+    }
+
     fn reply_policy(&self) -> wire::ToolResponsePolicy {
         self.into()
     }
@@ -1728,6 +1751,7 @@ impl Deref for RouteIdentity {
 
 #[derive(Debug, Clone)]
 struct RetainedSessionIdentity {
+    principal: Option<String>,
     harness: String,
     trust: BindTrust,
 }
@@ -1760,13 +1784,14 @@ type BgWakePending = HashMap<RouteChannel, BgWakeState>;
 
 // A session can be observed by multiple long-lived consumer records. Retain
 // every route so each wake uses the correlation captured by that route's BgSub.
-type BgSubsBySession = HashMap<(ProjectRootId, String), HashSet<RouteChannel>>;
+type BgSubsBySession =
+    HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), HashSet<RouteChannel>>;
 
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
     kind: MaintenanceDrainKind,
     response: Response,
-    empty_bg_sessions: Vec<(String, u64)>,
+    empty_bg_sessions: Vec<(crate::bash_background::TaskIdentity, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     diagnostics_on_edit: Option<bool>,
@@ -1800,7 +1825,7 @@ impl MaintenanceDrainKind {
 
 #[derive(Debug, Default)]
 struct MaintenanceJobOutcome {
-    empty_bg_sessions: Vec<(String, u64)>,
+    empty_bg_sessions: Vec<(crate::bash_background::TaskIdentity, u64)>,
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     /// The root's `lsp.diagnostics_on_edit` after a config reload, which the
@@ -3023,7 +3048,7 @@ fn purge_deleted_root_residents(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
@@ -3128,7 +3153,7 @@ fn submit_due_maintenance_jobs(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &BgWakePending,
-    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -3920,7 +3945,7 @@ fn sync_bg_live_delivery_sessions(
 fn insert_bg_subscription_index(
     bg_sub_by_session: &mut BgSubsBySession,
     root: ProjectRootId,
-    session: String,
+    session: crate::bash_background::TaskIdentity,
     channel: RouteChannel,
 ) {
     bg_sub_by_session
@@ -3935,7 +3960,7 @@ fn remove_bg_subscription_index(
     identity: Option<&RouteIdentity>,
 ) {
     if let Some(identity) = identity {
-        let key = (identity.root.clone(), identity.session.clone());
+        let key = (identity.root.clone(), identity.task_identity());
         let remove_key = bg_sub_by_session.get_mut(&key).is_some_and(|channels| {
             channels.remove(&channel);
             channels.is_empty()
@@ -4192,6 +4217,10 @@ async fn teardown_installed_route(
             .any(|route| route.root == identity.root && route.session == identity.session);
         if !session_still_routed {
             if let Some(ctx) = executor.actor_context(&identity.root) {
+                // The binding goes with the session's last route, but the edit
+                // mode its runner head's catalog recorded stays in aft.db: the
+                // head keeps that catalog when the route is reopened, and its
+                // next call installs the binding again.
                 ctx.hashline_bindings()
                     .teardown(identity.root.as_path(), &identity.session);
                 let _ = ctx.release_backup_session_in_background(identity.session.clone());
@@ -4280,6 +4309,7 @@ fn remember_session_identity(
     session_identity.insert(
         key,
         RetainedSessionIdentity {
+            principal: identity.task_identity().principal,
             harness: identity.harness.clone(),
             trust: identity.trust,
         },
@@ -4295,6 +4325,7 @@ fn replay_key_for_session(
     Some((
         push::ReplayKey {
             root: root.clone(),
+            principal: retained.principal.clone(),
             harness: retained.harness.clone(),
             session: session.to_string(),
         },
@@ -5467,7 +5498,8 @@ where
     // are answered at once and foreground bash waits detach to the background.
     let module_drain = drain::ModuleDrainWindow::default();
     let mut drain_progress: Option<drain::DrainProgress> = None;
-    let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
+    let mut bg_wake_epoch: HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64> =
+        HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
@@ -10498,6 +10530,8 @@ impl PlainToolRun {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
+            let _task_identity =
+                crate::bash_background::task_identity_scope(Some(identity_for_run.task_identity()));
             let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
@@ -10872,7 +10906,7 @@ async fn handle_tool_call(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     dispatch: DispatchFn,
     deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
@@ -10944,7 +10978,7 @@ async fn handle_tool_call_with_capabilities(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     dispatch: DispatchFn,
     deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
@@ -11193,6 +11227,7 @@ async fn handle_tool_call_with_capabilities(
         if carrier_read_only::restricted(&identity) {
             call.name = carrier_read_only::internal_name(&call.name).to_owned();
         }
+        tool_provider::route_head_call_name(&mut call, identity.scope.is_some());
         if let Err(error) =
             admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
         {
@@ -11226,6 +11261,7 @@ async fn handle_tool_call_with_capabilities(
             tool_provider::admission_trusted(&identity, &call),
             &identity.project_root,
             frame.header.channel,
+            tool_provider::head_catalog_key(&identity).is_some(),
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -11342,13 +11378,13 @@ async fn handle_tool_call_with_capabilities(
         insert_bg_subscription_index(
             bg_sub_by_session,
             identity.root.clone(),
-            identity.session.clone(),
+            identity.task_identity(),
             route_id,
         );
         metrics.record_bg_subscription_installed(&identity.root, &identity.session, route_id);
         push::arm_bg_wake(
             identity.root.clone(),
-            identity.session.clone(),
+            identity.task_identity(),
             route_id,
             bg_wake_pending,
             bg_wake_epoch,
@@ -11871,6 +11907,9 @@ async fn handle_tool_call_with_capabilities(
         edit_slot_survives: call.edit_slot_survives,
         report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
         standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
+        head_catalog_key: (role == tool_provider::CallerRole::Head)
+            .then(|| tool_provider::head_catalog_key(&identity))
+            .flatten(),
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
         worker_session: role.is_worker(),
         host_tool_names: format_context.host_tool_names.clone(),
@@ -12610,7 +12649,7 @@ fn submit_maintenance_job(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
     kind: MaintenanceDrainKind,
-    bg_sessions_to_check: Vec<(String, u64)>,
+    bg_sessions_to_check: Vec<(crate::bash_background::TaskIdentity, u64)>,
     completion_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -12668,7 +12707,8 @@ fn submit_maintenance_job(
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()
                     .filter(|(session, _)| {
-                        !ctx.bash_background().has_unacked_wakes_for_session(session)
+                        !ctx.bash_background()
+                            .has_unacked_wakes_for_identity(session)
                     })
                     .collect();
                 MaintenanceJobOutcome {
@@ -12844,11 +12884,13 @@ async fn deliver_resolved_subc_response(
                 .unwrap_or("unknown")
                 .to_string()
         };
-        // Queue before terminal settlement on the same actor. The frame loop
-        // never locks or writes SQLite, including for deferred responses.
+        // Queue before terminal settlement on the same actor: both run on the
+        // call-ledger lane, one at a time in submission order, so the outcome
+        // lands while the row is still open. The frame loop never locks or
+        // writes SQLite, including for deferred responses.
         drop(executor.submit_async(
             entry.root.clone(),
-            Lane::Mutating,
+            Lane::CallLedger,
             "ledger-deferred-outcome".into(),
             Box::new(move |ctx| {
                 let response = if outcome == "ok" {
@@ -15116,6 +15158,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            launching_identity: None,
             changed_files: None,
             frame_type: "bash_completed",
             task_id: task_id.to_string(),
@@ -15148,6 +15191,7 @@ pub(crate) mod test_support {
         elapsed_ms: u64,
     ) -> PushFrame {
         PushFrame::BashLongRunning(BashLongRunningFrame {
+            launching_identity: None,
             frame_type: "bash_long_running",
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
@@ -15158,6 +15202,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            launching_identity: None,
             batch: None,
             frame_type: "bash_pattern_match",
             task_id: "task-pattern".to_string(),
@@ -16362,7 +16407,10 @@ mod tests {
             },
         )]);
         let mut bg_sub_by_session = HashMap::from([(
-            (root.clone(), "deleted-route".to_string()),
+            (
+                root.clone(),
+                route_identity(&root, "deleted-route").task_identity(),
+            ),
             HashSet::from([route]),
         )]);
         let mut bg_wake_pending =
@@ -17922,7 +17970,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), ctx));
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        let session = "idle-session".to_string();
+        let session = route_identity(&root, "idle-session").task_identity();
         let channel = route_key(17, 1);
         let metrics = DispatchPathMetrics::new();
         let bg_sub_by_session =
@@ -18816,9 +18864,58 @@ mod tests {
         );
     }
 
-    /// Trust for the harness module is per harness: it hosts only OpenCode
-    /// today, so the same principal binding for any other harness, including
-    /// Pi whose adapter is not ready, must stay untrusted.
+    #[test]
+    fn thalamus_harness_on_claude_code_is_first_party_and_no_lookalike_is() {
+        let principal = reserved("thalamus-harness");
+        assert_eq!(
+            trust_for_bind("claude-code", &principal),
+            BindTrust::FirstParty
+        );
+        for harness in [
+            "Claude-Code",
+            "claude-code ",
+            "claude",
+            "claude_code",
+            "fed:claude-code",
+        ] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-harness must stay untrusted on harness {harness:?}"
+            );
+        }
+        // Another reserved module binding for Claude Code stays untrusted.
+        for module in ["thalamus-pi", "some-other-module"] {
+            assert_eq!(
+                trust_for_bind("claude-code", &reserved(module)),
+                BindTrust::Untrusted,
+                "{module} must stay untrusted on claude-code"
+            );
+        }
+    }
+
+    #[test]
+    fn thalamus_pi_on_pi_is_first_party_and_nowhere_else() {
+        let principal = reserved("thalamus-pi");
+        assert_eq!(trust_for_bind("pi", &principal), BindTrust::FirstParty);
+        for harness in ["opencode", "opencode2", "runner", "Pi", "pi ", "fed:pi", ""] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-pi must stay untrusted on harness {harness:?}"
+            );
+        }
+        // Another reserved module binding for Pi stays untrusted.
+        assert_eq!(
+            trust_for_bind("pi", &reserved("thalamus-harness")),
+            BindTrust::Untrusted
+        );
+        assert_eq!(trust_for_principal(&principal), BindTrust::Untrusted);
+    }
+
+    /// Trust for the harness module is per harness: it hosts only OpenCode,
+    /// so the same principal binding for any other harness, including Pi
+    /// (which `thalamus-pi` hosts), must stay untrusted.
     #[test]
     fn thalamus_harness_stays_untrusted_on_other_harnesses() {
         let principal = reserved("thalamus-harness");

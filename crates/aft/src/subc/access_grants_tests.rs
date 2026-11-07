@@ -178,7 +178,12 @@ fn saved_scope_grants_direct_broca_and_runner_hosts_keep_grants() {
     let (dir, ctx, head, worker) = fixture();
     let outside = dir.path().join("outside.txt");
     std::fs::write(&outside, "saved authority").unwrap();
-    for principal in ["direct", "reserved:broca", "reserved:thalamus-harness"] {
+    for principal in [
+        "direct",
+        "reserved:broca",
+        "reserved:thalamus-harness",
+        "reserved:thalamus-pi",
+    ] {
         for route in [&head, &worker] {
             assert_saved_scope_grants(&ctx, &with_carrier(route, principal), &outside, None);
         }
@@ -1098,6 +1103,159 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
                 "allow_paths[0]: denied_floor ({description}: {})",
                 floor.display()
             )
+        );
+    }
+}
+
+#[test]
+fn grants_allow_paths_staging_home_and_xdg_preserve_private_floors() {
+    let _lock = crate::test_env::process_env_lock();
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    let _restore = RestoreEnv(
+        ["XDG_DATA_HOME", "XDG_STATE_HOME"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let home = policy_path(dir.path());
+    let xdg = home.join("xdg-data");
+    std::env::set_var("XDG_DATA_HOME", &xdg);
+    std::env::set_var("XDG_STATE_HOME", home.join("xdg-state"));
+    let data_roots = [home.join(".local/share/cortexkit"), xdg.join("cortexkit")];
+    let storage = data_roots[0].join("staging/aft-store");
+    let connection = data_roots[0].join("staging/connection.json");
+    let mut config = crate::config::Config::default();
+    config.semantic.subc_connection_file = Some(connection.clone());
+    for data in &data_roots {
+        std::fs::create_dir_all(data.join("staging/nested")).unwrap();
+        std::fs::create_dir_all(data.join("synapse")).unwrap();
+        std::fs::write(data.join("synapse/x"), "private").unwrap();
+        config.sandbox.read_deny.push(data.join("staging/denied"));
+    }
+    let mut policy =
+        AccessPolicy::from_config(&config, &storage, vec![home.join("project")], &home);
+    policy.mode = crate::access_policy::ApprovalMode::FullAccess;
+
+    fn assert_floor(policy: &AccessPolicy, target: &Path, rule: &str) {
+        let target = policy_path(target);
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            assert_eq!(
+                policy.decide(operation, &target, false),
+                AccessDecision::Deny(crate::access_policy::AccessDenial::Floor),
+                "{}",
+                target.display()
+            );
+            let floor = policy
+                .capability_floor(operation, GrantKind::File, &target)
+                .unwrap();
+            assert_eq!(floor.rule.label(), rule, "{}", target.display());
+        }
+    }
+
+    for data in &data_roots {
+        for relative in [
+            "staging",
+            "staging/motor.current",
+            "staging/nested/subc.current",
+        ] {
+            let target = data.join(relative);
+            for operation in [AccessOperation::Read, AccessOperation::Write] {
+                assert_eq!(
+                    policy.decide(operation, &policy_path(&target), false),
+                    AccessDecision::Allow,
+                    "{}",
+                    target.display()
+                );
+            }
+        }
+        let declaration = data.join("staging/motor.current");
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(&declaration, "card declaration").unwrap();
+            }
+            for mode in ["read", "write"] {
+                assert!(
+                    validate(
+                        &json!([{"path":declaration,"mode":mode}]),
+                        Some(&policy),
+                        None,
+                    )
+                    .is_ok(),
+                    "{mode}, exists={exists}, {}",
+                    declaration.display()
+                );
+            }
+        }
+        for relative in [
+            "synapse/x",
+            "staging/../synapse/x",
+            "staging-old/x",
+            "run/subc-connection.json",
+        ] {
+            assert_floor(&policy, &data.join(relative), "cortexkit_module_data");
+        }
+        assert_floor(
+            &policy,
+            &data.join("staging/denied"),
+            "configured_read_deny",
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = data.join("staging/module-link");
+            std::os::unix::fs::symlink(data.join("synapse"), &alias).unwrap();
+            assert_floor(&policy, &alias.join("x"), "cortexkit_module_data");
+            assert_floor(&policy, &alias.join("missing"), "cortexkit_module_data");
+            assert_floor(&policy, &alias, "cortexkit_module_data");
+        }
+    }
+    assert_floor(&policy, &storage.join("aft.db"), "aft_storage");
+    assert_floor(&policy, &connection, "subc_connection");
+    assert_floor(&policy, &home.join(".ssh/keys"), "credential_path");
+    assert_floor(
+        &policy,
+        &home.join(".local/state/cortexkit/synapse/x"),
+        "cortexkit_module_state",
+    );
+    assert_floor(
+        &policy,
+        &home.join("xdg-state/cortexkit/synapse/x"),
+        "cortexkit_module_state",
+    );
+
+    // A second private floor on the same root still applies to staging.
+    std::env::set_var("XDG_STATE_HOME", &xdg);
+    let overlapping = AccessPolicy::from_config(&config, &storage, vec![], &home);
+    assert_floor(
+        &overlapping,
+        &data_roots[1].join("staging/other.current"),
+        "cortexkit_module_state",
+    );
+
+    #[cfg(unix)]
+    for data in &data_roots {
+        // Resolving the staging root itself must not turn its target into
+        // an exempt directory when a later policy snapshot is built.
+        std::fs::remove_dir_all(data.join("staging")).unwrap();
+        std::os::unix::fs::symlink(data.join("synapse"), data.join("staging")).unwrap();
+        let redirected =
+            AccessPolicy::from_config(&config, &storage, vec![home.join("project")], &home);
+        assert_floor(
+            &redirected,
+            &data.join("staging/x"),
+            "cortexkit_module_data",
         );
     }
 }

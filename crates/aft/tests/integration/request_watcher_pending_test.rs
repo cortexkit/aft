@@ -29,6 +29,7 @@ fn call_with_drain(
             request_id: name.into(),
             project_root: root,
             standard_edit_grammar: true,
+            head_catalog_key: None,
             session_id: None,
             diagnostics_on_edit: false,
             preview: false,

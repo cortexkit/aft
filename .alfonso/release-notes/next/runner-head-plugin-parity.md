@@ -1,0 +1,1 @@
+- Agent heads run by the CortexKit runner now see AFT's tools under the names OpenCode uses (`aft_search`, `aft_zoom`, `ast_grep_search`, …), get `bash_watch` while background bash is on, and follow `edit_mode: "hashline"` for `edit` and `read`.

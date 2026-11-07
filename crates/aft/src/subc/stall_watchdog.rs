@@ -1276,7 +1276,10 @@ mod tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let mut subscriptions = BgSubsBySession::new();
         subscriptions.insert(
-            (root, "watch-session".into()),
+            (
+                root.clone(),
+                crate::subc::test_support::route_identity(&root, "watch-session").task_identity(),
+            ),
             HashSet::from([route_key(125, 1)]),
         );
         let held = db.lock().unwrap();

@@ -79,6 +79,20 @@ fn catalog_needs_policy_database(body: &Value, identity: &RouteIdentity) -> bool
             })
 }
 
+/// A runner head's catalog (a `head` request naming its model) records its
+/// edit mode in aft.db, so while that database opens its fetch waits rather
+/// than be served before the mode can be recorded. A database that failed to
+/// open does not refuse it: nothing is recorded or read then, and the catalog
+/// and the head's calls both use the standard edit grammar.
+pub(super) fn catalog_records_edit_mode(body: &Value, identity: &RouteIdentity) -> bool {
+    body.get("preset").and_then(Value::as_str).unwrap_or("head") == "head"
+        && body
+            .get("params")
+            .and_then(|params| params.get("model"))
+            .is_some()
+        && tool_provider::head_catalog_key(identity).is_some()
+}
+
 pub(super) fn catalog(
     body: Value,
     identity: &RouteIdentity,
@@ -87,7 +101,9 @@ pub(super) fn catalog(
     // The transport already gave this open a bounded asynchronous wait. Do not
     // re-enter the open or silently skip a required preset/policy persistence.
     let needs_database = catalog_needs_database(&body, identity);
-    if needs_database && ctx.database_runtime_initializing() {
+    if (needs_database || catalog_records_edit_mode(&body, identity))
+        && ctx.database_runtime_initializing()
+    {
         return Err(if awaits_policy_store(ctx, identity) {
             policy_unavailable()
         } else {
@@ -219,6 +235,7 @@ fn catalog_inner(
             ctx.config().revision_reads,
             worker_wait_max_ms,
             confined(ctx, identity)?,
+            tool_provider::HeadSettings::from_config(&ctx.config()),
         );
     }
     let mut routing_policy = if preset == "worker"
@@ -254,12 +271,30 @@ fn catalog_inner(
             .with_detail(json!({"retryable": refusal.data["retryable"]})));
         }
     }
-    access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    let unsaved_grants =
+        access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    // Only the worker's own scope saves its routing policy; a head previewing
+    // a worker plan saves nothing.
+    let freeze_key = policy_key(identity, Some(&preset))
+        .ok()
+        .filter(|_| !head_scope(identity));
     if let Some(policy) = routing_policy.as_mut().filter(|p| !p.siblings.is_empty()) {
+        // A fetch that saves nothing may also count the grants its own
+        // allow_paths validated: the worker the plan launches will hold them.
+        // A fetch that saves its routing policy counts only saved grants, so a
+        // saved sibling is always one the session's file tools may read.
+        let preflight_grants: &[_] = if freeze_key.is_none() {
+            &unsaved_grants
+        } else {
+            &[]
+        };
         let _scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(identity)));
-        let _grants =
-            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(identity));
+        // A worker's own fetch counts its scope's saved grants as the worker's
+        // file tools will, even when core carries it over its own connection.
+        let _grants = crate::access_policy::scope_grants_guard(
+            access_grants::worker_catalog_sibling_grants_denial(identity, &preset),
+        );
         // Catalog discovery has no permission UI. Use the same scope and saved
         // grants as file calls, but never turn an outside-access ask into approval.
         let _ask =
@@ -267,10 +302,18 @@ fn catalog_inner(
                 once: vec![],
                 launch: access_grants::launch_key(identity, &preset),
             }));
+        let first = policy.siblings[0].clone();
         with_call_policy(ctx, identity, "tool.catalog", "read", json!({}), |_| {
-            policy.validate_siblings(ctx, "tool.catalog", &identity.session)
+            policy.validate_siblings(ctx, "tool.catalog", &identity.session, preflight_grants)
         })
-        .unwrap_or(Err(crate::exec_remote::SIBLINGS_REFUSAL))
+        // The session's call policy refused before any sibling could be
+        // resolved, so the first one is named as the plan gave it.
+        .unwrap_or_else(|_| {
+            Err(crate::exec_remote::sibling_refusal(
+                crate::exec_remote::SiblingRefusal::NotReadable,
+                std::path::Path::new(&first),
+            ))
+        })
         .map_err(|message| {
             cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
         })?;
@@ -305,10 +348,7 @@ fn catalog_inner(
     }
     // Head routes may preview a worker plan, but only the worker's own scope
     // can save its routing and confinement policy.
-    if let Some(key) = policy_key(identity, Some(&preset))
-        .ok()
-        .filter(|_| !head_scope(identity))
-    {
+    if let Some(key) = freeze_key {
         if let Some(policy) = routing_policy.as_ref() {
             let Some(db) = ctx.db() else {
                 return Err(cortexkit_role_tool_provider::errors::invalid_request(
@@ -356,20 +396,26 @@ fn catalog_inner(
     } else {
         confined(ctx, identity)?
     };
-    let render = if is_confined {
-        tool_provider::catalog_for_confined_request
-    } else {
-        tool_provider::catalog_for_request
-    };
-    let answer = render(
+    let mut head_settings = tool_provider::HeadSettings::from_config(&ctx.config());
+    // A runner head's hashline catalog is served only where its edit mode can
+    // be recorded, because its later calls are decoded by that record (see
+    // `tool_provider::record_runner_head_edit_mode`).
+    if tool_provider::head_catalog_key(identity).is_none() || ctx.db().is_none() {
+        head_settings.hashline = false;
+    }
+    let (answer, registration) = tool_provider::catalog_for_route(
         request,
         catalog_preset,
         &identity.disabled_tools,
         powershell,
-        runon.is_ok(),
-        ctx.config().revision_reads,
+        (runon.is_ok(), ctx.config().revision_reads),
         worker_wait_max_ms,
+        is_confined,
+        head_settings,
     )?;
+    if let Some(registration) = registration {
+        tool_provider::record_runner_head_edit_mode(ctx, identity, registration)?;
+    }
     // Digest-only replies have no tools array. For those, use the renderer's
     // tool selection and its confinement filter to describe the full catalog.
     let bash_in_catalog = answer

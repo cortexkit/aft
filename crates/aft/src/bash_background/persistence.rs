@@ -1766,6 +1766,8 @@ pub struct PersistedTask {
     pub harness: Option<String>,
     pub task_id: String,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launching_identity: Option<super::TaskIdentity>,
     pub command: String,
     /// Scanner-derived segment labels retained so completion rendering does not
     /// need to parse the command again.
@@ -1954,6 +1956,7 @@ impl PersistedTask {
         let metadata = Self {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
+            launching_identity: super::TaskIdentity::current(),
             task_id,
             session_id,
             command,
@@ -2122,6 +2125,7 @@ impl From<BashTaskRow> for PersistedTask {
             harness: Some(row.harness.clone()),
             task_id: row.task_id,
             session_id: row.session_id,
+            launching_identity: None,
             command: row.command,
             pipeline_segments: Vec::new(),
             pipeline_status_unavailable: None,

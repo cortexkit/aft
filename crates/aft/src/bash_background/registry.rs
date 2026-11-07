@@ -765,6 +765,8 @@ pub struct BgCompletion {
     /// carry `session_id` at the BashCompletedFrame envelope level for routing.
     #[serde(skip_serializing)]
     pub session_id: String,
+    #[serde(skip_serializing)]
+    pub launching_identity: Option<super::TaskIdentity>,
     pub status: BgTaskStatus,
     pub exit_code: Option<i64>,
     pub command: String,
@@ -1524,6 +1526,9 @@ pub(crate) struct BashDrainReplyState {
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
+    /// A remote task's job ID and phase, so a reply formatted on the module
+    /// loop can name the build-server job without reading task state.
+    pub(crate) remote: Option<remote::RemoteProgress>,
     /// Artifact-free terminal diagnostics, published with the metadata before
     /// the full output renderer can finish the canonical response below.
     pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
@@ -1558,6 +1563,7 @@ impl BashDrainReplyCache {
         published.execution_note = note;
         published.deadline = deadline;
         published.inputs_captured = inputs_captured;
+        published.remote = metadata.remote.as_ref().map(remote::RemoteProgress::of);
         published.uncaptured_terminal_facts = terminal_facts;
         if inputs_captured != Some(false) || !metadata.is_terminal() {
             published.uncaptured_terminal = None;
@@ -1588,6 +1594,7 @@ pub(crate) struct BgTask {
     completion_secrets: Mutex<Option<crate::log_redact::SecretValues>>,
     pub(crate) task_id: String,
     pub(crate) session_id: String,
+    launching_identity: Option<super::TaskIdentity>,
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
     /// Canonical root identity captured at registration and retained on deletion.
@@ -1963,7 +1970,13 @@ pub(crate) struct ArtifactPage {
 
 fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str>) -> bool {
     session_id
-        .map(|session_id| completion.session_id == session_id)
+        .map(|session_id| {
+            completion.session_id == session_id
+                && completion
+                    .launching_identity
+                    .as_ref()
+                    .is_none_or(|owner| super::TaskIdentity::current().as_ref() == Some(owner))
+        })
         .unwrap_or(true)
 }
 
@@ -3984,8 +3997,8 @@ impl BgTaskRegistry {
     /// configure replaces `db_harness` with its own. A session's task rows are
     /// written under the harness of the route that started them, so this
     /// prefers the harness recorded for the session's tasks, then the calling
-    /// route's harness, and only then the harness that configured the root
-    /// last.
+    /// route's harness, and finally the root configuration. Task-specific work
+    /// uses the task's own stored harness instead.
     fn db_harness_for_session(&self, session_id: &str) -> Option<String> {
         self.inner
             .session_harnesses
@@ -4026,6 +4039,27 @@ impl BgTaskRegistry {
             .ok()
             .and_then(|slot| slot.clone())?;
         Some((self.db_harness_for_task(task)?, pool))
+    }
+
+    fn db_harness_and_pool_for_task_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        if let Some(task) = self.task(task_id) {
+            return self.db_harness_and_pool_for_task(&task);
+        }
+        let (fallback, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let stored = {
+            let conn = pool.lock().ok()?;
+            conn.query_row(
+                "SELECT harness FROM bash_tasks WHERE task_id = ?1 AND session_id = ?2 LIMIT 1",
+                rusqlite::params![task_id, session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+        Some((stored.unwrap_or(fallback), pool))
     }
 
     /// Whether a response-data status names a finished task. Kept next to the
@@ -4112,41 +4146,88 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
     ) -> Vec<BashPatternMatchFrame> {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        self.pending_pattern_matches_for_caller(session_id, super::TaskIdentity::current().as_ref())
+    }
+
+    /// Read pending matches without relying on a request's thread-local scope.
+    /// Maintenance and watchers supply the identity retained from the authenticated bind.
+    pub fn pending_pattern_matches_for_identity(
+        &self,
+        identity: &super::TaskIdentity,
+    ) -> Vec<BashPatternMatchFrame> {
+        self.pending_pattern_matches_for_caller(&identity.session, Some(identity))
+    }
+
+    fn pending_pattern_matches_for_caller(
+        &self,
+        session_id: &str,
+        identity: Option<&super::TaskIdentity>,
+    ) -> Vec<BashPatternMatchFrame> {
+        let Some((default_harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
+        let mut harnesses = vec![default_harness];
+        if let Some(identity) = identity {
+            let Ok(owner_harness) = identity.harness.parse::<crate::harness::Harness>() else {
+                return Vec::new();
+            };
+            harnesses.push(owner_harness.storage_segment());
+            // Tasks saved without launching_identity retain session-only notice
+            // visibility. Newer tasks must match the caller's attested principal,
+            // harness and session below, even when several harnesses share a session.
+            if let Some((seen, _)) = self.db_seen_harnesses_and_pool() {
+                harnesses.extend(seen);
+            }
+        }
+        harnesses.sort();
+        harnesses.dedup();
         let rows = {
             let Ok(conn) = pool.lock() else {
                 return Vec::new();
             };
-            match crate::db::bash_watches::list_bash_pattern_watches_for_session(
-                &conn, &harness, session_id,
-            ) {
-                Ok(mut rows) => {
-                    match crate::db::bash_watches::list_delivery_gaps(
-                        &conn,
-                        &harness,
-                        Some(session_id),
-                    ) {
-                        Ok(gaps) => rows.extend(gaps),
-                        Err(error) => crate::slog_warn!(
+            let mut retained = Vec::new();
+            for harness in harnesses {
+                match crate::db::bash_watches::list_bash_pattern_watches_for_session(
+                    &conn, &harness, session_id,
+                ) {
+                    Ok(mut rows) => {
+                        match crate::db::bash_watches::list_delivery_gaps(
+                            &conn,
+                            &harness,
+                            Some(session_id),
+                        ) {
+                            Ok(gaps) => rows.extend(gaps),
+                            Err(error) => crate::slog_warn!(
                             "failed to load retained watch gaps for session {session_id}: {error}"
                         ),
+                        }
+                        retained.extend(rows.into_iter().map(|row| (harness.clone(), row)));
                     }
-                    rows
-                }
-                Err(error) => {
-                    crate::slog_warn!(
-                        "failed to load pending bash watches for session {session_id}: {error}"
-                    );
-                    return Vec::new();
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to load pending bash watches for session {session_id}: {error}"
+                        );
+                        return Vec::new();
+                    }
                 }
             }
+            retained
         };
 
         rows.into_iter()
-            .filter(|row| row.pending_match)
-            .filter_map(|row| {
+            .filter(|(_, row)| row.pending_match)
+            .filter(|(harness, row)| {
+                self.task_launching_identity_record(session_id, &row.task_id, Some(harness))
+                    .map_or(identity.is_none(), |owner| {
+                        owner.as_ref().is_none_or(|owner| Some(owner) == identity)
+                    })
+            })
+            .filter_map(|(harness, row)| {
+                let launching_identity = self.task_launching_identity_in_harness(
+                    session_id,
+                    &row.task_id,
+                    Some(&harness),
+                );
                 let Some(match_text) = row.match_text else {
                     crate::slog_warn!(
                         "pending bash watch {}/{} has no match text",
@@ -4177,6 +4258,7 @@ impl BgTaskRegistry {
                         row.once && !row.scanning,
                     )
                 };
+                frame.launching_identity = launching_identity;
                 frame.batch = row
                     .match_batch
                     .as_deref()
@@ -4199,7 +4281,7 @@ impl BgTaskRegistry {
         task_id: &str,
         storage_dir: &Path,
     ) -> Option<BgTaskSnapshot> {
-        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
         let conn = pool.lock().ok()?;
         let row =
             crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id).ok()??;
@@ -4207,6 +4289,9 @@ impl BgTaskRegistry {
             return None;
         }
         let metadata = PersistedTask::from(row.clone());
+        if !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref()) {
+            return None;
+        }
         metadata
             .status
             .is_terminal()
@@ -4219,6 +4304,11 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn observed_erased_watch_reference(&self, task_id: &str) -> bool {
+        if let Some(identity) = super::TaskIdentity::current() {
+            if !self.task_identity_allows_current(&identity.session, task_id) {
+                return false;
+            }
+        }
         // A task this registry still runs is not erased whatever its row
         // state: its output is still captured and its watches still scan, so
         // reporting it as a terminal storage failure would be false.
@@ -4363,7 +4453,8 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4397,7 +4488,8 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watch(&self, session_id: &str, task_id: &str, watch_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4411,7 +4503,8 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watches_for_task(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4678,7 +4771,8 @@ impl BgTaskRegistry {
         // Save that presentation verbatim so replay does not need task secrets.
         let (stdout_offset, stderr_offset, pty_offset) =
             self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4790,7 +4884,8 @@ impl BgTaskRegistry {
         {
             return;
         }
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -4868,11 +4963,14 @@ impl BgTaskRegistry {
         watch_id: &str,
         match_offset: u64,
     ) -> Result<Option<PatternMatchAckResult>, String> {
+        if !self.task_identity_allows_current(session_id, task_id) {
+            return Ok(None);
+        }
         let terminal = self
             .persisted_task_is_terminal(session_id, task_id)
             .unwrap_or(false);
         let (harness, pool) = self
-            .db_harness_and_pool_for_session(session_id)
+            .db_harness_and_pool_for_task_id(session_id, task_id)
             .ok_or_else(|| "watch persistence unavailable".to_string())?;
         let (removed, settled) = {
             let conn = pool.lock().map_err(|error| error.to_string())?;
@@ -4977,7 +5075,8 @@ impl BgTaskRegistry {
     /// Task-wide ack: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -5594,6 +5693,7 @@ impl BgTaskRegistry {
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
+            launching_identity: metadata.launching_identity.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -6044,6 +6144,7 @@ impl BgTaskRegistry {
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
+            launching_identity: metadata.launching_identity.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -6414,6 +6515,7 @@ impl BgTaskRegistry {
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
+            launching_identity: metadata.launching_identity.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -6941,6 +7043,7 @@ impl BgTaskRegistry {
             .map(|state| {
                 state.metadata.status.is_terminal()
                     && !state.metadata.completion_delivered
+                    && state.metadata.launching_identity.is_none()
                     && (self.should_retire_foreign_delivery(&task.session_id, binding_session_id)
                         || !task.paths.dir.exists())
             })?;
@@ -6984,6 +7087,7 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         if metadata.status.is_terminal()
             && !metadata.completion_delivered
+            && metadata.launching_identity.is_none()
             && self.should_retire_foreign_delivery(&metadata.session_id, binding_session_id)
         {
             metadata.completion_delivered = true;
@@ -7404,6 +7508,7 @@ impl BgTaskRegistry {
                     if error.kind() == std::io::ErrorKind::NotFound
                         && !task_artifacts_exist(&session_dir, &metadata.task_id)
                         && !Self::persisted_task_process_is_alive(&metadata)
+                        && metadata.launching_identity.is_none()
                         && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
                             || &metadata.session_id != session_id)
                     {
@@ -8380,7 +8485,10 @@ impl BgTaskRegistry {
         once: bool,
         each_line: bool,
     ) -> Result<String, &'static str> {
-        let task = self.task(&task_id).ok_or("task_not_found")?;
+        let task = self
+            .task(&task_id)
+            .filter(|task| super::TaskIdentity::allows_current(task.launching_identity.as_ref()))
+            .ok_or("task_not_found")?;
         self.record_live_delivery_session(&task.session_id);
         validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
         let (mode, terminal_at_registration) = task
@@ -9153,6 +9261,7 @@ impl BgTaskRegistry {
             resolve_task_layout(&session_tasks_dir(storage_dir, session_id), task_id).ok()?;
         let mut metadata = read_task_at(&resolved).ok()?;
         if metadata.session_id != session_id
+            || !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
             || metadata.task_id != task_id
             || project_root.is_some_and(|root| {
                 metadata.project_root.as_deref().map(canonicalized_path)
@@ -9209,6 +9318,9 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: &Path,
     ) -> Option<String> {
+        if !self.task_identity_allows_current(session_id, task_id) {
+            return None;
+        }
         validate_task_id(task_id).ok()?;
         let pool = self.inner.db_pool.read().ok()?.clone()?;
         let conn = pool.lock().ok()?;
@@ -9277,6 +9389,7 @@ impl BgTaskRegistry {
             resolve_task_layout(&session_tasks_dir(storage_dir, session_id), task_id).ok()?;
         let mut metadata = read_task_at(&resolved).ok()?;
         if metadata.session_id != session_id
+            || !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
             || project_root.is_some_and(|root| {
                 metadata.project_root.as_deref().map(canonicalized_path)
                     != Some(canonicalized_path(root))
@@ -9431,6 +9544,10 @@ impl BgTaskRegistry {
         resume_remote: bool,
         accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
+        let accept = |metadata: &PersistedTask| {
+            super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
+                && accept(metadata)
+        };
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
         match self.lookup_relaxed_task_from_db(task_id, project_root) {
@@ -9683,6 +9800,9 @@ impl BgTaskRegistry {
         }
         let row = fallback_row?;
         let metadata = PersistedTask::from(row.clone());
+        if !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref()) {
+            return None;
+        }
         if metadata.session_id != session_id && metadata.scope.is_some() {
             return None;
         }
@@ -10292,6 +10412,7 @@ impl BgTaskRegistry {
                     continue;
                 }
                 if metadata.session_id != row.session_id
+                    || !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
                     || metadata.task_id != row.task_id
                     || metadata.harness.as_deref() != Some(harness.as_str())
                 {
@@ -10327,6 +10448,7 @@ impl BgTaskRegistry {
                     continue;
                 }
                 if metadata.session_id != session_id
+                    || !super::TaskIdentity::allows_current(metadata.launching_identity.as_ref())
                     || metadata.harness.as_deref() != Some(harness.as_str())
                 {
                     continue;
@@ -10674,8 +10796,19 @@ impl BgTaskRegistry {
         let mut lines = Vec::new();
         for task_id in task_ids {
             let Some(task) = self.task_for_session(&task_id, session_id) else {
+                if self.task(&task_id).is_some() {
+                    self.index_cancelled_call_here(session_id, &task_id);
+                }
                 continue;
             };
+            if task
+                .launching_identity
+                .as_ref()
+                .is_some_and(|owner| super::TaskIdentity::current().as_ref() != Some(owner))
+            {
+                self.index_cancelled_call_here(session_id, &task_id);
+                continue;
+            }
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
                 continue;
@@ -11290,6 +11423,12 @@ impl BgTaskRegistry {
                     .count()
             })
             .unwrap_or(1);
+        if let (Some(session_id), Some(identity)) = (session_id, super::TaskIdentity::current()) {
+            return completion_count.saturating_add(
+                self.pending_pattern_matches_for_caller(session_id, Some(&identity))
+                    .len(),
+            );
+        }
         // A session's watches live under its own harness; the root-wide count
         // covers every harness seen on this root.
         let db = match session_id {
@@ -11320,6 +11459,20 @@ impl BgTaskRegistry {
 
     pub fn has_unacked_wakes_for_session(&self, session_id: &str) -> bool {
         self.unacked_wake_count_for_session(Some(session_id)) > 0
+    }
+
+    pub(crate) fn has_unacked_wakes_for_identity(&self, identity: &super::TaskIdentity) -> bool {
+        self.inner.completions.lock().map_or(true, |completions| {
+            completions.iter().any(|completion| {
+                completion.session_id == identity.session
+                    && completion
+                        .launching_identity
+                        .as_ref()
+                        .is_none_or(|owner| owner == identity)
+            })
+        }) || !self
+            .pending_pattern_matches_for_identity(identity)
+            .is_empty()
     }
 
     pub fn stuck_pending_watches_for_session(
@@ -11373,9 +11526,7 @@ impl BgTaskRegistry {
         let mut completion_sessions = HashMap::new();
         if let Ok(mut completions) = self.inner.completions.lock() {
             completions.retain(|completion| {
-                let session_matches = session_id
-                    .map(|session_id| completion.session_id == session_id)
-                    .unwrap_or(true);
+                let session_matches = completion_matches_session(completion, session_id);
                 if session_matches && requested_task_ids.contains(completion.task_id.as_str()) {
                     completion_sessions
                         .insert(completion.task_id.clone(), completion.session_id.clone());
@@ -11388,6 +11539,11 @@ impl BgTaskRegistry {
 
         let mut delivered = Vec::new();
         for task_id in task_ids {
+            if let Some(session_id) = session_id {
+                if !self.task_identity_allows_current(session_id, task_id) {
+                    continue;
+                }
+            }
             if self.has_erased_watch_reference(task_id) {
                 // The task's own harness when the registry still holds it;
                 // otherwise every harness seen on this root.
@@ -11482,7 +11638,7 @@ impl BgTaskRegistry {
     }
 
     fn persisted_task_is_terminal(&self, session_id: &str, task_id: &str) -> Option<bool> {
-        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
         let conn = pool.lock().ok()?;
         let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
             .ok()
@@ -11494,7 +11650,8 @@ impl BgTaskRegistry {
     }
 
     fn mark_persisted_completion_delivered(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
+        else {
             return;
         };
         // Drain already queued snapshots before applying the ack. The upsert
@@ -11555,7 +11712,7 @@ impl BgTaskRegistry {
             .map(|completions| {
                 completions
                     .iter()
-                    .filter(|completion| completion.session_id == session_id)
+                    .filter(|completion| completion_matches_session(completion, Some(session_id)))
                     .cloned()
                     .collect()
             })
@@ -11626,6 +11783,7 @@ impl BgTaskRegistry {
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
             session_id: task.session_id.clone(),
+            launching_identity: task.launching_identity.clone(),
             status: snapshot.info.status,
             exit_code: snapshot.exit_code,
             command: snapshot.info.command,
@@ -13145,6 +13303,7 @@ impl BgTaskRegistry {
             ),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
+            launching_identity: metadata.launching_identity.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -14479,6 +14638,7 @@ impl BgTaskRegistry {
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: metadata.task_id.clone(),
             session_id: metadata.session_id.clone(),
+            launching_identity: metadata.launching_identity.clone(),
             status: metadata.status.clone(),
             exit_code: metadata.exit_code,
             command: metadata.command.clone(),
@@ -14693,7 +14853,8 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
-        if !self.originating_session_has_live_route(session_id) {
+        let launching_identity = self.task_launching_identity(session_id, &pattern_match.task_id);
+        if launching_identity.is_none() && !self.originating_session_has_live_route(session_id) {
             return;
         }
         let Ok(progress_sender) = self
@@ -14722,6 +14883,7 @@ impl BgTaskRegistry {
                     pattern_match.once,
                 );
                 frame.batch = Some(summary);
+                frame.launching_identity = launching_identity;
                 sender(PushFrame::BashPatternMatch(frame));
                 return;
             }
@@ -14745,6 +14907,7 @@ impl BgTaskRegistry {
                 )
             };
             frame.batch = batch;
+            frame.launching_identity = launching_identity;
             sender(PushFrame::BashPatternMatch(frame));
         }
     }
@@ -14764,15 +14927,15 @@ impl BgTaskRegistry {
         let Some(sender) = progress_sender.as_ref() else {
             return;
         };
-        sender(PushFrame::BashPatternMatch(
-            BashPatternMatchFrame::watch_target_erased(
-                task_id,
-                session_id,
-                watch_id,
-                WATCH_TARGET_ERASED_TEXT,
-                WATCH_TARGET_ERASED_CONTEXT,
-            ),
-        ));
+        let mut frame = BashPatternMatchFrame::watch_target_erased(
+            task_id,
+            session_id,
+            watch_id,
+            WATCH_TARGET_ERASED_TEXT,
+            WATCH_TARGET_ERASED_CONTEXT,
+        );
+        frame.launching_identity = self.task_launching_identity(session_id, task_id);
+        sender(PushFrame::BashPatternMatch(frame));
     }
 
     fn record_bash_watch_exit(&self, completion: &BgCompletion, emit_frame: bool) {
@@ -14787,12 +14950,13 @@ impl BgTaskRegistry {
                 completion.task_id
             )
         };
-        let frame = BashPatternMatchFrame::task_exit(
+        let mut frame = BashPatternMatchFrame::task_exit(
             completion.task_id.clone(),
             completion.session_id.clone(),
             format!("exited ({status})"),
             context,
         );
+        frame.launching_identity = completion.launching_identity.clone();
         self.persist_bash_watch_exit(&frame);
         if emit_frame {
             self.emit_bash_watch_exit(frame);
@@ -14800,7 +14964,9 @@ impl BgTaskRegistry {
     }
 
     fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(&frame.session_id) else {
+        let Some((harness, pool)) =
+            self.db_harness_and_pool_for_task_id(&frame.session_id, &frame.task_id)
+        else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -14837,7 +15003,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
-        if !self.originating_session_has_live_route(&frame.session_id) {
+        if frame.launching_identity.is_none()
+            && !self.originating_session_has_live_route(&frame.session_id)
+        {
             return;
         }
         let Ok(progress_sender) = self
@@ -14855,7 +15023,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
-        if !self.originating_session_has_live_route(&completion.session_id) {
+        if completion.launching_identity.is_none()
+            && !self.originating_session_has_live_route(&completion.session_id)
+        {
             return;
         }
         let Ok(progress_sender) = self
@@ -14889,6 +15059,7 @@ impl BgTaskRegistry {
             completion.tokens_skipped,
         );
         frame.bash_output_list_envelope = completion.bash_output_list_envelope;
+        frame.launching_identity = completion.launching_identity;
         frame.changed_files = completion.changed_files;
         frame.status_reason = completion.status_reason;
         frame.output_incomplete = completion.output_incomplete;
@@ -14976,7 +15147,8 @@ impl BgTaskRegistry {
         ));
     }
 
-    fn emit_bash_long_running(&self, frame: BashLongRunningFrame) {
+    fn emit_bash_long_running(&self, mut frame: BashLongRunningFrame) {
+        frame.launching_identity = self.task_launching_identity(&frame.session_id, &frame.task_id);
         if !self.originating_session_has_live_route(&frame.session_id) {
             return;
         }
@@ -15068,8 +15240,55 @@ impl BgTaskRegistry {
     }
 
     fn task_for_session(&self, task_id: &str, session_id: &str) -> Option<Arc<BgTask>> {
-        self.task(task_id)
-            .filter(|task| task.session_id == session_id)
+        self.task(task_id).filter(|task| {
+            task.session_id == session_id
+                && super::TaskIdentity::allows_current(task.launching_identity.as_ref())
+        })
+    }
+
+    fn task_launching_identity(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<super::TaskIdentity> {
+        self.task_launching_identity_in_harness(session_id, task_id, None)
+    }
+
+    fn task_launching_identity_in_harness(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        harness_override: Option<&str>,
+    ) -> Option<super::TaskIdentity> {
+        self.task_launching_identity_record(session_id, task_id, harness_override)
+            .flatten()
+    }
+
+    fn task_launching_identity_record(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        harness_override: Option<&str>,
+    ) -> Option<Option<super::TaskIdentity>> {
+        if let Some(task) = self.task(task_id) {
+            return (task.session_id == session_id).then(|| task.launching_identity.clone());
+        }
+        let (harness, pool) = self.db_harness_and_pool_for_task_id(session_id, task_id)?;
+        let harness = harness_override.unwrap_or(&harness);
+        let conn = pool.lock().ok()?;
+        let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
+            .ok()
+            .flatten()?;
+        serde_json::from_str::<PersistedTask>(&row.metadata)
+            .ok()
+            .map(|task| task.launching_identity)
+    }
+
+    fn task_identity_allows_current(&self, session_id: &str, task_id: &str) -> bool {
+        match self.task_launching_identity_record(session_id, task_id, None) {
+            Some(owner) => super::TaskIdentity::allows_current(owner.as_ref()),
+            None => super::TaskIdentity::current().is_none(),
+        }
     }
 
     /// Test access to a task's shared state, so a test can hold its state
@@ -18507,6 +18726,7 @@ mod tests {
                 changed_files: None,
                 task_id: "bash-memory".to_string(),
                 session_id: "session-memory".to_string(),
+                launching_identity: None,
                 status: BgTaskStatus::Completed,
                 exit_code: Some(0),
                 command: "printf memory".to_string(),
@@ -26614,6 +26834,326 @@ mod tests {
         let shared = Arc::new(Mutex::new(conn));
         registry.set_db_pool(shared.clone());
         (registry, shared, frames)
+    }
+
+    fn task_caller(
+        root: &Path,
+        principal: &str,
+        harness: &str,
+        epoch: u32,
+    ) -> crate::sandbox_spawn::AuthenticatedPrincipal {
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+            route_channel: 7,
+            route_epoch: epoch,
+            project_root: root.to_path_buf(),
+            harness: harness.to_string(),
+            session_id: "session".to_string(),
+            principal_id: Some(principal.to_string()),
+        }
+    }
+
+    fn with_task_caller<T>(
+        caller: crate::sandbox_spawn::AuthenticatedPrincipal,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _identity =
+            super::super::task_identity_scope(super::super::TaskIdentity::from_principal(&caller));
+        run()
+    }
+
+    fn assert_task_caller_isolation(principal: &str, harness: &str) {
+        use crate::sandbox_spawn::with_authenticated_principal;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _db, frames) = registry_with_db_and_frames(dir.path());
+        let owner = task_caller(dir.path(), "reserved:thalamus-harness", "opencode", 1);
+        let other = task_caller(dir.path(), principal, harness, 2);
+        let (task_id, task) = with_authenticated_principal(owner.clone(), || {
+            insert_terminal_piped_task(&registry, &dir, "printf ready", "ready\n", "", false)
+        });
+        let identity = task
+            .launching_identity
+            .clone()
+            .expect("launch identity captured");
+        assert!(registry.ensure_task_row(&task));
+        let (pattern_task_id, pattern_task) = with_authenticated_principal(owner.clone(), || {
+            insert_terminal_piped_task(&registry, &dir, "printf ready", "ready\n", "", false)
+        });
+        assert!(registry.ensure_task_row(&pattern_task));
+        registry.record_live_delivery_session("session");
+        with_authenticated_principal(owner.clone(), || {
+            registry
+                .register_watch(
+                    pattern_task_id,
+                    WatchPattern::Substring("ready".into()),
+                    true,
+                )
+                .unwrap();
+        });
+        let metadata = task.lock_state().unwrap().metadata.clone();
+        registry.enqueue_completion_if_needed(&metadata, Some(&task.paths), true);
+        registry.emit_bash_long_running(BashLongRunningFrame::new(
+            &task_id,
+            "session",
+            "printf ready",
+            100,
+        ));
+        let notices = frames.lock().unwrap();
+        assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashCompleted(frame) if frame.launching_identity.as_ref() == Some(&identity))));
+        assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashPatternMatch(frame) if frame.launching_identity.as_ref() == Some(&identity))));
+        assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashLongRunning(frame) if frame.launching_identity.as_ref() == Some(&identity))));
+        drop(notices);
+        assert!(registry
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert!(!registry
+            .pending_pattern_matches_for_identity(&identity)
+            .is_empty());
+        let other_identity = super::super::TaskIdentity::from_principal(&other).unwrap();
+        assert!(registry
+            .pending_pattern_matches_for_identity(&other_identity)
+            .is_empty());
+        assert!(registry
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
+        with_authenticated_principal(owner.clone(), || {
+            assert!(
+                !registry
+                    .pending_pattern_matches_for_session("session")
+                    .is_empty(),
+                "owner has a durable match before foreign calls"
+            );
+        });
+        with_task_caller(other.clone(), || {
+            assert_eq!(
+                registry.write_pty(&task_id, "session", b"input"),
+                Err("task_not_found".to_string())
+            );
+            assert!(registry
+                .unadopted_task_message(&task_id, "session", dir.path())
+                .is_none());
+            assert!(registry
+                .drain_completions_for_session(Some("session"))
+                .is_empty());
+            assert!(registry
+                .pending_pattern_matches_for_session("session")
+                .is_empty());
+            assert!(registry
+                .ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id))
+                .is_empty());
+            assert!(registry
+                .observed_status(&task_id, "session", 1024)
+                .is_none());
+            assert!(registry
+                .observation_status(&task_id, "session", Some(dir.path()), dir.path(), 1024)
+                .is_none());
+            assert!(registry
+                .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+                .is_none());
+            assert!(registry
+                .status_relaxed(
+                    &task_id,
+                    "session",
+                    dir.path(),
+                    dir.path(),
+                    1024,
+                    true,
+                    Duration::ZERO
+                )
+                .is_none());
+            assert!(matches!(
+                registry.kill_typed(&task_id, "session"),
+                Err(RegistryError::TaskNotFound(_))
+            ));
+            assert!(registry
+                .register_watch(
+                    task_id.clone(),
+                    WatchPattern::Substring("ready".into()),
+                    true
+                )
+                .is_err());
+        });
+        assert!(!task.lock_state().unwrap().metadata.completion_delivered);
+
+        with_authenticated_principal(owner.clone(), || {
+            let matches = registry.pending_pattern_matches_for_session("session");
+            assert!(!matches.is_empty());
+            let matched = matches
+                .iter()
+                .find(|frame| frame.match_text == "ready")
+                .unwrap();
+            with_task_caller(other.clone(), || {
+                assert!(registry
+                    .ack_pattern_match_for_session(
+                        "session",
+                        &matched.task_id,
+                        &matched.watch_id,
+                        matched.match_offset
+                    )
+                    .unwrap()
+                    .is_none());
+            });
+            assert!(!registry
+                .pending_pattern_matches_for_session("session")
+                .is_empty());
+        });
+
+        // Enumeration must use the same identity gate even for a live record.
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.cancelled_call_unannounced = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        registry.index_cancelled_call_here("session", &task_id);
+        assert!(registry.take_cancelled_call_notices("session").is_empty());
+        with_task_caller(other.clone(), || {
+            assert!(registry.take_cancelled_call_notices("session").is_empty());
+            assert!(registry
+                .owned_running_task_ids(dir.path(), dir.path(), "session", None)
+                .unwrap()
+                .0
+                .is_empty());
+        });
+        with_authenticated_principal(owner, || {
+            assert_eq!(registry.take_cancelled_call_notices("session").len(), 1);
+            assert_eq!(
+                registry
+                    .owned_running_task_ids(dir.path(), dir.path(), "session", None)
+                    .unwrap()
+                    .0,
+                vec![task_id.clone()]
+            );
+        });
+        {
+            let mut state = task.lock_state().unwrap();
+            state
+                .metadata
+                .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        let reconnect = task_caller(dir.path(), "reserved:thalamus-harness", "opencode", 99);
+        with_authenticated_principal(reconnect.clone(), || {
+            assert_eq!(
+                registry
+                    .drain_completions_for_session(Some("session"))
+                    .len(),
+                1
+            );
+            assert!(registry
+                .observed_status(&task_id, "session", 1024)
+                .is_some());
+            assert_eq!(
+                registry
+                    .ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+                vec![task_id.clone()]
+            );
+        });
+        assert!(read_task(&task.paths.json).unwrap().completion_delivered);
+        registry.inner.tasks.lock().unwrap().remove(&task_id);
+        delete_task_bundle(&task.paths).unwrap();
+        with_task_caller(other, || {
+            assert!(registry
+                .terminal_db_status_for_session("session", &task_id, dir.path())
+                .is_none());
+        });
+        with_authenticated_principal(reconnect, || {
+            assert!(registry
+                .terminal_db_status_for_session("session", &task_id, dir.path())
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn task_launch_identity_isolates_principals() {
+        assert_task_caller_isolation("direct", "opencode");
+    }
+
+    #[test]
+    fn task_launch_identity_isolates_harnesses() {
+        assert_task_caller_isolation("reserved:thalamus-harness", "pi");
+    }
+
+    #[test]
+    fn task_launch_identity_survives_restart_and_legacy_records_remain_session_scoped() {
+        use crate::sandbox_spawn::with_authenticated_principal;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _db, _frames) = registry_with_db_and_frames(dir.path());
+        let owner = task_caller(dir.path(), "reserved:thalamus-harness", "opencode", 1);
+        let (task_id, task) = with_authenticated_principal(owner.clone(), || {
+            insert_terminal_piped_task(&registry, &dir, "true", "done\n", "", false)
+        });
+        let persisted = read_task(&task.paths.json).unwrap();
+        let recorded_identity = persisted.launching_identity.clone();
+        assert!(recorded_identity.is_some());
+        let (restarted, _db2, frames) = registry_with_db_and_frames(dir.path());
+        restarted
+            .insert_rehydrated_task(persisted.clone(), task.paths.clone(), true)
+            .unwrap();
+        restarted.replace_live_delivery_sessions(HashSet::new());
+        restarted.enqueue_completion_if_needed(&persisted, Some(&task.paths), true);
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, PushFrame::BashCompleted(frame) if frame.launching_identity == recorded_identity)));
+        let other = task_caller(dir.path(), "direct", "opencode", 2);
+        with_task_caller(other.clone(), || {
+            assert!(restarted
+                .drain_completions_for_session(Some("session"))
+                .is_empty());
+            assert!(restarted
+                .ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id))
+                .is_empty());
+            assert!(restarted
+                .observed_status(&task_id, "session", 1024)
+                .is_none());
+        });
+        with_authenticated_principal(owner, || {
+            assert_eq!(
+                restarted
+                    .drain_completions_for_session(Some("session"))
+                    .len(),
+                1
+            );
+            assert!(restarted
+                .observed_status(&task_id, "session", 1024)
+                .is_some());
+        });
+
+        let mut legacy = serde_json::to_value(&persisted).unwrap();
+        legacy.as_object_mut().unwrap().remove("launching_identity");
+        fs::write(&task.paths.json, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy = read_task(&task.paths.json).unwrap();
+        assert!(legacy.launching_identity.is_none());
+        let (upgraded, _db3, _frames) = registry_with_db_and_frames(dir.path());
+        upgraded
+            .insert_rehydrated_task(legacy.clone(), task.paths.clone(), true)
+            .unwrap();
+        upgraded.enqueue_completion_if_needed(&legacy, Some(&task.paths), false);
+        with_authenticated_principal(task_caller(dir.path(), "direct", "pi", 3), || {
+            assert_eq!(
+                upgraded
+                    .drain_completions_for_session(Some("session"))
+                    .len(),
+                1
+            );
+            assert!(upgraded
+                .observed_status(&task_id, "session", 1024)
+                .is_some());
+        });
+        with_task_caller(other, || {
+            assert_eq!(
+                upgraded
+                    .drain_completions_for_session(Some("session"))
+                    .len(),
+                1
+            );
+            assert!(upgraded
+                .observed_status(&task_id, "session", 1024)
+                .is_some());
+            assert_eq!(
+                upgraded
+                    .ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+                vec![task_id]
+            );
+        });
     }
 
     /// Kills every task the registry still holds when the test ends, whether

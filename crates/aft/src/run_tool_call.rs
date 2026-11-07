@@ -345,7 +345,12 @@ pub enum ToolCallOutcome {
 
 /// Server-owned settings for a single `tool_call` request.
 /// These fields cannot be supplied through the agent's arguments object.
-#[derive(Debug, Clone)]
+///
+/// `Default` gives every setting its off or empty value. Tests that pin a
+/// call's reply, such as the tool-call parity test, name only the settings
+/// they depend on and take the rest from it, so adding a setting does not
+/// change them.
+#[derive(Debug, Clone, Default)]
 pub struct ToolCallContext {
     pub project_root: PathBuf,
     pub session_id: Option<String>,
@@ -360,6 +365,11 @@ pub struct ToolCallContext {
     pub report_registration_downgrade: bool,
     /// A v1 route serves the standard edit schema without changing plugin bindings.
     pub standard_edit_grammar: bool,
+    /// For a runner head's call, the key its head catalog recorded its edit
+    /// mode under in aft.db (see [`resolve_head_edit_mode`]). That recorded
+    /// mode, not `standard_edit_grammar`, decides how its `edit` and `read`
+    /// calls are decoded. `None` for every other caller.
+    pub head_catalog_key: Option<crate::db::remote_exec::PolicyKey>,
     /// The session's `disabled_tools` as resolved when it connected. A subc
     /// route carries its own bind-time list because routes with different
     /// harnesses can share one root context; `None` uses the configure
@@ -418,6 +428,67 @@ pub(crate) fn ensure_hashline_registration(
     report_registration_downgrade
         && registration.downgrade.is_some()
         && !registration.stores_preserved
+}
+
+/// The root a session's hashline binding is registered and captured under.
+pub(crate) fn hashline_binding_root(
+    app_ctx: &AppContext,
+    project_root: &std::path::Path,
+) -> PathBuf {
+    app_ctx
+        .canonical_cache_root_opt()
+        .unwrap_or_else(|| project_root.to_path_buf())
+}
+
+/// Whether a runner head's call is decoded with the hashline `edit` grammar:
+/// the edit mode its catalog recorded under `key` (see
+/// `db::catalog_edit_modes`).
+///
+/// The head keeps that catalog across AFT restarts, route closes and rebinds,
+/// which all drop the session's in-memory hashline binding, so a hashline
+/// answer installs the binding again before the call captures it; its `read`
+/// then mints tags as it did before. No record, an unreadable one or no
+/// database means the standard grammar, as for a head whose catalog was
+/// served before edit modes were recorded.
+pub(crate) fn resolve_head_edit_mode(
+    app_ctx: &AppContext,
+    project_root: &std::path::Path,
+    session: &str,
+    key: &crate::db::remote_exec::PolicyKey,
+) -> bool {
+    let Some(db) = app_ctx.db() else {
+        return false;
+    };
+    let recorded = match db.lock() {
+        Ok(conn) => crate::db::catalog_edit_modes::lookup(&conn, key),
+        Err(_) => return false,
+    };
+    let hashline = match recorded {
+        Ok(mode) => mode == Some(true),
+        Err(error) => {
+            log::warn!("runner head edit mode unreadable for session {session}: {error}");
+            false
+        }
+    };
+    if hashline {
+        let root = hashline_binding_root(app_ctx, project_root);
+        let bindings = app_ctx.hashline_bindings();
+        if !bindings
+            .peek(&root, session)
+            .is_some_and(|binding| binding.effective())
+        {
+            bindings.register(
+                &root,
+                session.to_string(),
+                crate::hashline::integration::RegistrationRequest {
+                    configured_enabled: true,
+                    edit_slot_survives: true,
+                    read_slot_survives: true,
+                },
+            );
+        }
+    }
+    hashline
 }
 
 fn attach_hashline_downgrade(response: &mut Response) {
@@ -501,14 +572,20 @@ pub(crate) fn prepare_tool_call(
         app_ctx.disable_rust_cargo_for_worker();
     }
     let sanitized_args = strip_agent_preview_arg_owned(args);
-    let binding_root = app_ctx
-        .canonical_cache_root_opt()
-        .unwrap_or_else(|| ctx.project_root.clone());
+    let binding_root = hashline_binding_root(app_ctx, &ctx.project_root);
     let session = ctx
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let surface_downgraded = !ctx.standard_edit_grammar
+    // Only `edit` (its grammar) and `read` (its tags) depend on a runner
+    // head's recorded edit mode, so no other call reads aft.db for it.
+    let standard_edit_grammar = match ctx.head_catalog_key.as_ref() {
+        Some(key) if matches!(bare_name, "edit" | "read") => {
+            !resolve_head_edit_mode(app_ctx, &ctx.project_root, session, key)
+        }
+        _ => ctx.standard_edit_grammar,
+    };
+    let surface_downgraded = !standard_edit_grammar
         && ensure_hashline_registration(
             app_ctx,
             &ctx.project_root,
@@ -520,7 +597,7 @@ pub(crate) fn prepare_tool_call(
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
-        effective_hashline: !ctx.standard_edit_grammar
+        effective_hashline: !standard_edit_grammar
             && crate::hashline::integration::effective_for_capture(binding_guard.as_ref()),
     };
     let translated_bare_name = match bare_name {
@@ -1253,6 +1330,7 @@ mod tests {
             edit_slot_survives: None,
             report_registration_downgrade: false,
             standard_edit_grammar: true,
+            head_catalog_key: None,
             disabled_tools: None,
             worker_session: false,
             host_tool_names: None,
@@ -1685,6 +1763,7 @@ mod tests {
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
                 standard_edit_grammar: false,
+                head_catalog_key: None,
                 disabled_tools: None,
                 worker_session: false,
                 host_tool_names: None,

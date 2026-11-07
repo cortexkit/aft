@@ -301,9 +301,15 @@ if [ "${SKIP_DOCKER_E2E:-}" = "1" ]; then
   echo "  (skipping docker e2e — SKIP_DOCKER_E2E=1)"
 elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
   echo "  docker e2e (Linux x64)..."
+  # This trap is cleared below once the e2e run passes, so any exit while it is
+  # set is a failure. macOS /bin/bash 3.2 exits 0 when `set -eu` aborts on an
+  # unbound name under an EXIT trap, so a 0 seen here becomes exit 1.
   cleanup_fixture() {
+    local status=$?
     rm -f tests/docker/fixtures/aft-linux-x64
     rm -rf tests/docker/fixtures/npm-packs
+    [ "$status" -ne 0 ] || status=1
+    exit "$status"
   }
   trap cleanup_fixture EXIT
   # Build Linux x64 binary in Docker
@@ -377,9 +383,20 @@ if [[ -f "$gate_script" ]]; then
   (
     mkdir -p target/scratch
     snapshot_dir="$(mktemp -d "target/scratch/aft-release-publication.XXXXXX")"
-    trap 'rm -rf "$snapshot_dir"' EXIT
+    # Under macOS /bin/bash 3.2 an unbound name aborts this subshell with status
+    # 0 while the EXIT trap is set, which would pass the gate unrun. The trap
+    # keeps a nonzero status and fails a 0 unless both gate runs finished.
+    gates_finished=0
+    cleanup_snapshot() {
+      local status=$?
+      rm -rf "$snapshot_dir"
+      if [ "$status" -eq 0 ] && [ "$gates_finished" != 1 ]; then status=1; fi
+      exit "$status"
+    }
+    trap cleanup_snapshot EXIT
     node "$gate_script" --prepare --snapshot-dir "$snapshot_dir" --candidate || exit 1
     node "$gate_script" --snapshot-dir "$snapshot_dir" --candidate || exit 1
+    gates_finished=1
   ) || { echo "Error: committed release candidate failed publication gates"; exit 1; }
 fi
 

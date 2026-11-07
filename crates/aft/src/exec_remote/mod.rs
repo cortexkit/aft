@@ -17,11 +17,13 @@ pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
 // Only the Unix remote-dispatch path filters environment names.
 #[cfg(unix)]
 pub(crate) use request::denied_environment_name;
-pub(crate) use request::SIBLINGS_REFUSAL;
+#[cfg(any(unix, test))]
+pub(crate) use request::requested_return_max_bytes;
 pub use request::{
     build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
     RETURN_TOTAL_CAP_BYTES,
 };
+pub(crate) use request::{sibling_refusal, SiblingRefusal};
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
 
 #[derive(Debug, Clone, Copy)]

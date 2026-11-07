@@ -111,20 +111,39 @@ function coerceConfiguredWatchTimeout(
 }
 
 /**
+ * The two sentences of the `primary` bash_watch wording that describe async
+ * watches, which the plugins implement themselves. The module serves
+ * `bash_watch` itself and always waits synchronously, so a runner head's
+ * catalog entry leaves them out.
+ */
+const PRIMARY_ASYNC_WATCH_SENTENCES =
+  " The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.";
+
+/**
  * The bash_watch tool description. Every plugin registration uses the
  * `primary` wording, which covers both roles. The subc module catalog's
  * `worker` preset uses the `worker` wording: a delegated worker is never woken
  * by a completion reminder or an async notification once its turn ends, so it
- * is told only how to wait. The polling warning names bash_status only when
- * the model can call it.
+ * is told only how to wait. A runner head's catalog uses the `primary` wording
+ * without its async-watch sentences (`asyncWatches` false). The polling warning
+ * names bash_status only when the model can call it.
  */
-export function bashWatchDescription(role: WatchCallerRole, statusRegistered: boolean): string {
+export function bashWatchDescription(
+  role: WatchCallerRole,
+  statusRegistered: boolean,
+  asyncWatches = true,
+): string {
   const noPolling = statusRegistered ? " Never loop bash_status to wait." : "";
   if (role === "worker") {
     return `Watch a background bash task and wait until it exits or prints a pattern. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. A background task never wakes you, so wait on it before you report a result. ${WORKER_KEEP_WAITING}${noPolling}`;
   }
-  return `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${noPolling}`;
+  const asyncSentences = asyncWatches ? PRIMARY_ASYNC_WATCH_SENTENCES : "";
+  return `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else.${asyncSentences}${noPolling}`;
 }
+
+/** The `pattern` argument's sentence about the sync and async watch modes. */
+export const WATCH_PATTERN_MODES_SENTENCE =
+  " Optional in sync mode; required with background:true.";
 
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -138,7 +157,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .union([z.string(), z.object({ regex: z.string() })])
         .optional()
         .describe(
-          "Substring or regex pattern. Optional in sync mode; required with background:true. Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.",
+          `Substring or regex pattern.${WATCH_PATTERN_MODES_SENTENCE} Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.`,
         ),
       background: z
         .boolean()

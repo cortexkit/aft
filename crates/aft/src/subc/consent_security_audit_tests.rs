@@ -1286,10 +1286,13 @@ fn audit_schema25_additive_migration_preserves_all_ledger_columns_and_refuses_fu
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        25
+        crate::db::CURRENT_SCHEMA_VERSION
     );
-    db.execute_batch("UPDATE schema_version SET version=26;")
-        .unwrap();
+    db.execute_batch(&format!(
+        "UPDATE schema_version SET version={};",
+        crate::db::CURRENT_SCHEMA_VERSION + 1
+    ))
+    .unwrap();
     drop(db);
     assert!(
         crate::db::open(&path).is_err(),
@@ -1300,7 +1303,7 @@ fn audit_schema25_additive_migration_preserves_all_ledger_columns_and_refuses_fu
         raw.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        26
+        crate::db::CURRENT_SCHEMA_VERSION + 1
     );
     assert_eq!(
         raw.query_row(

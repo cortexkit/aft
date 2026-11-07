@@ -827,6 +827,7 @@ fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
 
 fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
     PushFrame::BashCompleted(BashCompletedFrame {
+        launching_identity: None,
         changed_files: None,
         frame_type: "bash_completed",
         task_id: task_id.to_string(),
@@ -851,6 +852,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
 
 fn bash_long_running_push(task_id: &str, session_id: &str) -> PushFrame {
     PushFrame::BashLongRunning(BashLongRunningFrame {
+        launching_identity: None,
         frame_type: "bash_long_running",
         task_id: task_id.to_string(),
         session_id: session_id.to_string(),
@@ -9670,17 +9672,76 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     ctx.bash_background().set_db_pool(watch_db);
     const BG_CHANNEL: u16 = 245;
     const BG_CORR: u64 = 790;
+    const FOREIGN_BG_CHANNEL: u16 = 246;
+    const FOREIGN_BG_CORR: u64 = 797;
     send_route_bind_with_session(&mut stream, BG_CHANNEL, 789, &root1, "session-1").await;
     expect_route_bind_ack(&mut stream, 789).await;
-    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
-    drain_bg_events_for(
+    send_route_bind_with_harness_session_principal_and_doc(
         &mut stream,
-        BG_CHANNEL,
-        BG_CORR,
-        Duration::from_millis(800),
-        "pattern dropped-nudge subscription seed",
+        FOREIGN_BG_CHANNEL,
+        796,
+        &root1,
+        "opencode",
+        "session-1",
+        Some(Principal::Reserved {
+            module_id: "thalamus-harness".into(),
+        }),
+        json!({"indexes":{"trigram":false,"semantic":false,"callgraph":false}}),
     )
     .await;
+    expect_route_bind_ack(&mut stream, 796).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    send_bg_events_subscribe(&mut stream, FOREIGN_BG_CHANNEL, FOREIGN_BG_CORR).await;
+    // Health requests can overtake subscriptions on the control channel. Wait
+    // for both subscriptions to install and their initial seeds to settle before
+    // testing which caller the pattern wakes.
+    loop {
+        send_control_request(&mut stream, 798, ModuleControlRequest::HealthCheck {}).await;
+        let report = loop {
+            let frame = read_any_frame_timeout(&mut stream, "pattern subscription seeds").await;
+            if (frame.header.channel == BG_CHANNEL
+                && is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR))
+                || (frame.header.channel == FOREIGN_BG_CHANNEL
+                    && is_expected_bg_event_stream_data(
+                        &frame,
+                        FOREIGN_BG_CHANNEL,
+                        FOREIGN_BG_CORR,
+                    ))
+            {
+                continue;
+            }
+            assert_no_bg_events_terminal(&frame, BG_CHANNEL, BG_CORR, "pattern subscription seeds");
+            assert_no_bg_events_terminal(
+                &frame,
+                FOREIGN_BG_CHANNEL,
+                FOREIGN_BG_CORR,
+                "pattern subscription seeds",
+            );
+            if frame.header.ty == FrameType::Push {
+                continue;
+            }
+            assert_eq!(frame.header.ty, FrameType::Response);
+            assert_eq!(frame.header.corr, 798);
+            let response: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+            break response.health_report().expect("subscription seed health");
+        };
+        if report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.pointer("/runtime/bg_subscriptions"))
+            .and_then(Value::as_u64)
+            == Some(2)
+            && report
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.pointer("/runtime/bg_wake_pending"))
+                .and_then(Value::as_u64)
+                == Some(0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let marker = root1.join("pattern-started");
     let release = crate::test_helpers::ReleaseOnDrop::new(root1.join("pattern-release"));
@@ -9736,6 +9797,15 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     std::fs::write(&release.0, "release").unwrap();
 
     let first_deadline = Instant::now() + Duration::from_secs(30);
+    let caller = aft::bash_background::TaskIdentity {
+        principal: Some("direct".into()),
+        harness: "opencode".into(),
+        session: "session-1".into(),
+    };
+    let foreign_caller = aft::bash_background::TaskIdentity {
+        principal: Some("reserved:thalamus-harness".into()),
+        ..caller.clone()
+    };
     loop {
         let _dropped = wait_for_bg_event(
             &mut stream,
@@ -9747,13 +9817,17 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         .await;
         if ctx
             .bash_background()
-            .pending_pattern_matches_for_session("session-1")
+            .pending_pattern_matches_for_identity(&caller)
             .iter()
             .any(|item| item.task_id == task_id)
         {
             break;
         }
     }
+    assert!(ctx
+        .bash_background()
+        .pending_pattern_matches_for_identity(&foreign_caller)
+        .is_empty());
     // StreamData can also announce a long-running command. Require both a
     // delivered nudge and the counter that advances after a retry is enqueued.
     // Poll health without waiting for another event first: retries back off,
@@ -9764,6 +9838,11 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         send_control_request(&mut stream, 795, ModuleControlRequest::HealthCheck {}).await;
         let report = loop {
             let frame = read_any_frame_timeout(&mut stream, "pattern rearm health").await;
+            assert!(
+                frame.header.ty != FrameType::StreamData
+                    || frame.header.channel != FOREIGN_BG_CHANNEL,
+                "pattern nudge reached a different caller on the same session"
+            );
             if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR) {
                 saw_rearmed_nudge = true;
                 continue;

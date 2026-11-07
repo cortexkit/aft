@@ -19,6 +19,11 @@ enum Shape {
     Interpreter,
 }
 
+pub(crate) struct LiteralWriteTarget {
+    pub path: PathBuf,
+    pub formatter_directory: bool,
+}
+
 // All command-shape classification lives here. Commands not listed, and
 // operands whose path can't be known before the job runs (for example `$VAR`),
 // are allowed; the build server is expected to make tracked files read-only
@@ -369,7 +374,7 @@ fn inline_paths(code: &str, javascript: bool) -> Vec<String> {
     paths
 }
 
-fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathBuf> {
+fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<LiteralWriteTarget> {
     let mut wrapper = node;
     while let Some(parent) = wrapper.parent() {
         if matches!(parent.kind(), "redirected_statement" | "list" | "pipeline") {
@@ -406,14 +411,21 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
         .and_then(|w| Path::new(w).file_name())
         .and_then(|w| w.to_str())
     else {
-        return paths.iter().filter_map(|p| resolve(p, cwd)).collect();
+        return paths
+            .iter()
+            .filter_map(|p| resolve(p, cwd))
+            .map(|path| LiteralWriteTarget {
+                path,
+                formatter_directory: false,
+            })
+            .collect();
     };
     let args = &words[1..];
     let shape = SHAPES
         .iter()
         .find(|(name, _)| *name == head)
         .map(|(_, shape)| *shape);
-    let mut targets: Vec<String> = match shape {
+    let targets: Vec<String> = match shape {
         Some(Shape::Tee) => operands(args, &[]).into_iter().map(str::to_owned).collect(),
         Some(Shape::Remove) => operands(
             args,
@@ -589,10 +601,21 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
         }
         _ => Vec::new(),
     };
-    paths.append(&mut targets);
     paths
         .iter()
-        .filter_map(|p| literal(p).and_then(|p| resolve(&p, cwd)))
+        .map(|path| (path, false))
+        .chain(
+            targets
+                .iter()
+                .map(|path| (path, matches!(shape, Some(Shape::Formatter)))),
+        )
+        .filter_map(|(path, formatter)| {
+            let path = literal(path).and_then(|path| resolve(&path, cwd))?;
+            Some(LiteralWriteTarget {
+                formatter_directory: formatter && path.is_dir(),
+                path,
+            })
+        })
         .collect()
 }
 
@@ -600,12 +623,15 @@ pub(crate) fn literal_write_targets(
     command: &str,
     cwd: &Path,
     known_directory: &dyn Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+) -> Vec<LiteralWriteTarget> {
+    let mut paths: Vec<LiteralWriteTarget> = Vec::new();
     walk_shell_commands(command, cwd, known_directory, &mut |node, cwd| {
-        for path in command_writes(command, node, cwd) {
-            if !paths.contains(&path) {
-                paths.push(path);
+        for target in command_writes(command, node, cwd) {
+            if let Some(existing) = paths.iter_mut().find(|entry| entry.path == target.path) {
+                // A formatter must not loosen another command's write to the same path.
+                existing.formatter_directory &= target.formatter_directory;
+            } else {
+                paths.push(target);
             }
         }
     });

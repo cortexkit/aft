@@ -374,6 +374,7 @@ pub(in crate::subc) async fn submit(
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
                 standard_edit_grammar: true,
+                head_catalog_key: None,
                 disabled_tools: Some(identity.disabled_tools.clone()),
                 worker_session: false,
                 host_tool_names: None,

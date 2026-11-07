@@ -55,6 +55,8 @@ pub struct PermissionAskFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashCompletedFrame {
+    #[serde(skip)]
+    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
     #[serde(
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
@@ -114,6 +116,8 @@ fn is_false(value: &bool) -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashLongRunningFrame {
+    #[serde(skip)]
+    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -124,6 +128,8 @@ pub struct BashLongRunningFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashPatternMatchFrame {
+    #[serde(skip)]
+    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -360,6 +366,7 @@ impl BashCompletedFrame {
     ) -> Self {
         Self {
             frame_type: "bash_completed",
+            launching_identity: None,
             changed_files: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
@@ -391,6 +398,7 @@ impl BashLongRunningFrame {
     ) -> Self {
         Self {
             frame_type: "bash_long_running",
+            launching_identity: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             command: command.into(),
@@ -411,6 +419,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            launching_identity: None,
             batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
@@ -431,6 +440,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            launching_identity: None,
             batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
@@ -454,6 +464,7 @@ impl BashPatternMatchFrame {
         // reason because clients only accept pattern_match and task_exit.
         Self {
             frame_type: "bash_pattern_match",
+            launching_identity: None,
             batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),

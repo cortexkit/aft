@@ -5070,3 +5070,142 @@ fn binds_first_dispatch_preserves_the_general_worker_pool() {
     assert_eq!(state.binds_inflight, 0);
     assert_eq!(state.idle_workers, config.total_workers());
 }
+
+#[test]
+fn call_ledger_jobs_run_beside_a_reader_and_a_waiting_writer_in_submission_order() {
+    // A running read keeps a queued writer waiting. Call-ledger jobs on the
+    // same root must neither wait for that read nor queue behind the writer,
+    // and must run one at a time in the order they were submitted.
+    let executor = test_executor(4, 2, 2, 1);
+    let (_dir, root) = test_root("call-ledger-beside-reader");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (read_started_tx, read_started_rx) = crossbeam_channel::bounded(1);
+    let (release_read_tx, release_read_rx) = crossbeam_channel::bounded::<()>(1);
+    let read = executor.submit_async(
+        root.clone(),
+        Lane::PureRead,
+        "held-read".into(),
+        Box::new(move |_| {
+            read_started_tx.send(()).unwrap();
+            release_read_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release the held read");
+            ok("held-read")
+        }),
+    );
+    read_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let writer = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "waiting-writer".into(),
+        Box::new(|_| ok("waiting-writer")),
+    );
+
+    let (order_tx, order_rx) = crossbeam_channel::unbounded::<&'static str>();
+    let (first_started_tx, first_started_rx) = crossbeam_channel::bounded(1);
+    let (release_first_tx, release_first_rx) = crossbeam_channel::bounded::<()>(1);
+    let first_order = order_tx.clone();
+    let first = executor.submit_async(
+        root.clone(),
+        Lane::CallLedger,
+        "ledger-first".into(),
+        Box::new(move |_| {
+            first_started_tx.send(()).unwrap();
+            release_first_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release the first ledger job");
+            first_order.send("first").unwrap();
+            ok("ledger-first")
+        }),
+    );
+    let second = executor.submit_async(
+        root.clone(),
+        Lane::CallLedger,
+        "ledger-second".into(),
+        Box::new(move |_| {
+            order_tx.send("second").unwrap();
+            ok("ledger-second")
+        }),
+    );
+    first_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a call-ledger job waited for the running read or the queued writer");
+    // The first job records itself only after release, so anything received
+    // now is the second job running beside it.
+    assert!(
+        order_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "a second call-ledger job ran beside the first on the same root"
+    );
+    release_first_tx.send(()).unwrap();
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        order_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "second"
+    );
+    assert!(recv_async(first, "first ledger job").success);
+    assert!(recv_async(second, "second ledger job").success);
+
+    release_read_tx.send(()).unwrap();
+    assert!(recv_async(read, "held read").success);
+    assert!(recv_async(writer, "waiting writer").success);
+}
+
+#[test]
+fn call_ledger_job_runs_while_a_writer_holds_the_root() {
+    let executor = test_executor(4, 2, 2, 1);
+    let (_dir, root) = test_root("call-ledger-beside-writer");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (writer_started_tx, writer_started_rx) = crossbeam_channel::bounded(1);
+    let (release_writer_tx, release_writer_rx) = crossbeam_channel::bounded::<()>(1);
+    let writer = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "held-writer".into(),
+        Box::new(move |_| {
+            writer_started_tx.send(()).unwrap();
+            release_writer_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release the held writer");
+            ok("held-writer")
+        }),
+    );
+    writer_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let (ran_tx, ran_rx) = crossbeam_channel::bounded(1);
+    let ledger = executor.submit_async(
+        root.clone(),
+        Lane::CallLedger,
+        "ledger-beside-writer".into(),
+        Box::new(move |_| {
+            ran_tx.send(()).unwrap();
+            ok("ledger-beside-writer")
+        }),
+    );
+    let ran = ran_rx.recv_timeout(Duration::from_secs(2));
+    release_writer_tx.send(()).unwrap();
+    ran.expect("a call-ledger job waited for the writer holding its root");
+    assert!(recv_async(ledger, "ledger job").success);
+    assert!(recv_async(writer, "held writer").success);
+}
+
+#[test]
+fn call_ledger_lane_refuses_maintenance_admission() {
+    let executor = test_executor(4, 2, 2, 1);
+    let (_dir, root) = test_root("call-ledger-maintenance");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let refused = executor.submit_maintenance_async(
+        root,
+        Lane::CallLedger,
+        "maintenance-ledger".into(),
+        Box::new(|_| ok("maintenance-ledger")),
+    );
+    let response = recv_async(refused, "maintenance ledger job");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "invalid_lane");
+}

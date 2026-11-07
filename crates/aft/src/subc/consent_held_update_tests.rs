@@ -86,7 +86,7 @@ fn held_update_migration_preserves_schema_24_calls() {
         db.query_row("SELECT version FROM schema_version", [], |row| row
             .get::<_, u32>(0))
             .unwrap(),
-        25
+        crate::db::CURRENT_SCHEMA_VERSION
     );
     let count: u64 = db
         .query_row("SELECT count(*) FROM call_ledger_updates", [], |row| {

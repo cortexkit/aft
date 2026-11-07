@@ -1023,12 +1023,28 @@ impl AccessPolicy {
                 .iter()
                 .any(|carveout| path.starts_with(carveout))
         {
-            return self
-                .private_stores
-                .deny
-                .iter()
-                .find(|floor| contains(path, floor))
-                .map(|floor| self.describe_floor(floor));
+            return self.private_stores.deny.iter().find_map(|floor| {
+                if !contains(path, floor) {
+                    return None;
+                }
+                let matched = self.describe_floor(floor);
+                // Exempt staging only from module-data floors. Keep the
+                // prefix unresolved so a staging symlink cannot exempt its
+                // target elsewhere in a private store.
+                if matches!(matched.rule, FloorRule::CortexkitModuleData)
+                    && path.starts_with(&floor.join("staging"))
+                {
+                    return self
+                        .floor_rules
+                        .iter()
+                        .find(|other| {
+                            other.path == *floor
+                                && !matches!(other.rule, FloorRule::CortexkitModuleData)
+                        })
+                        .cloned();
+                }
+                Some(matched)
+            });
         }
         None
     }

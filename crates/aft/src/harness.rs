@@ -170,12 +170,13 @@ impl std::str::FromStr for Harness {
             "opencode" => Ok(Harness::Opencode),
             "pi" => Ok(Harness::Pi),
             // `opencode2` names sessions that the Thalamus harness module runs
-            // on an OpenCode 2 server. Their AFT calls arrive over Thalamus's
-            // own scoped routes, consent goes through core, and AFT's OpenCode
-            // plugin is never loaded there, so they are runner sessions in
-            // everything the harness decides (storage, consent, reply shape).
-            // The route identity keeps the name the daemon sent.
-            "runner" | "opencode2" => Ok(Harness::Runner),
+            // on an OpenCode 2 server, and `claude-code` the headless Claude
+            // Code sessions it runs. Their AFT calls arrive over Thalamus's
+            // own scoped routes, consent goes through core, and no AFT plugin
+            // is loaded there, so they are runner sessions in everything the
+            // harness decides (storage, consent, reply shape). The route
+            // identity keeps the name the daemon sent.
+            "runner" | "opencode2" | "claude-code" => Ok(Harness::Runner),
             other if other.starts_with("mcp:") => {
                 let client = &other[4..];
                 if client.is_empty() {
@@ -236,6 +237,17 @@ mod tests {
     fn opencode_pi_storage_segment_unchanged() {
         assert_eq!(Harness::Opencode.storage_segment(), "opencode");
         assert_eq!(Harness::Pi.storage_segment(), "pi");
+    }
+
+    #[test]
+    fn claude_code_parses_as_the_runner_harness() {
+        let harness = Harness::from_str("claude-code").unwrap();
+        assert_eq!(harness, Harness::Runner);
+        assert_eq!(harness.storage_segment(), "runner");
+        // Only the exact name is an alias.
+        for other in ["Claude-Code", "claude_code", "claude-code ", "claude"] {
+            assert!(Harness::from_str(other).is_err(), "{other:?}");
+        }
     }
 
     #[test]

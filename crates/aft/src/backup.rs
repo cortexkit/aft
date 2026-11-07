@@ -9052,8 +9052,12 @@ mod tests {
         let elapsed = started.elapsed();
         drop(held);
         result.unwrap();
+        // The cleanup lock is held for the whole call, so a retry that waited
+        // for it would spend the full cleanup allowance. Comparing against the
+        // allowance rather than a fixed small bound keeps a slow disk (Windows
+        // CI took 824 ms for the snapshot's own writes) from failing it.
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < ROLLBACK_CLEANUP_ALLOWANCE,
             "snapshot waited for queued cleanup: {elapsed:?}"
         );
         assert_eq!(store.pending_discards.len(), 1);

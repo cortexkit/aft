@@ -2295,12 +2295,21 @@ fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
     });
     let paths: Vec<_> = paths
         .into_iter()
-        .filter(|path| {
-            if returned.contains(path) {
+        .filter(|target| {
+            if returned.contains(&target.path) {
                 return false;
             }
-            runon_snapshot_write_target(checkout, path, deadline)
+            // Other formatter outputs remain protected by the server's read-only checkout.
+            if target.formatter_directory
+                && returned
+                    .iter()
+                    .any(|path| path != &target.path && path.starts_with(&target.path))
+            {
+                return false;
+            }
+            runon_snapshot_write_target(checkout, &target.path, deadline)
         })
+        .map(|target| target.path)
         .collect();
     let first = paths.first()?;
     let mut display = first.display().to_string();
@@ -3490,8 +3499,9 @@ impl BgTaskRegistry {
                 }
             };
             if !request.return_paths.is_empty() {
+                let maximum = client.return_max_bytes().await.map_err(|e| e.to_string())?;
                 request.return_max_bytes =
-                    Some(client.return_max_bytes().await.map_err(|e| e.to_string())?);
+                    Some(exec::requested_return_max_bytes(&request, maximum));
             }
             fallback = Some(local);
             if remote.explicit_runon {
@@ -6022,7 +6032,7 @@ fn proves_no_start(error: &exec::Error) -> bool {
 mod tests;
 
 #[cfg(all(test, unix))]
-pub(crate) use tests::assert_siblings_submit_refused_before_connect;
+pub(crate) use tests::{assert_siblings_submit_refused_before_connect, submit_runon_for_test};
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::{

@@ -6456,10 +6456,12 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
         .collect()
 }
 
+/// `message` is the exact refusal the bash response must carry.
 pub(crate) fn assert_siblings_submit_refused_before_connect(
     ctx: &crate::context::AppContext,
     launch: crate::bash_background::RemoteLaunch,
     daemon: &crate::exec_remote::wire_tests::Daemon,
+    message: &str,
 ) {
     let marker = ctx
         .config()
@@ -6481,11 +6483,9 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
         ctx.bash_background().list(0).is_empty(),
         "a refused sibling must not register a remote or local task"
     );
-    assert!(
-        response.data["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("runon refused: siblings"),
+    assert_eq!(
+        response.data["message"].as_str().unwrap(),
+        message,
         "{response:?}"
     );
     assert!(
@@ -6501,6 +6501,30 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
         0,
         "the daemon must not be contacted"
     );
+}
+
+/// Submit a runon command under `launch`, wait until its task completes, and
+/// return the parameters of the one `exec.run` the daemon received.
+pub(crate) async fn submit_runon_for_test(
+    ctx: &crate::context::AppContext,
+    launch: crate::bash_background::RemoteLaunch,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) -> serde_json::Value {
+    let response = handle_with_policy(
+        ctx,
+        Some(launch),
+        serde_json::json!({"command":"printf remote", "runon":"linux", "compressed":false}),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let mut runs = exec_runs(daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    runs.remove(0)
 }
 
 #[test]
@@ -6525,7 +6549,11 @@ fn runon_siblings_refusal_line_is_pinned_byte_for_byte() {
     assert_eq!(response.data["code"], "remote_run_refused");
     assert_eq!(
         response.data["message"].as_str().unwrap().as_bytes(),
-        b"runon refused: siblings must be git checkout roots the session's file tools may read; the command was not run"
+        format!(
+            "runon refused: sibling {} is not the root of a git checkout; the command was not run",
+            folder.display()
+        )
+        .as_bytes()
     );
 }
 
@@ -12614,6 +12642,106 @@ fn runon_write_return_paths_exempt_only_the_resolved_requested_file() {
     assert!(runon_write_refusal("echo new > ../other.rs", &request).is_some());
 }
 
+#[test]
+fn runon_write_formatter_workdir_accepts_one_returned_file() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "source\n").unwrap();
+    hermetic_git(root, &["add", "src/a.rs"]);
+    for command in [
+        "cargo fmt",
+        "cargo fmt --all",
+        "prettier --write .",
+        "gofmt -w .",
+        "ruff format",
+        "black .",
+    ] {
+        request.return_paths.clear();
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+        request.return_paths = vec!["./src/a.rs".into()];
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+    }
+    request.cwd = root.join("src").to_string_lossy().into_owned();
+    request.return_paths = vec!["./a.rs".into()];
+    assert!(runon_write_refusal("cargo fmt --all", &request).is_none());
+}
+
+#[test]
+fn runon_write_formatter_folder_requires_a_returned_descendant() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    for path in ["src/a.ts", "docs/a.md", "src-extra/a.ts"] {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), "source\n").unwrap();
+    }
+    hermetic_git(root, &["add", "src/a.ts", "docs/a.md", "src-extra/a.ts"]);
+    for command in [
+        "cd src && cargo fmt",
+        "cd src && cargo fmt --all",
+        "rustfmt --edition 2021 src/",
+        "prettier --write src/",
+        "gofmt -w src/",
+        "cd src && ruff format",
+        "black src/",
+        "biome format --write src/",
+        "biome check --write src/",
+    ] {
+        request.return_paths.clear();
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+        request.return_paths = vec!["./src/a.ts".into()];
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+        for outside in ["docs/a.md", "src-extra/a.ts"] {
+            request.return_paths = vec![outside.into()];
+            assert!(
+                runon_write_refusal(command, &request).is_some(),
+                "{command}, return_paths: {outside}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runon_write_formatter_files_and_other_edits_keep_exact_return_paths() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("src")).unwrap();
+    for path in ["src/a.ts", "src/b.ts"] {
+        fs::write(root.join(path), "source\n").unwrap();
+    }
+    hermetic_git(root, &["add", "src/a.ts", "src/b.ts"]);
+    request.return_paths = vec!["src/a.ts".into()];
+    assert!(runon_write_refusal("prettier --write src/a.ts", &request).is_none());
+    assert!(runon_write_refusal("echo new > src/a.ts", &request).is_none());
+    for command in [
+        "prettier --write src/a.ts src/b.ts",
+        "prettier --write src/ && echo new > src/b.ts",
+        "prettier --write src/ && sed -i 's/a/b/' src/b.ts",
+        "prettier --write src/ && rm -rf src",
+        "rm -rf src && prettier --write src/",
+        "prettier --write src/ > src",
+    ] {
+        assert!(
+            runon_write_refusal(command, &request).is_some(),
+            "{command}"
+        );
+    }
+    request.return_paths.push("src/b.ts".into());
+    assert!(runon_write_refusal("prettier --write src/a.ts src/b.ts", &request).is_none());
+}
+
 #[tokio::test]
 async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
@@ -16013,6 +16141,55 @@ fn expired_gap_unverified_line_is_the_approved_text() {
 }
 
 #[tokio::test]
+async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
+    for existing in [false, true] {
+        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+            Script::ReturnVector("two-files-one-empty"),
+            &[
+                "exec-remote/v1",
+                "exec-remote-return/v2",
+                "exec-remote-return/v3",
+                exec::types::SUBMISSION_KEY_CAPABILITY,
+            ],
+            1,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        if existing {
+            fs::create_dir(dir.path().join("dist")).unwrap();
+            fs::write(dir.path().join("dist/hello.txt"), b"hello").unwrap();
+        }
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            return_call(&["dist/hello.txt", "dist/empty.txt"]),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let saved = read_task(&task.paths.json).unwrap();
+        let remote = saved.remote.unwrap();
+        assert_eq!(remote.return_max_bytes, 10_485_760);
+        let restored =
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+        assert_eq!(restored.return_max_bytes, Some(10_485_760));
+    }
+}
+
+fn seed_large_local_return_output(root: &Path) {
+    fs::create_dir(root.join("dist")).unwrap();
+    fs::File::create(root.join("dist/empty.txt"))
+        .unwrap()
+        .set_len(5 * 1024 * 1024 + 1)
+        .unwrap();
+}
+
+#[tokio::test]
 async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
     for retry in [false, true] {
         let script = if retry {
@@ -16039,6 +16216,7 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context(dir.path());
+        seed_large_local_return_output(dir.path());
         let (reply, _) = orchestrated_reply(
             &ctx,
             &daemon,
@@ -16097,6 +16275,7 @@ async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
+    seed_large_local_return_output(dir.path());
     let (reply, _) = orchestrated_reply(
         &ctx,
         &daemon,
