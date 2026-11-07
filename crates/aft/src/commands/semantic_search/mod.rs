@@ -108,6 +108,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use crate::commands::callgraph_store_adapter::callers_result;
 use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, render_symbol_within_budget,
     BudgetedSymbolRenderStatus,
@@ -2017,6 +2018,13 @@ fn disclose_skipped_chunks(
 /// callgraph cannot serve it, the enrichment is explicitly omitted with the
 /// callgraph index status and the analysis code, never silently absent.
 fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
+    if warm_callgraph(ctx).is_some() {
+        return serde_json::json!({
+            "status": "applied",
+            "code": serde_json::Value::Null,
+            "index": IndexObservation::ready().consumer_json(),
+        });
+    }
     let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
         // Resident but mid-refresh: enrichment waits for the refresh.
         observation if observation.is_ready() => IndexObservation::building(),
@@ -7326,6 +7334,7 @@ fn format_lexical_unavailable_text_counted(
     let (mut sections, shown) = format_result_sections_counted(
         results,
         project_root,
+        None,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -7817,6 +7826,7 @@ fn format_ranked_text_counted(
     let (mut text, shown) = format_result_sections_counted(
         results,
         display_root,
+        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -8448,7 +8458,7 @@ fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root:
 
 #[cfg(test)]
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
-    format_result_sections_with_context(results, project_root)
+    format_result_sections_with_context(results, project_root, None)
 }
 
 /// Whether textual (lexical) hits may be called matches. They may not when
@@ -8474,20 +8484,25 @@ fn absent_literal_line(literal: &str) -> String {
 }
 
 #[cfg(test)]
-fn format_result_sections_with_context(results: &[HybridResult], project_root: &Path) -> String {
-    format_result_sections_labelled(results, project_root, TextualHits::Matches)
+fn format_result_sections_with_context(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+) -> String {
+    format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
 }
 
 #[cfg(test)]
 fn format_result_sections_labelled(
     results: &[HybridResult],
     project_root: &Path,
-
+    ctx: Option<&AppContext>,
     textual_hits: TextualHits,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
+        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         textual_hits,
     )
@@ -8501,12 +8516,13 @@ fn format_result_sections_labelled(
 fn format_result_sections_within_budget(
     results: &[HybridResult],
     project_root: &Path,
-
+    ctx: Option<&AppContext>,
     max_bytes: usize,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
+        ctx,
         max_bytes,
         TextualHits::Matches,
     )
@@ -8518,24 +8534,33 @@ fn format_result_sections_within_budget(
 fn format_result_sections_within_budget_labelled(
     results: &[HybridResult],
     project_root: &Path,
-
+    ctx: Option<&AppContext>,
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> String {
-    format_result_sections_counted(results, project_root, max_bytes, textual_hits).0
+    format_result_sections_counted(results, project_root, ctx, max_bytes, textual_hits).0
 }
 
 fn format_result_sections_counted(
     results: &[HybridResult],
     project_root: &Path,
-
+    ctx: Option<&AppContext>,
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> (String, usize) {
+    // Results arrive sorted by fused score desc. Group by file preserving
+    // first-appearance order so the most relevant file's group renders first.
+    // A BTreeMap would re-sort groups alphabetically by path and scramble the
+    // ranking the agent relies on to read most-relevant-first. Snippet line
+    // counts are budgeted by enrich_snippets_from_source; here each line is
+    // capped in length and the whole reply is held to `max_bytes`.
+    let annotations = ctx
+        .map(|ctx| blast_radius_annotations(ctx, results))
+        .unwrap_or_else(|| vec![None; results.len()]);
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<&HybridResult>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<(usize, &HybridResult)>> = HashMap::new();
 
-    for result in results {
+    for (index, result) in results.iter().enumerate() {
         let display_path = result
             .file
             .strip_prefix(project_root)
@@ -8545,13 +8570,16 @@ fn format_result_sections_counted(
         if !groups.contains_key(&display_path) {
             group_order.push(display_path.clone());
         }
-        groups.entry(display_path).or_default().push(result);
+        groups
+            .entry(display_path)
+            .or_default()
+            .push((index, result));
     }
 
     let mut out = snippet_bounds::BudgetedText::new(max_bytes);
     let mut shown = 0usize;
     'groups: for file in &group_order {
-        let matching_line = groups[file].iter().find(|result| {
+        let matching_line = groups[file].iter().find(|(_, result)| {
             matches!(result.kind, SymbolKind::FileSummary)
                 && (result.exact || result.source == "lexical")
                 && !result.snippet.trim().is_empty()
@@ -8562,14 +8590,16 @@ fn format_result_sections_counted(
             "\n\n".to_string()
         };
         match matching_line {
-            Some(result) => header.push_str(&format!(
+            Some((_, result)) => header.push_str(&format!(
                 "{file}:{}",
                 display_line_number(result.start_line)
             )),
             None => header.push_str(file),
         }
-        let exact = groups[file].iter().any(|result| result.exact);
-        let lexical = groups[file].iter().any(|result| result.source == "lexical");
+        let exact = groups[file].iter().any(|(_, result)| result.exact);
+        let lexical = groups[file]
+            .iter()
+            .any(|(_, result)| result.source == "lexical");
         match textual_hits {
             TextualHits::Matches => {
                 if exact {
@@ -8590,7 +8620,7 @@ fn format_result_sections_counted(
         if !out.push(&header) {
             break;
         }
-        if let Some(result) = matching_line {
+        if let Some((_, result)) = matching_line {
             shown += 1;
             if !push_snippet_lines(&mut out, &result.snippet) {
                 break;
@@ -8602,8 +8632,8 @@ fn format_result_sections_counted(
         // extension), symbol header at 2 spaces, snippet body at 6. Without
         // this, file paths and symbol headers were both at col 0 and could
         // only be told apart by parsing the "[kind] lines X-Y" suffix.
-        for result in &groups[file] {
-            if matching_line.is_some_and(|matching| std::ptr::eq(*matching, *result)) {
+        for (index, result) in &groups[file] {
+            if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
                 continue;
             }
             if result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary) {
@@ -8615,11 +8645,15 @@ fn format_result_sections_counted(
                 format!("\n  {} [file summary]", result.name)
             } else {
                 format!(
-                    "\n  {} [{}] lines {}-{}",
+                    "\n  {} [{}] lines {}-{}{}",
                     result.name,
                     symbol_kind_label(&result.kind),
                     display_line_number(result.start_line),
-                    display_line_number(result.end_line)
+                    display_line_number(result.end_line),
+                    annotations
+                        .get(*index)
+                        .and_then(|annotation| annotation.as_deref())
+                        .unwrap_or("")
                 )
             };
             if !out.push(&symbol_header) {
@@ -8650,6 +8684,101 @@ fn push_snippet_lines(out: &mut snippet_bounds::BudgetedText, snippet: &str) -> 
         let line = snippet_bounds::cap_snippet_line(line);
         out.push(&format!("\n      {line}"))
     })
+}
+
+fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
+    let Some((graph, view)) = warm_callgraph(ctx) else {
+        return vec![None; results.len()];
+    };
+
+    let annotations = results
+        .iter()
+        .map(|result| blast_radius_annotation_for_result(&graph, &view, result))
+        .collect();
+    // A file whose slice could not be read looked absent, so the counts may
+    // be short: leave every annotation out rather than show a wrong one.
+    if crate::data_layer::tools::callgraph::read_failure(&view).is_some() {
+        return vec![None; results.len()];
+    }
+    annotations
+}
+
+/// The index store's call graph for `ctx`'s root when it is current now:
+/// published, with no recorded edit waiting for it. Search annotates only
+/// from such a graph; it never waits for a refresh or starts one.
+fn warm_callgraph(
+    ctx: &AppContext,
+) -> Option<(
+    crate::data_layer::tools::callgraph::DataGraph,
+    crate::data_layer::checkout::CheckoutView,
+)> {
+    let checkout = ctx
+        .data_checkout()
+        .filter(|checkout| checkout.checkout().planes().callgraph)?;
+    let view = checkout.view().filter(|view| {
+        view.status().callgraph == crate::data_layer::checkout::PlaneStatus::Ready
+    })?;
+    Some((view.callgraph(), view))
+}
+
+fn blast_radius_annotation_for_result(
+    graph: &crate::data_layer::tools::callgraph::DataGraph,
+    view: &crate::data_layer::checkout::CheckoutView,
+    result: &HybridResult,
+) -> Option<String> {
+    if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
+        return None;
+    }
+    if result.name.trim().is_empty() {
+        return None;
+    }
+    if !crate::data_layer::tools::callgraph::covers(view, &result.file) {
+        return None;
+    }
+
+    let callers = callers_result(graph, &result.file, &result.name, 1, true).ok()?;
+    let mut caller_basenames = Vec::new();
+    let mut seen_files = HashSet::new();
+    for group in &callers.callers {
+        if seen_files.insert(group.file.clone()) {
+            caller_basenames.push(compact_caller_basename(&group.file));
+        }
+    }
+
+    let mut suffix = format!("  ↩{}", callers.total_callers);
+    if !caller_basenames.is_empty() {
+        let more = caller_basenames.len() > 2;
+        let names = caller_basenames
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        suffix.push(' ');
+        suffix.push_str(&names);
+        if more {
+            suffix.push_str(",…");
+        }
+    }
+    Some(suffix)
+}
+
+fn compact_caller_basename(file: &str) -> String {
+    let basename = Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file);
+    truncate_chars(basename, 18)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
@@ -12126,7 +12255,7 @@ mod tests {
             .map(|index| long_line_result(index, format!("line of result {index:03}")))
             .collect::<Vec<_>>();
 
-        let text = format_result_sections_within_budget(&results, Path::new("/project"), 200);
+        let text = format_result_sections_within_budget(&results, Path::new("/project"), None, 200);
 
         assert!(
             text.contains("data/census_000.json:1 [lexical match]"),
@@ -12144,7 +12273,7 @@ mod tests {
         );
 
         let uncut =
-            format_result_sections_within_budget(&results, Path::new("/project"), usize::MAX);
+            format_result_sections_within_budget(&results, Path::new("/project"), None, usize::MAX);
         assert!(uncut.contains("census_019"));
         assert!(!uncut.contains("Output reached"));
     }
@@ -12811,6 +12940,65 @@ mod tests {
             !text.contains("↩"),
             "cold store should not annotate rows: {text}"
         );
+    }
+
+    /// A symbol hit is annotated with its caller count and the callers' files
+    /// from the index store's current call graph.
+    #[test]
+    fn symbol_hit_is_annotated_with_callers_from_the_index_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(root.join("first.rs"), "fn a() { crate::target(); }\n").unwrap();
+        std::fs::write(root.join("second.rs"), "fn b() { crate::target(); }\n").unwrap();
+        std::fs::write(
+            root.join("main.rs"),
+            "mod first;\nmod second;\nmod lib;\nuse lib::target;\nfn c() { target(); }\n",
+        )
+        .unwrap();
+        let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
+            &root,
+            &temp.path().join("store"),
+            None,
+            crate::data_layer::checkout::Planes {
+                text: false,
+                callgraph: true,
+            },
+        )
+        .unwrap();
+        let crate::data_layer::runtime::Fresh::Ready(view) =
+            checkout.fresh_view(Duration::from_secs(60))
+        else {
+            panic!("call graph did not publish");
+        };
+        let callers = callers_result(&view.callgraph(), Path::new("lib.rs"), "target", 1, true)
+            .expect("callers of target");
+        assert!(callers.total_callers >= 1, "fixture has callers");
+
+        let mut hit = snippet_hit(root.join("lib.rs"), "target", SymbolKind::Function, 0, 0, 0.5);
+        hit.source = "semantic";
+        let annotation = blast_radius_annotation_for_result(&view.callgraph(), &view, &hit)
+            .expect("a symbol hit with callers is annotated");
+        assert!(
+            annotation.starts_with(&format!("  ↩{}", callers.total_callers)),
+            "{annotation}"
+        );
+
+        // A lexical row, or a file the call graph doesn't cover, gets none.
+        hit.source = "lexical";
+        assert!(blast_radius_annotation_for_result(&view.callgraph(), &view, &hit).is_none());
+        let mut outside = snippet_hit(
+            temp.path().join("elsewhere.rs"),
+            "target",
+            SymbolKind::Function,
+            0,
+            0,
+            0.5,
+        );
+        outside.source = "semantic";
+        assert!(blast_radius_annotation_for_result(&view.callgraph(), &view, &outside).is_none());
     }
 
     #[test]

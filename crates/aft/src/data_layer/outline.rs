@@ -398,7 +398,7 @@ mod tests {
     /// files no record covers (Markdown and Cargo.toml). Returns the source
     /// files, relative to `root`.
     fn fixture(root: &Path) -> Vec<String> {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = crate::test_support::manifest_dir();
         let mut sources = Vec::new();
         for entry in std::fs::read_dir(crate_dir.join("tests/fixtures/callgraph")).unwrap() {
             let path = entry.unwrap().path();

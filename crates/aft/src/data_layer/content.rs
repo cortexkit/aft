@@ -718,7 +718,7 @@ mod tests {
     /// of AFT's own sources, among them files with `#[cfg(unix)]` and
     /// `#[cfg(windows)]` twins and Rust impl methods.
     pub(crate) fn sample_files() -> Vec<std::path::PathBuf> {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = crate::test_support::manifest_dir();
         let fixtures = crate_dir.join("tests/fixtures");
         let mut files = Vec::new();
         for dir in [fixtures.clone(), fixtures.join("callgraph")] {

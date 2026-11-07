@@ -13,7 +13,7 @@ use serde_json::Value;
 fn load_fixture(name: &str) -> Value {
     let path = format!(
         "{}/tests/fixtures/trace/{}",
-        env!("CARGO_MANIFEST_DIR"),
+        crate::test_helpers::manifest_dir().display(),
         name
     );
     let content = std::fs::read_to_string(&path)

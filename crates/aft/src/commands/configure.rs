@@ -6592,9 +6592,9 @@ mod tests {
     }
 
     /// Configure migrates a user file that uses retired keys and reports it
-    /// once. A project file's recently retired keys are translated in memory,
-    /// and its bytes are never touched; a project file that names a key
-    /// retired in 0.62 or earlier rejects the configure.
+    /// once. A project file's retired keys are translated in memory and its
+    /// bytes are never touched, including names retired in 0.62 or earlier:
+    /// those refuse only in the user file, which AFT can rewrite.
     #[test]
     fn configure_migrates_the_user_file_and_translates_the_project_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -6642,21 +6642,24 @@ mod tests {
                 .any(|warning| warning["kind"] == "config_migrated")));
         assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
 
-        let refused_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
-        write_config(&project_path, refused_text);
-        let refused = handle_configure_for_test(&request(), &ctx);
-        assert!(!refused.success, "{refused:?}");
-        assert_eq!(refused.data["code"], "config_rejected", "{refused:?}");
+        let long_retired_text =
+            r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        write_config(&project_path, long_retired_text);
+        let loaded = handle_configure_for_test(&request(), &ctx);
+        assert!(loaded.success, "{loaded:?}");
+        // `semantic_search` becomes `indexes.semantic`; `gh_read` becomes the
+        // GitHub section, which only the user file may set. Meaning search is
+        // on by default, so it being off shows the translation applied.
+        assert!(!ctx.config().indexes.semantic);
         assert!(
-            refused.data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(
-                    "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix"
-                ) && message
-                    .contains("removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix")),
-            "{refused:?}"
+            loaded.data["config_dropped_keys"]
+                .as_array()
+                .is_some_and(|dropped| dropped
+                    .iter()
+                    .any(|key| key["key"] == "github" && key["tier"] == "project")),
+            "{loaded:?}"
         );
-        assert_eq!(fs::read_to_string(&project_path).unwrap(), refused_text);
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), long_retired_text);
     }
 
     #[test]

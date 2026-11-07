@@ -8296,11 +8296,12 @@ mod tests {
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
 
         let view = crate::callgraph_store::dead_code_projection::view_for_test(&root);
-        let tree = crate::callgraph_store::CallGraphRead::call_tree(
+        let tree = crate::commands::callgraph_store_adapter::call_tree_result(
             &view.callgraph(),
             Path::new("src/main.rs"),
             "Handler::with_draw",
             1,
+            true,
         )
         .unwrap();
         assert!(
