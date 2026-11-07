@@ -18,7 +18,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-use crate::callgraph_store::disk_facts::{CanonicalProbeMemo, DiskFacts};
+use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
 use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(test)]
@@ -234,7 +234,6 @@ impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
-    canonical_probes: Arc<CanonicalProbeMemo>,
     module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
     json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
@@ -254,7 +253,6 @@ impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
-            canonical_probes: Arc::default(),
             module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
@@ -285,14 +283,6 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
-    pub(crate) fn disk_facts(&self, root: &Path) -> DiskFacts {
-        if self.enabled {
-            DiskFacts::with_probe_memo(root, Arc::clone(&self.canonical_probes))
-        } else {
-            DiskFacts::new(root)
-        }
-    }
-
     fn resolve_module_path(
         &self,
         from_dir: &Path,
@@ -403,30 +393,6 @@ impl ModuleResolutionMemo {
         self.workspace_packages
             .borrow_mut()
             .insert(key, resolved, retained_weight);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test(enabled: bool, collect_metrics: bool) -> Self {
-        Self {
-            enabled,
-            collect_metrics,
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn module_computations_for_test(&self) -> HashMap<ModuleResolutionKey, usize> {
-        self.module_computations.borrow().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn json_probes_for_test(&self) -> HashMap<PathBuf, usize> {
-        self.json_probes.borrow().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rust_declaration_parses_for_test(&self) -> HashMap<String, usize> {
-        self.rust_declaration_parses.borrow().clone()
     }
 
     #[cfg(test)]
@@ -541,56 +507,6 @@ fn symbol_unqualified_name(symbol: &str) -> &str {
 
 pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
     full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
-}
-
-fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    let qualified_query = symbol_name.contains("::");
-
-    let mut consider = |candidate: &str| {
-        let matches = if qualified_query {
-            candidate == symbol_name
-        } else {
-            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
-        };
-
-        if matches && seen.insert(candidate.to_string()) {
-            candidates.push(candidate.to_string());
-        }
-    };
-
-    for candidate in file_data.symbol_metadata.keys() {
-        consider(candidate);
-    }
-    for candidate in file_data.calls_by_symbol.keys() {
-        consider(candidate);
-    }
-    for candidate in &file_data.exported_symbols {
-        consider(candidate);
-    }
-
-    candidates.sort();
-    candidates
-}
-
-pub(crate) fn resolve_symbol_query_in_data(
-    file_data: &FileCallData,
-    file: &Path,
-    symbol_name: &str,
-) -> Result<String, AftError> {
-    let candidates = symbol_query_candidates(file_data, symbol_name);
-    match candidates.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        [] => Err(AftError::SymbolNotFound {
-            name: symbol_name.to_string(),
-            file: file.display().to_string(),
-        }),
-        _ => Err(AftError::AmbiguousSymbol {
-            name: symbol_name.to_string(),
-            candidates,
-        }),
-    }
 }
 
 /// A call or function-value dependency site owned by a symbol.
@@ -1467,28 +1383,6 @@ pub(crate) fn build_file_data_from_source(
             message: format!("unsupported file for call graph: {}", path.display()),
         })?;
     build_file_data_from_source_with_lang(path, source, lang)
-}
-
-pub(crate) fn build_file_data_with_typescript_objects(
-    path: &Path,
-    source: &str,
-) -> Result<
-    (
-        FileCallData,
-        Option<crate::callgraph_store::join::ParseBlob>,
-    ),
-    AftError,
-> {
-    let lang =
-        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
-            message: format!("unsupported file for call graph: {}", path.display()),
-        })?;
-    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
-        return build_file_data_from_source_with_lang(path, source, lang).map(|data| (data, None));
-    }
-    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
-    let lines = SourceLineIndex::new(source);
-    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true, Direct, None)
 }
 
 #[derive(Debug)]
@@ -3462,40 +3356,6 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
         current = dir.parent();
     }
     None
-}
-
-/// The `compilerOptions.paths` of `tsconfig_dir/tsconfig.json` as
-/// `resolve_tsconfig_path` reads them: the directory targets are relative to
-/// (`baseUrl`, default the tsconfig's directory) and each alias with its
-/// targets. None when the file is missing, unparsable or has no `paths`.
-pub(crate) fn tsconfig_path_aliases(
-    tsconfig_dir: &Path,
-    facts: &FactPaths<'_>,
-) -> Option<(PathBuf, Vec<(String, Vec<String>)>)> {
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), None, facts)?;
-    let compiler_options = tsconfig.get("compilerOptions")?;
-    let paths = compiler_options.get("paths")?.as_object()?;
-    let base_url = compiler_options
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let aliases = paths
-        .iter()
-        .map(|(alias, targets)| {
-            let targets = targets
-                .as_array()
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            (alias.clone(), targets)
-        })
-        .collect();
-    Some((tsconfig_dir.join(base_url), aliases))
 }
 
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
@@ -5993,173 +5853,6 @@ function hidden() {}
         }
     }
 
-    /// A bare package import that is not a workspace member costs one
-    /// member-directory walk per (workspace, package), not one per resolution:
-    /// the walk's answer must reach the process-wide cache even when the caller
-    /// resolves with a throwaway memo, which is what the refresh and extract
-    /// paths do per import.
-    #[test]
-    fn workspace_package_miss_is_walked_once_across_throwaway_memos() {
-        use crate::callgraph_store::facts::{DirEntry, ProjectFacts};
-        use std::cell::Cell;
-        use std::sync::Arc;
-
-        struct CountingFacts<'a> {
-            inner: &'a DiskFacts,
-            list_dir_calls: Cell<usize>,
-        }
-        impl ProjectFacts for CountingFacts<'_> {
-            fn is_file(&self, rel: &[u8]) -> bool {
-                self.inner.is_file(rel)
-            }
-            fn is_dir(&self, rel: &[u8]) -> bool {
-                self.inner.is_dir(rel)
-            }
-            fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
-                self.inner.config_bytes(rel)
-            }
-            fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
-                self.inner.symlink_target(rel)
-            }
-            fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
-                self.inner.canonical(rel)
-            }
-            fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
-                self.list_dir_calls.set(self.list_dir_calls.get() + 1);
-                self.inner.list_dir(rel)
-            }
-        }
-
-        let dir = TempDir::new().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        fs::write(
-            root.join("package.json"),
-            r#"{"workspaces":["packages/*"]}"#,
-        )
-        .unwrap();
-        for member in ["a", "b", "c"] {
-            let member_dir = root.join("packages").join(member);
-            fs::create_dir_all(member_dir.join("src")).unwrap();
-            fs::write(
-                member_dir.join("package.json"),
-                format!(r#"{{"name":"@ws/{member}"}}"#),
-            )
-            .unwrap();
-        }
-        let disk = DiskFacts::new(&root);
-        let counting = CountingFacts {
-            inner: &disk,
-            list_dir_calls: Cell::new(0),
-        };
-        let facts = FactPaths {
-            root: &root,
-            facts: &counting,
-        };
-        clear_workspace_package_cache();
-
-        let first = resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(first, None, "react is not a member");
-        let walked = counting.list_dir_calls.get();
-        assert!(
-            walked > 0,
-            "the first miss must walk the member directories"
-        );
-
-        let second = resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(second, None);
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "a second resolution with a fresh memo must not walk again"
-        );
-
-        // The walk is per workspace, not per package: a different non-member
-        // import is answered from the same member list.
-        let third = resolve_workspace_package(
-            &root,
-            "effect",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(third, None, "effect is not a member either");
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "a second package on the same workspace must reuse the member walk"
-        );
-        // And a member resolves from the same list too.
-        let member = resolve_workspace_package(
-            &root,
-            "@ws/b",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        )
-        .expect("@ws/b is a member");
-        assert!(member.ends_with("packages/b"), "{member:?}");
-        assert_eq!(counting.list_dir_calls.get(), walked);
-
-        // A configure of some OTHER root must leave this workspace's entries
-        // alone: the daemon binds other roots many times a minute.
-        let other = TempDir::new().unwrap();
-        clear_workspace_package_cache_under(other.path());
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "clearing under another root must not drop this workspace's entries"
-        );
-        crate::callgraph_store::invalidate_refresh_workspace_package_cache(other.path());
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "another root's manifest refresh must not drop this workspace's entries"
-        );
-        // A configure of THIS root drops them.
-        clear_workspace_package_cache_under(&root);
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        let rewalked = counting.list_dir_calls.get();
-        assert!(rewalked > walked, "clearing under this root re-walks");
-
-        // A workspace manifest change is the other thing that may re-walk.
-        clear_workspace_package_cache();
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert!(
-            counting.list_dir_calls.get() > rewalked,
-            "after the cache is dropped the next miss walks again"
-        );
-    }
-
     #[test]
     fn same_named_methods_use_scoped_symbol_identity() {
         let dir = TempDir::new().unwrap();
@@ -6319,5 +6012,53 @@ function helperB() {}
     fn extract_parameters_javascript() {
         let params = extract_parameters("function handleClick(event, target)", LangId::JavaScript);
         assert_eq!(params, vec!["event", "target"]);
+    }
+}
+
+#[cfg(test)]
+fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
+    let mut consider = |candidate: &str| {
+        let matches = if qualified_query {
+            candidate == symbol_name
+        } else {
+            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
+        };
+        if matches && seen.insert(candidate.to_string()) {
+            candidates.push(candidate.to_string());
+        }
+    };
+    for candidate in file_data.symbol_metadata.keys() {
+        consider(candidate);
+    }
+    for candidate in file_data.calls_by_symbol.keys() {
+        consider(candidate);
+    }
+    for candidate in &file_data.exported_symbols {
+        consider(candidate);
+    }
+    candidates.sort();
+    candidates
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_symbol_query_in_data(
+    file_data: &FileCallData,
+    file: &Path,
+    symbol_name: &str,
+) -> Result<String, AftError> {
+    let candidates = symbol_query_candidates(file_data, symbol_name);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol_name.to_string(),
+            file: file.display().to_string(),
+        }),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates,
+        }),
     }
 }

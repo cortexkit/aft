@@ -267,7 +267,6 @@ pub(crate) fn unix_millis_now() -> u64 {
 }
 
 thread_local! {
-    static LANE_PAUSE_RETRY_POLICY: std::cell::RefCell<Option<PauseRetryPolicy>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
@@ -301,19 +300,6 @@ fn checkpoint_work(allocations: usize, inserts: usize, clones: usize) {
     let _ = (allocations, inserts, clones);
 }
 
-#[cfg(test)]
-pub(crate) fn with_checkpoint_work<T>(run: impl FnOnce() -> T) -> (T, CheckpointWork) {
-    struct Restore(CheckpointWork);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CHECKPOINT_WORK.with(|work| work.set(self.0));
-        }
-    }
-    let _restore = Restore(CHECKPOINT_WORK.with(|work| work.replace(CheckpointWork::default())));
-    let value = run();
-    (value, CHECKPOINT_WORK.with(std::cell::Cell::get))
-}
-
 /// Created only when Synapse refuses an embedding request with `lane_paused`.
 /// The interrupted collector or embed loop transfers its source chunks and
 /// finished vectors here before returning, without retaining admission permits,
@@ -324,8 +310,6 @@ struct PreparedPauseJob {
     cold: Option<ColdPauseCheckpoint>,
     reuse: Option<ReusePauseCheckpoint>,
     file_chunks: HashMap<FileCheckpointKey, (IndexedFileMetadata, Vec<SemanticChunk>)>,
-    view: Option<ViewPauseCheckpoint>,
-    producer: Option<SemanticIndexFingerprint>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -432,25 +416,6 @@ impl ReusePauseCheckpoint {
     }
 }
 
-struct ViewPauseCheckpoint {
-    runs: Vec<Vec<EmbeddingEntry>>,
-    refused_files: Vec<usize>,
-    pending: Vec<(usize, SemanticChunk)>,
-    next_chunk: usize,
-    dimension: Option<usize>,
-}
-
-struct PreparedPauseJobScope(bool);
-
-impl Drop for PreparedPauseJobScope {
-    fn drop(&mut self) {
-        PAUSE_JOB_DEPTH.with(|depth| depth.set(depth.get() - 1));
-        if !self.0 {
-            PREPARED_PAUSE_JOB.with(|slot| slot.take());
-        }
-    }
-}
-
 fn prepared_pause_job() -> Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>> {
     PREPARED_PAUSE_JOB.with(|slot| slot.borrow().clone())
 }
@@ -534,31 +499,6 @@ fn retain_reuse_files(
 }
 
 #[cfg(test)]
-pub(crate) fn lane_pause_chunk_calls() -> usize {
-    LANE_PAUSE_CHUNK_CALLS.with(std::cell::Cell::get)
-}
-
-struct PauseRetryPolicy {
-    initial: Duration,
-    max: Duration,
-    current: Box<dyn Fn() -> bool>,
-    // Keep in-flight indexing alive through short route reconnects. Consult this
-    // stricter predicate only after the backend returned `lane_paused`: no embed
-    // request is running during that wait, so route loss can cancel it immediately.
-    pause_current: Option<std::rc::Rc<dyn Fn() -> bool>>,
-}
-
-pub(crate) struct PauseRetryScope(Option<PauseRetryPolicy>);
-
-impl PauseRetryScope {}
-
-impl Drop for PauseRetryScope {
-    fn drop(&mut self) {
-        LANE_PAUSE_RETRY_POLICY.with(|policy| policy.replace(self.0.take()));
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn with_lane_pause_clock<T>(
     start_ms: u64,
     run: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicU64>) -> T,
@@ -573,21 +513,6 @@ pub(crate) fn with_lane_pause_clock<T>(
     let _restore =
         Restore(LANE_PAUSE_TEST_CLOCK.with(|current| current.replace(Some(clock.clone()))));
     run(clock)
-}
-
-#[cfg(test)]
-pub(crate) fn with_lane_pause_wait_hook<T>(
-    hook: impl FnMut(Duration) + 'static,
-    run: impl FnOnce() -> T,
-) -> T {
-    struct Restore(Option<Box<dyn FnMut(Duration)>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(self.0.take()));
-        }
-    }
-    let _restore = Restore(LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
-    run()
 }
 
 /// Delay before the cold semantic build retries an unreachable embedding backend.
@@ -1473,8 +1398,6 @@ struct BuildRequestBudget {
 #[derive(Debug, Clone, Copy)]
 enum EmbeddingRequestPolicy {
     Build(BuildRequestBudget),
-    /// The view worker owns retry backoff; an identity probe sends one request.
-    Probe(Duration),
     Query(QueryBudget),
 }
 
@@ -1482,14 +1405,13 @@ impl EmbeddingRequestPolicy {
     fn max_attempts(self) -> usize {
         match self {
             Self::Build(_) => EMBEDDING_REQUEST_MAX_ATTEMPTS,
-            Self::Probe(_) | Self::Query(_) => 1,
+            Self::Query(_) => 1,
         }
     }
 
     fn request_timeout(self) -> Duration {
         match self {
             Self::Build(budget) => Duration::from_millis(budget.deadline_ms),
-            Self::Probe(timeout) => timeout,
             Self::Query(budget) => Duration::from_millis(budget.timeout_ms),
         }
     }
@@ -1601,6 +1523,7 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
         Self::from_config(config, dimension)
     }
@@ -2880,9 +2803,7 @@ where
         let request = make_request().timeout(policy.request_timeout());
 
         let exchange = match policy {
-            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => {
-                execute_embedding_exchange(request)
-            }
+            EmbeddingRequestPolicy::Build(_) => execute_embedding_exchange(request),
             EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
         };
         let (status, raw) = match exchange {
@@ -3671,7 +3592,7 @@ impl SemanticEmbeddingModel {
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
         let query_cache_key = match policy {
-            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => None,
+            EmbeddingRequestPolicy::Build(_) => None,
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
@@ -3895,7 +3816,7 @@ impl SemanticEmbeddingModel {
             }
             SemanticEmbeddingEngine::Synapse(client) => {
                 let vectors = match policy {
-                    EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => client
+                    EmbeddingRequestPolicy::Build(_) => client
                         .embed_batch(&texts)
                         .map_err(|error| error.to_string())?,
                     EmbeddingRequestPolicy::Query(budget) => {
@@ -4819,40 +4740,9 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct SemanticVectors {
     entries: Vec<EmbeddingEntry>,
-    pub(crate) provider_refused_chunks: usize,
 }
 
 impl SemanticVectors {
-    /// A run of `chunks` distinct chunks of `file`, each with its own
-    /// `dimension`-float vector, for tests that need resident vectors without
-    /// running an embedding model.
-    #[cfg(test)]
-    pub(crate) fn synthetic_for_test(file: &Path, chunks: usize, dimension: usize) -> Self {
-        Self {
-            provider_refused_chunks: 0,
-            entries: (0..chunks)
-                .map(|ordinal| {
-                    EmbeddingEntry::new(
-                        SemanticChunk {
-                            file: file.to_path_buf(),
-                            name: format!("symbol_{ordinal}"),
-                            qualified_name: None,
-                            kind: SymbolKind::Function,
-                            start_line: ordinal as u32,
-                            end_line: ordinal as u32 + 1,
-                            exported: false,
-                            embed_text: String::new(),
-                            snippet: String::new(),
-                        },
-                        (0..dimension)
-                            .map(|position| (ordinal * dimension + position) as f32 + 1.0)
-                            .collect::<Vec<f32>>(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
     /// Number of embedded chunks in this run.
     pub fn chunk_count(&self) -> usize {
         self.entries.len()
@@ -4915,14 +4805,8 @@ struct SharedSemanticBase {
     entry_files: HashSet<PathBuf>,
     file_mtimes: HashMap<PathBuf, SystemTime>,
     file_sizes: HashMap<PathBuf, u64>,
-    any_missing_sizes: bool,
     file_hashes: HashMap<PathBuf, blake3::Hash>,
-    dimension: usize,
-    fingerprint: Option<SemanticIndexFingerprint>,
-    summary_budget_limited: bool,
     deferred_files: HashSet<PathBuf>,
-    skipped_rows: SkippedEmbeddingRows,
-    persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -7832,27 +7716,6 @@ impl SemanticIndex {
         self.removal_retain_passes
     }
 
-    #[cfg(test)]
-    pub(crate) fn uses_shared_base_for_test(&self) -> bool {
-        self.shared_base.is_some()
-    }
-
-    /// The replacement runs an index built by `for_view` holds by `Arc` from
-    /// the family arena (its `view_runs`), in the order they are searched.
-    #[cfg(test)]
-    pub(crate) fn view_runs_for_test(&self) -> &[Arc<SemanticVectors>] {
-        &self.view_runs
-    }
-
-    /// Every vector a search would score, as the shared handles themselves,
-    /// so a test can compare allocations with `Arc::ptr_eq`.
-    #[cfg(test)]
-    pub(crate) fn live_vectors_for_test(&self) -> Vec<Arc<[f32]>> {
-        self.live_entries()
-            .map(|(_, entry)| Arc::clone(&entry.vector))
-            .collect()
-    }
-
     /// Every entry as `(absolute file, symbol name, vector)`, sorted, so a test
     /// can check that vectors survived an operation bit-for-bit.
     #[cfg(test)]
@@ -10469,11 +10332,6 @@ pub struct ViewPayloadProducer<'a> {
     pub model_fingerprint: &'a str,
 }
 
-fn push_view_field(output: &mut Vec<u8>, bytes: &[u8]) {
-    output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    output.extend_from_slice(bytes);
-}
-
 impl SemanticVectors {}
 
 /// Chunks one checkout file for a view fill, from the very bytes whose hash
@@ -10630,9 +10488,6 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
         _ => return Err(format!("invalid semantic symbol kind: {v}")),
     })
 }
-
-#[cfg(test)]
-pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -16117,76 +15972,6 @@ public class Greeter {
         );
         assert_eq!(summary.embed_text.chars().count(), 1600);
         assert!(summary.embed_text.ends_with('x'));
-    }
-
-    pub(crate) fn saved_pre_budget_summary_fixture(
-        small: bool,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        PathBuf,
-        SemanticIndexFingerprint,
-    ) {
-        saved_summary_fixture_for_tokens(small.then_some(20))
-    }
-
-    fn saved_summary_fixture_for_tokens(
-        max_input_tokens: Option<usize>,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        PathBuf,
-        SemanticIndexFingerprint,
-    ) {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let file = root.join("summary.rs");
-        let source = "//! A long module description that deliberately exceeds the configured small embedding budget.\npub fn exported() {\n    42;\n}\n";
-        fs::write(&file, source).unwrap();
-        let config = SemanticBackendConfig {
-            backend: SemanticBackend::Ollama,
-            max_input_tokens,
-            ..Default::default()
-        };
-        let fingerprint = SemanticIndexFingerprint::from_config(&config, 4);
-        let mut embedder = RecordingEmbedder::default();
-        let mut index = SemanticIndex::build_with_caps(
-            &root,
-            &[file.clone()],
-            &mut |texts| embedder.embed(texts),
-            16,
-            fingerprint.embed_text_caps,
-        )
-        .unwrap();
-        let old = build_file_summary_chunk(
-            &file,
-            &root,
-            source,
-            &["exported"],
-            &[Some("pub fn exported()")],
-        );
-        let summary = index
-            .entries
-            .iter_mut()
-            .find(|entry| entry.chunk.kind == SymbolKind::FileSummary)
-            .unwrap();
-        *summary = EmbeddingEntry::new(old.clone(), deterministic_test_vector(&old.embed_text));
-        index.set_fingerprint(fingerprint.clone());
-        assert!(index.write_to_disk(storage.path(), "summary-budget"));
-        let path = storage.path().join("semantic/summary-budget/semantic.bin");
-        let mut bytes = fs::read(&path).unwrap();
-        let len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let mut identity: serde_json::Value = serde_json::from_slice(&bytes[13..13 + len]).unwrap();
-        identity
-            .as_object_mut()
-            .unwrap()
-            .remove("file_summary_budget_limited");
-        let legacy_identity = serde_json::to_vec(&identity).unwrap();
-        bytes.splice(13..13 + len, legacy_identity.iter().copied());
-        bytes[9..13].copy_from_slice(&(legacy_identity.len() as u32).to_le_bytes());
-        fs::write(path, bytes).unwrap();
-        (project, storage, root, fingerprint)
     }
 
     #[test]

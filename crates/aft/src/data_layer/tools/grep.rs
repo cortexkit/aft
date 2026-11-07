@@ -327,22 +327,4 @@ pub(crate) mod test_hooks {
     pub(super) fn note_answer() {
         ANSWERS.with(|answers| answers.set(answers.get() + 1));
     }
-
-    /// Runs `run` with grep, glob and a parent folder's `aft_search` ignoring
-    /// the data layer on this thread.
-    pub(crate) fn without_data_layer<R>(run: impl FnOnce() -> R) -> R {
-        struct Restore(bool);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                TODAY_ONLY.with(|today| today.set(self.0));
-            }
-        }
-        let _restore = Restore(TODAY_ONLY.with(|today| today.replace(true)));
-        run()
-    }
-
-    /// How many grep and glob roots this thread has answered from a view.
-    pub(crate) fn answers() -> usize {
-        ANSWERS.with(Cell::get)
-    }
 }

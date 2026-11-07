@@ -13216,14 +13216,6 @@ impl BgTaskRegistry {
         Some(false)
     }
 
-    /// Hold the watch map lock for the duration of `while_held`, so a test can
-    /// prove a caller does not wait for it.
-    #[cfg(test)]
-    pub(crate) fn hold_watchdog_tasks_lock_for_test(&self, while_held: impl FnOnce()) {
-        let _held = self.inner.watchdog_tasks.lock();
-        while_held();
-    }
-
     pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
         if let Ok(mut tasks) = self.inner.watchdog_tasks.lock() {
             tasks.remove(task_id);

@@ -73,11 +73,6 @@ pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> Free
     set_free_space_probe_for_test(storage, Some((free, capacity)))
 }
 
-#[cfg(test)]
-pub(crate) fn set_free_space_probe_failure_for_test(storage: &Path) -> FreeSpaceTestGuard {
-    set_free_space_probe_for_test(storage, None)
-}
-
 fn set_free_space_probe_for_test(storage: &Path, value: Option<(u64, u64)>) -> FreeSpaceTestGuard {
     let storage = storage.to_path_buf();
     let entry = FreeSpaceOverride {
@@ -129,11 +124,6 @@ pub(crate) fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTe
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .unlimited += 1;
     UnlimitedFreeSpaceForTestProcess
-}
-/// The platform probe itself, bypassing the test override.
-#[cfg(test)]
-pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
-    probe_free_space(path)
 }
 pub(crate) fn free_space(path: &Path) -> Option<(u64, u64)> {
     let value = {

@@ -629,23 +629,6 @@ thread_local! {
     static CONFIG_TIMEOUT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
-pub(crate) struct ConfigTimeoutGuard(bool);
-
-#[cfg(test)]
-impl Drop for ConfigTimeoutGuard {
-    fn drop(&mut self) {
-        CONFIG_TIMEOUT_ONCE.with(|slot| slot.set(self.0));
-    }
-}
-
-/// Make the next real `git config` child time out at once (a zero pipe
-/// timeout), so tests reach the timeout path without sleeping.
-#[cfg(test)]
-pub(crate) fn timeout_next_config_for_test() -> ConfigTimeoutGuard {
-    ConfigTimeoutGuard(CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(true)))
-}
-
 impl GitQueries {
     pub fn new(root: PathBuf, timeout: Duration) -> Self {
         Self {

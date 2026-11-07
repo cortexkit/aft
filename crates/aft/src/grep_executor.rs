@@ -44,12 +44,6 @@ pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
-/// Fallback filesystem walks started on this thread so far.
-#[cfg(test)]
-pub(crate) fn fallback_walks_for_test() -> usize {
-    FALLBACK_WALKS.with(std::cell::Cell::get)
-}
-
 fn fallback_walk_limit() -> usize {
     #[cfg(test)]
     {
@@ -4161,27 +4155,6 @@ mod tests {
             crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
             other => panic!("compile regex {pattern:?}: {other:?}"),
         }
-    }
-
-    fn grep_result_bytes(result: &GrepResult) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "matches": result.matches.iter().map(|matched| serde_json::json!({
-                "file": matched.file,
-                "line": matched.line,
-                "column": matched.column,
-                "line_text": matched.line_text,
-                "match_text": matched.match_text,
-            })).collect::<Vec<_>>(),
-            "total_matches": result.total_matches,
-            "files_searched": result.files_searched,
-            "files_with_matches": result.files_with_matches,
-            "index_status": result.index_status.as_str(),
-            "truncated": result.truncated,
-            "fully_degraded": result.fully_degraded,
-            "engine_capped": result.engine_capped,
-            "walk_truncated": result.walk_truncated,
-        }))
-        .expect("serialize grep result projection")
     }
 
     /// Manual release-mode probe for a warm indexed TypeScript corpus searched across four roots.

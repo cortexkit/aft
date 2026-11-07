@@ -3,7 +3,6 @@ use std::path::Path;
 #[path = "../list_surfaces/trace.rs"]
 pub mod trace;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
     note_callgraph_served, serialized_value, store_error_response, trace_to_result,
 };
@@ -12,15 +11,7 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to` request.
 pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_trace_to(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::TraceTo,
-    );
-    response
+    answer_trace_to(req, ctx)
 }
 
 fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {

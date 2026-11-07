@@ -333,15 +333,6 @@ pub(crate) fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
     Arc::new(ColdBuildLimiter::new(limit))
 }
 
-#[cfg(test)]
-pub(crate) fn acquire_blocking_while_with_test_limiter(
-    limiter: &Arc<ColdBuildLimiter>,
-    kind: &str,
-    admitted: impl Fn() -> bool,
-) -> Option<ColdBuildPermit> {
-    acquire_blocking_while_with_limiter(limiter, kind, admitted)
-}
-
 #[derive(Debug)]
 pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
@@ -486,13 +477,6 @@ impl ColdBuildLimiter {
             #[cfg(test)]
             refusal_observer: Mutex::new(None),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn observe_refusals_for_test(&self) -> crossbeam_channel::Receiver<String> {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *self.refusal_observer.lock().unwrap() = Some(tx);
-        rx
     }
 
     pub(crate) fn limit(&self) -> usize {

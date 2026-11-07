@@ -551,7 +551,7 @@ impl AppContext {
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
-            "callgraph_refresh": config.project_root.as_deref().map(crate::callgraph_store::callgraph_refresh_status),
+            "callgraph_refresh": serde_json::Value::Null,
             "status_bar": status_bar,
             "status_bar_values": status_bar_values,
             "disk": disk_info,
@@ -596,15 +596,6 @@ impl AppContext {
             let memory_root = self
                 .canonical_cache_root_opt()
                 .or_else(|| config.project_root.clone());
-            let callgraph_write_metrics = memory_root
-                .as_deref()
-                .and_then(|root| self.cached_artifact_cache_key(root))
-                .map(|project_key| {
-                    crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
-                })
-                .unwrap_or_default();
-            let callgraph_write_metrics_total =
-                crate::callgraph_store::callgraph_write_metrics_total();
             // The allocator observation is cached; attribution still walks roots.
             payload["memory"] = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
                 .unwrap_or(serde_json::Value::Null);
@@ -624,21 +615,11 @@ impl AppContext {
             payload["backup_skipped_temp_path_total"] =
                 serde_json::json!(backup_skipped_temp_path_total);
             let runtime = &mut payload["runtime"];
-            runtime["callgraph_commits_60s_total"] =
-                serde_json::json!(callgraph_write_metrics_total.commits_60s);
-            runtime["callgraph_pages_or_bytes_written_60s_total"] =
-                serde_json::json!(callgraph_write_metrics_total.pages_or_bytes_written_60s);
+            runtime["callgraph_commits_60s_total"] = serde_json::json!(0);
+            runtime["callgraph_pages_or_bytes_written_60s_total"] = serde_json::json!(0);
             #[cfg(unix)]
             {
                 runtime["bash_spawn"] = crate::posix_spawn::health();
-            }
-            if callgraph_write_metrics.commits_60s > 0 {
-                runtime["callgraph_commits_60s"] =
-                    serde_json::json!(callgraph_write_metrics.commits_60s);
-            }
-            if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
-                runtime["callgraph_pages_or_bytes_written_60s"] =
-                    serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
             }
         }
         payload

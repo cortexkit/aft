@@ -506,30 +506,6 @@ fn excluded_error() -> std::io::Error {
     )
 }
 
-/// Independent pre-optimization oracle for walker admission parity tests,
-/// which run on Unix only.
-#[cfg(all(test, unix))]
-pub(crate) fn legacy_walker_excludes(path: &Path, file_type: Option<&std::fs::FileType>) -> bool {
-    let known_directory = file_type.is_some_and(std::fs::FileType::is_dir);
-    let metadata = (!known_directory)
-        .then(|| crate::db::file_identity::candidate_metadata(path).ok())
-        .flatten();
-    if is_excluded_file_with_metadata(path, file_type, metadata.as_ref()) || is_storage_path(path) {
-        return true;
-    }
-    if known_directory || metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
-        return false;
-    }
-    let excluded_alias = metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-        && path
-            .canonicalize()
-            .is_ok_and(|target| legacy_walker_excludes(&target, None));
-    excluded_alias
-        || crate::db::file_identity::is_live_sqlite_file_with_metadata(path, metadata.as_ref())
-}
-
 #[cfg(test)]
 mod open_probe {
     use super::*;

@@ -204,7 +204,6 @@ fn synthetic_bound_roots() {
                 if ctx.watcher_drain_has_work() {
                     crate::runtime_drain::drain_watcher_events(ctx);
                 }
-                crate::runtime_drain::drain_callgraph_store_events(ctx);
             }
             std::thread::sleep(Duration::from_millis(250));
         }

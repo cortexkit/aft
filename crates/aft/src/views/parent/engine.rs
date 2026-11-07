@@ -25,8 +25,6 @@ use super::{display_relative, lock, read, Child, ParentSession};
 /// One child's search engine context and what is installed in it.
 pub(crate) struct ChildEngine {
     ctx: AppContext,
-    /// Fills and live edits can replace this index within the same generation.
-    semantic: Option<Arc<crate::semantic_index::SemanticIndex>>,
 }
 
 impl ChildEngine {
@@ -40,7 +38,6 @@ impl ChildEngine {
         config.semantic = session.semantic_config.clone();
         Self {
             ctx: AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config),
-            semantic: None,
         }
     }
 }

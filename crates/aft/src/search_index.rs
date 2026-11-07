@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
-use crate::native_stat::NativeStat;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};
@@ -101,23 +100,10 @@ const TRANSIENT_SEARCH_CACHE_PREFIX: &str = "aft-search-cache.";
 /// eight executor workers inside a configure sweep and starved route binds
 /// (2026-09-19). Owning a subdirectory makes the sweep O(our entries).
 const TRANSIENT_SEARCH_CACHE_DIR_NAME: &str = "aft-search-caches";
-/// A streaming build owns its temporary cache for minutes, not days. Use the
-/// same conservative age-only predicate as other interrupted-build reapers so
-/// a recycled PID can never protect abandoned data.
-const TRANSIENT_SEARCH_CACHE_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT: usize = 200;
-/// Raw directory entries examined in one sweep, whether or not they are ours.
-/// The reap limit above bounds what we act on; this bounds what we *read*, so
-/// a foreign directory with hundreds of thousands of entries cannot hold the
-/// calling worker for the length of a full listing.
-const TRANSIENT_SEARCH_CACHE_SCAN_LIMIT: usize = 2_048;
-const TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
 #[cfg(test)]
 static INDEX_ORPHAN_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
-static TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> =
-    OnceLock::new();
 static TRANSIENT_SEARCH_CACHE_BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
 
@@ -181,31 +167,6 @@ struct IndexOrphanSweepSummary {
     budget_exhausted: bool,
 }
 
-#[derive(Default)]
-struct TransientSearchCacheSweepSummary {
-    scanned: usize,
-    /// Raw directory entries read, including entries that are not ours. The
-    /// reaping numbers below cannot show a listing that never reached us.
-    examined: usize,
-    removed: usize,
-    bytes: u64,
-    skipped_fresh: usize,
-    skipped_unreadable: usize,
-    budget_exhausted: bool,
-}
-
-#[derive(Clone, Debug)]
-struct TransientSearchCacheName {
-    key: String,
-    pid: u32,
-}
-
-enum TransientSearchCacheWalk {
-    Complete(u64),
-    BudgetExceeded,
-    Failed,
-}
-
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
 const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 
@@ -216,26 +177,6 @@ pub(crate) enum BorrowedIndexLoadStop {
     /// The snapshot was written for a different part of the checkout than the
     /// loading root covers (see `checkout_position`).
     CoverageMismatch,
-}
-
-/// What reconciling a borrowed snapshot against this checkout's files found.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BorrowedReconcileSummary {
-    /// Files the ignore-aware walk found on disk.
-    pub(crate) walked: usize,
-    /// Snapshot records whose bytes still match disk (kept on shared postings).
-    pub(crate) unchanged: usize,
-    /// The subset of `unchanged` that needed a content hash to prove it.
-    pub(crate) hashed_unchanged: usize,
-    /// Snapshot records whose content differs and were re-indexed in RAM.
-    pub(crate) reindexed: usize,
-    /// Files on disk that the snapshot does not contain.
-    pub(crate) added: usize,
-    /// Snapshot records with no file on disk any more.
-    pub(crate) removed: usize,
-    pub(crate) walk: Duration,
-    pub(crate) verify: Duration,
-    pub(crate) apply: Duration,
 }
 
 struct BorrowedIndexLoadBudget<'a> {
@@ -302,28 +243,6 @@ impl<'a> BorrowedIndexLoadBudget<'a> {
 #[cfg(test)]
 static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
     OnceLock::new();
-
-/// Register `root` for borrowed-load record observation and return its
-/// counter. Callers remove the probe with
-/// [`unobserve_borrowed_load_records_read_for_test`] after the assertion.
-#[cfg(test)]
-pub(crate) fn observe_borrowed_load_records_read_for_test(root: &Path) -> Arc<AtomicUsize> {
-    let counter = Arc::new(AtomicUsize::new(0));
-    BORROWED_LOAD_RECORDS_READ_PROBES
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap()
-        .insert(root.to_path_buf(), Arc::clone(&counter));
-    counter
-}
-
-/// Stop observing borrowed-load record reads for `root`.
-#[cfg(test)]
-pub(crate) fn unobserve_borrowed_load_records_read_for_test(root: &Path) {
-    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
-        probes.lock().unwrap().remove(root);
-    }
-}
 
 #[cfg(test)]
 fn note_borrowed_load_record_read_for_test(project_root: &Path) {
@@ -439,17 +358,6 @@ thread_local! {
     static LEGACY_SEARCH_PUBLICATION: std::cell::RefCell<Option<Arc<LegacySearchPublicationGate>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct LegacySearchPublicationScope {
-    previous: Option<Arc<LegacySearchPublicationGate>>,
-    _not_send: std::marker::PhantomData<*const ()>,
-}
-
-impl Drop for LegacySearchPublicationScope {
-    fn drop(&mut self) {
-        LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(self.previous.take()));
-    }
-}
-
 impl LegacySearchPublicationGate {
     pub(crate) fn allowed(&self) -> bool {
         self.allowed.load(std::sync::atomic::Ordering::Acquire)
@@ -510,44 +418,6 @@ pub struct SearchIndex {
     base_file_count: u32,
     delta_packed_bytes: usize,
     compaction_state: Arc<Mutex<CompactionState>>,
-    /// The `cache.bin` this index last wrote itself, and the header values it
-    /// wrote there. `None` for an index read from disk or built in memory.
-    published_cache: Option<PublishedCache>,
-}
-
-/// Where an index wrote its own cache, and the header fields that a rewrite
-/// from the index would take from mutable index state.
-#[derive(Clone, Debug)]
-struct PublishedCache {
-    cache_dir: PathBuf,
-    /// Stored the way the header stores it: no head is an empty string.
-    git_head: String,
-    ignore_fingerprint: String,
-    max_file_size: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct VerifiedFile {
-    stat: NativeStat,
-    observed_ns: u128,
-    content_hash: [u8; 32],
-}
-
-/// Content proofs collected during verification, not a later metadata sweep.
-#[derive(Default, Deserialize, Serialize)]
-pub(crate) struct WarmVerification {
-    files: BTreeMap<PathBuf, VerifiedFile>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct WarmVerifyRecord {
-    index_version: u32,
-    cache_generation: NativeStat,
-    root: PathBuf,
-    git_head: Option<String>,
-    ignore_fingerprint: String,
-    max_file_size: u64,
-    verification: WarmVerification,
 }
 
 // A query must observe postings and superseded base files from one version;
@@ -1859,7 +1729,6 @@ enum SearchMatcher {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum IgnoreRulesLoadPolicy {
     Strict,
-    BorrowTolerant,
 }
 
 impl SearchIndex {
@@ -1882,7 +1751,6 @@ impl SearchIndex {
             base_file_count: 0,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            published_cache: None,
         }
     }
 
@@ -2480,12 +2348,6 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
-                self.published_cache = Some(PublishedCache {
-                    cache_dir: cache_dir.to_path_buf(),
-                    git_head: self.git_head.clone().unwrap_or_default(),
-                    ignore_fingerprint: self.ignore_rules_fingerprint.clone(),
-                    max_file_size: self.max_file_size,
-                });
                 true
             }
             Err(error) => {
@@ -2837,7 +2699,6 @@ impl SearchIndex {
             base_file_count: u32::try_from(file_count).ok()?,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            published_cache: None,
         };
 
         if migrated_counts && allow_legacy_repair {
@@ -2863,15 +2724,6 @@ impl SearchIndex {
         let changed = verify_file_mtimes(self, verify_strategy);
         self.ready = true;
         changed
-    }
-
-    /// True when `path` is answered from the shared snapshot's postings rather
-    /// than from the in-RAM delta.
-    #[cfg(test)]
-    pub(crate) fn serves_path_from_shared_base_for_test(&self, path: &Path) -> bool {
-        self.path_to_id.get(path).is_some_and(|file_id| {
-            *file_id < self.base_file_count && !self.delta.superseded.contains(file_id)
-        })
     }
 
     #[cfg(debug_assertions)]
@@ -2935,26 +2787,6 @@ impl SearchIndex {
         filter: Option<PostingFilter>,
     ) -> std::io::Result<Vec<u32>> {
         self.snapshot().postings_for_trigram(trigram, filter)
-    }
-
-    /// The `(next_mask, loc_mask)` of every not-yet-compacted posting of
-    /// `path`, by trigram, so tests elsewhere can compare against what this
-    /// index actually stored.
-    #[cfg(test)]
-    pub(crate) fn delta_posting_masks(&self, path: &Path) -> BTreeMap<u32, (u8, u8)> {
-        let Some(&file_id) = self.path_to_id.get(path) else {
-            return BTreeMap::new();
-        };
-        self.delta
-            .postings
-            .iter()
-            .filter_map(|(&trigram, postings)| {
-                postings
-                    .iter()
-                    .find(|posting| posting.file_id == file_id)
-                    .map(|posting| (trigram, (posting.next_mask, posting.loc_mask)))
-            })
-            .collect()
     }
 
     fn update_compaction_flags(&mut self, changed_path: Option<&Path>) {
@@ -4912,12 +4744,6 @@ fn build_streaming_index(
     let base = build_result?;
     let base_file_count =
         u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
-    let published_cache = Some(PublishedCache {
-        cache_dir: cache_dir.to_path_buf(),
-        git_head: git_head.clone().unwrap_or_default(),
-        ignore_fingerprint: ignore_fingerprint.clone(),
-        max_file_size,
-    });
     let index = SearchIndex {
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
@@ -4936,7 +4762,6 @@ fn build_streaming_index(
         base_file_count,
         delta_packed_bytes: 0,
         compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-        published_cache,
     };
     Ok((index, indexed))
 }
@@ -5384,302 +5209,6 @@ fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> 
         }
     }
     Ok(())
-}
-
-/// Reap stale timestamped caches from older AFT versions and stable caches left
-/// by processes that exited without a future in-process rebuild. The directory
-/// name contains a PID for diagnostics, but PID liveness is intentionally not
-/// consulted: a bare PID can be recycled, while age remains trustworthy.
-pub(crate) fn sweep_transient_search_cache_dirs() {
-    // Our own directory, which holds one entry per process/root pair.
-    let root = transient_search_cache_home();
-    let summary = sweep_transient_search_cache_dirs_with_limits(
-        &root,
-        TRANSIENT_SEARCH_CACHE_MIN_AGE,
-        TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
-        TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
-    );
-    crate::slog_info!(
-        "transient search cache sweep root={} scanned={} examined={} removed={} bytes={} skipped_fresh={} skipped_unreadable={} budget_exhausted={}",
-        root.display(),
-        summary.scanned,
-        summary.examined,
-        summary.removed,
-        summary.bytes,
-        summary.skipped_fresh,
-        summary.skipped_unreadable,
-        summary.budget_exhausted
-    );
-    sweep_legacy_transient_search_cache_dirs(&root);
-}
-
-/// Reap caches left at the top level of `$TMPDIR` by versions that wrote there
-/// directly.
-///
-/// Runs inline, under the same iterator bound as the sweep above: the bound is
-/// what makes reading a directory we do not own safe, and it is cheaper than
-/// owning a thread. A legacy entry that sits beyond the scan limit is simply
-/// reaped by a later pass once the directory shrinks; the entries are one
-/// scratch directory per process and root, so nothing accumulates while we wait.
-///
-/// It does not run on a thread of its own on purpose: a detached thread that
-/// outlives a test process aborted the storm suite on macOS (SIGBUS, train 132)
-/// because it was still inside the sweep while the process tore its globals
-/// down.
-fn sweep_legacy_transient_search_cache_dirs(home: &Path) {
-    let root = std::env::temp_dir();
-    if root == home {
-        return;
-    }
-    let summary = sweep_transient_search_cache_dirs_with_limits(
-        &root,
-        TRANSIENT_SEARCH_CACHE_MIN_AGE,
-        TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
-        TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
-    );
-    if summary.scanned > 0 || summary.removed > 0 {
-        crate::slog_info!(
-            "legacy transient search cache sweep root={} scanned={} examined={} removed={} bytes={} budget_exhausted={}",
-            root.display(),
-            summary.scanned,
-            summary.examined,
-            summary.removed,
-            summary.bytes,
-            summary.budget_exhausted
-        );
-    }
-}
-
-fn sweep_transient_search_cache_dirs_with_limits(
-    root: &Path,
-    min_age: Duration,
-    wall_clock_budget: Duration,
-    entry_limit: usize,
-) -> TransientSearchCacheSweepSummary {
-    let deadline = Instant::now() + wall_clock_budget;
-    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(root) {
-        Ok(boundary) => boundary,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return TransientSearchCacheSweepSummary::default();
-        }
-        Err(error) => {
-            crate::slog_warn!(
-                "cannot establish filesystem boundary for transient search cache sweep {}: {}",
-                root.display(),
-                error
-            );
-            return TransientSearchCacheSweepSummary {
-                skipped_unreadable: 1,
-                ..TransientSearchCacheSweepSummary::default()
-            };
-        }
-    };
-    // Read entries under an explicit bound. The directory may be shared with
-    // the rest of the machine, and a full listing of a fat one costs minutes on
-    // the worker that calls this; the reap limit further down cannot help,
-    // because it only bounds what we act on after the listing is complete.
-    let mut examined = 0usize;
-    let mut scan_truncated = false;
-    let mut entries = match fs::read_dir(root) {
-        Ok(iterator) => {
-            let mut collected = Vec::new();
-            for entry in iterator {
-                if examined >= TRANSIENT_SEARCH_CACHE_SCAN_LIMIT || Instant::now() >= deadline {
-                    scan_truncated = true;
-                    break;
-                }
-                examined += 1;
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if file_type.is_dir() && parse_transient_search_cache_name(&name).is_some() {
-                    collected.push((name, entry.path()));
-                }
-            }
-            collected
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            crate::slog_warn!(
-                "cannot read transient search cache sweep directory {}: {}",
-                root.display(),
-                error
-            );
-            return TransientSearchCacheSweepSummary {
-                examined,
-                skipped_unreadable: 1,
-                ..TransientSearchCacheSweepSummary::default()
-            };
-        }
-    };
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let cursor_store =
-        TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let last_name = cursor_store
-        .lock()
-        .ok()
-        .and_then(|cursors| cursors.get(root).cloned());
-    if let Some(start) = last_name
-        .as_deref()
-        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
-    {
-        entries.rotate_left(start);
-    }
-
-    let now = SystemTime::now();
-    let mut summary = TransientSearchCacheSweepSummary {
-        examined,
-        budget_exhausted: scan_truncated,
-        ..TransientSearchCacheSweepSummary::default()
-    };
-    let mut cursor_name = last_name;
-    for (processed, (name, path)) in entries.into_iter().enumerate() {
-        if processed >= entry_limit || Instant::now() >= deadline {
-            summary.budget_exhausted = true;
-            break;
-        }
-        summary.scanned += 1;
-        cursor_name = Some(name.clone());
-        if !boundary.should_descend(&path).unwrap_or(false) {
-            summary.skipped_unreadable += 1;
-            continue;
-        }
-        let modified = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
-            Ok(modified) => modified,
-            Err(_) => {
-                summary.skipped_unreadable += 1;
-                continue;
-            }
-        };
-        if now.duration_since(modified).unwrap_or(Duration::ZERO) <= min_age {
-            summary.skipped_fresh += 1;
-            continue;
-        }
-        let bytes = match transient_search_cache_dir_bytes(&path, &boundary, deadline) {
-            TransientSearchCacheWalk::Complete(bytes) => bytes,
-            TransientSearchCacheWalk::BudgetExceeded => {
-                summary.budget_exhausted = true;
-                break;
-            }
-            TransientSearchCacheWalk::Failed => {
-                summary.skipped_unreadable += 1;
-                continue;
-            }
-        };
-        let Some(parsed) = parse_transient_search_cache_name(&name) else {
-            summary.skipped_unreadable += 1;
-            continue;
-        };
-        match fs::remove_dir_all(&path) {
-            Ok(()) => {
-                summary.removed += 1;
-                summary.bytes = summary.bytes.saturating_add(bytes);
-                crate::slog_info!(
-                    "transient search cache sweep reaped dir={} key={} pid={} bytes={}",
-                    path.display(),
-                    parsed.key,
-                    parsed.pid,
-                    bytes
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.exists() => {
-                summary.removed += 1;
-                summary.bytes = summary.bytes.saturating_add(bytes);
-                crate::slog_info!(
-                    "transient search cache sweep reaped dir={} key={} pid={} bytes={}",
-                    path.display(),
-                    parsed.key,
-                    parsed.pid,
-                    bytes
-                );
-            }
-            Err(_) => summary.skipped_unreadable += 1,
-        }
-    }
-
-    if let Ok(mut cursors) = cursor_store.lock() {
-        if summary.budget_exhausted {
-            if let Some(cursor_name) = cursor_name {
-                cursors.insert(root.to_path_buf(), cursor_name);
-            }
-        } else {
-            cursors.remove(root);
-        }
-    }
-    if summary.removed > 0 {}
-    summary
-}
-
-fn parse_transient_search_cache_name(name: &str) -> Option<TransientSearchCacheName> {
-    let mut parts = name.strip_prefix(TRANSIENT_SEARCH_CACHE_PREFIX)?.split('.');
-    let key = parts.next()?;
-    if !artifact_key_looks_valid(key) {
-        return None;
-    }
-    let pid = parts.next()?.parse::<u32>().ok().filter(|pid| *pid != 0)?;
-    match (parts.next(), parts.next()) {
-        (None, None) => {}
-        (Some(nanos), None) if nanos.parse::<u128>().is_ok() => {}
-        _ => return None,
-    }
-    Some(TransientSearchCacheName {
-        key: key.to_owned(),
-        pid,
-    })
-}
-
-fn transient_search_cache_dir_bytes(
-    directory: &Path,
-    boundary: &crate::walk_boundary::DeviceBoundary,
-    deadline: Instant,
-) -> TransientSearchCacheWalk {
-    if Instant::now() >= deadline {
-        return TransientSearchCacheWalk::BudgetExceeded;
-    }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return TransientSearchCacheWalk::Failed,
-    };
-    let mut bytes = 0u64;
-    for entry in entries {
-        if Instant::now() >= deadline {
-            return TransientSearchCacheWalk::BudgetExceeded;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return TransientSearchCacheWalk::Failed,
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => return TransientSearchCacheWalk::Failed,
-        };
-        let path = entry.path();
-        if file_type.is_file() {
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => return TransientSearchCacheWalk::Failed,
-            };
-            bytes = bytes.saturating_add(metadata.len());
-        } else if file_type.is_dir() {
-            if !boundary.should_descend(&path).unwrap_or(false) {
-                return TransientSearchCacheWalk::Failed;
-            }
-            match transient_search_cache_dir_bytes(&path, boundary, deadline) {
-                TransientSearchCacheWalk::Complete(nested) => {
-                    bytes = bytes.saturating_add(nested);
-                }
-                other => return other,
-            }
-        } else {
-            return TransientSearchCacheWalk::Failed;
-        }
-    }
-    TransientSearchCacheWalk::Complete(bytes)
 }
 
 fn read_file_trigram_count_extension(
@@ -6426,67 +5955,13 @@ fn project_walk_admits_entry(
     !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
 }
 
-/// What `project_walk_lists` found: the files the walk lists, and the places
-/// it could not look.
-#[derive(Debug, Default)]
-pub(crate) struct ProjectWalkListing {
-    pub listed: BTreeSet<PathBuf>,
-    /// Paths the walk could not read (a directory it could not list, an
-    /// ignore file it could not read), with the error. Whether a file at or
-    /// under one of them is listed is unknown, not "no".
-    pub gaps: Vec<(PathBuf, String)>,
-}
-
 /// `project_walk_lists` answers per file with the project walk's own rules,
 /// so it must agree with `walk_project_files` on every file of a tree.
 #[cfg(test)]
-mod project_walk_lists_tests {
-    use super::*;
-
-    fn every_file(dir: &Path, files: &mut BTreeSet<PathBuf>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let kind = entry.file_type().unwrap();
-            if kind.is_dir() {
-                if entry.file_name() != ".git" {
-                    every_file(&entry.path(), files);
-                }
-            } else if kind.is_file() {
-                files.insert(entry.path());
-            }
-        }
-    }
-}
+mod project_walk_lists_tests {}
 
 #[cfg(all(test, unix))]
-mod membership_admission_tests {
-    use super::*;
-    use crate::project_content::{is_excluded_with_file_type, legacy_walker_excludes};
-
-    fn inventory(root: &Path, legacy: bool) -> (Vec<PathBuf>, usize) {
-        let mut paths = Vec::new();
-        let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
-            let builder = project_walk_builder_with_admission(
-                root,
-                if legacy {
-                    legacy_walker_excludes
-                } else {
-                    is_excluded_with_file_type
-                },
-            );
-            for entry in builder.build() {
-                paths.push(entry.unwrap().into_path());
-            }
-        });
-        paths.sort();
-        let stats = counts
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .map(|(_, count)| count)
-            .sum();
-        (paths, stats)
-    }
-}
+mod membership_admission_tests {}
 
 fn walk_project_files_from_inner_matching<F>(
     filter_root: &Path,
@@ -9935,19 +9410,6 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// One record of `git diff --name-status -z` output, borrowing its raw bytes.
-struct GitNameStatusRecord<'a> {
-    /// Status letters, such as `M`, `A`, `D` or `R100` for a rename.
-    status: &'a [u8],
-    /// One path, or the old path then the new path for a rename or copy.
-    paths: Vec<&'a [u8]>,
-}
-
-#[cfg(not(unix))]
-fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
-    std::str::from_utf8(bytes).ok().map(PathBuf::from)
-}
-
 pub(crate) fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
     #[cfg(test)]
     LINE_STARTS_BUILDS.with(|count| count.set(count.get() + 1));
@@ -10107,11 +9569,6 @@ pub(crate) fn helper_state_scope() -> HelperStateScope {
 #[cfg(test)]
 pub(crate) fn audit_cancel_elapsed(started: Instant) -> Duration {
     AUDIT_CANCEL_ELAPSED.with(|slot| slot.get().unwrap_or_else(|| started.elapsed()))
-}
-
-#[cfg(test)]
-pub(crate) fn audit_set_io_probe(probe: Option<Box<dyn FnMut()>>) {
-    AUDIT_IO_PROBE.with(|slot| *slot.borrow_mut() = probe);
 }
 
 #[cfg(test)]
@@ -11791,44 +11248,6 @@ mod tests {
         ));
     }
 
-    fn transient_search_cache_test_dir(root: &Path, name: &str, contents: &[u8]) -> PathBuf {
-        let path = root.join(name);
-        fs::create_dir_all(&path).expect("create transient cache fixture");
-        fs::write(path.join("cache.bin"), contents).expect("write transient cache fixture");
-        path
-    }
-
-    fn age_transient_search_cache_test_dir(path: &Path) {
-        let old = SystemTime::now()
-            .checked_sub(TRANSIENT_SEARCH_CACHE_MIN_AGE + Duration::from_secs(1))
-            .expect("construct aged transient cache time");
-        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old))
-            .expect("age transient cache fixture");
-    }
-
-    #[test]
-    fn transient_search_cache_name_parses_stable_and_legacy_layouts() {
-        let key = "0123456789abcdef";
-        let stable = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42");
-        let legacy = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42.123456789");
-        assert_eq!(
-            parse_transient_search_cache_name(&stable)
-                .expect("stable transient cache name")
-                .pid,
-            42
-        );
-        assert_eq!(
-            parse_transient_search_cache_name(&legacy)
-                .expect("legacy transient cache name")
-                .key,
-            key
-        );
-        assert!(parse_transient_search_cache_name(&format!(
-            "{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42.not-a-nanosecond"
-        ))
-        .is_none());
-    }
-
     #[test]
     fn transient_builds_reuse_one_cache_dir_and_truncate_previous_contents() {
         let project = tempfile::tempdir().expect("project tempdir");
@@ -11883,109 +11302,6 @@ mod tests {
         remove_matching();
     }
 
-    #[test]
-    fn transient_search_cache_sweep_reaps_aged_legacy_dir_and_counts_bytes() {
-        let root = tempfile::tempdir().expect("temporary sweep root");
-        let legacy = transient_search_cache_test_dir(
-            root.path(),
-            "aft-search-cache.1111111111111111.4242.123456789",
-            b"legacy cache bytes",
-        );
-        age_transient_search_cache_test_dir(&legacy);
-
-        let summary = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            Duration::from_secs(1),
-            10,
-        );
-
-        assert!(
-            !legacy.exists(),
-            "an aged legacy transient cache must be reaped"
-        );
-        assert_eq!(summary.removed, 1);
-        assert_eq!(summary.bytes, b"legacy cache bytes".len() as u64);
-    }
-
-    #[test]
-    fn transient_search_cache_sweep_age_guard_spares_fresh_dir_until_aged() {
-        let root = tempfile::tempdir().expect("temporary sweep root");
-        let fresh = transient_search_cache_test_dir(
-            root.path(),
-            "aft-search-cache.2222222222222222.4242",
-            b"fresh cache bytes",
-        );
-
-        let fresh_summary = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            Duration::from_secs(1),
-            10,
-        );
-        assert!(fresh.exists(), "the age guard must protect a fresh cache");
-        assert_eq!(fresh_summary.skipped_fresh, 1);
-
-        age_transient_search_cache_test_dir(&fresh);
-        let aged_summary = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            Duration::from_secs(1),
-            10,
-        );
-        assert!(
-            !fresh.exists(),
-            "aging the same directory must make the age guard reap it"
-        );
-        assert_eq!(aged_summary.removed, 1);
-    }
-
-    #[test]
-    fn transient_search_cache_sweep_resumes_after_entry_budget() {
-        let root = tempfile::tempdir().expect("temporary sweep root");
-        let first = transient_search_cache_test_dir(
-            root.path(),
-            "aft-search-cache.3333333333333333.4242",
-            b"first cache bytes",
-        );
-        let second = transient_search_cache_test_dir(
-            root.path(),
-            "aft-search-cache.4444444444444444.4242",
-            b"second cache bytes",
-        );
-        age_transient_search_cache_test_dir(&first);
-        age_transient_search_cache_test_dir(&second);
-
-        let first_pass = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            Duration::from_secs(1),
-            1,
-        );
-        assert!(
-            first_pass.budget_exhausted,
-            "the one-entry cap must stop the pass"
-        );
-        assert_eq!(first_pass.removed, 1);
-        assert_eq!(
-            [first.exists(), second.exists()]
-                .into_iter()
-                .filter(|exists| *exists)
-                .count(),
-            1,
-            "the entry budget must leave one aged directory for a later pass"
-        );
-
-        let second_pass = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            Duration::from_secs(1),
-            10,
-        );
-        assert_eq!(second_pass.removed, 1);
-        assert!(!first.exists() && !second.exists());
-    }
-
     /// Our scratch must not sit loose in the shared temporary directory, whose
     /// listing is the fleet's, not ours.
     #[test]
@@ -11999,41 +11315,6 @@ mod tests {
             Some(TRANSIENT_SEARCH_CACHE_DIR_NAME)
         );
         assert_eq!(parent.parent(), Some(std::env::temp_dir().as_path()));
-    }
-
-    /// The sweep reads a directory it does not own the size of. A listing must
-    /// cost the caller a bounded number of entries whatever is in there: the
-    /// unbounded version pinned six executor workers for minutes on a $TMPDIR
-    /// holding 290,697 entries and starved route binds (2026-09-19).
-    #[test]
-    fn sweep_stops_reading_a_fat_directory_at_the_scan_limit() {
-        let root = tempfile::tempdir().expect("temporary sweep root");
-        let litter = TRANSIENT_SEARCH_CACHE_SCAN_LIMIT + 256;
-        for index in 0..litter {
-            fs::write(root.path().join(format!("foreign-{index}")), b"x")
-                .expect("write foreign temp entry");
-        }
-
-        let summary = sweep_transient_search_cache_dirs_with_limits(
-            root.path(),
-            TRANSIENT_SEARCH_CACHE_MIN_AGE,
-            TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
-            TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
-        );
-
-        assert!(
-            summary.examined <= TRANSIENT_SEARCH_CACHE_SCAN_LIMIT,
-            "read {} of {litter} entries; the scan limit is {TRANSIENT_SEARCH_CACHE_SCAN_LIMIT}",
-            summary.examined
-        );
-        assert!(
-            summary.budget_exhausted,
-            "a truncated listing must say so rather than read as a complete pass"
-        );
-        // Nothing of ours was in there, so a bounded read is not a licence to
-        // report work it did not do.
-        assert_eq!(summary.scanned, 0);
-        assert_eq!(summary.removed, 0);
     }
 
     /// The cache writer stores paths relative to the root and refuses the
@@ -12178,19 +11459,6 @@ mod tests {
             .expect("missing child should fall back to lexical validation");
 
         assert_eq!(path, root.join("future/file.rs"));
-    }
-
-    fn count_cached_path_canonicalizations<T>(
-        reload: impl FnOnce() -> T,
-    ) -> (T, CachedPathCanonicalizationWork) {
-        CACHED_PATH_CANONICALIZATION_WORK.with(|slot| {
-            assert!(slot.borrow().is_none());
-            *slot.borrow_mut() = Some(CachedPathCanonicalizationWork::default());
-        });
-        let result = reload();
-        let work = CACHED_PATH_CANONICALIZATION_WORK
-            .with(|slot| slot.borrow_mut().take().expect("reload counters"));
-        (result, work)
     }
 
     #[cfg(unix)]
@@ -12971,86 +12239,6 @@ mod tests {
         let mut command = Command::new("git");
         crate::test_env::apply_hermetic_git_env(command.arg("-C").arg(root));
         command
-    }
-
-    /// File names that `git diff` quotes unless it is run with `-z`: non-ASCII
-    /// bytes everywhere, plus a tab, double quotes and a backslash where the
-    /// platform allows them in a file name. The space is never quoted and
-    /// serves as a control.
-    fn names_git_quotes() -> Vec<&'static str> {
-        let mut names = vec!["café.rs", "with space.rs"];
-        if cfg!(unix) {
-            names.extend(["tab\tname.rs", "say \"hi\".rs", "back\\slash.rs"]);
-        }
-        names
-    }
-
-    /// Commit everything in the working tree, rehashing every file.
-    ///
-    /// `git add` normally skips a file whose size and mtime match what the
-    /// index recorded, unless the file was written so close to the index that
-    /// the mtime cannot be trusted. On Linux and macOS git also compares the
-    /// change time, which every write updates; git for Windows has no such
-    /// time to compare. So on Windows an edit that keeps the size and restores
-    /// the old mtime is not staged, and the commit fails with nothing to
-    /// commit, unless the index is emptied first so every file is hashed
-    /// again.
-    fn git_commit_all_for_test(project: &Path, message: &str) {
-        assert!(git_command_for_test(project)
-            .args(["read-tree", "--empty"])
-            .status()
-            .expect("git read-tree")
-            .success());
-        assert!(git_command_for_test(project)
-            .args(["add", "-A"])
-            .status()
-            .expect("git add")
-            .success());
-        assert!(git_command_for_test(project)
-            .args(["commit", "--quiet", "-m", message])
-            .status()
-            .expect("git commit")
-            .success());
-    }
-
-    /// Move a file's mtime an hour into the past, so git trusts its recorded
-    /// size and mtime for the file instead of hashing it again. A same-size
-    /// edit that restores this mtime is then invisible to a plain `git add`
-    /// on Windows every time, not only when the index happens to be written
-    /// in a later clock tick than the file.
-    fn backdate_for_test(path: &Path) {
-        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-        File::options()
-            .write(true)
-            .open(path)
-            .and_then(|file| file.set_modified(an_hour_ago))
-            .expect("backdate mtime");
-    }
-
-    /// A repository whose first commit holds every file already in `project`.
-    /// `core.quotePath` is set explicitly so git quotes non-ASCII names no
-    /// matter what the surrounding configuration says.
-    fn init_quoting_git_repo(project: &Path) -> String {
-        let mut init = Command::new("git");
-        assert!(crate::test_env::apply_hermetic_git_env(
-            init.arg("init").arg("--quiet").arg(project)
-        )
-        .status()
-        .expect("git init")
-        .success());
-        for args in [
-            ["config", "user.email", "aft@example.invalid"],
-            ["config", "user.name", "AFT Test"],
-            ["config", "core.quotePath", "true"],
-        ] {
-            assert!(git_command_for_test(project)
-                .args(args)
-                .status()
-                .expect("git config")
-                .success());
-        }
-        git_commit_all_for_test(project, "initial");
-        run_git(project, &["rev-parse", "HEAD"]).expect("initial head")
     }
 
     #[test]
@@ -15939,24 +15127,6 @@ mod warm_reload_verification_tests {
         assert!(index.delta.superseded.contains(&cached_id));
     }
 
-    fn restart_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(project.path()).unwrap();
-        for n in 0..4 {
-            let path = root.join(format!("file-{n}.rs"));
-            fs::write(&path, "fn before_marker() {}\n").unwrap();
-            filetime::set_file_mtime(
-                &path,
-                filetime::FileTime::from_unix_time(1_700_000_000, 123),
-            )
-            .unwrap();
-        }
-        let mut index = SearchIndex::build(&root);
-        assert!(index.write_to_disk(storage.path(), None));
-        (project, storage, root)
-    }
-
     #[test]
     fn warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -16116,73 +15286,4 @@ mod interactive_artifact_read_budget_tests {
 /// semantic collector and views membership apply `.gitignore` files the same
 /// way in a plain folder as in a git repository.
 #[cfg(test)]
-mod project_ignore_rule_tests {
-    use super::*;
-    use crate::context::ignore_rules_fixture as fixture;
-    use std::collections::BTreeSet;
-
-    fn fixture_root(git: bool) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        fixture::write(&root, git);
-        (dir, root)
-    }
-
-    fn indexed_needle_files(root: &Path) -> BTreeSet<String> {
-        let index = SearchIndex::build(root);
-        let result = index
-            .grep(fixture::NEEDLE, true, &[], &[], root, 1000)
-            .unwrap();
-        let files = result
-            .matches
-            .iter()
-            .map(|found| found.file.clone())
-            .collect::<Vec<_>>();
-        fixture::relative_set(root, &files)
-    }
-
-    fn indexed_glob_files(root: &Path) -> BTreeSet<String> {
-        let index = SearchIndex::build(root);
-        fixture::relative_set(root, &index.glob("**/*", root))
-    }
-
-    /// The project walker as it was built before every walker shared
-    /// `apply_project_ignore_rules`, reproduced independently with the
-    /// crate's default `require_git`, so the comparison below is not two
-    /// calls through the same implementation.
-    fn pre_change_project_walk(root: &Path) -> BTreeSet<String> {
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .same_file_system(true)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .add_custom_ignore_filename(".aftignore")
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                    return !matches!(
-                        name.as_ref(),
-                        "node_modules"
-                            | "target"
-                            | "venv"
-                            | ".venv"
-                            | ".git"
-                            | "__pycache__"
-                            | ".tox"
-                            | "dist"
-                            | "build"
-                    );
-                }
-                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-            });
-        let files = builder
-            .build()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .map(|entry| entry.into_path())
-            .collect::<Vec<_>>();
-        fixture::relative_set(root, &files)
-    }
-}
+mod project_ignore_rule_tests {}

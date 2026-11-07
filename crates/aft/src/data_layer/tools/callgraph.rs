@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, EitherGraph};
+use crate::callgraph_store::CallGraphStoreError;
 use crate::context::AppContext;
 use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::query::{SliceReader, SliceSource};
@@ -25,7 +25,7 @@ pub(crate) const READ_WAIT: Duration = Duration::from_secs(30);
 pub(crate) type DataGraph = SliceReader<Arc<dyn SliceSource + Send + Sync>>;
 
 /// The reader a call-graph command answers from.
-pub(crate) type OpsGraph = EitherGraph<CallGraphStore, DataGraph>;
+pub(crate) type OpsGraph = DataGraph;
 
 /// What the data layer offers a call-graph command.
 pub(crate) enum Access {
@@ -136,7 +136,7 @@ pub(crate) fn ops_graph(
                     return Err(not_indexed_response(req_id, operation, ctx, &path));
                 }
             }
-            Ok((EitherGraph::Data(reader), Some(view)))
+            Ok((reader, Some(view)))
         }
         // No checkout answers: the call graph is switched off, or the root
         // has no checkout of its own (it could not be bound, or is a parent

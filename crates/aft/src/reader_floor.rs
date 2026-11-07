@@ -283,11 +283,6 @@ fn durable_floors() -> &'static Mutex<HashMap<PathBuf, DurableFloor>> {
     FLOORS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn forget_durable_for_test(storage_root: &Path) {
-    durable_floors().lock().unwrap().remove(storage_root);
-}
-
 fn durable_snapshot(storage_root: &Path) -> Option<DurableFloor> {
     use crate::file_identity::FileIdentity;
     let (_, root @ FileIdentity::Known { .. }) =

@@ -15,7 +15,6 @@ use serde_json::Value;
 
 #[derive(Deserialize)]
 struct CounterCases {
-    zero_embedding_queries: Vec<String>,
     semantic_controls: Vec<String>,
 }
 

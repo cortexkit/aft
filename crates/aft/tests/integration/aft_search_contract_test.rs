@@ -334,76 +334,6 @@ fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     (base_url, handle)
 }
 
-/// How long the recovering server holds its first response. It is far past
-/// every bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
-/// asserts, so a search that waits for this response instead of honouring
-/// its 500ms query budget fails those bounds instead of slipping under them,
-/// while a loaded runner that is merely slow at the lexical fallback after
-/// the budget fires still passes.
-const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(10_000);
-
-/// Holds a request's connection open without answering until `hold` has
-/// passed or the client closes the connection, whichever comes first. A
-/// client that gave up after its timeout no longer needs a reply, so ending
-/// the hold there keeps the test from idling out the full hold at teardown.
-fn hold_unless_client_disconnects(stream: &mut std::net::TcpStream, hold: Duration) {
-    let deadline = Instant::now() + hold;
-    let mut scratch = [0u8; 4096];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
-            return;
-        }
-        match stream.read(&mut scratch) {
-            // The client closed its side: nobody is waiting for the reply.
-            Ok(0) => return,
-            // Late request bytes (for example a body sent after the headers).
-            Ok(_) => {}
-            // The read timed out; the loop re-checks the deadline.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            // Reset or aborted connection: the client is gone.
-            Err(_) => return,
-        }
-    }
-}
-
-fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
-    let addr = listener.local_addr().expect("slow embedding server addr");
-    let requests = Arc::new(AtomicUsize::new(0));
-    let requests_for_thread = Arc::clone(&requests);
-    let handle = thread::spawn(move || {
-        let mut handlers = Vec::new();
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept embedding request");
-            let ordinal = requests_for_thread.fetch_add(1, Ordering::SeqCst);
-            handlers.push(thread::spawn(move || {
-                let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request);
-                if ordinal == 0 {
-                    hold_unless_client_disconnects(&mut stream, SLOW_FIRST_EMBEDDING_RESPONSE);
-                }
-                let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }));
-        }
-        for handler in handlers {
-            handler.join().expect("embedding response handler");
-        }
-    });
-
-    (format!("http://{addr}"), requests, handle)
-}
-
 fn start_mock_embedding_server_with_response(
     status: &str,
     body: &str,
@@ -466,39 +396,6 @@ fn start_mock_embedding_server_with_response(
 
 fn path_ends_with(file: &str, suffix: &str) -> bool {
     file.replace('\\', "/").ends_with(suffix)
-}
-
-fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
-    assert_eq!(
-        response["success"], true,
-        "response should succeed: {response:?}"
-    );
-    assert_eq!(response["complete"], false);
-    assert_eq!(response["semantic_unavailable"], true);
-    assert_eq!(response["lexical_only_fallback"], true);
-    assert_eq!(response["semantic_status"], semantic_status);
-    // The fallback is index-backed and does not call semantic embeddings.
-    // Exact evidence may promote lexical candidates, but interpreted_as remains
-    // "lexical" to describe the resource that actually executed.
-    assert_eq!(response["interpreted_as"], "lexical");
-    assert_eq!(response["status"], "ready");
-    let results = response["results"].as_array().expect("results array");
-    assert!(
-        results.iter().any(
-            |result| matches!(result["source"].as_str(), Some("exact" | "lexical"))
-                && result["file"]
-                    .as_str()
-                    .is_some_and(|file| path_ends_with(file, "src/lib.rs"))
-        ),
-        "expected index-backed fallback result, got {results:?}"
-    );
-    let warnings = response["warnings"].as_array().expect("warnings array");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("lexical-only fallback"))),
-        "expected lexical fallback warning, got {warnings:?}"
-    );
 }
 
 fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
@@ -978,27 +875,6 @@ fn external_path_obeys_force_restrict_guard() {
     );
 }
 
-/// A census-style JSON document that quotes a phrase twice, next to the one
-/// source file that emits it.
-fn project_with_phrase_in_source_and_data() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>)
-{
-    let project = tempfile::tempdir().expect("create project dir");
-    let source = project.path().join("src/configure.rs");
-    let data = project.path().join("benchmarks/census_episodes.json");
-    std::fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
-    std::fs::create_dir_all(data.parent().expect("data parent")).expect("create data dir");
-    let source_text =
-        "pub fn verify_tool(tool: &str) {\n    warn!(\"configured tool {} was not found on PATH\", tool);\n}\n"
-            .to_string();
-    let body = "x".repeat(300);
-    let data_text = format!(
-        "{{\n  \"query\": \"was not found on PATH\",\n  \"file_content\": \"{body} was not found on PATH\"\n}}\n"
-    );
-    std::fs::write(&source, &source_text).expect("write source");
-    std::fs::write(&data, &data_text).expect("write data");
-    (project, vec![(data, data_text), (source, source_text)])
-}
-
 fn ranked_files(response: &Value) -> Vec<String> {
     response["results"]
         .as_array()
@@ -1107,25 +983,6 @@ fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_ex
     assert_exact_only_on_files_containing(&response, "residue-source-hash");
 }
 
-/// Write `files` (project-relative path, text) under a fresh project and
-/// return it with the entries for `install_lexical_index_entries`.
-fn project_with_files(
-    files: &[(&str, &str)],
-) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
-    let project = tempfile::tempdir().expect("create project dir");
-    // The canonical root (macOS temp dirs sit behind a /var symlink) so the
-    // indexed paths match the root the reply strips from displayed paths.
-    let root = std::fs::canonicalize(project.path()).expect("canonical project dir");
-    let mut entries = Vec::new();
-    for (relative, text) in files {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-        std::fs::write(&path, text).expect("write file");
-        entries.push((path, text.to_string()));
-    }
-    (project, entries)
-}
-
 #[test]
 fn auto_mode_refuses_when_trigram_unavailable_and_semantic_disabled() {
     // With no ready index lane aft_search refuses with each lane's status;
@@ -1155,25 +1012,6 @@ fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
 
     assert_degraded_grep_fallback(&response, "unavailable");
     handle.join().expect("embedding server thread");
-}
-
-fn capture_query_embedding_phases<T>(
-    started: Instant,
-    action: impl FnOnce() -> T,
-) -> (T, Vec<(&'static str, Instant)>) {
-    let phases = std::rc::Rc::new(std::cell::RefCell::new(vec![("search_start", started)]));
-    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
-    let value = {
-        let observed = std::rc::Rc::clone(&phases);
-        aft::semantic_index::with_query_embedding_phase_observer_for_test(
-            move |phase| observed.borrow_mut().push((phase, Instant::now())),
-            action,
-        )
-    };
-    #[cfg(not(any(debug_assertions, feature = "test-timing-hooks")))]
-    let value = action();
-    phases.borrow_mut().push(("reply", Instant::now()));
-    (value, std::rc::Rc::try_unwrap(phases).unwrap().into_inner())
 }
 
 fn format_query_embedding_phases(phases: &[(&str, Instant)], started: Instant) -> String {
@@ -1725,30 +1563,6 @@ fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
         response.get("results_list_envelope").is_none(),
         "a complete, uncut list carries no trailer: {response:#?}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Issue #826: aft_search replies an agent misread. Each test below states the
-// honest reply that replaced a misleading one.
-// ---------------------------------------------------------------------------
-
-/// Files that talk about `bash_watch`, waiting and detaching, but never
-/// contain the literal `bash_wait_detach(`.
-fn issue_826_bash_files() -> [(&'static str, &'static str); 3] {
-    [
-        (
-            "src/bash_watch.rs",
-            "/// bash_watch waits for a background bash task.\npub fn bash_watch(task_id: &str) -> bool {\n    wait_for(task_id)\n}\n\nfn wait_for(task_id: &str) -> bool {\n    !task_id.is_empty()\n}\n",
-        ),
-        (
-            "src/detach.rs",
-            "/// Detach a running bash command into the background.\npub fn detach_running(command: &str) {\n    drop(command);\n}\n",
-        ),
-        (
-            "docs/tools.md",
-            "# Tools\n\nUse bash_watch to wait for a background task.\nbash_watch(taskId) returns when the task exits.\n",
-        ),
-    ]
 }
 
 fn render_search(response: Response) -> (String, Value) {

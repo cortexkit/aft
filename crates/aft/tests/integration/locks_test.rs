@@ -140,10 +140,6 @@ fn search_cache_dir(root: &Path) -> PathBuf {
     root.join("index").join("project")
 }
 
-fn symbol_lock_path(root: &Path, project_key: &str) -> PathBuf {
-    root.join("symbols").join(project_key).join("symbols.lock")
-}
-
 fn semantic_lock_path(root: &Path, project_key: &str) -> PathBuf {
     root.join("semantic").join(project_key).join("cache.lock")
 }

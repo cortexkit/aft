@@ -589,29 +589,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn still_alive(connection: &crate::db::file_identity::IdentityConnection) {
-        assert_eq!(
-            connection
-                .query_row("SELECT value FROM probe", [], |row| row.get::<_, String>(0))
-                .unwrap(),
-            "alive"
-        );
-    }
-
-    /// Whether descriptor `fd` is still open on the file at `path`. A closed
-    /// descriptor fails fstat, and a number reused for another file has a
-    /// different device or inode.
-    #[cfg(unix)]
-    fn fd_open_on(fd: std::os::fd::RawFd, path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let expected = std::fs::metadata(path).unwrap();
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: fstat only writes into `stat`; an invalid descriptor fails.
-        let status = unsafe { libc::fstat(fd, &mut stat) };
-        status == 0 && stat.st_dev as u64 == expected.dev() && stat.st_ino as u64 == expected.ino()
-    }
-
     #[test]
     fn file_read_exact_parent_escape_never_opened() {
         let (dir, mut policy) = fixture();

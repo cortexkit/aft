@@ -1336,12 +1336,6 @@ pub struct SymbolCache {
 
 pub type SharedSymbolCache = Arc<RwLock<SymbolCache>>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SymbolCacheLoadOutcome {
-    pub(crate) loaded: usize,
-    pub(crate) needs_persistence: bool,
-}
-
 fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
     symbols.iter().fold(0u64, |bytes, symbol| {
         let scope_bytes = symbol.scope_chain.iter().fold(0u64, |scope_bytes, scope| {

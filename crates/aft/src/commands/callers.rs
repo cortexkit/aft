@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::{
     callers_result, note_callgraph_served, store_error_response,
@@ -12,15 +11,7 @@ use crate::{slog_info, slog_warn};
 
 /// Handle a `callers` request.
 pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_callers(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::Callers,
-    );
-    response
+    answer_callers(req, ctx)
 }
 
 fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {

@@ -108,7 +108,6 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::commands::callgraph_store_adapter::callers_result;
 use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, render_symbol_within_budget,
     BudgetedSymbolRenderStatus,
@@ -144,10 +143,6 @@ pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
-/// Fresh borrowed trigram bases were measured ready 1.1–2.5 seconds after root
-/// bind. Waiting through that observed window prevents a healthy first search
-/// from returning an empty loading response while keeping a stuck load bounded.
-const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
     "trigram index building; results from a bounded walk";
@@ -158,32 +153,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn first_search_index_load_wait_budget() -> Duration {
-    #[cfg(test)]
-    if let Some(budget) = FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
-        return budget;
-    }
-    FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET
-}
-
-#[cfg(test)]
-fn with_first_search_index_load_wait_budget_for_test<T>(
-    budget: Duration,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset(Option<Duration>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.set(self.0));
-        }
-    }
-
-    let previous =
-        FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.replace(Some(budget)));
-    let _reset = Reset(previous);
-    action()
-}
-
 #[cfg(test)]
 thread_local! {
     /// Called on the searching thread each time the trigram wait sees a load
@@ -192,27 +161,6 @@ thread_local! {
     /// sleeping publisher thread against the wait budget.
     static SEARCH_INDEX_LOAD_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Runs `action` with `hook` installed as the trigram-load wait hook on this
-/// thread, and removes it (dropping anything it captured) when `action` ends.
-#[cfg(test)]
-fn with_search_index_load_wait_hook_for_test<T>(
-    hook: impl FnMut() + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            // Assign rather than `Option::take`: the list-envelope scanner treats
-            // `.take(` as a list-cutting site, and this only clears a test hook.
-            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
 }
 
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
@@ -291,12 +239,6 @@ enum SearchMode {
     Literal,
     Semantic,
     Hybrid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchIndexWaitError {
-    Cancelled,
-    Contended,
 }
 
 struct RuntimeReadinessSource<'a> {
@@ -442,10 +384,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         {
             return extensions::ReadinessWait::Completed;
         }
-        match search_index_ready_with_budget(self.ctx, first_search_index_load_wait_budget()) {
-            Err(SearchIndexWaitError::Cancelled) => extensions::ReadinessWait::Cancelled,
-            Ok(_) | Err(SearchIndexWaitError::Contended) => extensions::ReadinessWait::Completed,
-        }
+        extensions::ReadinessWait::Completed
     }
 }
 
@@ -1434,11 +1373,7 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET) {
-            Ok(ready) => ready,
-            Err(SearchIndexWaitError::Cancelled) => return (plan, cancelled_search_response(req)),
-            Err(SearchIndexWaitError::Contended) => false,
-        }
+        search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
     };
     let patterns = match external {
         Some(corpus) => match corpus.collect(compiled, include_tests) {
@@ -2082,13 +2017,6 @@ fn disclose_skipped_chunks(
 /// callgraph cannot serve it, the enrichment is explicitly omitted with the
 /// callgraph index status and the analysis code, never silently absent.
 fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
-    if warm_callgraph_store(ctx).is_some() {
-        return serde_json::json!({
-            "status": "applied",
-            "code": serde_json::Value::Null,
-            "index": IndexObservation::ready().consumer_json(),
-        });
-    }
     let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
         // Resident but mid-refresh: enrichment waits for the refresh.
         observation if observation.is_ready() => IndexObservation::building(),
@@ -2273,22 +2201,7 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
-    {
-        Ok(ready) => ready,
-        Err(SearchIndexWaitError::Cancelled) => return cancelled_search_response(req),
-        Err(SearchIndexWaitError::Contended) => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                &project_root,
-                top_k,
-                "search index remained busy",
-            );
-        }
-    };
+    let lexical_ready = search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET);
     // Ordinary roots retain the index-lane refusal policy. Parent children
     // may still be warming their first indexes, so their reader engines use
     // the existing bounded exact/lexical fallback instead.
@@ -3102,24 +3015,6 @@ fn rank_regex_collection(
 thread_local! {
     static REGEX_ROUTE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(bool)>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The hook runs before the index read with `false`, and after a lock timeout
-/// with `true`, so tests can release a contended writer before the fallback.
-#[cfg(test)]
-pub(crate) fn with_regex_route_lock_hook_for_test<T>(
-    hook: impl FnMut(bool) + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-    REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
 }
 
 #[cfg(test)]
@@ -6897,15 +6792,12 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn search_index_ready_with_budget(
-    ctx: &AppContext,
-    _wait_budget: Duration,
-) -> Result<bool, SearchIndexWaitError> {
+fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
     if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
-        return Ok(true);
+        return true;
     }
 
-    Ok(false)
+    false
 }
 
 /// Ranks every semantic chunk against `query_vector` with no enumeration
@@ -7005,7 +6897,7 @@ fn data_meaning_search(
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET).unwrap_or(false)
+    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
@@ -7434,7 +7326,6 @@ fn format_lexical_unavailable_text_counted(
     let (mut sections, shown) = format_result_sections_counted(
         results,
         project_root,
-        None,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -7926,7 +7817,6 @@ fn format_ranked_text_counted(
     let (mut text, shown) = format_result_sections_counted(
         results,
         display_root,
-        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -8558,7 +8448,7 @@ fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root:
 
 #[cfg(test)]
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
-    format_result_sections_with_context(results, project_root, None)
+    format_result_sections_with_context(results, project_root)
 }
 
 /// Whether textual (lexical) hits may be called matches. They may not when
@@ -8584,25 +8474,20 @@ fn absent_literal_line(literal: &str) -> String {
 }
 
 #[cfg(test)]
-fn format_result_sections_with_context(
-    results: &[HybridResult],
-    project_root: &Path,
-    ctx: Option<&AppContext>,
-) -> String {
-    format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
+fn format_result_sections_with_context(results: &[HybridResult], project_root: &Path) -> String {
+    format_result_sections_labelled(results, project_root, TextualHits::Matches)
 }
 
 #[cfg(test)]
 fn format_result_sections_labelled(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     textual_hits: TextualHits,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
-        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         textual_hits,
     )
@@ -8616,13 +8501,12 @@ fn format_result_sections_labelled(
 fn format_result_sections_within_budget(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
-        ctx,
         max_bytes,
         TextualHits::Matches,
     )
@@ -8634,33 +8518,24 @@ fn format_result_sections_within_budget(
 fn format_result_sections_within_budget_labelled(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> String {
-    format_result_sections_counted(results, project_root, ctx, max_bytes, textual_hits).0
+    format_result_sections_counted(results, project_root, max_bytes, textual_hits).0
 }
 
 fn format_result_sections_counted(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> (String, usize) {
-    // Results arrive sorted by fused score desc. Group by file preserving
-    // first-appearance order so the most relevant file's group renders first.
-    // A BTreeMap would re-sort groups alphabetically by path and scramble the
-    // ranking the agent relies on to read most-relevant-first. Snippet line
-    // counts are budgeted by enrich_snippets_from_source; here each line is
-    // capped in length and the whole reply is held to `max_bytes`.
-    let annotations = ctx
-        .map(|ctx| blast_radius_annotations(ctx, results))
-        .unwrap_or_else(|| vec![None; results.len()]);
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<(usize, &HybridResult)>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<&HybridResult>> = HashMap::new();
 
-    for (index, result) in results.iter().enumerate() {
+    for result in results {
         let display_path = result
             .file
             .strip_prefix(project_root)
@@ -8670,16 +8545,13 @@ fn format_result_sections_counted(
         if !groups.contains_key(&display_path) {
             group_order.push(display_path.clone());
         }
-        groups
-            .entry(display_path)
-            .or_default()
-            .push((index, result));
+        groups.entry(display_path).or_default().push(result);
     }
 
     let mut out = snippet_bounds::BudgetedText::new(max_bytes);
     let mut shown = 0usize;
     'groups: for file in &group_order {
-        let matching_line = groups[file].iter().find(|(_, result)| {
+        let matching_line = groups[file].iter().find(|result| {
             matches!(result.kind, SymbolKind::FileSummary)
                 && (result.exact || result.source == "lexical")
                 && !result.snippet.trim().is_empty()
@@ -8690,16 +8562,14 @@ fn format_result_sections_counted(
             "\n\n".to_string()
         };
         match matching_line {
-            Some((_, result)) => header.push_str(&format!(
+            Some(result) => header.push_str(&format!(
                 "{file}:{}",
                 display_line_number(result.start_line)
             )),
             None => header.push_str(file),
         }
-        let exact = groups[file].iter().any(|(_, result)| result.exact);
-        let lexical = groups[file]
-            .iter()
-            .any(|(_, result)| result.source == "lexical");
+        let exact = groups[file].iter().any(|result| result.exact);
+        let lexical = groups[file].iter().any(|result| result.source == "lexical");
         match textual_hits {
             TextualHits::Matches => {
                 if exact {
@@ -8720,7 +8590,7 @@ fn format_result_sections_counted(
         if !out.push(&header) {
             break;
         }
-        if let Some((_, result)) = matching_line {
+        if let Some(result) = matching_line {
             shown += 1;
             if !push_snippet_lines(&mut out, &result.snippet) {
                 break;
@@ -8732,8 +8602,8 @@ fn format_result_sections_counted(
         // extension), symbol header at 2 spaces, snippet body at 6. Without
         // this, file paths and symbol headers were both at col 0 and could
         // only be told apart by parsing the "[kind] lines X-Y" suffix.
-        for (index, result) in &groups[file] {
-            if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
+        for result in &groups[file] {
+            if matching_line.is_some_and(|matching| std::ptr::eq(*matching, *result)) {
                 continue;
             }
             if result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary) {
@@ -8745,15 +8615,11 @@ fn format_result_sections_counted(
                 format!("\n  {} [file summary]", result.name)
             } else {
                 format!(
-                    "\n  {} [{}] lines {}-{}{}",
+                    "\n  {} [{}] lines {}-{}",
                     result.name,
                     symbol_kind_label(&result.kind),
                     display_line_number(result.start_line),
-                    display_line_number(result.end_line),
-                    annotations
-                        .get(*index)
-                        .and_then(|annotation| annotation.as_deref())
-                        .unwrap_or("")
+                    display_line_number(result.end_line)
                 )
             };
             if !out.push(&symbol_header) {
@@ -8784,85 +8650,6 @@ fn push_snippet_lines(out: &mut snippet_bounds::BudgetedText, snippet: &str) -> 
         let line = snippet_bounds::cap_snippet_line(line);
         out.push(&format!("\n      {line}"))
     })
-}
-
-fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
-    let Some(store) = warm_callgraph_store(ctx) else {
-        return vec![None; results.len()];
-    };
-
-    results
-        .iter()
-        .map(|result| blast_radius_annotation_for_result(&store, result))
-        .collect()
-}
-
-fn warm_callgraph_store(
-    ctx: &AppContext,
-) -> Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> {
-    let receiver = ctx.callgraph_store_rx().try_lock()?;
-    if receiver.is_some() {
-        return None;
-    }
-    drop(receiver);
-    try_read_with_budget(ctx.callgraph_store(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        .and_then(|store| store.as_ref().map(std::sync::Arc::clone))
-}
-
-fn blast_radius_annotation_for_result(
-    store: &crate::callgraph_store::ReadonlyCallGraphStore,
-    result: &HybridResult,
-) -> Option<String> {
-    if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
-        return None;
-    }
-    if result.name.trim().is_empty() {
-        return None;
-    }
-
-    let callers = callers_result(store, &result.file, &result.name, 1, true).ok()?;
-    let mut caller_basenames = Vec::new();
-    let mut seen_files = HashSet::new();
-    for group in &callers.callers {
-        if seen_files.insert(group.file.clone()) {
-            caller_basenames.push(compact_caller_basename(&group.file));
-        }
-    }
-
-    let mut suffix = format!("  ↩{}", callers.total_callers);
-    if !caller_basenames.is_empty() {
-        let more = caller_basenames.len() > 2;
-        let names = caller_basenames
-            .iter()
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(",");
-        suffix.push(' ');
-        suffix.push_str(&names);
-        if more {
-            suffix.push_str(",…");
-        }
-    }
-    Some(suffix)
-}
-
-fn compact_caller_basename(file: &str) -> String {
-    let basename = Path::new(file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(file);
-    truncate_chars(basename, 18)
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
 }
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
@@ -9057,15 +8844,14 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::walk_project_files;
-    use crate::callgraph_store::CallGraphStore;
+
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::{
         with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
     };
-    use serde_json::Value;
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -9107,18 +8893,6 @@ mod tests {
             "hint": hint,
         }))
         .expect("build semantic search request")
-    }
-
-    fn semantic_page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
-        serde_json::from_value(serde_json::json!({
-            "id": "semantic-search-page-test",
-            "command": "semantic_search",
-            "query": query,
-            "top_k": top_k,
-            "offset": offset,
-            "hint": "literal",
-        }))
-        .expect("build paged semantic search request")
     }
 
     fn response_value(response: Response) -> serde_json::Value {
@@ -12352,7 +12126,7 @@ mod tests {
             .map(|index| long_line_result(index, format!("line of result {index:03}")))
             .collect::<Vec<_>>();
 
-        let text = format_result_sections_within_budget(&results, Path::new("/project"), None, 200);
+        let text = format_result_sections_within_budget(&results, Path::new("/project"), 200);
 
         assert!(
             text.contains("data/census_000.json:1 [lexical match]"),
@@ -12370,7 +12144,7 @@ mod tests {
         );
 
         let uncut =
-            format_result_sections_within_budget(&results, Path::new("/project"), None, usize::MAX);
+            format_result_sections_within_budget(&results, Path::new("/project"), usize::MAX);
         assert!(uncut.contains("census_019"));
         assert!(!uncut.contains("Output reached"));
     }
@@ -13026,7 +12800,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_warm_callgraph_emits_no_blast_radius_and_starts_no_build() {
+    fn absent_warm_callgraph_emits_no_blast_radius() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_context(dir.path());
         let results = vec![write_symbol_hit(dir.path(), "target.rs", "target", 1)];
@@ -13037,8 +12811,6 @@ mod tests {
             !text.contains("↩"),
             "cold store should not annotate rows: {text}"
         );
-        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
-        assert!(ctx.callgraph_store_rx().lock().is_none());
     }
 
     #[test]
@@ -13115,20 +12887,6 @@ mod tests {
             crate::list_envelope::render_trailer(&page_cut).as_deref(),
             Some("shown 3 of ≥4 results (cap) · narrow: offset, topK, path, includeTests")
         );
-    }
-
-    #[test]
-    fn contended_callgraph_receiver_does_not_block_search_formatting() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let ctx = test_context(project.path());
-        let receiver_guard = ctx.callgraph_store_rx().lock();
-        let started = std::time::Instant::now();
-        assert!(warm_callgraph_store(&ctx).is_none());
-        assert!(
-            started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET,
-            "callgraph receiver contention exceeded artifact budget"
-        );
-        drop(receiver_guard);
     }
 }
 

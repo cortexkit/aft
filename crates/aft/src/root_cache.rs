@@ -1076,44 +1076,12 @@ pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarke
     read_marker_protection(cache_dir, generation_label, true)
 }
 
-/// A sweep may retain a positive census across its epoch bump: an extra mark
-/// only postpones garbage collection. Never cache a negative result, because a
-/// reader can register before the deleting mark. Removal checks must bypass
-/// this cache entirely and inspect protection again under the registry barrier.
-#[derive(Default)]
-pub(crate) struct ReadMarkerProtectionCache {
-    protected: std::collections::BTreeMap<(PathBuf, String), bool>,
-}
-
-/// Marker inputs a storage sweep re-reads for every generation it visits:
-/// the process hostname and each live pid's start time. The hostname cannot
-/// change mid-pass and a cached start time only ever over-retains (pids are
-/// reused with ever newer start times), so one pass keeps one copy of each
-/// instead of re-reading them once per generation or once per marker.
-/// Liveness itself is still probed per marker and never cached.
-pub(crate) struct ReadMarkerSweepContext {
-    hostname: String,
-    started: HashMap<u32, Option<u64>>,
-}
-
-impl ReadMarkerSweepContext {}
-
 // Test hook counting hostname resolutions on this thread. Reset before a
 // marker pass and read after it to prove the pass resolved the hostname
 // once instead of once per generation.
 #[cfg(test)]
 thread_local! {
     static HOSTNAME_RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn hostname_resolutions_for_test() -> u64 {
-    HOSTNAME_RESOLUTIONS.with(|count| count.get())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_hostname_resolutions_for_test() {
-    HOSTNAME_RESOLUTIONS.with(|count| count.set(0));
 }
 
 // Test hook counting process-start-time resolutions on this thread: cache
@@ -1124,16 +1092,6 @@ pub(crate) fn reset_hostname_resolutions_for_test() {
 thread_local! {
     static PROCESS_START_RESOLUTIONS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn process_start_resolutions_for_test() -> u64 {
-    PROCESS_START_RESOLUTIONS.with(|count| count.get())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_process_start_resolutions_for_test() {
-    PROCESS_START_RESOLUTIONS.with(|count| count.set(0));
 }
 
 fn read_marker_protection(
@@ -1184,21 +1142,6 @@ fn read_marker_protection(
 #[cfg(test)]
 thread_local! {
     static READER_CENSUS: std::cell::RefCell<Option<std::collections::BTreeMap<(PathBuf, String), usize>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct ReaderCensusProbe;
-
-#[cfg(test)]
-impl ReaderCensusProbe {
-    pub(crate) fn start() -> Self {
-        READER_CENSUS.with(|reads| *reads.borrow_mut() = Some(Default::default()));
-        Self
-    }
-
-    pub(crate) fn finish(self) -> std::collections::BTreeMap<(PathBuf, String), usize> {
-        READER_CENSUS.with(|reads| reads.borrow_mut().take().unwrap())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

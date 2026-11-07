@@ -33,6 +33,7 @@ static VERIFY_MEMO: OnceLock<Mutex<VerifyMemo>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerifyArtifact {
     Search,
+    #[cfg(test)]
     Semantic,
 }
 
@@ -414,13 +415,6 @@ fn map_files_bounded<K: Send, V: Send>(
 fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(build_strict_verify_pool).as_ref()
-}
-
-/// Start the process-wide verification pool now, so a test that counts
-/// threads can take its baseline after it exists.
-#[cfg(test)]
-pub(crate) fn warm_strict_verify_pool_for_test() {
-    let _ = strict_verify_pool();
 }
 
 fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {

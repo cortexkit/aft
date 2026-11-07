@@ -70,25 +70,6 @@ fn main_io() -> &'static Mutex<BTreeMap<usize, (u64, u64)>> {
     IO.get_or_init(Default::default)
 }
 
-pub(crate) fn main_io_counts(connection: &Connection) -> (u64, u64) {
-    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
-    let rc = unsafe {
-        ffi::sqlite3_file_control(
-            connection.handle(),
-            c"main".as_ptr(),
-            ffi::SQLITE_FCNTL_FILE_POINTER,
-            std::ptr::from_mut(&mut file).cast(),
-        )
-    };
-    assert_eq!(rc, ffi::SQLITE_OK);
-    main_io()
-        .lock()
-        .unwrap()
-        .get(&(file as usize))
-        .copied()
-        .unwrap_or_default()
-}
-
 /// Which file class each open `sqlite3_file` belongs to. A `sqlite3_file` is
 /// only ever handed out by `xOpen`, so re-registering on every open keeps this
 /// correct even when SQLite reuses an address for a later file.

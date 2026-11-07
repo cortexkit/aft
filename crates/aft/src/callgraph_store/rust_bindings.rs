@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
 use tree_sitter::Node;
 
-use super::join::syntax_index::{Direct, Nav};
+use super::join::syntax_index::Nav;
 
 #[derive(Clone, Debug)]
 pub(super) struct Declaration {
@@ -15,9 +15,6 @@ pub(super) struct Declaration {
     pub owner: Option<String>,
     pub return_type: Option<String>,
     pub bytes: Range<usize>,
-    pub line: u32,
-    pub has_self: bool,
-    pub trait_name: Option<String>,
 }
 
 pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
@@ -38,8 +35,8 @@ pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub(super) enum Initializer {
-    Call { callee: String, bytes: Range<usize> },
-    Nominal(String, bool),
+    Call { callee: String },
+    Nominal(String),
 }
 
 #[derive(Clone, Debug)]
@@ -155,8 +152,14 @@ fn identity<'tree>(
 }
 
 impl RustBindings {
+    #[cfg(test)]
     pub fn new(source: &str, root: Node<'_>) -> Self {
-        Self::new_with(source, root, Direct)
+        Self::new_with(source, root, super::join::syntax_index::Direct)
+    }
+
+    #[cfg(test)]
+    pub fn unit_struct(&self, symbol: &str) -> bool {
+        self.unit_structs.get(symbol).copied() == Some(true)
     }
 
     /// [`RustBindings::new`], walking and looking up with `nav`.
@@ -275,22 +278,6 @@ impl RustBindings {
                             .child_by_field_name("return_type")
                             .map(|n| text(n, source).to_string()),
                         bytes: node.byte_range(),
-                        line: node.start_position().row as u32 + 1,
-                        has_self: has_self_parameter(node, source),
-                        trait_name: {
-                            let mut parent = nav.parent(node);
-                            let mut trait_name = None;
-                            while let Some(ancestor) = parent {
-                                if nav.kind(ancestor) == "impl_item" {
-                                    trait_name = ancestor
-                                        .child_by_field_name("trait")
-                                        .map(|name| text(name, source).to_string());
-                                    break;
-                                }
-                                parent = nav.parent(ancestor);
-                            }
-                            trait_name
-                        },
                     };
                     let position = result.records.len();
                     result.symbols.insert(node.start_byte(), position);
@@ -315,11 +302,9 @@ impl RustBindings {
                             .and_then(|value| match value.kind() {
                                 "call_expression" => Some(Initializer::Call {
                                     callee: crate::calls::extract_full_callee(&value, source)?,
-                                    bytes: value.byte_range(),
                                 }),
                                 "struct_expression" => Some(Initializer::Nominal(
                                     text(value.child_by_field_name("name")?, source).to_string(),
-                                    false,
                                 )),
                                 "identifier"
                                     if text(value, source)
@@ -327,10 +312,7 @@ impl RustBindings {
                                         .next()
                                         .is_some_and(char::is_uppercase) =>
                                 {
-                                    Some(Initializer::Nominal(
-                                        text(value, source).to_string(),
-                                        true,
-                                    ))
+                                    Some(Initializer::Nominal(text(value, source).to_string()))
                                 }
                                 _ => None,
                             });
@@ -429,17 +411,6 @@ impl RustBindings {
         self.calls
             .get(&call_byte)
             .is_some_and(|callable| self.generic_functions.contains(callable))
-    }
-
-    pub fn unit_struct(&self, symbol: &str) -> bool {
-        self.unit_structs.get(symbol).copied() == Some(true)
-    }
-
-    pub fn type_parameter_in(&self, symbol: &str, name: &str) -> bool {
-        self.declaration(symbol).is_some_and(|declaration| {
-            self.parameters
-                .contains(&(declaration.bytes.start, name.to_string()))
-        })
     }
 }
 

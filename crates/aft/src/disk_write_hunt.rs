@@ -2,37 +2,10 @@
 //! Run with AFT_DISK_HUNT_INPUT pointing at aft.db, semantic.bin, derived.sqlite,
 //! callgraph.sqlite and manifest.json captured together outside the daemon.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{backup::Backup, Connection, OpenFlags};
-
-fn copy_db(source: &Path, destination: &Path) {
-    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let mut destination = Connection::open(destination).unwrap();
-    Backup::new(&source, &mut destination)
-        .unwrap()
-        .run_to_completion(256, Duration::from_millis(1), None)
-        .unwrap();
-}
-
-fn sidecar(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push("-wal");
-    name.into()
-}
-
-fn reset(conn: &Connection, path: &Path) {
-    let result: (u64, u64, u64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .unwrap();
-    assert_eq!(result.0, 0);
-    fs::File::open(path).unwrap().sync_all().unwrap();
-}
+use rusqlite::{Connection, OpenFlags};
 
 fn measure<T>(name: &str, operation: impl FnOnce() -> T) -> T {
     let before = usage();
@@ -46,50 +19,6 @@ fn measure<T>(name: &str, operation: impl FnOnce() -> T) -> T {
         after.1.saturating_sub(before.1)
     );
     value
-}
-
-fn wal_report(conn: &Connection, path: &Path) {
-    let page_size: u64 = conn
-        .pragma_query_value(None, "page_size", |r| r.get(0))
-        .unwrap();
-    let bytes = fs::read(sidecar(path)).unwrap_or_default();
-    let owners: BTreeMap<u32, String> = conn
-        .prepare("SELECT pageno, name FROM dbstat")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    let mut frames: BTreeMap<String, u64> = BTreeMap::new();
-    for frame in bytes
-        .get(32..)
-        .unwrap_or_default()
-        .chunks_exact(page_size as usize + 24)
-    {
-        let page = u32::from_be_bytes(frame[..4].try_into().unwrap());
-        *frames
-            .entry(
-                owners
-                    .get(&page)
-                    .cloned()
-                    .unwrap_or_else(|| "<freelist>".into()),
-            )
-            .or_default() += 1;
-    }
-    eprintln!(
-        "hunt wal: bytes={} page_size={page_size} owners={frames:?}",
-        bytes.len()
-    );
-    let checkpoint: (u64, u64, u64) = measure("passive-checkpoint", || {
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .unwrap()
-    });
-    eprintln!(
-        "hunt checkpoint: {checkpoint:?} payload_bytes={}",
-        checkpoint.2 * page_size
-    );
 }
 
 fn usage() -> (u64, u64) {

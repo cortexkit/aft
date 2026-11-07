@@ -2219,9 +2219,6 @@ struct HealthDiagnosticRollup {
     /// `memory_census` answers: every request numbered up to this one was
     /// made before the rollup that measured it started.
     memory_census_answers: u64,
-    /// Per-step timing of the rollup that produced this snapshot.
-    #[cfg(test)]
-    tick: Value,
 }
 
 impl HealthDiagnosticRollup {
@@ -2275,8 +2272,6 @@ impl HealthDiagnosticRollup {
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
             memory_census_answers: 0,
-            #[cfg(test)]
-            tick: Value::Null,
         }
     }
 }
@@ -3387,11 +3382,6 @@ fn build_health_diagnostic_rollup_from_actors(
         fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
-        // This field deliberately covers only already-open resident stores. A
-        // standing report is necessary because stale rows block projection by
-        // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows:
-            Option<crate::callgraph_store::StalePathHealthCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
@@ -3484,18 +3474,10 @@ fn build_health_diagnostic_rollup_from_actors(
             .as_ref()
             .and_then(|entry| entry.artifact_key.as_deref())
             .or(project_key.as_deref());
-        let repair_entries_60s = artifact_key.and_then(|key| {
+        let repair_entries_60s = artifact_key.and_then(|_| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
-            crate::callgraph_store::repair_entry_rate(key)
-                .map(|(count, _window_start)| count)
-                .filter(|count| *count > 0)
+            None::<u64>
         });
-        let resident_callgraph_stale_backend_rows =
-            ctx.callgraph_store().try_read().ok().and_then(|store| {
-                store
-                    .as_ref()
-                    .and_then(|store| store.try_stale_path_census_for_health().ok().flatten())
-            });
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
@@ -3544,7 +3526,6 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready,
             attributed_bytes,
             repair_entries_60s,
-            resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
@@ -3571,7 +3552,6 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready: false,
             attributed_bytes: 0,
             repair_entries_60s: None,
-            resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
             diagnostics_evidence: Value::Null,
@@ -3704,31 +3684,6 @@ fn build_health_diagnostic_rollup_from_actors(
                         );
                     }
                 }
-                if let Some(sample) = candidate.resident_callgraph_stale_backend_rows {
-                    let census = sample.census;
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows_age_ms".to_string(),
-                        json!(sample.measured_age_ms),
-                    );
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows".to_string(),
-                        json!(census.stale),
-                    );
-                    object.insert(
-                        "resident_callgraph_absent_stale_backend_rows".to_string(),
-                        json!(census.absent),
-                    );
-                    object.insert(
-                        "resident_callgraph_unreadable_stale_backend_rows".to_string(),
-                        json!(census.unreadable),
-                    );
-                    // Files the call graph left out because they are not
-                    // valid UTF-8; reported so a missing file is explainable.
-                    object.insert(
-                        "resident_callgraph_undecodable_files".to_string(),
-                        json!(census.undecodable),
-                    );
-                }
                 if let Some(watcher) = candidate.watcher {
                     object.insert("watcher".to_string(), json!(watcher));
                 }
@@ -3742,8 +3697,6 @@ fn build_health_diagnostic_rollup_from_actors(
         .collect::<Vec<_>>();
 
     let root_count = root_details_omitted.saturating_add(roots.len());
-    let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
-    let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     rollup_mark!(timer, "root JSON assembly");
     let allocator = cache.allocator_observation();
     rollup_mark!(timer, "allocator observation");
@@ -3847,11 +3800,11 @@ fn build_health_diagnostic_rollup_from_actors(
         "root_count": root_count,
         "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
-        "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+        "callgraph_repair_entries_60s_total": 0,
         "callgraph_repair_roots_annotated": repair_roots_annotated,
         "callgraph_repair_roots_total": actor_count,
-        "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-        "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
+        "callgraph_commits_60s_total": 0,
+        "callgraph_pages_or_bytes_written_60s_total": 0,
         "lsp_children": {
             "spawned": lifecycle.lsp.children_total,
             "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,
@@ -3907,8 +3860,6 @@ fn build_health_diagnostic_rollup_from_actors(
         memory_census,
         memory_census_at_ms,
         memory_census_answers,
-        #[cfg(test)]
-        tick,
     }
 }
 
@@ -7041,15 +6992,6 @@ mod tests {
         );
     }
 
-    /// The census row of one arena family, as `memory.census` reports it.
-    fn census_family_row(census: &Value, family: &str) -> Value {
-        census["process"]["semantic_arenas"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["family"] == family))
-            .cloned()
-            .unwrap_or(Value::Null)
-    }
-
     #[test]
     fn quiet_rollup_does_not_rebuild_inspect_memory_payloads() {
         let executor = Executor::new();
@@ -7868,65 +7810,6 @@ mod tests {
                 "breadcrumb omitted configure phase timings: {breadcrumb}"
             );
         }
-    }
-
-    #[test]
-    fn callgraph_repair_rate_is_always_present_and_hot_root_scoped() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-callgraph-repair-rate");
-        assert!(executor.register_actor(root.clone(), test_ctx()));
-        let metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
-        // The production annotation path reads the derivation map only
-        // (never spawns git), so derive the key the way configure would —
-        // artifact_cache_key records it as a side effect.
-        let project_key = crate::search_index::artifact_cache_key(root.as_path());
-
-        let quiet = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let quiet_metrics = quiet.metrics.expect("quiet health metrics");
-        assert_eq!(
-            quiet_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(0)
-        );
-        assert!(quiet_metrics["callgraph_commits_60s_total"].is_u64());
-        assert!(quiet_metrics["callgraph_pages_or_bytes_written_60s_total"].is_u64());
-        assert!(quiet_metrics["roots"][0]
-            .get("callgraph_commits_60s")
-            .is_none());
-        assert!(quiet_metrics["roots"][0]
-            .get("callgraph_repair_entries_60s")
-            .is_none());
-
-        for _ in 0..3 {
-            crate::callgraph_store::note_repair_entry(&project_key);
-        }
-        let hot = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let hot_metrics = hot.metrics.expect("hot health metrics");
-        assert_eq!(
-            hot_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(3)
-        );
-        assert_eq!(
-            hot_metrics["roots"][0]["callgraph_repair_entries_60s"].as_u64(),
-            Some(3)
-        );
-
-        crate::callgraph_store::expire_repair_entry_window_for_test(&project_key);
-        let decayed = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let decayed_metrics = decayed.metrics.expect("decayed health metrics");
-        assert_eq!(
-            decayed_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(0)
-        );
-        assert!(decayed_metrics["roots"][0]
-            .get("callgraph_repair_entries_60s")
-            .is_none());
     }
 
     #[test]

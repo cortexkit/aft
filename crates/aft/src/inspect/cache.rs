@@ -266,21 +266,6 @@ pub(crate) fn aggregate_memory_walks_for_test() -> usize {
     AGGREGATE_MEMORY_WALKS.with(std::cell::Cell::get)
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) struct AggregateMemoryModeGuard(bool);
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-impl Drop for AggregateMemoryModeGuard {
-    fn drop(&mut self) {
-        UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.set(self.0));
-    }
-}
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn uncached_aggregate_memory_for_test(uncached: bool) -> AggregateMemoryModeGuard {
-    AggregateMemoryModeGuard(UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.replace(uncached)))
-}
-
 #[derive(Debug, Clone)]
 struct MemoryAggregate {
     touched: u64,

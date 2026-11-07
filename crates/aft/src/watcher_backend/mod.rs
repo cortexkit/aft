@@ -5,7 +5,6 @@ use std::sync::{mpsc, Arc};
 use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
 pub(crate) mod flush;
-pub(crate) mod subscription;
 
 // Inotify reports per-directory gaps. Recursive-handle backends currently
 // report only successful or unproved registration at construction.
@@ -33,27 +32,8 @@ pub(crate) enum InitialCoverage {
     Unproved,
 }
 
-// Raw-event test shims and other opaque handles cannot grant kernel coverage.
-// Inspect the actual retained native handle without constraining the generic
-// filter API used by those event injectors.
-pub(crate) fn initial_coverage_of(handle: &dyn std::any::Any) -> InitialCoverage {
-    handle
-        .downcast_ref::<ProjectWatcher>()
-        .map_or(InitialCoverage::Unproved, |watcher| {
-            watcher.initial_coverage()
-        })
-}
-
 #[cfg(not(target_os = "linux"))]
-impl ProjectWatcher {
-    pub(crate) fn initial_coverage(&self) -> InitialCoverage {
-        if cfg!(any(target_os = "macos", windows)) {
-            InitialCoverage::Complete
-        } else {
-            InitialCoverage::Unproved
-        }
-    }
-}
+impl ProjectWatcher {}
 
 #[cfg(target_os = "macos")]
 mod fsevents;

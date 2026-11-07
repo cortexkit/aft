@@ -106,16 +106,11 @@ fn search_settled(ctx: &AppContext) -> bool {
     aft::data_layer::surfaces::text_plane_ready(ctx) != Some(false)
 }
 
-fn drain(ctx: &AppContext) {
-    aft::runtime_drain::drain_callgraph_store_events(ctx);
-}
-
 /// Wait until `done` holds (the component settled after refusing), draining
 /// background events meanwhile.
 fn settle(ctx: &AppContext, what: &str, mut done: impl FnMut(&AppContext) -> bool) {
     let deadline = Instant::now() + SETTLE;
     while Instant::now() < deadline {
-        drain(ctx);
         if done(ctx) {
             return;
         }

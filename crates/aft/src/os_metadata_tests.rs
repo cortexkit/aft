@@ -9,9 +9,6 @@ use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
 use crate::search_index::SearchIndex;
 
-/// The metadata files an "empty" macOS or Windows folder typically holds.
-const METADATA_ONLY: [&str; 3] = [".localized", ".DS_Store", "Thumbs.db"];
-
 fn fixture(files: &[&str]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("fixture dir");
     let root = std::fs::canonicalize(dir.path()).expect("canonical root");

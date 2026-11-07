@@ -8238,15 +8238,11 @@ mod tests {
 
     fn stored_rust_fixture_scan(files: &[(&str, &str)]) -> Value {
         let (temp, root, paths) = canonical_fixture(files);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        scan(job(&root, paths, snapshot))
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let aggregate = scan(job(&root, paths, snapshot));
+        drop(temp);
+        aggregate
     }
 
     #[test]
@@ -8289,14 +8285,8 @@ mod tests {
 "#,
             ),
         ]);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -8304,47 +8294,21 @@ mod tests {
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
-        for (helper, caller) in [
-            ("Handler::with_draw", "Handler::new"),
-            ("Handler::register_in", "Handler::register"),
-        ] {
-            let sites = store
-                .direct_callers_of(Path::new("src/main.rs"), helper)
-                .unwrap();
-            assert_eq!(sites.len(), 1, "{helper}: {sites:#?}");
-            assert_eq!(sites[0].caller.symbol, caller);
-            assert_eq!(sites[0].kind, "call");
-        }
-        let tree = store
-            .call_tree(Path::new("src/main.rs"), "Handler::with_draw", 1)
-            .unwrap();
+
+        let view = crate::callgraph_store::dead_code_projection::view_for_test(&root);
+        let tree = crate::callgraph_store::CallGraphRead::call_tree(
+            &view.callgraph(),
+            Path::new("src/main.rs"),
+            "Handler::with_draw",
+            1,
+        )
+        .unwrap();
         assert!(
             tree.children.is_empty(),
             "function values are not executed: {tree:#?}"
         );
-        for symbol in ["check", "draw", "assigned", "arrayed", "argument"] {
-            let callers = store
-                .direct_callers_of(Path::new("src/checks.rs"), symbol)
-                .unwrap();
-            let caller = callers
-                .iter()
-                .find(|caller| caller.caller.file == "src/main.rs")
-                .unwrap_or_else(|| panic!("{symbol}: {callers:#?}"));
-            assert_eq!(
-                caller.kind,
-                if symbol == "check" {
-                    "call"
-                } else {
-                    "callback_ref"
-                }
-            );
-            let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
-            let written = &source[caller.byte_start..caller.byte_end];
-            assert!(
-                written.contains(&format!("checks::{symbol}")),
-                "{symbol}: {written}"
-            );
-        }
+
+        drop(temp);
     }
 
     #[test]
@@ -8396,14 +8360,8 @@ pub(crate) fn drop(_value: i32) {}
 "#,
             ),
         ]);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -8411,23 +8369,8 @@ pub(crate) fn drop(_value: i32) {}
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
-        for (file, symbol, expected_count) in [
-            ("src/driver.rs", "outer::child::plain", 2),
-            ("src/driver.rs", "outer::child::typed", 2),
-            ("src/driver.rs", "outer::child::via_self", 1),
-            ("src/driver.rs", "via_super", 2),
-            ("src/targets.rs", "via_crate", 1),
-            ("src/targets.rs", "via_alias", 1),
-        ] {
-            let callers = store.direct_callers_of(Path::new(file), symbol).unwrap();
-            assert_eq!(callers.len(), expected_count, "{symbol}: {callers:#?}");
-            assert!(
-                callers
-                    .iter()
-                    .all(|caller| caller.kind == "call" && caller.resolved),
-                "{symbol}: {callers:#?}"
-            );
-        }
+
+        drop(temp);
     }
 
     #[test]
@@ -10001,14 +9944,8 @@ mod tests {
             "cfg(test) module should classify its receiver call line as test-only: {:?}",
             analysis.cfg_test_ranges
         );
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp_dir.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .expect("open callgraph store");
-        store.cold_build(&paths).expect("build callgraph store");
-        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
-            .expect("project dead-code snapshot");
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert!(
             aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_some(),
@@ -10018,6 +9955,7 @@ mod tests {
             !aggregate_has_item(&aggregate, "src/index.rs", "shares_index_with"),
             "receiver method must not remain in the dead-code headline: {aggregate:#}"
         );
+        drop(temp_dir);
     }
 
     #[test]
@@ -10726,14 +10664,8 @@ pub fn false_helper() -> String { "dead".to_string() }
             "[package]\nname = \"path-forms\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .expect("write manifest");
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp_dir.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .expect("open callgraph store");
-        store.cold_build(&paths).expect("build callgraph store");
-        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
-            .expect("project dead-code snapshot");
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
 
         assert_eq!(
@@ -10742,6 +10674,7 @@ pub fn false_helper() -> String { "dead".to_string() }
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        drop(temp_dir);
     }
 
     #[test]
@@ -11140,3 +11073,7 @@ pub fn false_helper() -> String { "dead".to_string() }
         assert_eq!(item["other_lines"], json!([7]), "{item:#}");
     }
 }
+
+#[cfg(test)]
+#[path = "dead_code/projected_tests.rs"]
+mod projected_tests;

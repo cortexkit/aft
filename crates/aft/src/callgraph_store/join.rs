@@ -133,51 +133,6 @@ pub trait ManifestBlobReader {
     }
 }
 
-/// Shares a decoded object while a consumer owns it, without retaining an
-/// all decoded blobs after emission has finished.
-#[derive(Default)]
-pub(crate) struct DecodedBlobCache(
-    std::cell::RefCell<HashMap<String, std::sync::Weak<CallgraphBlob>>>,
-);
-
-impl DecodedBlobCache {
-    pub(crate) fn read(
-        &self,
-        key: &str,
-        read: impl FnOnce() -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError>,
-    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
-        if let Some(blob) = self.0.borrow().get(key).and_then(std::sync::Weak::upgrade) {
-            return Ok(Some(blob));
-        }
-        let blob = read()?;
-        if let Some(blob) = &blob {
-            self.0
-                .borrow_mut()
-                .insert(key.to_string(), Arc::downgrade(blob));
-        }
-        Ok(blob)
-    }
-}
-
-pub(crate) struct SharedBlobReader<'a, R> {
-    pub(crate) inner: &'a R,
-    pub(crate) decoded: DecodedBlobCache,
-}
-
-impl<R: ManifestBlobReader> ManifestBlobReader for SharedBlobReader<'_, R> {
-    fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
-        self.inner.read_callgraph_blob(key)
-    }
-
-    fn read_callgraph_blob_decoded(
-        &self,
-        key: &str,
-    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
-        self.decoded
-            .read(key, || self.inner.read_callgraph_blob_decoded(key))
-    }
-}
-
 /// Tree-sitter node position in canonical pre-order traversal order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AstPreorderNode {
@@ -323,19 +278,6 @@ impl CallgraphBlob {
         extractor_version: impl Into<String>,
     ) -> Result<Self, ManifestJoinError> {
         single_walk::extract(source, language, extractor_version.into())
-    }
-
-    /// Extracts the parse output of `source` from `tree`, its syntax tree
-    /// in `language`, without the outline [`Self::extract_tree_with_outline`]
-    /// also returns: for measuring what keeping the outline costs.
-    #[cfg(test)]
-    pub(crate) fn extract_tree(
-        source: &str,
-        language: &str,
-        extractor_version: impl Into<String>,
-        tree: &tree_sitter::Tree,
-    ) -> Result<Self, ManifestJoinError> {
-        single_walk::extract_tree(source, language, extractor_version.into(), tree, None)
     }
 
     /// [`Self::extract_tree`], also returning the file's symbols as the
@@ -1377,37 +1319,13 @@ impl ParseBlob {
                 let id = format!("{path}:{occurrence}:{scoped_name}");
                 *occurrence += 1;
                 super::NodeRecord {
-                    is_test: symbol.is_test,
                     id,
-                    file_path: path.to_string(),
                     name: bound_name(&symbol.name, path),
                     scoped_name,
                     kind: symbol.kind.clone(),
-                    range: crate::symbols::Range {
-                        start_line: symbol.start_line,
-                        start_col: symbol.start_col,
-                        end_line: symbol.end_line,
-                        end_col: symbol.end_col,
-                    },
-                    range_ordinal: symbol.ordinal,
-                    signature: symbol.signature.clone(),
-                    exported: symbol.exported,
-                    is_default_export: symbol.is_default_export,
-                    is_type_like: false,
-                    is_callgraph_entry_point: self
-                        .entry_point_symbols
-                        .contains(&symbol.scoped_name),
                 }
             })
             .collect::<Vec<_>>();
-        // Overloads can share a scoped name. Preserve the first node chosen by
-        // the source-order scan without rescanning all symbols for every call.
-        let mut caller_nodes = HashMap::with_capacity(nodes.len());
-        for node in &nodes {
-            #[cfg(test)]
-            CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
-            caller_nodes.entry(&node.scoped_name).or_insert(&node.id);
-        }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
         // A module path's dependencies are computed once per file and reused
@@ -1450,24 +1368,8 @@ impl ParseBlob {
                 .caller_symbol
                 .as_ref()
                 .map(|name| bound_name(name, path));
-            let caller_node = caller_symbol.as_ref().and_then(|name| {
-                #[cfg(test)]
-                CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
-                #[cfg(test)]
-                if SCAN_CALLER_NODES.with(std::cell::Cell::get) {
-                    return nodes
-                        .iter()
-                        .find(|node| {
-                            CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
-                            &node.scoped_name == name
-                        })
-                        .map(|node| node.id.clone());
-                }
-                caller_nodes.get(name).map(|id| (*id).clone())
-            });
             raw_refs.push(super::RawRef {
                 ref_id: format!("{path}:{reference_key}:{:?}", raw.kind),
-                caller_node,
                 caller_symbol,
                 caller_file: path.to_string(),
                 kind: match raw.kind {
@@ -1506,19 +1408,10 @@ impl ParseBlob {
         }
         Ok(super::FileExtract {
             rel_path: path.to_string(),
-            source_identity: None,
-            freshness: crate::cache_freshness::FileFreshness {
-                mtime: std::time::UNIX_EPOCH,
-                size: 0,
-                content_hash: crate::cache_freshness::zero_hash(),
-            },
             lang: data.lang,
             data,
-            typescript_objects: None,
             nodes,
             raw_refs,
-            dispatch_hints: Vec::new(),
-            surface_fingerprint: String::new(),
         })
     }
 }
@@ -1889,7 +1782,6 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
         for site in sites {
             let raw = super::RawRef {
                 ref_id: String::new(),
-                caller_node: None,
                 caller_symbol: site.and_then(|raw| raw.caller_symbol.clone()),
                 caller_file: file.to_string(),
                 kind: "call".into(),
@@ -2165,26 +2057,6 @@ impl ViewResolutionBinding {
             },
         }
     }
-}
-
-pub(crate) struct SelectedManifestJoin {
-    pub result: JoinResult,
-    pub bindings: BTreeMap<String, ViewBindingDependencies>,
-    pub resolved_callers: BTreeSet<String>,
-    pub rebuilt_surface_entries: usize,
-    pub rebuilt_surface_paths: BTreeSet<String>,
-    pub decoded_caller_blobs: usize,
-    pub resolved_bindings: usize,
-    /// Receiver type targets of the Rust files the join's
-    /// [`DispatchTypeTargetPlan`] resolved; other files keep their previous ones.
-    pub dispatch_type_targets: BTreeMap<String, DispatchTypeTargets>,
-    /// Parse blobs decoded only to resolve receiver type targets.
-    pub dispatch_type_target_decoded_blobs: usize,
-    /// Previous traces of other files checked against the new index.
-    pub dispatch_type_target_traces: usize,
-    /// Checked traces whose only dependency among the seeds was the module
-    /// domain.
-    pub module_domain_traces: usize,
 }
 
 /// Compact, deterministic snapshot of one file's resolver index. It deliberately
@@ -3328,51 +3200,6 @@ mod consultation_tests {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static CALLER_NODE_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    // Select the original caller-node scan in tests so the benchmark can
-    // compare scan and indexed lookup in the same process and host-load window.
-    pub(crate) static SCAN_CALLER_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[test]
-fn binding_caller_node_lookup_is_linear_and_preserves_first_duplicate() {
-    let source = (0..200)
-        .map(|i| format!("export function f{i}() {{ f0(); }}\n"))
-        .collect::<String>();
-    let blob = CallgraphBlob::extract(&source, "typescript", "lookup-test").unwrap();
-    let mut parse = blob.parse().unwrap().clone();
-    let mut duplicate = parse.symbols[0].clone();
-    duplicate.ordinal += 10000;
-    parse.symbols.push(duplicate);
-    let paths = FactPaths {
-        root: Path::new("/"),
-        facts: &NoProjectFacts,
-    };
-    CALLER_NODE_LOOKUP_WORK.with(|work| work.set(0));
-    let extract = parse
-        .bind_with_dependencies("caller.ts", &paths, None)
-        .unwrap();
-    let work = CALLER_NODE_LOOKUP_WORK.with(std::cell::Cell::get);
-    assert!(work > 0, "lookup work must actually be observed");
-    assert!(
-        work <= parse.symbols.len() + parse.refs.len(),
-        "caller node lookup must be linear: {work} operations for {} symbols and {} refs",
-        parse.symbols.len(),
-        parse.refs.len()
-    );
-    for reference in &extract.raw_refs {
-        let expected = reference.caller_symbol.as_ref().and_then(|caller| {
-            extract
-                .nodes
-                .iter()
-                .find(|node| &node.scoped_name == caller)
-                .map(|node| node.id.clone())
-        });
-        assert_eq!(reference.caller_node, expected);
-    }
-}
 aft_store::heap_bytes_none!(BlobRefKind, ResolutionStatus);
 aft_store::heap_bytes_of_fields!(ParseBlob {
     entry_point_symbols,

@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 #[cfg(test)]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,15 +28,7 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
-static SEMANTIC_STALE_GENERATION_SIGNAL: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
-#[cfg(test)]
-static CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
 static CONFIGURE_DEFERRED_DELAY_REACHED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static CONFIGURE_ARTIFACT_POST_GATE_REACHED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static CONFIGURE_DEFERRED_MAINTENANCE_GATE: OnceLock<
     Mutex<Option<ConfigureDeferredMaintenanceGate>>,
@@ -54,109 +46,11 @@ struct ConfigureDeferredMaintenanceGate {
 }
 
 #[cfg(test)]
-pub(crate) struct ConfigureDeferredMaintenanceGateGuard {
-    root: PathBuf,
-}
-
-#[cfg(test)]
-impl Drop for ConfigureDeferredMaintenanceGateGuard {
-    fn drop(&mut self) {
-        let mut slot = CONFIGURE_DEFERRED_MAINTENANCE_GATE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.as_ref().is_some_and(|gate| gate.root == self.root) {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn gate_configure_deferred_maintenance_for_test(
-    root: PathBuf,
-) -> (
-    ConfigureDeferredMaintenanceGateGuard,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let gate = ConfigureDeferredMaintenanceGate {
-        root: root.clone(),
-        reached: reached_tx,
-        release: release_rx,
-    };
-    let mut slot = CONFIGURE_DEFERRED_MAINTENANCE_GATE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(slot.is_none(), "configure gate already installed");
-    *slot = Some(gate);
-    (
-        ConfigureDeferredMaintenanceGateGuard { root },
-        reached_rx,
-        release_tx,
-    )
-}
-
-#[cfg(test)]
 #[derive(Clone)]
 struct ConfigureSemanticSnapshotGate {
     request_id: String,
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
-}
-
-#[cfg(test)]
-struct ConfigureSemanticSnapshotGateGuard {
-    request_id: String,
-}
-
-#[cfg(test)]
-impl Drop for ConfigureSemanticSnapshotGateGuard {
-    fn drop(&mut self) {
-        let mut slot = CONFIGURE_SEMANTIC_SNAPSHOT_GATE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot
-            .as_ref()
-            .is_some_and(|gate| gate.request_id == self.request_id)
-        {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-fn gate_configure_after_semantic_snapshot_for_test(
-    request_id: String,
-) -> (
-    ConfigureSemanticSnapshotGateGuard,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let gate = ConfigureSemanticSnapshotGate {
-        request_id: request_id.clone(),
-        reached: reached_tx,
-        release: release_rx,
-    };
-    let mut slot = CONFIGURE_SEMANTIC_SNAPSHOT_GATE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(
-        slot.is_none(),
-        "configure semantic snapshot gate already installed"
-    );
-    *slot = Some(gate);
-    (
-        ConfigureSemanticSnapshotGateGuard { request_id },
-        reached_rx,
-        release_tx,
-    )
 }
 
 #[cfg(test)]
@@ -288,60 +182,6 @@ thread_local! {
     static WORKSPACE_MANIFEST_FINGERPRINT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Attempts are also recorded per project root: the process-wide total is
-// observed by every configure in a parallel libtest binary, so a test that
-// asserts "no load started yet" must read its own root's count or a neighbour's
-// background load races it.
-
-// Keys are canonical so a test that configured `/var/...` matches the load
-// recorded under `/private/var/...`.
-
-#[cfg(test)]
-type ReadOnlyQueryWarmupHook =
-    Box<dyn FnOnce() -> Result<crate::semantic_index::EmbeddingModel, String> + Send>;
-
-#[cfg(test)]
-static READ_ONLY_QUERY_WARMUP_HOOKS: Mutex<Option<HashMap<PathBuf, ReadOnlyQueryWarmupHook>>> =
-    Mutex::new(None);
-
-// Test seam between the worker's start gate and its lifecycle recheck. A
-// non-zero "delay" HOLDS the worker here until the test releases it (bounded so
-// a test that forgets cannot hang the suite) rather than sleeping a fixed time:
-// the tests using it change the lifecycle in that window, and on a loaded
-// Windows runner a 500 ms sleep elapsed before the test thread got scheduled,
-// so the worker rechecked a still-bound lifecycle and the test read one load
-// attempt where it expected none (train 126).
-
-#[cfg(test)]
-fn reset_configure_deferred_delay_reached_for_test() {
-    CONFIGURE_DEFERRED_DELAY_REACHED.store(0, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn configure_deferred_delay_reached_for_test() -> usize {
-    CONFIGURE_DEFERRED_DELAY_REACHED.load(Ordering::SeqCst)
-}
-
-/// Non-zero arms the post-gate hold; zero releases it (and is what the tests'
-/// drop guards call so a panicking test still frees the worker).
-#[cfg(test)]
-fn set_configure_artifact_post_gate_delay_for_test(delay_ms: u64) {
-    if delay_ms > 0 {
-        CONFIGURE_ARTIFACT_POST_GATE_REACHED.store(0, Ordering::SeqCst);
-    }
-    CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.store(delay_ms, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn release_configure_artifact_post_gate_for_test() {
-    CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.store(0, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn configure_artifact_post_gate_reached_for_test() -> usize {
-    CONFIGURE_ARTIFACT_POST_GATE_REACHED.load(Ordering::SeqCst)
-}
-
 #[doc(hidden)]
 pub fn reset_semantic_stale_generation_discards_for_test() {
     SEMANTIC_STALE_GENERATION_DISCARDS.store(0, Ordering::SeqCst);
@@ -351,41 +191,6 @@ pub fn reset_semantic_stale_generation_discards_for_test() {
 pub fn semantic_stale_generation_discards_for_test() -> usize {
     SEMANTIC_STALE_GENERATION_DISCARDS.load(Ordering::SeqCst)
 }
-
-#[cfg(test)]
-fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> bool {
-    if semantic_stale_generation_discards_for_test() > 0 {
-        return true;
-    }
-    let (lock, changed) = SEMANTIC_STALE_GENERATION_SIGNAL.get_or_init(Default::default);
-    let guard = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (_guard, result) = changed
-        .wait_timeout_while(guard, timeout, |_| {
-            semantic_stale_generation_discards_for_test() == 0
-        })
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    !result.timed_out() || semantic_stale_generation_discards_for_test() > 0
-}
-
-// Quiet window before a semantic re-embed batch runs. Embedding costs ~1-2s
-// per collect under load, and nobody semantically searches a file within
-// seconds of editing it — a long window coalesces an agent's whole edit burst
-// into one collect instead of one per save. Freshness is preserved where it
-// matters: unembedded changed files are already excluded from results by the
-// stale-file mask, and grep/read see changes instantly. A batch is admitted
-// after at most four quiet windows even if requests keep arriving.
-
-#[cfg(test)]
-static INDEX_ORDER_GRACE_MS: AtomicU64 = AtomicU64::new(30_000);
-#[cfg(test)]
-static INDEX_ORDER_TIMEOUT_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-#[cfg(test)]
-static INDEX_ORDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-#[derive(Clone)]
-struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
 
 #[cfg(test)]
 static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -832,63 +637,12 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
     };
     if root_path.exists() {
         install_project_watcher(ctx, &root_path);
-        // With the watcher attached again, edits from here on are observed, so
-        // this is the point to compare the callgraph store with the disk for
-        // the edits made while nothing was watching.
-        ctx.start_pending_callgraph_reconcile();
         // Config edits made while nothing watched the files are picked up
         // now; the reload compares file contents, so it is a no-op otherwise.
         crate::config_live::sync_config_watches(ctx);
         ctx.config_live().signal().request_now();
     }
 }
-
-#[cfg(test)]
-static SEMANTIC_BLOB_OPEN_OBSERVERS: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<(PathBuf, bool)>>>,
-> = std::sync::OnceLock::new();
-
-/// Tracks one worker's private index without retaining the index in the census.
-/// Each worker owns its contribution: a retiring generation cannot erase a
-/// replacement worker's bytes. Shared bases contribute zero here and are counted
-/// once by the process-wide semantic base registry. Estimates are refreshed at
-/// completed mutation boundaries; transient embedding/refresh buffers are excluded.
-struct SemanticWorkerMemory {
-    total: Arc<AtomicU64>,
-    bytes: u64,
-}
-
-impl SemanticWorkerMemory {}
-
-impl Drop for SemanticWorkerMemory {
-    fn drop(&mut self) {
-        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
-
-#[cfg(any(test, feature = "test-timing-hooks"))]
-fn semantic_quiet_gate_path() -> Option<PathBuf> {
-    std::env::var_os("AFT_TEST_SEMANTIC_QUIET_GATE").map(PathBuf::from)
-}
-
-#[cfg(any(test, feature = "test-timing-hooks"))]
-fn semantic_quiet_gate_held() -> bool {
-    let Some(path) = semantic_quiet_gate_path()
-        .filter(|path| path.exists() && !path.with_extension("release").exists())
-    else {
-        return false;
-    };
-    std::fs::write(path.with_extension("waiting"), b"waiting").expect("quiet gate observation");
-    true
-}
-
-struct SemanticRefreshDebounce {
-    quiet_window: Duration,
-    quiet_deadline: Instant,
-    batch_deadline: Instant,
-}
-
-impl SemanticRefreshDebounce {}
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -1079,14 +833,7 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let callgraph_ready = !config.indexes.callgraph
-        || ctx
-            .callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx.callgraph_store_rx().lock().is_some();
-    callgraph_ready
+    !config.indexes.callgraph
 }
 
 #[cfg(test)]
@@ -1097,49 +844,6 @@ fn reset_workspace_manifest_fingerprint_scans_for_test() {
 #[cfg(test)]
 fn workspace_manifest_fingerprint_scans_for_test() -> usize {
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(std::cell::Cell::get)
-}
-
-/// Resolution fields of the workspace manifests configure watches, keyed by
-/// path; None marks a watched file that does not exist.
-type WorkspaceResolutionManifests = std::collections::BTreeMap<PathBuf, Option<String>>;
-
-/// Read what module resolution uses from the workspace manifests (see
-/// `callgraph_store::resolution_config`). A `version` bump or a new dependency
-/// leaves this unchanged; an `exports`, `main`, `name` or `workspaces` change
-/// does not.
-fn workspace_manifest_fingerprint(project_root: &Path) -> WorkspaceResolutionManifests {
-    #[cfg(test)]
-    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(count.get() + 1));
-    crate::callgraph_store::resolution_config::workspace_resolution_manifest_paths(project_root)
-        .into_iter()
-        .map(|path| {
-            let fields = crate::callgraph_store::resolution_config::resolution_fields(&path);
-            (path, fields)
-        })
-        .collect()
-}
-
-/// Hand workspace manifests whose resolution fields changed since this root's
-/// previous configure to the incremental callgraph refresh. The refresh
-/// compares each with the fields the store recorded and re-resolves only the
-/// files importing through it, so a manifest change never rebuilds the store.
-fn refresh_changed_workspace_manifests(
-    ctx: &AppContext,
-    canonical_root: &Path,
-    manifests: Option<WorkspaceResolutionManifests>,
-) {
-    let Some(manifests) = manifests else {
-        return;
-    };
-    let changed = ctx.note_workspace_resolution_manifests(canonical_root, manifests);
-    if changed.is_empty() || !ctx.callgraph_writer() {
-        return;
-    }
-    slog_info!(
-        "workspace manifest resolution fields changed in {} file(s); refreshing their importers in the callgraph store",
-        changed.len()
-    );
-    ctx.enqueue_callgraph_store_refresh_before_queries(changed);
 }
 
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
@@ -2016,29 +1720,6 @@ fn audit01_warning_current_generation_publishes() {
     assert_eq!(rx.try_recv().unwrap().0, 2);
 }
 
-/// When a symbol-cache prewarm should give up before visiting every file.
-/// The prewarm can run for a long time on a large root, so it stops between
-/// files when its configuration is replaced or its root has been unbound past
-/// the abandon grace. Idle eviction resets the symbol cache to a new
-/// generation, which the prewarm checks on every file as well.
-#[derive(Clone)]
-struct SymbolPrewarmStop {
-    lifecycle: crate::context::SubcLifecycleAdmission,
-    content_generation_flag: Arc<AtomicU64>,
-    content_generation: u64,
-}
-
-impl SymbolPrewarmStop {
-    #[cfg(test)]
-    fn never() -> Self {
-        Self {
-            lifecycle: crate::context::SubcLifecycleAdmission::default(),
-            content_generation_flag: Arc::new(AtomicU64::new(0)),
-            content_generation: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     /// Called with the number of files visited so far, after each prewarm file.
@@ -2046,24 +1727,8 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-/// What one views-routed symbol prewarm did with the files it was given.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SymbolViewPrewarm {
-    /// Already in the symbol cache for the file's current modification time.
-    cached: u64,
-    /// Served from rows the family's v3 symbol plane already held.
-    reused: u64,
-    /// Parsed here and stored into the v3 symbol plane.
-    stored: u64,
-    /// Left for an ordinary on-demand parse: unreadable, changed since the
-    /// lexical view verified it, or not parseable.
-    skipped: u64,
-}
-
 #[cfg(test)]
-mod nested_worktree_semantic_tests {
-    use super::*;
-}
+mod nested_worktree_semantic_tests {}
 
 #[cfg(not(debug_assertions))]
 fn delay_search_rebuild_publish_for_debug() {}
@@ -2204,27 +1869,6 @@ fn configure_warm_key(
         config.indexes.semantic,
         semantic,
         false,
-        config.indexes.callgraph,
-    )
-}
-
-/// What selects the callgraph store itself. Workspace manifests are not part
-/// of it: a manifest change moves only the imports that resolve through it,
-/// which `refresh_changed_workspace_manifests` refreshes incrementally.
-fn configure_callgraph_build_key(
-    canonical_root: &Path,
-    config: &Config,
-    root_too_broad: bool,
-    is_worktree_bridge: bool,
-    shared_artifacts_read_only: bool,
-) -> String {
-    format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
-        canonical_root,
-        (config.cache_storage_dir(), config.cache_epoch),
-        root_too_broad,
-        is_worktree_bridge,
-        shared_artifacts_read_only,
         config.indexes.callgraph,
     )
 }
@@ -2970,12 +2614,8 @@ fn handle_configure_inner(
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
                     canonical_cache_root: canonical_root.clone(),
-                    project_key: ctx
-                        .cached_artifact_cache_key(canonical_root)
-                        .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
-                    artifact_root: crate::root_cache::cache_root(&next_config),
                     harness_dir: storage_root.join(harness.storage_segment()),
                     session_id: req.session().to_string(),
                     root_too_broad: ctx.root_too_broad(),
@@ -2986,9 +2626,7 @@ fn handle_configure_inner(
                     sync_bash_compress_flag: false,
                     reset_filter_registry: false,
                     clear_failed_spawns: false,
-                    warm_callgraph_store: false,
                     supersede_search_artifact_persistence: false,
-                    supersede_callgraph_artifact_persistence: false,
                     supersede_semantic_artifact_persistence: false,
                 });
                 if enqueue_result.is_err() {
@@ -3136,13 +2774,6 @@ fn handle_configure_inner(
             )
         });
     let effective_configure_changed = current_fingerprint.as_ref() != Some(&requested_fingerprint);
-    // Workspace manifests only matter to the callgraph store. Read them once
-    // when that lane is enabled; disabled roots should not read every package
-    // manifest on every equivalent bind.
-    let workspace_manifests = next_config
-        .indexes
-        .callgraph
-        .then(|| workspace_manifest_fingerprint(&canonical_cache_root));
     let preflight_warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
@@ -3197,7 +2828,6 @@ fn handle_configure_inner(
                 );
             }
         }
-        refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
         register_hashline_for_configure(
             ctx,
             &canonical_cache_root,
@@ -3220,12 +2850,8 @@ fn handle_configure_inner(
                 generation,
                 root_path: root_path.clone(),
                 canonical_cache_root: canonical_cache_root.clone(),
-                project_key: ctx
-                    .cached_artifact_cache_key(&canonical_cache_root)
-                    .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
-                artifact_root: crate::root_cache::cache_root(&next_config),
                 harness_dir: storage_root.join(harness.storage_segment()),
                 session_id: req.session().to_string(),
                 root_too_broad,
@@ -3236,9 +2862,7 @@ fn handle_configure_inner(
                 sync_bash_compress_flag: false,
                 reset_filter_registry: false,
                 clear_failed_spawns: false,
-                warm_callgraph_store: false,
                 supersede_search_artifact_persistence: false,
-                supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
             });
             if enqueue_result.is_err() {
@@ -3578,16 +3202,7 @@ fn handle_configure_inner(
         &canonical_cache_root,
         equivalent_warm_config,
     );
-    let callgraph_build_key = configure_callgraph_build_key(
-        &canonical_cache_root,
-        &next_config,
-        root_too_broad,
-        is_worktree_bridge,
-        ctx.shared_artifacts_read_only(),
-    );
-    let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
     ctx.begin_configure_ack_step("build_state");
-    let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_build_adopted = cache_available
         && !equivalent_warm_config
@@ -3657,12 +3272,6 @@ fn handle_configure_inner(
                 configure_generation
             );
         }
-        if callgraph_build_in_progress {
-            slog_info!(
-                "callgraph store warm build adopted by equivalent reconfigure (generation {})",
-                configure_generation
-            );
-        }
     } else {
         // Semantic and callgraph workers keep their receiver and dedicated
         // build epoch when that lane's inputs are unchanged. Changed lane inputs
@@ -3676,19 +3285,6 @@ fn handle_configure_inner(
             } else {
                 slog_warn!(
                     "semantic index build cancelled (semantic build inputs changed at generation {})",
-                    configure_generation
-                );
-            }
-        }
-        if callgraph_build_in_progress {
-            if equivalent_callgraph_build {
-                slog_info!(
-                    "callgraph store warm build adopted by matching root and corpus configuration (generation {})",
-                    configure_generation
-                );
-            } else {
-                slog_warn!(
-                    "callgraph store warm build cancelled (callgraph inputs changed at generation {})",
                     configure_generation
                 );
             }
@@ -3716,29 +3312,6 @@ fn handle_configure_inner(
             );
             ctx.set_semantic_build_progress(None);
         }
-        if equivalent_callgraph_build {
-            if callgraph_build_in_progress {
-                let adopted = ctx.adopt_callgraph_store_rx_generation(configure_generation);
-                debug_assert!(
-                    adopted,
-                    "callgraph build receiver disappeared before adoption"
-                );
-            }
-        } else {
-            *ctx.callgraph_store()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            ctx.retire_callgraph_store_rx();
-            // Only a callgraph writer can fulfil a force token. A read-only
-            // root (linked worktree, borrowed index family) follows the
-            // owner's published store; a token here would never be fulfilled
-            // and would keep every later callgraph query Unavailable.
-            if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
-                ctx.mark_callgraph_store_force_rebuild(
-                    "callgraph build inputs changed (storage, enablement, or worktree topology)",
-                );
-            }
-        }
         if !semantic_build_adopted {
             if !retain_semantic {
                 *ctx.semantic_index_status()
@@ -3749,11 +3322,7 @@ fn handle_configure_inner(
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
         }
-        if equivalent_callgraph_build {
-            ctx.clear_pending_index_updates_preserving_callgraph();
-        } else {
-            ctx.clear_pending_index_updates();
-        }
+        ctx.clear_pending_index_updates();
 
         // Reconfigure can point AFT at a different root; reset that root's
         // entries before warming the callgraph store for it.
@@ -3761,7 +3330,6 @@ fn handle_configure_inner(
             crate::callgraph::clear_workspace_package_cache_under(root);
         }
     }
-    refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
 
     let refresh_project_runtime =
         project_root_changed || watcher_topology_changed || !ctx.watcher_runtime_active();
@@ -3781,10 +3349,8 @@ fn handle_configure_inner(
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
-        project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root: storage_root.clone(),
-        artifact_root: crate::root_cache::cache_root(&next_config),
         harness_dir: storage_root.join(harness.storage_segment()),
         session_id: req.session().to_string(),
         root_too_broad,
@@ -3795,12 +3361,7 @@ fn handle_configure_inner(
         sync_bash_compress_flag,
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
-        warm_callgraph_store: next_config.indexes.callgraph
-            && !root_too_broad
-            && (!equivalent_warm_config || ctx.configure_callgraph_upgrade_pending())
-            && (!equivalent_callgraph_build || !callgraph_build_in_progress),
         supersede_search_artifact_persistence: !equivalent_warm_config,
-        supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
         supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
     });
     if enqueue_result.is_err() {
@@ -3865,12 +3426,6 @@ fn handle_configure_inner(
         }),
     );
     response
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ArtifactLoadNeeds {
-    search: bool,
-    semantic: bool,
 }
 
 fn release_callgraph_start_waiters_for_generation_change(
@@ -4236,7 +3791,6 @@ struct ConfigureMaintenanceContinuation {
     stage: ConfigureMaintenanceStage,
     replay_retry_at: Option<Instant>,
     lexical_bind_retry_at: Option<Instant>,
-    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -4248,7 +3802,6 @@ impl ConfigureMaintenanceContinuation {
             stage: ConfigureMaintenanceStage::Admission,
             replay_retry_at: None,
             lexical_bind_retry_at: None,
-            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
@@ -4270,12 +3823,6 @@ pub(crate) struct ConfigureMaintenanceState {
 }
 
 impl ConfigureMaintenanceState {
-    pub(crate) fn callgraph_upgrade_pending(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|continuation| continuation.callgraph_upgrade_retry_at.is_some())
-    }
-
     pub(crate) fn jobs_is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
@@ -4787,8 +4334,7 @@ fn run_configure_maintenance_unit_inner(
                 && !job.refresh_project_runtime
                 && !job.sync_bash_compress_flag
                 && !job.reset_filter_registry
-                && !job.clear_failed_spawns
-                && !job.warm_callgraph_store;
+                && !job.clear_failed_spawns;
             if session_only {
                 if ctx
                     .database_runtime_refusal("configure-session-replay", "bash_drain_completions")
@@ -4820,9 +4366,6 @@ fn run_configure_maintenance_unit_inner(
                         && job.supersede_semantic_artifact_persistence
                     {
                         ctx.next_semantic_persist_epoch();
-                    }
-                    if job.supersede_callgraph_artifact_persistence {
-                        ctx.next_callgraph_persist_epoch();
                     }
                 })
                 .is_none()
@@ -5015,18 +4558,6 @@ thread_local! {
     static VIEW_WORKING_TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-struct ConfigureViewInput {
-    family: String,
-    git_common_dir: Option<PathBuf>,
-    callgraph: bool,
-    /// A linked worktree that has not needed its call graph yet; see
-    /// `AppContext::defer_callgraph_build`.
-    defer_callgraph: bool,
-    read_only: bool,
-    semantic: SemanticBackendConfig,
-    limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -5074,36 +4605,27 @@ mod tests {
     }
     use serde_json::{json, Value};
 
-    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock, RwLock};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
-        configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
         only_lsp_process_state_changed, parse_lsp_paths_extra, project_root_is_too_broad,
-        release_callgraph_start_waiters_for_generation_change,
-        release_configure_artifact_post_gate_for_test,
-        reset_configure_deferred_delay_reached_for_test,
-        set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
-        slow_configure_prefix_line, validate_storage_dir, ConfigureMaintenanceStage,
-        INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
+        should_clear_failed_spawns, slow_configure_prefix_line, validate_storage_dir,
+        ConfigureMaintenanceStage, WATCHER_GENERATION,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
-    use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
-    use crate::context::{
-        App, AppContext, CallgraphStoreAccess, SemanticRefreshEvent, SemanticRefreshRequest,
-    };
-    use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
+    use crate::config::{Config, SemanticBackendConfig};
+    use crate::context::AppContext;
+    use crate::parser::TreeSitterProvider;
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
-    use crate::search_index::{CacheLock, SearchIndex};
-    use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+    use crate::search_index::CacheLock;
+
     use std::process::Command;
 
     struct TestContext {
@@ -5756,36 +5278,6 @@ mod tests {
         assert!(registry.project_replay_scan_total_examined_for_test() > before);
     }
 
-    fn symbol_cache_prewarm_test_mutex() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn write_symbol_cache_source(
-        project: &std::path::Path,
-        relative: &str,
-        content: &str,
-    ) -> PathBuf {
-        let path = project.join(relative);
-        std::fs::create_dir_all(path.parent().expect("source parent"))
-            .expect("create source parent");
-        std::fs::write(&path, content).expect("write source");
-        path
-    }
-
-    fn symbol_file(path: &std::path::Path) -> crate::search_index::FileEntry {
-        let modified = std::fs::metadata(path)
-            .expect("stat source")
-            .modified()
-            .expect("source mtime");
-        crate::search_index::FileEntry {
-            path: path.to_path_buf(),
-            size: 0,
-            modified,
-            content_hash: crate::cache_freshness::zero_hash(),
-        }
-    }
-
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -6354,87 +5846,6 @@ mod tests {
             "the newer configure's tail runs to completion: {records:?}"
         );
         assert!(!ctx.configure_tail_has_work());
-    }
-
-    /// `lib.rs` of the on-demand call-graph fixtures: one caller, one callee
-    /// and one function nothing calls, so callers, impact and dead code all
-    /// have something to report.
-    const LAZY_LIB: &str = "pub fn caller() { target(); }\npub fn target() {}\nfn unused() {}\n";
-
-    struct LazyWorktree {
-        _temp: tempfile::TempDir,
-        main: PathBuf,
-        linked: PathBuf,
-        storage: PathBuf,
-        /// The main checkout's context, kept alive for the fixture's
-        /// lifetime; `None` when it was never bound in this process.
-        _owner: Option<Arc<AppContext>>,
-        borrower: Arc<AppContext>,
-    }
-
-    fn lazy_bind(root: &Path, storage: &Path, session: &str) -> Arc<AppContext> {
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.to_path_buf()),
-                ..Config::default()
-            },
-        ));
-        let params = json!({
-            "project_root": root, "storage_dir": storage, "harness": "opencode",
-            "config": [user_tier(json!({ "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-        });
-        let response =
-            handle_configure_for_test(&configure_request_with_session(params, session), &ctx);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        ctx
-    }
-
-    /// Write `lib.rs` in `root` and commit it.
-    fn lazy_commit(root: &Path, contents: &str, message: &str) {
-        fs::write(root.join("lib.rs"), contents).unwrap();
-        assert!(git_command(root)
-            .args(["add", "lib.rs"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(root)
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                message,
-            ])
-            .status()
-            .unwrap()
-            .success());
-    }
-
-    fn lazy_view_dir(storage: &Path, root: &Path) -> PathBuf {
-        storage
-            .join("views")
-            .join(crate::path_identity::project_scope_key(root))
-    }
-
-    /// Edit `lib.rs` in the worktree and deliver the change through the
-    /// watcher drain, without publishing it yet.
-    fn lazy_edit_through_watcher(fixture: &LazyWorktree, contents: &str) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *fixture.borrower.watcher_rx().lock() = Some(rx);
-        let source = fixture.linked.join("lib.rs");
-        fs::write(&source, contents).unwrap();
-        tx.send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
-            source,
-        ]))
-        .unwrap();
-        let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
-        assert_eq!(outcome.processed, 1);
     }
 
     #[test]
@@ -7137,409 +6548,6 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
-    }
-
-    fn configure_lexical_views(root: &Path, storage: &Path) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root, "harness": "opencode", "storage_dir": storage,
-            "config": [user_tier(json!({
-                "views": { "enabled": true },
-                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
-            }))]
-        }))
-    }
-
-    /// The navigation answers whose output the views route must reproduce.
-    fn callgraph_views_answers(ctx: &AppContext, root: &Path) -> Vec<(String, Response)> {
-        let requests = [
-            ("callers", "a.ts", "target", 2),
-            ("impact", "a.ts", "target", 3),
-            ("call_tree", "c.ts", "top", 3),
-            ("trace_to", "a.ts", "target", 5),
-            ("callers", "b.ts", "caller", 1),
-        ];
-        requests
-            .into_iter()
-            .map(|(command, file, symbol, depth)| {
-                let request = RawRequest {
-                    id: format!("callgraph-views-{command}"),
-                    command: command.into(),
-                    lsp_hints: None,
-                    session_id: None,
-                    params: json!({"file": root.join(file), "symbol": symbol, "depth": depth}),
-                };
-                let response = match command {
-                    "callers" => crate::commands::callers::handle_callers(&request, ctx),
-                    "impact" => crate::commands::impact::handle_impact(&request, ctx),
-                    "call_tree" => crate::commands::call_tree::handle_call_tree(&request, ctx),
-                    _ => crate::commands::trace_to::handle_trace_to(&request, ctx),
-                };
-                (format!("{command} {file} {symbol}"), response)
-            })
-            .collect()
-    }
-
-    fn configure_search_with_max_file_size(
-        root: &std::path::Path,
-        storage: &std::path::Path,
-        max_file_size: u64,
-    ) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root,
-            "harness": "opencode",
-            "storage_dir": storage,
-            "search_index_max_file_size": max_file_size,
-            "config": [user_tier(json!({
-                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
-            }))],
-        }))
-    }
-
-    fn configure_semantic_with_storage(
-        root: &std::path::Path,
-        storage: &std::path::Path,
-        base_url: &str,
-        semantic_search: bool,
-    ) -> RawRequest {
-        configure_semantic_with_options(root, storage, base_url, semantic_search, 64, false)
-    }
-
-    fn configure_semantic_with_options(
-        root: &std::path::Path,
-        storage: &std::path::Path,
-        base_url: &str,
-        semantic_search: bool,
-        max_batch_size: usize,
-        callgraph_store: bool,
-    ) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root,
-            "harness": "opencode",
-            "storage_dir": storage,
-            "config": [user_tier(json!({
-                "indexes": {
-                    "trigram": false,
-                    "semantic": semantic_search,
-                    "callgraph": callgraph_store,
-                },
-                "semantic": {
-                    "backend": "openai_compatible",
-                    "model": "counting-test-embedding",
-                    "base_url": base_url,
-                    "timeout_ms": 5_000,
-                    "max_batch_size": max_batch_size,
-                    "max_files": 1_000
-                }
-            }))],
-        }))
-    }
-
-    fn semantic_cache_file(
-        storage: &std::path::Path,
-        root: &std::path::Path,
-    ) -> std::path::PathBuf {
-        let project_key = crate::search_index::artifact_cache_key(root);
-        storage
-            .join("semantic")
-            .join(project_key)
-            .join("semantic.bin")
-    }
-
-    fn count_non_probe_inputs(requests: &[Vec<String>]) -> usize {
-        requests
-            .iter()
-            .flatten()
-            .filter(|text| text.as_str() != "semantic index fingerprint probe")
-            .count()
-    }
-
-    struct CountingEmbeddingServer {
-        base_url: String,
-        stop: Arc<AtomicBool>,
-        requests: Arc<Mutex<Vec<Vec<String>>>>,
-        request_changed: Arc<Condvar>,
-        response_release: Arc<(Mutex<usize>, Condvar)>,
-        fail_summaries: Arc<AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl CountingEmbeddingServer {
-        fn start() -> Self {
-            Self::start_with_dimension(3)
-        }
-
-        fn start_with_dimension(dimension: usize) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
-            let addr = listener.local_addr().expect("embedding mock addr");
-            listener
-                .set_nonblocking(true)
-                .expect("embedding mock nonblocking");
-            let stop = Arc::new(AtomicBool::new(false));
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let request_changed = Arc::new(Condvar::new());
-            let response_release = Arc::new((Mutex::new(0usize), Condvar::new()));
-            let fail_summaries = Arc::new(AtomicBool::new(false));
-            let stop_for_thread = Arc::clone(&stop);
-            let requests_for_thread = Arc::clone(&requests);
-            let request_changed_for_thread = Arc::clone(&request_changed);
-            let response_release_for_thread = Arc::clone(&response_release);
-            let fail_summaries_for_thread = Arc::clone(&fail_summaries);
-            let handle = std::thread::spawn(move || {
-                while !stop_for_thread.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let requests = Arc::clone(&requests_for_thread);
-                            let request_changed = Arc::clone(&request_changed_for_thread);
-                            let response_release = Arc::clone(&response_release_for_thread);
-                            let fail_summaries = Arc::clone(&fail_summaries_for_thread);
-                            std::thread::spawn(move || {
-                                handle_counting_embedding_request(
-                                    stream,
-                                    requests,
-                                    request_changed,
-                                    response_release,
-                                    fail_summaries,
-                                    dimension,
-                                )
-                            });
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("embedding mock accept failed: {error}"),
-                    }
-                }
-            });
-            Self {
-                base_url: format!("http://{addr}"),
-                stop,
-                requests,
-                request_changed,
-                response_release,
-                fail_summaries,
-                handle: Some(handle),
-            }
-        }
-
-        fn non_probe_input_count(&self) -> usize {
-            count_non_probe_inputs(
-                &self
-                    .requests
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-        }
-
-        fn non_probe_request_count(&self) -> usize {
-            self.requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .filter(|inputs| {
-                    inputs
-                        .iter()
-                        .any(|text| text != "semantic index fingerprint probe")
-                })
-                .count()
-        }
-
-        fn wait_for_non_probe_input(&self, timeout: Duration) -> bool {
-            self.wait_for_non_probe_input_count(1, timeout)
-        }
-
-        fn wait_for_non_probe_input_count(&self, expected: usize, timeout: Duration) -> bool {
-            let requests = self
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (requests, result) = self
-                .request_changed
-                .wait_timeout_while(requests, timeout, |requests| {
-                    count_non_probe_inputs(requests) < expected
-                })
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !result.timed_out() || count_non_probe_inputs(&requests) >= expected
-        }
-
-        fn wait_for_non_probe_request_count(&self, expected: usize, timeout: Duration) -> bool {
-            let requests = self
-                .requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (requests, result) = self
-                .request_changed
-                .wait_timeout_while(requests, timeout, |requests| {
-                    requests
-                        .iter()
-                        .filter(|inputs| {
-                            inputs
-                                .iter()
-                                .any(|text| text != "semantic index fingerprint probe")
-                        })
-                        .count()
-                        < expected
-                })
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !result.timed_out()
-                || requests
-                    .iter()
-                    .filter(|inputs| {
-                        inputs
-                            .iter()
-                            .any(|text| text != "semantic index fingerprint probe")
-                    })
-                    .count()
-                    >= expected
-        }
-
-        fn release_response(&self) {
-            let (remaining, changed) = &*self.response_release;
-            let mut remaining = remaining
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *remaining = remaining.saturating_add(1);
-            changed.notify_one();
-        }
-
-        fn release_responses(&self) {
-            let (remaining, changed) = &*self.response_release;
-            *remaining
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = usize::MAX;
-            changed.notify_all();
-        }
-    }
-
-    impl Drop for CountingEmbeddingServer {
-        fn drop(&mut self) {
-            self.release_responses();
-            self.stop.store(true, Ordering::Relaxed);
-            let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("embedding mock joins");
-            }
-        }
-    }
-
-    fn handle_counting_embedding_request(
-        mut stream: std::net::TcpStream,
-        requests: Arc<Mutex<Vec<Vec<String>>>>,
-        request_changed: Arc<Condvar>,
-        response_release: Arc<(Mutex<usize>, Condvar)>,
-        fail_summaries: Arc<AtomicBool>,
-        dimension: usize,
-    ) {
-        stream
-            .set_nonblocking(false)
-            .expect("embedding request stream blocking mode");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone embedding stream"));
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let read = reader.read_line(&mut line).expect("read embedding header");
-            if read == 0 || line == "\r\n" {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse().unwrap_or(0);
-                }
-            }
-        }
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body).expect("read embedding body");
-        let request_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let inputs = match request_body.get("input") {
-            Some(serde_json::Value::Array(values)) => values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect::<Vec<_>>(),
-            Some(serde_json::Value::String(value)) => vec![value.clone()],
-            _ => vec![String::new()],
-        };
-        requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(inputs.clone());
-        request_changed.notify_all();
-        if fail_summaries.load(Ordering::SeqCst)
-            && inputs.iter().any(|text| text.contains("kind:file-summary"))
-        {
-            let body = "temporary summary backend outage";
-            let response = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            let _ = stream.write_all(response.as_bytes());
-            return;
-        }
-        if inputs
-            .iter()
-            .any(|text| text != "semantic index fingerprint probe")
-        {
-            let (remaining, changed) = &*response_release;
-            let mut remaining = remaining
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while *remaining == 0 {
-                remaining = changed
-                    .wait(remaining)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            if *remaining != usize::MAX {
-                *remaining -= 1;
-            }
-        }
-        let data = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let base = index as f64 + 1.0;
-                json!({
-                    "embedding": (0..dimension).map(|axis| base + axis as f64 * 0.1).collect::<Vec<_>>(),
-                    "index": index,
-                })
-            })
-            .collect::<Vec<_>>();
-        let response_body = json!({ "data": data }).to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write embedding response");
-    }
-
-    /// Every non-probe embedding input the server has received so far.
-    fn non_probe_inputs(server: &CountingEmbeddingServer) -> Vec<String> {
-        server
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .flatten()
-            .filter(|text| text.as_str() != "semantic index fingerprint probe")
-            .cloned()
-            .collect()
-    }
-
-    fn semantic_search_request(query: &str) -> RawRequest {
-        serde_json::from_value(json!({
-            "id": "semantic-reload-query",
-            "command": "semantic_search",
-            "query": query,
-            "top_k": 5
-        }))
-        .expect("semantic search request")
-    }
-
-    fn grep_request(pattern: &str) -> RawRequest {
-        serde_json::from_value(json!({
-            "id": "grep-reload-query",
-            "command": "grep",
-            "pattern": pattern,
-            "max_results": 10
-        }))
-        .expect("grep request")
     }
 
     #[test]
@@ -8772,171 +7780,10 @@ mod tests {
         );
     }
 
-    /// A semantic configure as a route under `harness` and `session` would send
-    /// it, with optional user-tier `index.roots`.
-    fn configure_semantic_bind(
-        root: &Path,
-        storage: &Path,
-        base_url: &str,
-        harness: &str,
-        session: &str,
-        index_roots: Option<serde_json::Value>,
-    ) -> RawRequest {
-        let mut user = json!({
-            "indexes": { "trigram": false, "semantic": true, "callgraph": false },
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": "counting-test-embedding",
-                "base_url": base_url,
-                "timeout_ms": 5_000,
-                "max_batch_size": 64,
-                "max_files": 1_000
-            }
-        });
-        if let Some(roots) = index_roots {
-            user["index"] = json!({ "roots": roots });
-        }
-        configure_request_with_session(
-            json!({
-                "project_root": root,
-                "harness": harness,
-                "storage_dir": storage,
-                "config": [user_tier(user)],
-            }),
-            session,
-        )
-    }
-
-    fn semantic_admission_project(parent: &Path) -> PathBuf {
-        let project = parent.join("project");
-        std::fs::create_dir_all(project.join("src")).unwrap();
-        for index in 0..3 {
-            std::fs::write(
-                project.join("src").join(format!("opened_{index}.rs")),
-                format!("pub fn opened_symbol_{index}() {{}}\n"),
-            )
-            .unwrap();
-        }
-        project
-    }
-
-    fn total_embedding_requests(server: &CountingEmbeddingServer) -> usize {
-        server
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-
-    /// Starts a semantic cold build over nine small files at one chunk per
-    /// embed batch and returns once the first batch is parked in the embedding
-    /// server, so the build holds its cold-build permit mid-loop.
-    fn semantic_cold_build_parked_on_first_batch(
-        grace: Duration,
-    ) -> (
-        TestContext,
-        CountingEmbeddingServer,
-        tempfile::TempDir,
-        PathBuf,
-        PathBuf,
-    ) {
-        let server = CountingEmbeddingServer::start();
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
-        let storage = temp.path().join("storage");
-        std::fs::create_dir_all(&project).unwrap();
-        for index in 0..8 {
-            std::fs::write(
-                project.join(format!("batch_{index}.rs")),
-                format!("pub fn abandoned_batch_symbol_{index}() -> usize {{ {index} }}\n"),
-            )
-            .unwrap();
-        }
-        init_git_fixture(&project);
-        let request =
-            configure_semantic_with_options(&project, &storage, &server.base_url, true, 1, false);
-        let ctx = test_context();
-        ctx.isolate_cold_build_limiter_for_test(4);
-        ctx.set_unbound_build_abandon_grace_for_test(grace);
-
-        let response = handle_configure_for_test(&request, &ctx);
-        assert!(response.success, "configure failed: {:?}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        assert!(
-            server.wait_for_non_probe_request_count(1, Duration::from_secs(10)),
-            "semantic cold build did not reach the embedding server"
-        );
-        (ctx, server, temp, project, storage)
-    }
-
-    fn configure_ram_overlay_worktree(root: &Path, storage: &Path) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root,
-            "harness": "opencode",
-            "storage_dir": storage,
-            "config": [user_tier(json!({
-                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                "worktree": { "ram_overlay": true }
-            }))]
-        }))
-    }
-
-    fn grep_matches_and_status(ctx: &AppContext, pattern: &str) -> (u64, String) {
-        let response = crate::commands::grep::handle_grep(&grep_request(pattern), ctx);
-        assert!(
-            response.success,
-            "grep {pattern} failed: {:?}",
-            response.data
-        );
-        (
-            response.data["total_matches"].as_u64().unwrap_or_default(),
-            response.data["index_status"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        )
-    }
-
-    const PRE_EXISTING_DRIFT_TOKENS: [&str; 4] = [
-        "BRANCH_EDITED_TOKEN",
-        "BRANCH_NEW_FILE_TOKEN",
-        "UNCOMMITTED_EDIT_TOKEN",
-        "UNTRACKED_TOKEN",
-    ];
-
     // ---------------------------------------------------------------------
     // A second checkout of an OLDER commit of the same repository borrows the
     // live checkout's search snapshot.
     //
-    // All roots whose HEAD history shares a root commit derive the same
-    // artifact key (`artifact_cache_key` hashes the root commit set), so a
-    // clone, a `cp -R` copy or a linked worktree opens the live checkout's
-    // `cache.bin`. With `worktree.ram_overlay` on (the default), the borrow-only
-    // root reconciles that snapshot with its own files before reporting ready,
-    // so it answers with its own files and contents. With the escape hatch
-    // (`ram_overlay: false`) the snapshot is served as it is, and only the
-    // on-disk backstop in glob and aft_search keeps the live checkout's files
-    // out of the results. See
-    // docs/investigations/borrowed-index-phantom-paths-2026-09.md.
-    // ---------------------------------------------------------------------
-
-    /// How the second, older checkout of the live repository is produced.
-    #[derive(Clone, Copy, Debug)]
-    enum OlderCheckoutKind {
-        /// `git clone --shared live scratch`, then detach at the older commit.
-        SharedClone,
-        /// `git clone live scratch`, then detach at the older commit.
-        PlainClone,
-        /// `git worktree add --detach scratch <older commit>` from the live repo.
-        LinkedWorktree,
-        /// `cp -R live scratch`, then detach at the older commit. Unix only,
-        /// like the test that uses it.
-        #[cfg(unix)]
-        CopiedTree,
-    }
-
-    /// File that exists only at the live checkout's HEAD.
-    const PHANTOM_REL_PATH: &str = "extra/phantom.ts";
 
     fn git_ok(root: &Path, args: &[&str]) {
         let status = git_command(root).args(args).status().unwrap();
@@ -8947,31 +7794,10 @@ mod tests {
         );
     }
 
-    /// Canonical temp root in a form `git worktree add` accepts: on Windows,
-    /// `fs::canonicalize` returns a `\\?\` verbatim path, which git rejects.
-    fn git_friendly_canonical(path: &Path) -> PathBuf {
-        let canonical = std::fs::canonicalize(path).unwrap();
-        #[cfg(windows)]
-        let canonical = crate::windows_path::normalize_windows_path(&canonical);
-        canonical
-    }
-
     fn git_stdout(root: &Path, args: &[&str]) -> String {
         let output = git_command(root).args(args).output().unwrap();
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8(output.stdout).unwrap().trim().to_string()
-    }
-
-    fn configure_ram_overlay_escape_hatch(root: &Path, storage: &Path) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root,
-            "harness": "opencode",
-            "storage_dir": storage,
-            "config": [user_tier(json!({
-                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                "worktree": { "ram_overlay": false }
-            }))]
-        }))
     }
 
     #[test]
@@ -9037,126 +7863,6 @@ mod tests {
         assert_eq!(frame.frame_type, "configure_warnings");
     }
 
-    struct IndexOrderTestGuard {
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for IndexOrderTestGuard {
-        fn drop(&mut self) {
-            INDEX_ORDER_GRACE_MS.store(30_000, Ordering::SeqCst);
-            clear_index_order_timeout_logs();
-        }
-    }
-
-    fn index_order_test_guard() -> IndexOrderTestGuard {
-        IndexOrderTestGuard {
-            _guard: INDEX_ORDER_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        }
-    }
-
-    fn clear_index_order_timeout_logs() {
-        INDEX_ORDER_TIMEOUT_LOGS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-
-    fn callgraph_event(
-        root: &Path,
-        kind: crate::logging::IndexEventKind,
-    ) -> crate::logging::IndexEvent {
-        crate::logging::IndexEvent::new(
-            kind,
-            crate::logging::IndexPlane::Callgraph,
-            "configure-order-test-build",
-            root,
-            "configure-order-test-key",
-        )
-    }
-
-    fn index_build_started(events: &[String], plane: &str) -> bool {
-        events.iter().any(|line| {
-            line.contains("kind=build_started") && line.contains(&format!("plane={plane}"))
-        })
-    }
-
-    fn lifecycle_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(root.path());
-        std::fs::write(
-            root.path().join("lib.rs"),
-            "pub fn entry() { leaf(); }\npub fn leaf() {}\n",
-        )
-        .unwrap();
-        (root, storage)
-    }
-
-    struct BusyObsoleteNonGitUpgrade {
-        ctx: TestContext,
-        _root: tempfile::TempDir,
-        _storage: tempfile::TempDir,
-        source: PathBuf,
-        request: RawRequest,
-        slots: Vec<crate::cold_build_limiter::ColdBuildPermit>,
-    }
-
-    #[test]
-    fn non_equivalent_reconfigure_retires_superseded_callgraph_receiver() {
-        let _env_guard = home_env_mutex();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let first_root = tempfile::tempdir().unwrap();
-        let second_root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(first_root.path());
-        init_git_fixture(second_root.path());
-        let ctx = test_context();
-        let config = [user_tier(json!({
-            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
-        }))];
-        let first = configure_request_with_params(json!({
-            "project_root": first_root.path(),
-            "harness": "opencode",
-            "storage_dir": storage.path(),
-            "config": config.clone()
-        }));
-        assert!(handle_configure_for_test(&first, &ctx).success);
-
-        let generation = ctx.configure_generation();
-        let (_old_tx, old_rx) = crossbeam_channel::unbounded();
-        ctx.note_callgraph_store_rx_generation(generation);
-        let old_epoch = ctx.next_callgraph_store_rx_epoch();
-        let old_persist_epoch = ctx.next_callgraph_persist_epoch();
-        *ctx.callgraph_store_rx().lock() = Some(old_rx);
-
-        let second = configure_request_with_params(json!({
-            "project_root": second_root.path(),
-            "harness": "opencode",
-            "storage_dir": storage.path(),
-            "config": config
-        }));
-        assert!(handle_configure_for_test(&second, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
-
-        assert!(
-            ctx.callgraph_store_rx().lock().is_none(),
-            "a non-equivalent configure must retire the superseded receiver"
-        );
-        assert!(
-            ctx.callgraph_store_rx_epoch() > old_epoch,
-            "receiver retirement must invalidate a dequeued stale completion"
-        );
-        assert!(
-            ctx.callgraph_persist_epoch_flag().current() > old_persist_epoch,
-            "receiver retirement must also invalidate stale disk publication"
-        );
-    }
-
     #[test]
     fn workspace_manifest_fingerprint_is_lazy_and_reused_per_configure() {
         let _env_guard = home_env_mutex();
@@ -9220,12 +7926,6 @@ mod tests {
         assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
     }
 
-    /// Writes `packages/pkg-a/package.json` under `root` with `contents`.
-    fn write_workspace_manifest(root: &std::path::Path, contents: &str) {
-        std::fs::create_dir_all(root.join("packages/pkg-a")).unwrap();
-        std::fs::write(root.join("packages/pkg-a/package.json"), contents).unwrap();
-    }
-
     #[test]
     fn configure_publishes_bash_compression_before_deferred_maintenance() {
         let _env_guard = home_env_mutex();
@@ -9249,20 +7949,6 @@ mod tests {
             ctx.bash_compress_flag().load(Ordering::Relaxed),
             "configure must publish compression before maintenance can run"
         );
-    }
-
-    fn callgraph_only_configure_request(
-        root: &std::path::Path,
-        storage: &std::path::Path,
-    ) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root,
-            "harness": "opencode",
-            "storage_dir": storage,
-            "config": [user_tier(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-            }))]
-        }))
     }
 
     #[test]
@@ -9487,7 +8173,6 @@ mod tests {
             assert!(!ctx.config().indexes.callgraph);
             assert!(!false);
             assert!(ctx.semantic_index_rx().lock().is_none());
-            assert!(ctx.callgraph_store_rx().lock().is_none());
             assert!(
                 ctx.data_checkout().is_none(),
                 "broad root must bind no checkout"
@@ -11182,8 +9867,6 @@ mod tests {
     }
 
     /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.
-    /// The legacy samples explicitly replay the manifest scans removed from the
-    /// handler, keeping before/after timings paired in the same process.
     /// Run with:
     /// `cargo test --release -p agent-file-tools configure_bind_path_measurement -- --ignored --nocapture`
     #[test]
@@ -11253,14 +9936,10 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
         });
-        let measure_cold_bind = |session: &str, emulate_legacy_scans: bool| {
+        let measure_cold_bind = |session: &str| {
             let ctx = test_context();
             let req = configure_request_with_session(params.clone(), session);
             let started = Instant::now();
-            if emulate_legacy_scans {
-                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
-                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
-            }
             let response = handle_configure_for_test(&req, &ctx);
             let pre_ack = started.elapsed();
             assert!(response.success, "cold configure failed: {response:?}");
@@ -11269,31 +9948,12 @@ mod tests {
             super::drain_deferred_configure_maintenance(&ctx);
             (pre_ack, started.elapsed())
         };
-        let mut legacy_cold_pre_ack = Vec::with_capacity(RUNS);
-        let mut legacy_cold_post_ack = Vec::with_capacity(RUNS);
         let mut optimized_cold_pre_ack = Vec::with_capacity(RUNS);
         let mut optimized_cold_post_ack = Vec::with_capacity(RUNS);
         for run in 0..RUNS {
-            let legacy_session = format!("legacy-cold-{run}");
-            let optimized_session = format!("optimized-cold-{run}");
-            let (first_session, first_legacy, second_session, second_legacy) = if run % 2 == 0 {
-                (&optimized_session, false, &legacy_session, true)
-            } else {
-                (&legacy_session, true, &optimized_session, false)
-            };
-            for (session, legacy) in [
-                (first_session.as_str(), first_legacy),
-                (second_session.as_str(), second_legacy),
-            ] {
-                let (pre_ack, post_ack) = measure_cold_bind(session, legacy);
-                if legacy {
-                    legacy_cold_pre_ack.push(pre_ack);
-                    legacy_cold_post_ack.push(post_ack);
-                } else {
-                    optimized_cold_pre_ack.push(pre_ack);
-                    optimized_cold_post_ack.push(post_ack);
-                }
-            }
+            let (pre_ack, post_ack) = measure_cold_bind(&format!("cold-{run}"));
+            optimized_cold_pre_ack.push(pre_ack);
+            optimized_cold_post_ack.push(post_ack);
         }
 
         let ctx = test_context();
@@ -11301,11 +9961,8 @@ mod tests {
         assert!(handle_configure_for_test(&initial, &ctx).success);
         ctx.mark_subc_bound();
         super::drain_deferred_configure_maintenance(&ctx);
-        let measure_warm_bind = |req: &RawRequest, emulate_legacy_scan: bool| {
+        let measure_warm_bind = |req: &RawRequest| {
             let started = Instant::now();
-            if emulate_legacy_scan {
-                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
-            }
             let response = handle_configure_for_test(req, &ctx);
             let pre_ack = started.elapsed();
             assert!(response.success, "warm configure failed: {response:?}");
@@ -11313,70 +9970,28 @@ mod tests {
             super::drain_deferred_configure_maintenance(&ctx);
             (pre_ack, started.elapsed())
         };
-        let mut legacy_warm_pre_ack = Vec::with_capacity(RUNS);
-        let mut legacy_warm_post_ack = Vec::with_capacity(RUNS);
         let mut optimized_warm_pre_ack = Vec::with_capacity(RUNS);
         let mut optimized_warm_post_ack = Vec::with_capacity(RUNS);
         for run in 0..RUNS {
-            let legacy =
-                configure_request_with_session(params.clone(), &format!("legacy-warm-{run}"));
-            let optimized =
-                configure_request_with_session(params.clone(), &format!("optimized-warm-{run}"));
-            let (first, first_legacy, second, second_legacy) = if run % 2 == 0 {
-                (&optimized, false, &legacy, true)
-            } else {
-                (&legacy, true, &optimized, false)
-            };
-            for (req, legacy) in [(first, first_legacy), (second, second_legacy)] {
-                let (pre_ack, post_ack) = measure_warm_bind(req, legacy);
-                if legacy {
-                    legacy_warm_pre_ack.push(pre_ack);
-                    legacy_warm_post_ack.push(post_ack);
-                } else {
-                    optimized_warm_pre_ack.push(pre_ack);
-                    optimized_warm_post_ack.push(post_ack);
-                }
-            }
+            let request = configure_request_with_session(params.clone(), &format!("warm-{run}"));
+            let (pre_ack, post_ack) = measure_warm_bind(&request);
+            optimized_warm_pre_ack.push(pre_ack);
+            optimized_warm_post_ack.push(post_ack);
         }
 
         eprintln!(
-            "configure bind path: files={} packages={PACKAGES} runs={RUNS} legacy_cold_pre_ack_us={} optimized_cold_pre_ack_us={} legacy_cold_post_ack_us={} optimized_cold_post_ack_us={} legacy_warm_pre_ack_us={} optimized_warm_pre_ack_us={} legacy_warm_post_ack_us={} optimized_warm_post_ack_us={}",
+            "configure bind path: files={} packages={PACKAGES} runs={RUNS} cold_pre_ack_us={} cold_post_ack_us={} warm_pre_ack_us={} warm_post_ack_us={}",
             PACKAGES * FILES_PER_PACKAGE,
-            median(&mut legacy_cold_pre_ack).as_micros(),
             median(&mut optimized_cold_pre_ack).as_micros(),
-            median(&mut legacy_cold_post_ack).as_micros(),
             median(&mut optimized_cold_post_ack).as_micros(),
-            median(&mut legacy_warm_pre_ack).as_micros(),
             median(&mut optimized_warm_pre_ack).as_micros(),
-            median(&mut legacy_warm_post_ack).as_micros(),
             median(&mut optimized_warm_post_ack).as_micros(),
         );
     }
 }
 
 #[cfg(test)]
-mod inspect_orphan_sweep_tests {
-    use super::*;
-
-    /// Write a URL download fetched at `fetched_at_ms` under `storage`, the
-    /// way `url_fetch` lays it out, and return its content and metadata paths.
-    fn url_download(storage: &Path, url: &str, fetched_at_ms: u64) -> (PathBuf, PathBuf) {
-        let content = crate::url_fetch::cache_content_path_for_url(storage, url, ".md");
-        let meta = crate::url_fetch::cache_meta_path_for_url(storage, url);
-        fs::create_dir_all(content.parent().unwrap()).unwrap();
-        fs::write(&content, "body").unwrap();
-        let meta_json = serde_json::json!({
-            "url": url,
-            "contentType": "text/markdown",
-            "extension": ".md",
-            "fetchedAt": fetched_at_ms,
-        });
-        fs::write(&meta, serde_json::to_vec(&meta_json).unwrap()).unwrap();
-        (content, meta)
-    }
-}
+mod inspect_orphan_sweep_tests {}
 
 #[cfg(test)]
-mod startup_view_sweep_tests {
-    use super::*;
-}
+mod startup_view_sweep_tests {}

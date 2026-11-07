@@ -632,17 +632,6 @@ fn record_child_failure(
     }
 }
 
-/// Test seam for [`record_child_failure`], so tests need no running worker.
-#[cfg(test)]
-pub(crate) fn record_child_failure_for_test(
-    root: &Path,
-    child: &str,
-    plane: &'static str,
-    error: &str,
-) {
-    record_child_failure(root, child, plane, error, None);
-}
-
 fn child_reserve_key(child: &str, plane: &str) -> String {
     format!("{plane}/{}", blake3::hash(child.as_bytes()).to_hex())
 }
@@ -733,7 +722,6 @@ pub struct Child {
     pub root: PathBuf,
     /// Path relative to the parent folder, used as the answer's path prefix.
     pub relative: PathBuf,
-    scope: String,
     /// Read-only handle on the child's persisted inspect aggregates, holding
     /// a read marker on the inspect generation it reads.
     pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
@@ -748,11 +736,9 @@ impl Child {
             .strip_prefix(parent)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| root.clone());
-        let scope = crate::path_identity::project_scope_key(&root);
         Self {
             root,
             relative,
-            scope,
             inspect: RwLock::new(None),
             engine: Mutex::new(None),
         }

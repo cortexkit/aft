@@ -1384,9 +1384,7 @@ pub fn query_pending(
     let pending = ctx.pending_changes_for_query(callgraph_command);
     (
         watcher_command && pending.watcher,
-        Some(pending.callgraph).filter(|changes| {
-            callgraph_command && (!changes.is_empty() || changes.observe_reconciles())
-        }),
+        Some(pending.callgraph).filter(|changes| callgraph_command && !changes.is_empty()),
     )
 }
 
@@ -1411,7 +1409,7 @@ pub fn attach_callgraph_pending_gaps(
     if !response.success {
         return;
     }
-    let pending = pending.resolved();
+    let pending = pending.clone();
     if pending.is_empty() {
         return;
     }
@@ -1558,7 +1556,6 @@ mod callgraph_pending_tests {
             view_paths: view.iter().map(|path| path.to_string()).collect(),
             whole_checkout,
             whole_store: false,
-            reconcile_query: None,
         }
     }
 

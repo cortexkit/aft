@@ -224,7 +224,7 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     match plane {
         IndexPlane::Trigram => observe_trigram(ctx),
         IndexPlane::Semantic => observe_semantic(ctx),
-        IndexPlane::Callgraph => observe_callgraph(ctx),
+        IndexPlane::Callgraph => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
 }
 
@@ -376,32 +376,6 @@ pub const fn local_semantic_platform_supported() -> bool {
     ))
 }
 
-fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
-    let resident = match ctx.callgraph_store().try_read() {
-        Ok(guard) => guard.is_some(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
-    if resident && ctx.pending_callgraph_store_force_token().is_none() {
-        return IndexObservation::ready();
-    }
-    if ctx.callgraph_store_build_suspension().is_some() {
-        return IndexObservation::unavailable(cause::BUILD_SUSPENDED);
-    }
-    if ctx.callgraph_store_build_denial().is_some() {
-        return IndexObservation::unavailable(cause::CALLGRAPH_BUILD_DENIED);
-    }
-    if ctx
-        .callgraph_store_rx()
-        .try_lock()
-        .is_none_or(|rx| rx.is_some())
-        || ctx.pending_callgraph_store_force_token().is_some()
-    {
-        return IndexObservation::building();
-    }
-    IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED)
-}
-
 /// Translate the result of a callgraph store request into the plane's
 /// observation, so a consumer that already asked for the store reports the
 /// same state it acted on.
@@ -412,7 +386,6 @@ pub fn callgraph_access_observation(
     use crate::context::CallgraphStoreAccess;
     match access {
         CallgraphStoreAccess::Off => IndexObservation::off(),
-        CallgraphStoreAccess::Ready(_) => IndexObservation::ready(),
         CallgraphStoreAccess::Building => IndexObservation::building(),
         CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => {
             IndexObservation::building()
@@ -436,31 +409,9 @@ pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
     observe_callgraph_query_with_contention(ctx).0
 }
 
-/// Observe a query access and indicate whether SQLite explicitly reported a
-/// transient busy or locked error while opening the published view database.
+/// Observe the current call-graph lane without opening a retired view database.
 pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
-    let served_by_view = false;
-    if !served_by_view {
-        return (observed_index_status(ctx, IndexPlane::Callgraph), false);
-    }
-
-    let access = ctx.callgraph_store_for_query_without_wait();
-    match &access {
-        crate::context::CallgraphStoreAccess::Error(error)
-            if error.is_transient_lock_contention() =>
-        {
-            (IndexObservation::building(), true)
-        }
-        crate::context::CallgraphStoreAccess::Error(
-            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
-        ) if crate::view_storage_reserve::is_message(message) => {
-            (IndexObservation::unavailable(message.clone()), false)
-        }
-        crate::context::CallgraphStoreAccess::Error(error) => {
-            (IndexObservation::unavailable(error.to_string()), false)
-        }
-        _ => (callgraph_access_observation(ctx, &access), false),
-    }
+    (observed_index_status(ctx, IndexPlane::Callgraph), false)
 }
 
 #[cfg(test)]

@@ -707,14 +707,6 @@ mod busy_retry_hook {
             }
         });
     }
-
-    /// Run `body` with `hook` called before each busy-file retry.
-    pub(super) fn with<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
-        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-        let value = body();
-        HOOK.with(|slot| *slot.borrow_mut() = None);
-        value
-    }
 }
 
 #[cfg(unix)]

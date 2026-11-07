@@ -21,9 +21,8 @@
 //! reflects every file on disk or only part of the project.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::external_exact::classify_file;
@@ -34,18 +33,12 @@ use crate::semantic_index::SemanticIndex;
 const WALK_BUDGET: Duration = Duration::from_secs(2);
 /// Time allowed, after the walk, for reading changed and new files.
 const REREAD_BUDGET: Duration = Duration::from_secs(1);
-/// How long a finished check keeps answering later queries for the same
-/// saved index before the project is walked again. Agents often send several
-/// queries to another project in a row; each reply that reuses a check says
-/// how old it is.
-const REUSE_WINDOW: Duration = Duration::from_secs(12);
 
 /// Walk budget, re-read budget and reuse window.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Budgets {
     pub walk: Duration,
     pub reread: Duration,
-    pub reuse_window: Duration,
 }
 
 thread_local! {
@@ -62,42 +55,7 @@ pub(super) fn budgets() -> Budgets {
     BUDGETS_FOR_TEST.with(Cell::get).unwrap_or(Budgets {
         walk: WALK_BUDGET,
         reread: REREAD_BUDGET,
-        reuse_window: REUSE_WINDOW,
     })
-}
-
-/// Run `run` with the walk and re-read budgets replaced on this thread. The
-/// reuse window is zero so every query checks the disk afresh.
-#[cfg(test)]
-pub(crate) fn with_budgets_for_test<R>(
-    walk: Duration,
-    reread: Duration,
-    run: impl FnOnce() -> R,
-) -> R {
-    with_all_budgets_for_test(
-        Budgets {
-            walk,
-            reread,
-            reuse_window: Duration::ZERO,
-        },
-        run,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn with_all_budgets_for_test<R>(budgets: Budgets, run: impl FnOnce() -> R) -> R {
-    BUDGETS_FOR_TEST.with(|slot| {
-        let previous = slot.replace(Some(budgets));
-        let result = run();
-        slot.set(previous);
-        result
-    })
-}
-
-/// How many project walks [`check_against_disk`] has started on this thread.
-#[cfg(test)]
-pub(crate) fn walks_for_test() -> usize {
-    WALKS_FOR_TEST.with(Cell::get)
 }
 
 /// What comparing a saved index with the files on disk found. Every count
@@ -167,40 +125,6 @@ pub(crate) struct CheckedIndex {
     /// were. Two queries over the same unchanged files get the same digest, so
     /// caches keyed by index generation stay usable without mixing versions.
     pub applied_digest: Option<String>,
-    /// Time spent walking the project and comparing metadata.
-    pub walk_time: Duration,
-    /// Time spent reading changed and new files.
-    pub reread_time: Duration,
-}
-
-/// One project's checked index, kept for [`REUSE_WINDOW`].
-#[derive(Debug)]
-struct CheckedOverlay {
-    root: PathBuf,
-    /// Generation of the saved index the check started from.
-    generation: String,
-    /// The saved index and semantic index the check compared; a later query
-    /// reuses the check only while it is answered from these same indexes.
-    saved: Weak<SearchIndex>,
-    semantic: Option<Weak<SemanticIndex>>,
-    checked: CheckedIndex,
-    checked_at: Instant,
-}
-
-/// Recently checked indexes of other projects, at most one per project and
-/// [`MAX_CHECKED_ROOTS`] projects, least recently used dropped first. The
-/// owner drops a project's entry whenever it drops or replaces that project's
-/// borrowed index, so a kept copy never outlives the index it was made from.
-#[derive(Debug, Default)]
-pub(crate) struct CheckedOverlays {
-    entries: VecDeque<CheckedOverlay>,
-}
-
-impl CheckedOverlays {
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 /// Changed files whose size still matches are hashed this many at a time, so
@@ -213,22 +137,6 @@ thread_local! {
     /// re-read deadline in tests that need a pass to stop at a known point.
     static WORK_LIMIT_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
     static REINDEXES_FOR_TEST: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_work_limit_for_test<R>(limit: usize, run: impl FnOnce() -> R) -> R {
-    WORK_LIMIT_FOR_TEST.with(|slot| {
-        let previous = slot.replace(Some(limit));
-        let result = run();
-        slot.set(previous);
-        result
-    })
-}
-
-/// How many files [`check_against_disk`] has re-indexed on this thread.
-#[cfg(test)]
-pub(crate) fn reindexes_for_test() -> usize {
-    REINDEXES_FOR_TEST.with(Cell::get)
 }
 
 fn work_limit() -> usize {
@@ -278,8 +186,7 @@ pub(super) fn check_against_disk(
     WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
     let base = previous.unwrap_or(saved);
     let base_is_saved = Arc::ptr_eq(base, saved);
-    let walk_started = Instant::now();
-    let walk_deadline = walk_started + budgets.walk;
+    let walk_deadline = Instant::now() + budgets.walk;
     let stop_requested =
         |deadline: Instant| Instant::now() >= deadline || crate::executor::current_job_cancelled();
 
@@ -367,10 +274,8 @@ pub(super) fn check_against_disk(
     } else {
         (unseen(base, &seen_base), unseen(saved, &seen_saved))
     };
-    let walk_time = walk_started.elapsed();
 
     let mut work: Vec<usize> = (0..walked.len()).filter(|&i| walked[i].differs).collect();
-    let reread_started = Instant::now();
     let mut copy = None;
     if !work.is_empty() || !removed_from_base.is_empty() {
         let mut overlay = SearchIndex::clone(base);
@@ -380,7 +285,6 @@ pub(super) fn check_against_disk(
         resolve_differences(&mut overlay, &mut walked, &mut work, budgets.reread);
         copy = Some(overlay);
     }
-    let reread_time = reread_started.elapsed();
 
     // Describe the final copy against the saved index.
     let current: &SearchIndex = copy.as_ref().unwrap_or(base.as_ref());
@@ -448,8 +352,6 @@ pub(super) fn check_against_disk(
         index: copy.map(Arc::new).unwrap_or_else(|| Arc::clone(base)),
         check,
         applied_digest,
-        walk_time,
-        reread_time,
     }
 }
 
@@ -549,13 +451,6 @@ mod tests {
         (dir, root)
     }
 
-    fn backdate(path: &Path) {
-        // Equal sizes with different mtimes must still count as a change, so
-        // give the original file an mtime the rewrite cannot share.
-        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-        filetime::set_file_mtime(path, old).expect("backdate file");
-    }
-
     #[test]
     fn unchanged_project_is_verified_and_keeps_the_saved_index() {
         let (_dir, root) = project(&[("src/lib.rs", "pub fn kept_needle() {}\n")]);
@@ -568,50 +463,5 @@ mod tests {
         assert_eq!(checked.check.changed + checked.check.added, 0);
         assert!(Arc::ptr_eq(&checked.index, &index));
         assert!(checked.applied_digest.is_none());
-    }
-
-    fn borrowed_search_fixture() -> (
-        tempfile::TempDir,
-        PathBuf,
-        tempfile::TempDir,
-        tempfile::TempDir,
-        crate::context::AppContext,
-    ) {
-        let (dir, root) = project(&[(
-            "src/lib.rs",
-            "// Assemble the zephyrine quokkalith.\npub fn assemble() {}\n",
-        )]);
-        let mut git = std::process::Command::new("git");
-        crate::test_env::apply_hermetic_git_env(git.current_dir(&root));
-        assert!(git
-            .args(["init", "-q"])
-            .status()
-            .expect("git init")
-            .success());
-        let storage = tempfile::tempdir().expect("storage");
-        let cache_dir = crate::search_index::resolve_cache_dir(&root, Some(storage.path()));
-        SearchIndex::build(&root).write_to_disk(&cache_dir, None);
-        let session = tempfile::tempdir().expect("session");
-        let ctx = crate::context::AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config {
-                project_root: Some(session.path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        (dir, root, storage, session, ctx)
-    }
-
-    fn prose_search(ctx: &crate::context::AppContext, root: &Path) -> serde_json::Value {
-        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "disk-check-reuse",
-            "command": "semantic_search",
-            "query": "where is the zephyrine quokkalith assembled",
-            "top_k": 5,
-            "path": root.display().to_string(),
-        }))
-        .expect("request");
-        serde_json::to_value(super::super::handle_semantic_search(&request, ctx)).expect("response")
     }
 }

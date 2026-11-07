@@ -39,14 +39,13 @@ fn wait_for_capture_ready(ctx: &AppContext, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         crate::runtime_drain::drain_watcher_events(ctx);
-        crate::runtime_drain::drain_build_completions(ctx);
         let search_ready = crate::data_layer::surfaces::text_plane_ready(ctx) == Some(true);
         let callgraph_ready = crate::data_layer::surfaces::warm(ctx).1
             == crate::data_layer::surfaces::WarmState::Ready;
         // These are the same pending signals captured before indexed tool calls
         // and rendered as watcher/callgraph lag disclosures in their replies.
         let pending = ctx.pending_changes_for_query(true);
-        let callgraph_pending = pending.callgraph.resolved();
+        let callgraph_pending = pending.callgraph;
         assert!(
             Instant::now() < deadline,
             "rich-UI sample fixture did not catch up within {timeout:?}: \
@@ -260,12 +259,7 @@ fn rich_ui_samples_wait_for_pending_watcher_application() {
         "sample-readiness barrier returned before the watcher applied the event"
     );
     assert!(!f.ctx.watcher_query_has_pending_changes());
-    assert!(f
-        .ctx
-        .pending_changes_for_query(true)
-        .callgraph
-        .resolved()
-        .is_empty());
+    assert!(f.ctx.pending_changes_for_query(true).callgraph.is_empty());
 }
 
 #[test]

@@ -1,27 +1,3 @@
-fn completed_scoped_waiter(
-    manager: &InspectManager,
-    snapshot: &InspectSnapshot,
-    cache: &InspectCache,
-    category: InspectCategory,
-    scope: &JobScope,
-    payload: Value,
-) -> Value {
-    // Model completion fanout after a shared project scan has finished. Keeping
-    // the channel ready makes the work assertion independent of thread timing.
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    tx.send(JobOutcome::Fresh { payload }).unwrap();
-    match manager.wait_for_tier2_reuse(
-        &JobKey::for_project_category(category),
-        scope,
-        cache,
-        rx,
-        snapshot,
-    ) {
-        JobOutcome::Fresh { payload } => payload,
-        other => panic!("expected fresh scoped completion, got {other:?}"),
-    }
-}
-
 thread_local! {
     static CALLGRAPH_READ_RETRY_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
