@@ -448,7 +448,7 @@ describe("loadAftConfig", () => {
     expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(text);
   });
 
-  test("retired keys load translated from the user file and refuse a project file", () => {
+  test("retired keys load translated from both files without rewriting them", () => {
     const fixture = createConfigFixture();
     const userText = JSON.stringify({
       tool_surface: "all",
@@ -480,11 +480,14 @@ describe("loadAftConfig", () => {
       idle: { lsp_ttl_minutes: 10 },
     });
     writeFileSync(fixture.projectConfigPath, retiredProjectText);
-    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual(
-      ["search_index", "idle.lsp_ttl_minutes", "inspect.tier2_soft_deadline_ms"].map(
-        (path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`,
-      ),
-    );
+    const translated = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
+    expect(translated.disabled_tools).toEqual([]);
+    expect(translated.indexes).toEqual({ trigram: false, semantic: false, callgraph: false });
+    expect(translated.lsp.idle_minutes).toBe(10);
+    expect(translated).not.toHaveProperty("search_index");
+    expect(translated).not.toHaveProperty("idle.lsp_ttl_minutes");
+    expect(translated).not.toHaveProperty("inspect.tier2_soft_deadline_ms");
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(userText);
     expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(retiredProjectText);
   });
 
@@ -593,12 +596,12 @@ describe("loadAftConfig", () => {
     expect(github()).toMatchObject({ read: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
     expect(github()).toMatchObject({ shim: false });
-    // A project file naming a retired alias is refused.
+    // The alias translates, but a project cannot enable GitHub reading.
     writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
-    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual([
-      "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix",
-    ]);
+    const projectText = JSON.stringify({ gh_read: { enabled: true } });
+    writeFileSync(fixture.projectConfigPath, projectText);
+    expect(github()).toMatchObject({ read: false });
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
   });
 
   test("edit_mode uses ordinary project-over-user precedence", () => {
@@ -788,19 +791,38 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("edit_mode");
   });
 
-  test("a project file setting the retired enabled key is refused", () => {
+  test("a project retired enabled:false disables only unprotected tools without rewriting", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: false }));
+    const projectText = JSON.stringify({ enabled: false });
+    writeFileSync(fixture.projectConfigPath, projectText);
 
-    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
+    const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(rejected.errors).toEqual([
-      "removed_config_key:enabled; run npx @cortexkit/aft doctor --fix",
+    const config = JSON.parse(result.stdout);
+    expect(config.disabled_tools).toEqual([
+      "aft_callgraph",
+      "aft_conflicts",
+      "aft_delete",
+      "aft_import",
+      "aft_inspect",
+      "aft_move",
+      "aft_outline",
+      "aft_search",
+      "aft_zoom",
+      "ast_grep_replace",
+      "ast_grep_search",
+      "bash_kill",
+      "bash_status",
+      "bash_watch",
+      "bash_write",
     ]);
+    expect(config.indexes).toEqual({ trigram: true, semantic: true, callgraph: true });
+    expect(config).not.toHaveProperty("enabled");
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
   });
 
   test("legacy user enabled:false disables every tool", () => {

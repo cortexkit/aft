@@ -204,7 +204,7 @@ describe("OpenCode feature-config registration", () => {
     ).toEqual([]);
   });
 
-  test("names retired in 0.62 or earlier refuse a project file and leave it unwritten", () => {
+  test("project retired names translate within project limits and leave the file unwritten", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     const text = JSON.stringify({
@@ -214,18 +214,19 @@ describe("OpenCode feature-config registration", () => {
       disabled_tools: ["aft_grep"],
     });
     writeFileSync(projectFile, text);
-    let rejected: unknown;
-    try {
-      loadWithUserConfig({ github: { read: false } });
-    } catch (error) {
-      rejected = error;
-    }
-    expect((rejected as { errors?: string[] } | undefined)?.errors).toEqual([
-      "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
-      "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
-      "removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix",
-      "removed_config_key:aft_grep; run npx @cortexkit/aft doctor --fix",
-    ]);
+    const config = loadWithUserConfig({ github: { read: false } });
+    expect(config.indexes).toEqual({ trigram: false, semantic: true, callgraph: true });
+    expect(config.github?.read).toBe(false);
+    // A project may not unregister the host's tools, so the translated
+    // aft_grep name is ignored and only the user defaults remain disabled.
+    expect(config.disabled_tools).toEqual(["aft_delete", "aft_move"]);
+    expect(v1Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
+    expect(v2Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
+    expect(
+      getConfigLoadNotices().some(
+        (notice) => notice.configPath === projectFile && notice.message.includes("retired keys"),
+      ),
+    ).toBe(true);
     expect(readFileSync(projectFile, "utf8")).toBe(text);
   });
 
