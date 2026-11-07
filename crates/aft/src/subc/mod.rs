@@ -1341,15 +1341,18 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// `Harness::from_str`). It also hosts headless Claude Code sessions as
 /// `claude-code`, whose tools reach AFT over the same scoped routes as its
 /// OpenCode 2 sessions, with consent answered by core, so they are runner
-/// sessions too. `thalamus-pi` is its counterpart for Pi: it binds
-/// its Pi sessions with harness `pi`, on routes core opens under each
-/// session's scope, and a call that needs the user's permission is held
-/// and answered by core (the `held-reply/v1` capability), as on the
-/// OpenCode 2 server. No AFT plugin runs inside those sessions.
+/// sessions too. Pi sessions bind with harness `pi`, on routes core opens
+/// under each session's scope, and a call that needs the user's permission
+/// is held and answered by core (the `held-reply/v1` capability), as on the
+/// OpenCode 2 server. Pi heads move from the separate `thalamus-pi` module
+/// into `thalamus-harness`, so both pairs are trusted for `pi` until that
+/// move has run without problems; then the `thalamus-pi` pair goes. No AFT
+/// plugin runs inside any of these sessions.
 const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[
     ("thalamus-harness", "opencode"),
     ("thalamus-harness", "opencode2"),
     ("thalamus-harness", "claude-code"),
+    ("thalamus-harness", "pi"),
     ("thalamus-pi", "pi"),
 ];
 
@@ -20289,20 +20292,39 @@ mod tests {
         }
         // Another reserved module binding for Pi stays untrusted.
         assert_eq!(
-            trust_for_bind("pi", &reserved("thalamus-harness")),
+            trust_for_bind("pi", &reserved("some-other-module")),
             BindTrust::Untrusted
         );
         assert_eq!(trust_for_principal(&principal), BindTrust::Untrusted);
     }
 
-    /// Trust for the harness module is per harness: it hosts only OpenCode,
-    /// so the same principal binding for any other harness, including Pi
-    /// (which `thalamus-pi` hosts), must stay untrusted.
+    /// Pi heads moving into `thalamus-harness` keep first-party trust under
+    /// the new module, beside the old `thalamus-pi` pair; only the exact
+    /// harness name `pi` counts.
+    #[test]
+    fn thalamus_harness_on_pi_is_first_party_and_no_lookalike_is() {
+        let principal = reserved("thalamus-harness");
+        assert_eq!(trust_for_bind("pi", &principal), BindTrust::FirstParty);
+        for harness in ["Pi", "pi ", " pi", "pi2", "fed:pi"] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-harness must stay untrusted on harness {harness:?}"
+            );
+        }
+        // The old pair still holds until the move is complete.
+        assert_eq!(
+            trust_for_bind("pi", &reserved("thalamus-pi")),
+            BindTrust::FirstParty
+        );
+    }
+
+    /// Trust for the harness module is per harness: the same principal
+    /// binding for any harness it does not host must stay untrusted.
     #[test]
     fn thalamus_harness_stays_untrusted_on_other_harnesses() {
         let principal = reserved("thalamus-harness");
         for harness in [
-            "pi",
             "runner",
             "mcp:claude",
             "OpenCode",
