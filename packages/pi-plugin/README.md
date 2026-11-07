@@ -139,6 +139,31 @@ remove a registration. `tool_surface`, `hoist_builtin_tools` and the `search_ind
 - **Session isolation.** Pi's `session_shutdown` event triggers clean bridge shutdown — undo history, checkpoints, and LSP state don't leak across sessions.
 - **Auto-download + version check.** Each plugin version pins a compatible binary version and resolves it in order: versioned cache → platform npm package → `PATH` → `~/.cargo/bin/aft` → GitHub release download. Mismatched binaries hot-swap transparently.
 
+## Interop binding (OMP)
+
+On OMP, AFT answers a synchronous `aft:binding-request { v: 1, sessionId, requestId }`
+event (the same pattern as the `adr`/`roadmap` plugins' `adr:binding-request`) with
+`aft:binding { v: 1, sessionId, requestId, tools, project }`:
+
+- `tools`: the AFT tool names actually registered in this host process right now, read live
+  from the host's own tool registry, never a static list, each with the absolute
+  `sourcePath` OMP recorded for it (this extension's own bundled entry file) and its
+  `capabilities` (`observation` | `mutation` | `execution` | `native-url`).
+- `project(toolName, input, cwd)`: resolves one call's real filesystem targets as
+  `{ kind: "observation" | "mutation" | "execution" | "native" | "unknown", paths: string[], broad: boolean }`,
+  without mutating a file or running a model/shell command (it may call the AFT bridge
+  for a read-only preflight, starting it if one is not already running for that `cwd`,
+  e.g. `hashline_preflight` for a hashline edit's affected paths and move destinations,
+  when the real tool already has one). `broad: true` means the paths are
+  recursive/ancestor scopes, not exact files.
+  `kind: "unknown"` with empty `paths` means the effect has no enumerable targets from
+  here (e.g. a whole-checkpoint restore with no preview); never reported as an
+  empty-but-safe mutation.
+
+No answer means either AFT is not loaded, the request's session doesn't match, or the
+host's tool registry was not yet readable; callers retry rather than cache a negative.
+Binding registration lives in `src/tool-registration.ts`; scope projection lives in `src/omp-internal-urls.ts`.
+
 ## Logs
 
 Plugin logs go to `<storage_root>/logs/aft-plugin.log` with an `[aft-pi]` tag. The file rolls at 32 MiB into one `.1` backup; Rust module processes use adjacent `aft-<pid>.log` files.

@@ -47,8 +47,9 @@ pub fn handle_preflight(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let mut agent_arguments = req.params.clone();
     if let Some(arguments) = agent_arguments.as_object_mut() {
-        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
+        // Host tool names and worker identity are envelope metadata, not patch arguments.
         arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+        arguments.remove(crate::protocol::WORKER_SESSION_FIELD);
     }
     match hashline_preflight_from_args(&agent_arguments, Some(&root)) {
         Ok(result) => Response::success(&req.id, result.to_json()),
@@ -72,8 +73,9 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut agent_arguments = req.params.clone();
     if let Some(arguments) = agent_arguments.as_object_mut() {
         arguments.remove("preview");
-        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
+        // Host tool names and worker identity are envelope metadata, not patch arguments.
         arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+        arguments.remove(crate::protocol::WORKER_SESSION_FIELD);
     }
     let patch_text = match crate::hashline::syntax::validate_raw_arguments(&agent_arguments) {
         Ok(request) => request.patch,
@@ -410,14 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn host_tool_names_envelope_field_is_not_a_patch_argument() {
+    fn host_envelope_fields_are_not_patch_arguments() {
         let (_temp, _root, path, ctx, tag) = registered_fixture("alpha\nbeta\n");
         let patch = format!("*** Begin Patch\n[sample.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
         let names = json!({ "bash": "shell", "apply_patch": "patch" });
         let preflight = handle_preflight(
             &request(
                 "hashline_preflight",
-                json!({ "patch": patch, "host_tool_names": names }),
+                json!({ "patch": patch, "host_tool_names": names, "worker_session": true }),
             ),
             &ctx,
         );
@@ -425,7 +427,7 @@ mod tests {
         let applied = handle_edit(
             &request(
                 "hashline_edit",
-                json!({ "patch": patch, "host_tool_names": names }),
+                json!({ "patch": patch, "host_tool_names": names, "worker_session": true }),
             ),
             &ctx,
         );
