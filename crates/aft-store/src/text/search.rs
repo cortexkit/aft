@@ -280,7 +280,8 @@ impl SegmentMembers {
         let len = ordinals.last().map_or(0, |last| *last as usize + 1);
         let mut first = vec![Self::NONE; len];
         for (position, (ordinal, _)) in members.iter().enumerate().rev() {
-            first[*ordinal as usize] = position as u32;
+            first[*ordinal as usize] =
+                u32::try_from(position).expect("a checkout holds fewer than 2^32 members");
         }
         Self {
             members,

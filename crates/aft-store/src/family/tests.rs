@@ -653,7 +653,7 @@ fn a_manifest_a_newer_build_wrote_is_refused_and_nothing_is_changed() {
         2,
     );
     assert_newer(
-        &family.try_write().err().expect("the writer is refused"),
+        &family.try_write().expect_err("the writer is refused"),
         &planted,
         FileKind::Record,
         2,
@@ -701,7 +701,7 @@ fn a_segment_a_newer_build_wrote_is_refused_and_never_reclaimed() {
     // No writer starts, so nothing can publish a generation without the
     // segment or reclaim it.
     assert_newer(
-        &family.try_write().err().expect("the writer is refused"),
+        &family.try_write().expect_err("the writer is refused"),
         &path,
         FileKind::Segment,
         2,
@@ -754,7 +754,7 @@ fn a_checkout_state_a_newer_build_wrote_is_refused() {
         2,
     );
     assert_newer(
-        &family.try_write().err().expect("the writer is refused"),
+        &family.try_write().expect_err("the writer is refused"),
         &path,
         FileKind::Record,
         2,
@@ -819,7 +819,7 @@ fn a_checkout_state_payload_a_newer_build_wrote_is_refused() {
             3,
         );
         assert_newer_than(
-            &family.try_write().err().expect("the writer is refused"),
+            &family.try_write().expect_err("the writer is refused"),
             &path,
             FileKind::Record,
             4,

@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::segment::BLOCK_LEN;
 
@@ -48,28 +48,62 @@ pub struct CacheStats {
 
 /// Verified segment blocks, evicted least recently used first once their
 /// total size passes the budget.
+///
+/// A build's resolver threads read the same segments at once, and one lock
+/// for every hit made each hit wait for all the others (12 threads: 4.9 us
+/// per hit, against 0.1 us for one thread). So the cache is split into
+/// shards by block, each with its own lock, its own share of the budget and
+/// its own use order, and a hit takes only its shard's read lock: it stamps
+/// the block's last use atomically and leaves the use order alone. The
+/// order catches up at eviction, which moves a block it finds used since it
+/// was listed instead of evicting it. Eviction is therefore least recently
+/// used within a shard; a small cache keeps one shard, so its order is
+/// exact.
 #[derive(Debug)]
 pub struct BlockCache {
     budget: usize,
-    state: Mutex<State>,
+    shards: Box<[Shard]>,
 }
+
+/// Aligned to a cache line (128 bytes covers every target AFT builds for),
+/// so one shard's lock traffic never moves its neighbour's line.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Shard {
+    budget: usize,
+    /// Stamps of use, increasing; every touch and insert takes a new one,
+    /// so no two blocks share a stamp.
+    clock: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    state: RwLock<State>,
+}
+
+/// The most shards a cache splits into.
+const MAX_SHARDS: usize = 32;
+/// The fewest blocks a shard's budget holds: below that, a shard would
+/// evict blocks a read is still using.
+const MIN_SHARD_BLOCKS: usize = 64;
 
 #[derive(Debug, Default)]
 struct State {
     entries: HashMap<BlockKey, Entry>,
-    /// Entries by last use; the first is the next to evict.
+    /// Entries by the stamp they were listed under, the first the next
+    /// candidate for eviction. A hit does not move its entry here; eviction
+    /// moves an entry whose last use is newer than its listing.
     by_use: BTreeMap<u64, BlockKey>,
-    clock: u64,
     resident: usize,
-    hits: u64,
-    misses: u64,
     evictions: u64,
 }
 
 #[derive(Debug)]
 struct Entry {
     bytes: Arc<[u8]>,
-    used_at: u64,
+    /// The stamp of the entry's last use, written by hits under the read
+    /// lock.
+    used_at: AtomicU64,
+    /// The stamp `by_use` lists the entry under.
+    listed_at: u64,
 }
 
 impl BlockCache {
@@ -85,23 +119,44 @@ impl BlockCache {
             budget_bytes >= BLOCK_LEN,
             "block cache budget {budget_bytes} is below one block ({BLOCK_LEN} bytes)"
         );
+        let count = (budget_bytes / (MIN_SHARD_BLOCKS * BLOCK_LEN)).clamp(1, MAX_SHARDS);
+        // Every shard's budget is at least one block, and together they are
+        // exactly the cache's budget.
+        let share = budget_bytes / count;
+        let shards = (0..count)
+            .map(|index| Shard {
+                budget: if index == 0 {
+                    budget_bytes - share * (count - 1)
+                } else {
+                    share
+                },
+                clock: AtomicU64::new(0),
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                state: RwLock::default(),
+            })
+            .collect();
         Self {
             budget: budget_bytes,
-            state: Mutex::default(),
+            shards,
         }
     }
 
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        let state = self.lock();
-        CacheStats {
+        let mut stats = CacheStats {
             budget_bytes: self.budget,
-            resident_bytes: state.resident,
-            blocks: state.entries.len(),
-            hits: state.hits,
-            misses: state.misses,
-            evictions: state.evictions,
+            ..CacheStats::default()
+        };
+        for shard in &*self.shards {
+            let state = shard.read();
+            stats.resident_bytes += state.resident;
+            stats.blocks += state.entries.len();
+            stats.hits += shard.hits.load(Ordering::Relaxed);
+            stats.misses += shard.misses.load(Ordering::Relaxed);
+            stats.evictions += state.evictions;
         }
+        stats
     }
 
     /// The cached block for `key`, or the block `load` returns, which is then
@@ -113,21 +168,19 @@ impl BlockCache {
         key: BlockKey,
         load: impl FnOnce() -> Result<Arc<[u8]>, E>,
     ) -> Result<Arc<[u8]>, E> {
-        {
-            let mut state = self.lock();
-            if let Some(bytes) = state.touch(key) {
-                state.hits += 1;
-                return Ok(bytes);
-            }
-            state.misses += 1;
-        }
-        let loaded = load()?;
-        let mut state = self.lock();
-        if let Some(bytes) = state.touch(key) {
+        let shard = self.shard(key);
+        if let Some(bytes) = shard.read().touch(key, &shard.clock) {
+            shard.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(bytes);
         }
-        state.insert(key, Arc::clone(&loaded));
-        while state.resident > self.budget {
+        shard.misses.fetch_add(1, Ordering::Relaxed);
+        let loaded = load()?;
+        let mut state = shard.write();
+        if let Some(bytes) = state.touch(key, &shard.clock) {
+            return Ok(bytes);
+        }
+        state.insert(key, Arc::clone(&loaded), &shard.clock);
+        while state.resident > shard.budget {
             state.evict_oldest();
         }
         Ok(loaded)
@@ -136,15 +189,17 @@ impl BlockCache {
     /// Drops every block of one file, so a closed segment's memory is
     /// released at once rather than waiting for eviction.
     pub(crate) fn forget(&self, file: FileToken) {
-        let mut state = self.lock();
-        let doomed: Vec<BlockKey> = state
-            .entries
-            .keys()
-            .filter(|key| key.file == file)
-            .copied()
-            .collect();
-        for key in doomed {
-            state.remove(key);
+        for shard in &*self.shards {
+            let mut state = shard.write();
+            let doomed: Vec<BlockKey> = state
+                .entries
+                .keys()
+                .filter(|key| key.file == file)
+                .copied()
+                .collect();
+            for key in doomed {
+                state.remove(key);
+            }
         }
     }
 
@@ -155,66 +210,108 @@ impl BlockCache {
     /// for it.
     #[must_use]
     pub fn memory_bytes(&self) -> Option<usize> {
-        let state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
         let mut seen = crate::heap::Seen::new();
-        Some(
-            crate::heap::HeapBytes::heap_bytes(&state.entries, &mut seen)
-                + crate::heap::HeapBytes::heap_bytes(&state.by_use, &mut seen),
-        )
+        let mut total = std::mem::size_of_val(&*self.shards);
+        for shard in &*self.shards {
+            let state = match shard.state.try_read() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            total += crate::heap::HeapBytes::heap_bytes(&state.entries, &mut seen)
+                + crate::heap::HeapBytes::heap_bytes(&state.by_use, &mut seen);
+        }
+        Some(total)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().expect("block cache lock poisoned")
+    /// The shard holding `key`: a mix of the key's parts, so neighbouring
+    /// blocks of one section spread over the shards.
+    fn shard(&self, key: BlockKey) -> &Shard {
+        let mixed = key.file.0.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(key.section).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ key.block.wrapping_mul(0x1656_67B1_9E37_79F9);
+        let index = usize::try_from((mixed >> 32) % self.shards.len() as u64)
+            .expect("a shard index fits in usize");
+        &self.shards[index]
+    }
+}
+
+impl Shard {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, State> {
+        self.state.read().expect("block cache lock poisoned")
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
+        self.state.write().expect("block cache lock poisoned")
     }
 }
 
 impl State {
-    fn touch(&mut self, key: BlockKey) -> Option<Arc<[u8]>> {
-        self.clock += 1;
-        let now = self.clock;
-        let entry = self.entries.get_mut(&key)?;
-        self.by_use.remove(&entry.used_at);
-        entry.used_at = now;
-        self.by_use.insert(now, key);
+    /// The cached block for `key`, stamped as used now. Needs only the read
+    /// lock.
+    fn touch(&self, key: BlockKey, clock: &AtomicU64) -> Option<Arc<[u8]>> {
+        let entry = self.entries.get(&key)?;
+        let now = clock.fetch_add(1, Ordering::Relaxed) + 1;
+        entry.used_at.fetch_max(now, Ordering::Relaxed);
         Some(Arc::clone(&entry.bytes))
     }
 
-    fn insert(&mut self, key: BlockKey, bytes: Arc<[u8]>) {
-        self.clock += 1;
+    fn insert(&mut self, key: BlockKey, bytes: Arc<[u8]>, clock: &AtomicU64) {
+        let now = clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.resident += bytes.len();
-        self.by_use.insert(self.clock, key);
+        self.by_use.insert(now, key);
         self.entries.insert(
             key,
             Entry {
                 bytes,
-                used_at: self.clock,
+                used_at: AtomicU64::new(now),
+                listed_at: now,
             },
         );
     }
 
+    /// Evicts the least recently used block. A block used since it was
+    /// listed is listed again under its last use instead, until the first
+    /// listed block is one nothing used since.
     fn evict_oldest(&mut self) {
-        if let Some((_, key)) = self.by_use.pop_first()
-            && let Some(entry) = self.entries.remove(&key)
-        {
-            self.resident -= entry.bytes.len();
-            self.evictions += 1;
+        while let Some((listed, key)) = self.by_use.pop_first() {
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            let used = entry.used_at.load(Ordering::Relaxed);
+            if used > listed {
+                entry.listed_at = used;
+                self.by_use.insert(used, key);
+                continue;
+            }
+            if let Some(entry) = self.entries.remove(&key) {
+                self.resident -= entry.bytes.len();
+                self.evictions += 1;
+            }
+            return;
         }
     }
 
     fn remove(&mut self, key: BlockKey) {
         if let Some(entry) = self.entries.remove(&key) {
-            self.by_use.remove(&entry.used_at);
+            self.by_use.remove(&entry.listed_at);
             self.resident -= entry.bytes.len();
         }
     }
 }
 
 crate::heap_bytes_none!(FileToken, BlockKey);
-crate::heap_bytes_of_fields!(Entry { bytes, used_at });
+impl crate::heap::HeapBytes for Entry {
+    fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
+        // The stamps are plain integers; only the block owns heap memory.
+        let Self {
+            bytes,
+            used_at: _,
+            listed_at: _,
+        } = self;
+        crate::heap::HeapBytes::heap_bytes(bytes, seen)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -235,7 +332,9 @@ mod tests {
     #[test]
     fn memory_counts_every_block_and_the_tables_that_find_them() {
         let cache = BlockCache::new(4 * BLOCK_LEN);
-        assert_eq!(cache.memory_bytes(), Some(0));
+        // An empty cache holds only its shards.
+        let shards = std::mem::size_of_val(&*cache.shards);
+        assert_eq!(cache.memory_bytes(), Some(shards));
         let file = FileToken::next();
         for index in 0..3 {
             cache
@@ -243,13 +342,13 @@ mod tests {
                 .unwrap();
         }
         let measured = cache.memory_bytes().unwrap();
-        let blocks = 3 * (crate::heap::COUNTS + BLOCK_LEN);
+        let blocks = shards + 3 * (crate::heap::COUNTS + BLOCK_LEN);
         assert!(measured > blocks, "{measured} <= {blocks}");
         assert!(
             measured < blocks + 2048,
             "tables of three entries: {measured}"
         );
-        let _held = cache.lock();
+        let _held = cache.shards[0].write();
         assert_eq!(
             cache.memory_bytes(),
             None,
@@ -334,6 +433,145 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.blocks, 1);
         assert_eq!(stats.resident_bytes, BLOCK_LEN);
+    }
+
+    #[test]
+    fn a_sharded_cache_keeps_its_whole_budget_and_releases_a_file_from_every_shard() {
+        let cache = BlockCache::new(4 * MIN_SHARD_BLOCKS * BLOCK_LEN);
+        assert_eq!(cache.shards.len(), 4);
+        assert_eq!(
+            cache.shards.iter().map(|shard| shard.budget).sum::<usize>(),
+            cache.budget
+        );
+        let (closed, open) = (FileToken::next(), FileToken::next());
+        let loads = 6 * MIN_SHARD_BLOCKS as u64;
+        for index in 0..loads {
+            cache
+                .get_or_load(key(open, index), || Ok::<_, ()>(block(1)))
+                .unwrap();
+            let stats = cache.stats();
+            assert!(
+                stats.resident_bytes <= stats.budget_bytes,
+                "{stats:?} after {index}"
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.misses, loads);
+        assert!(stats.evictions > 0, "{stats:?}");
+        // Each shard is full, so the blocks held are close to the budget.
+        assert!(stats.blocks > 3 * MIN_SHARD_BLOCKS, "{stats:?}");
+        // The block loaded last is still held.
+        cache
+            .get_or_load(key(open, loads - 1), || -> Result<Arc<[u8]>, ()> {
+                panic!("the newest block is cached")
+            })
+            .unwrap();
+
+        for index in 0..32 {
+            cache
+                .get_or_load(key(closed, index), || Ok::<_, ()>(block(2)))
+                .unwrap();
+        }
+        let before = cache.stats().blocks;
+        cache.forget(closed);
+        let after = cache.stats();
+        assert_eq!(after.blocks, before - 32, "{after:?}");
+        for shard in &*cache.shards {
+            assert!(shard.read().entries.keys().all(|key| key.file != closed));
+        }
+    }
+
+    /// Hits under read locks while other threads load and evict: every read
+    /// gets its own block's bytes, and the budget holds throughout.
+    #[test]
+    fn concurrent_loads_and_hits_return_their_own_blocks_within_the_budget() {
+        let cache = Arc::new(BlockCache::new(2 * MIN_SHARD_BLOCKS * BLOCK_LEN));
+        let file = FileToken::next();
+        // Three times what the cache holds, so loads keep evicting.
+        let blocks = 6 * MIN_SHARD_BLOCKS as u64;
+        std::thread::scope(|scope| {
+            for thread in 0..8u64 {
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    let mut index = thread * 31;
+                    for _ in 0..4_000 {
+                        index = (index + 97) % blocks;
+                        let fill = (index % 251) as u8;
+                        let bytes = cache
+                            .get_or_load(key(file, index), || Ok::<_, ()>(block(fill)))
+                            .unwrap();
+                        assert!(bytes.iter().all(|byte| *byte == fill), "block {index}");
+                    }
+                });
+            }
+        });
+        let stats = cache.stats();
+        assert!(stats.resident_bytes <= stats.budget_bytes, "{stats:?}");
+        assert_eq!(stats.resident_bytes, stats.blocks * BLOCK_LEN, "{stats:?}");
+        assert!(stats.evictions > 0 && stats.hits > 0, "{stats:?}");
+        for shard in &*cache.shards {
+            let state = shard.read();
+            // Every entry is listed exactly once, under its own stamp.
+            assert_eq!(state.by_use.len(), state.entries.len());
+            for (listed, key) in &state.by_use {
+                assert_eq!(state.entries[key].listed_at, *listed);
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_cache_keeps_one_shard() {
+        assert_eq!(BlockCache::new(BLOCK_LEN).shards.len(), 1);
+        assert_eq!(
+            BlockCache::new(2 * MIN_SHARD_BLOCKS * BLOCK_LEN - 1)
+                .shards
+                .len(),
+            1
+        );
+        assert_eq!(BlockCache::new(1 << 40).shards.len(), MAX_SHARDS);
+    }
+
+    /// Measures warm hits from many threads at once, as a build's resolver
+    /// threads read the same segments: run with `--ignored --nocapture` in a
+    /// release build to compare cache designs.
+    #[test]
+    #[ignore = "measurement; prints nanoseconds per hit"]
+    fn measure_concurrent_warm_hits() {
+        let cache = Arc::new(BlockCache::new(256 << 20));
+        let file = FileToken::next();
+        let blocks = 1024;
+        for index in 0..blocks {
+            cache
+                .get_or_load(key(file, index), || Ok::<_, ()>(block(1)))
+                .unwrap();
+        }
+        for threads in [1usize, 4, 12] {
+            let hits_per_thread = 400_000u64;
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for thread in 0..threads {
+                    let cache = Arc::clone(&cache);
+                    scope.spawn(move || {
+                        let mut index = thread as u64 * 7919;
+                        for _ in 0..hits_per_thread {
+                            index = (index + 2_654_435_761) % blocks;
+                            let bytes = cache
+                                .get_or_load(key(file, index), || -> Result<Arc<[u8]>, ()> {
+                                    panic!("every block is cached")
+                                })
+                                .unwrap();
+                            std::hint::black_box(bytes);
+                        }
+                    });
+                }
+            });
+            let elapsed = started.elapsed();
+            println!(
+                "threads={threads} wall_ms={} ns_per_hit_per_thread={:.0}",
+                elapsed.as_millis(),
+                elapsed.as_nanos() as f64 / hits_per_thread as f64
+            );
+        }
     }
 
     #[test]
