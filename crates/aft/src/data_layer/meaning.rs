@@ -159,6 +159,13 @@ pub(crate) struct Meaning {
     reads_only: std::sync::atomic::AtomicBool,
     /// When a read-only plane last looked for a newer generation.
     refreshed_at: Mutex<Option<std::time::Instant>>,
+    /// A fill under the current configuration has finished, so files still
+    /// waiting for vectors are being refreshed after edits, not embedded for
+    /// the first time: status reports the plane ready with a refreshing
+    /// count, as today's index does. Cleared when a new configuration makes
+    /// a new plane, whose first fill is a build again. Kept in memory only:
+    /// after a restart the plane counts as built once a fill finishes.
+    filled: std::sync::atomic::AtomicBool,
 }
 
 /// How long a read-only plane serves the generation it read before it looks
@@ -354,6 +361,16 @@ impl Meaning {
         if matches!(outcome, Round::Done | Round::Idle) {
             lock(&self.times).started_at_ms = None;
         }
+        if matches!(outcome, Round::Done) {
+            self.filled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether a fill under the current configuration has finished; see
+    /// the `filled` field.
+    pub(crate) fn filled(&self) -> bool {
+        self.filled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Records a round's progress report, and when it stored, if it did.
@@ -543,6 +560,8 @@ impl Meaning {
             config: config.clone(),
             plane: Arc::clone(&plane),
         });
+        self.filled
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(plane)
     }
 }

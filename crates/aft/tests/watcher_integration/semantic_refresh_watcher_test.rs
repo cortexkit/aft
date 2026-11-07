@@ -839,7 +839,6 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
 }
 
 #[test]
-#[ignore = "after the first fill, the index store's meaning plane reports a re-embed of an edited file as building (stage filling, files_pending 1, refreshing_count 0) instead of ready with a refreshing count"]
 fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = setup_project(&[
@@ -930,13 +929,14 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     assert_eq!(mid_refresh["status"], "ready", "{mid_refresh:?}");
     assert_eq!(mid_refresh["semantic_status"], "ready", "{mid_refresh:?}");
     assert_eq!(mid_refresh["interpreted_as"], "semantic");
-    let mid_warnings = mid_refresh["warnings"].as_array().expect("warnings array");
+    // The index store names the files still waiting for vectors, and the
+    // reply says it is incomplete, where today's index printed a count.
+    let mid_text = mid_refresh["text"].as_str().unwrap_or_default();
     assert!(
-        mid_warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("1 file(s) refreshing"))),
-        "expected refreshing warning, got {mid_warnings:?}"
+        mid_text.contains("semantic: 1 file(s) not yet embedded: src/b.rs"),
+        "expected the refreshing file to be named, got {mid_text:?}"
     );
+    assert_eq!(mid_refresh["complete"], false, "{mid_refresh:?}");
     let mid_results = mid_refresh["results"].as_array().expect("results array");
     assert!(
         mid_results.iter().any(|result| {

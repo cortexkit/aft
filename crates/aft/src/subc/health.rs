@@ -8464,6 +8464,7 @@ mod tests {
         let fill = MeaningReport {
             plane: MeaningPlane::Serving {
                 complete: false,
+                refreshing: false,
                 coverage: MeaningCoverage {
                     files: 123_456,
                     files_embedded: 100_000,

@@ -437,6 +437,9 @@ pub(crate) enum MeaningPlane {
     /// a fill succeeds.
     Serving {
         complete: bool,
+        /// A fill under this configuration has finished before, so the files
+        /// still waiting are refreshes after edits (see `Meaning::filled`).
+        refreshing: bool,
         coverage: MeaningCoverage,
         error: Option<String>,
     },
@@ -490,11 +493,15 @@ impl MeaningReport {
         let mut value = match &self.plane {
             MeaningPlane::Serving {
                 complete,
+                refreshing,
                 coverage,
                 error,
             } => {
+                // After its first fill a plane refreshing edited files stays
+                // ready; its pending files are the refreshing count.
+                let ready = *complete || *refreshing;
                 let mut value = json!({
-                    "status": if *complete { READY } else { BUILDING },
+                    "status": if ready { READY } else { BUILDING },
                     "files": coverage.files,
                     "files_embedded": coverage.files_embedded,
                     "files_too_large": coverage.files_too_large,
@@ -505,7 +512,7 @@ impl MeaningReport {
                     "chunks_embedded": coverage.chunks_embedded,
                     "chunks_failed": coverage.chunks_failed,
                 });
-                if !complete {
+                if !ready {
                     value["stage"] = json!(super::meaning::FILLING_STAGE);
                 }
                 if let Some(error) = error {
@@ -533,7 +540,15 @@ impl MeaningReport {
             value["stage"] = json!(super::meaning::WAITING_STAGE);
         }
         value["state"] = value["status"].clone();
-        value["refreshing_count"] = json!(0);
+        value["refreshing_count"] = json!(match &self.plane {
+            MeaningPlane::Serving {
+                complete: false,
+                refreshing: true,
+                coverage,
+                ..
+            } => coverage.files_pending,
+            _ => 0,
+        });
         value["filling"] = json!(self.filling);
         value["waiting_for_another_fill"] = json!(self.waiting);
         value
@@ -567,11 +582,16 @@ impl MeaningReport {
         match &self.plane {
             MeaningPlane::Serving {
                 complete,
+                refreshing,
                 coverage,
                 error,
             } => {
                 health.reason.clone_from(error);
-                if !complete {
+                if !complete && *refreshing {
+                    // Refreshing edited files after a finished fill: ready,
+                    // as status reports it, with the files still waiting.
+                    fill.files_pending = nonzero(coverage.files_pending);
+                } else if !complete {
                     health.status = BUILDING;
                     health.stage = Some(super::meaning::FILLING_STAGE.to_string());
                     health.embedded_chunks = Some(coverage.chunks_embedded);
@@ -628,6 +648,7 @@ fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
     let plane = match semantic {
         DataSemantic::Serving(meaning) => MeaningPlane::Serving {
             complete: meaning.complete(),
+            refreshing: checkout.meaning_filled(),
             coverage: MeaningCoverage::of(meaning.coverage()),
             error: meaning.failure().map(str::to_string),
         },
@@ -1979,6 +2000,7 @@ mod tests {
         let filling = MeaningReport {
             plane: MeaningPlane::Serving {
                 complete: false,
+                refreshing: false,
                 coverage,
                 error: Some("embedder timed out".into()),
             },
@@ -2023,6 +2045,7 @@ mod tests {
         let ready = MeaningReport {
             plane: MeaningPlane::Serving {
                 complete: true,
+                refreshing: false,
                 coverage: MeaningCoverage {
                     files_pending: 0,
                     files_failed: 0,

@@ -10075,8 +10075,21 @@ mod tests {
     /// so an answer that discloses a failure can only have it from the plane.
     fn data_layer_context(project: &Path, storage: &Path) -> (PathBuf, AppContext) {
         let root = std::fs::canonicalize(project).expect("canonical root");
-        let ctx = lexical_ready_context_with_semantic(&root, SemanticIndexStatus::ready());
+        let source_file = root.join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "pub fn needle_symbol() -> bool { true }\n")
+            .expect("write source file");
+        let ctx = test_context(&root);
+        // The storage folder is set before the checkout binds: a checkout
+        // keeps the folder it bound with, and the meaning plane looks for the
+        // ONNX Runtime and its install lock there.
         ctx.update_config(|config| config.storage_dir = Some(storage.to_path_buf()));
+        ctx.set_canonical_cache_root(root.clone());
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         crate::semantic_admission::note_opened("data-layer-semantic-test", &root);
         (root, ctx)
     }
@@ -10139,7 +10152,6 @@ mod tests {
     /// downloading it waits for the download, and the reply says so rather
     /// than calling the runtime missing.
     #[test]
-    #[ignore = "the index store's meaning plane reports a missing ONNX Runtime as failed even while the plugin's install lock is held, instead of building while it waits for the download"]
     fn waiting_for_the_onnx_runtime_download_is_disclosed_as_waiting() {
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");

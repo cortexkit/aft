@@ -1259,6 +1259,12 @@ impl DataCheckout {
         self.work.filling.load(Ordering::Acquire)
     }
 
+    /// Whether meaning search has finished a fill under its current
+    /// configuration, so pending files are refreshes, not a first build.
+    pub(crate) fn meaning_filled(&self) -> bool {
+        self.work.meaning.filled()
+    }
+
     /// What the last fill round reported, if a fill ran.
     pub(crate) fn meaning_progress(&self) -> Option<super::vectors::FillProgress> {
         self.work.meaning.progress()
