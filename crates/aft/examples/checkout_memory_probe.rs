@@ -155,6 +155,7 @@ fn sample(
         "text_overlay_kib": live.text_overlay_bytes >> 10,
         "shared_kib": live.shared_bytes >> 10,
         "refreshed_files": live.refreshed_files,
+        "callgraph_mib": live.callgraph_bytes >> 20,
     })
 }
 
