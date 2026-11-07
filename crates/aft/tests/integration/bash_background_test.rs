@@ -2050,7 +2050,7 @@ fn piped_terminal_preview_normalizes_crlf_and_overprints_without_changing_artifa
 /// standalone OpenCode 2 completion wake. Pin the shape on both sides.
 #[test]
 fn drain_completion_entries_match_the_plugin_wire_fixture() {
-    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+    let fixture_path = crate::test_helpers::manifest_dir().join(
         "../../packages/opencode-plugin/src/__tests__/fixtures/bash-drain-completions-reply.json",
     );
     let fixture: Value =

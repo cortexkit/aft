@@ -252,7 +252,7 @@ fn collect(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) {
 
 #[test]
 fn launch_nonce_has_only_one_source_reader() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = crate::test_helpers::manifest_dir().join("../..");
     let mut files = Vec::new();
     // src/bin is included by this recursive walk, not scanned twice.
     collect(&root.join("crates/aft/src"), &["rs"], &mut files);
@@ -341,7 +341,7 @@ mod arbitrary_name { fn fixture() { std::env::var("SUBC_LAUNCH_NONCE"); } }
     );
     let js = "// process.env.SUBC_LAUNCH_NONCE\nconst example = 'process.env.SUBC_LAUNCH_NONCE'; process.env.SUBC_LAUNCH_NONCE = 'x'; delete Bun.env.SUBC_LAUNCH_NONCE;";
     assert!(scan(Path::new("packages/plugin/src/example.js"), js).is_empty());
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate::test_helpers::manifest_dir();
     let actual = fs::read_to_string(root.join("src/agent_child_env.rs")).unwrap();
     assert!(
         scan(rust, &actual).is_empty(),

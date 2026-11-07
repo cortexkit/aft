@@ -18,7 +18,7 @@ fn metal_extension_outline_and_zoom_ride_the_cpp_grammar() {
         Some(LangId::Metal)
     );
 
-    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let project_root = crate::test_helpers::manifest_dir();
     let file = project_root.join("tests/fixtures/sample.metal");
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(project_root)["success"], true);

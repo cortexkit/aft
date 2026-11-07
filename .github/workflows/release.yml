@@ -22,6 +22,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The aft binary reports the commit it was built from when it registers
+  # with the daemon. The crate has no build script, so the release sets it here;
+  # cross runs the Linux builds in a container and needs it passed through.
+  AFT_BUILD_GIT_SHA: ${{ github.sha }}
+  CROSS_BUILD_ENV_PASSTHROUGH: AFT_BUILD_GIT_SHA
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SCCACHE_IDLE_TIMEOUT: "0"
   # Tags restore the main baseline without creating tag-private compiler caches.

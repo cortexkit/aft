@@ -6,15 +6,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::sync::RwLock;
 
-/// The crate folder, read when the test runs. The test runner remaps
-/// `CARGO_MANIFEST_DIR` when a test binary built on one machine runs from
-/// another checkout (CI builds the macOS archive on a different host), so a
-/// path fixed at compile time would point at a folder that doesn't exist.
-fn manifest_dir() -> PathBuf {
-    std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
+use crate::test_support::manifest_dir;
 
 fn assets() -> PathBuf {
     manifest_dir().join("tests/store_diet")

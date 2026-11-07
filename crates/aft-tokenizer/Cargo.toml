@@ -9,9 +9,6 @@ rust-version.workspace = true
 [dependencies]
 fancy-regex = "0.18"
 
-[build-dependencies]
-regex = "1"
-
 [dev-dependencies]
 regex = "1"
 criterion = "0.8"

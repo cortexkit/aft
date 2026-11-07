@@ -3033,6 +3033,72 @@ async fn runon_queue_wait_refusal_behind_another_owner_keeps_the_runner_report()
 }
 
 #[tokio::test]
+async fn bash_background_remote_restart_without_secrets_keeps_status_watch_and_completion_preview()
+{
+    let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let original = registry();
+    let id = original
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Host {
+                shell_path: resolve_posix_shell(),
+                environment: Default::default(),
+            },
+            "printf output",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    terminal(&original, &id).await;
+    let task = original.task(&id).unwrap();
+    let mut metadata = read_task(&task.paths.json).unwrap();
+    assert_eq!(metadata.completion_has_env_secrets, Some(false));
+    assert_eq!(metadata.completion_has_non_ticket_env_secrets, Some(false));
+    assert_eq!(metadata.completion_has_secret_placeholders, Some(false));
+    // Rebuild the completion from the task's captured output bytes, not a saved notice.
+    metadata.completion_preview = None;
+    metadata.status = BgTaskStatus::Running;
+    metadata.finished_at = None;
+    metadata.duration_ms = None;
+    let restarted = registry();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let reloaded = restarted.task(&id).unwrap();
+    {
+        let mut state = reloaded.lock_state().unwrap();
+        assert_eq!(state.metadata.status, BgTaskStatus::Running);
+        // Simulate the runner reporting completion after task recovery.
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    }
+    let status = restarted
+        .status(&id, "session", None, None, RUNNING_OUTPUT_PREVIEW_BYTES)
+        .unwrap();
+    assert!(status.output_preview.contains('€'));
+    assert!(status.output_preview.contains('😀'));
+    let (matched, context) = restarted.render_watch_preview(&id, "€\n".as_bytes(), 0..3);
+    assert_eq!(matched, "€");
+    assert!(!context.contains("withheld"));
+    let completion = restarted.completion_snapshot_for_task(&reloaded).unwrap();
+    assert!(completion.output_preview.contains('€'));
+    assert!(completion.output_preview.contains('😀'));
+    assert!(!completion.output_preview.contains("withheld"));
+}
+
+#[tokio::test]
 async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
     let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();

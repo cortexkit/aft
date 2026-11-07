@@ -67,6 +67,7 @@ SHA="$(git rev-parse --short=12 HEAD)"
 
 BUILD_START="$(date +%s)"
 if [ "$SKIP_BUILD" -eq 0 ]; then
+  export AFT_BUILD_GIT_SHA="$(git rev-parse HEAD)"
   echo "==> cargo build --release -p agent-file-tools (sha $SHA)"
   cargo build --release -p agent-file-tools --bin aft
 fi

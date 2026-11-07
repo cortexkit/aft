@@ -670,7 +670,11 @@ pub fn assert_reply_contract(vector: &Value) {
             let writes = writes.unwrap();
             assert_eq!(reads.len(), 1, "{name}");
             assert_eq!(writes.len(), 1, "{name}");
-            assert_eq!(pr["author"]["login"], "app-fixture[bot]", "{name}");
+            // GitHub's GraphQL API names a bot author by its bare slug and
+            // types it `Bot`; the REST form `app-fixture[bot]` never appears
+            // here, and Plexus matches the two.
+            assert_eq!(pr["author"]["__typename"], "Bot", "{name}");
+            assert_eq!(pr["author"]["login"], "app-fixture", "{name}");
             assert_eq!(pr["state"], "OPEN", "{name}");
             let variables = &writes[0]["request_body"]["variables"];
             assert_eq!(variables["pullRequestId"], pr["id"], "{name}");

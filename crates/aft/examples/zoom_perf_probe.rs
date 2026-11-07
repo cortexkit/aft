@@ -7,6 +7,9 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[path = "../tests/helpers/manifest_dir.rs"]
+mod manifest_dir;
+
 struct Args {
     file: PathBuf,
     symbol: String,
@@ -64,7 +67,7 @@ fn main() {
 }
 
 fn parse_args() -> Args {
-    let mut file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/parser.rs");
+    let mut file = manifest_dir::manifest_dir().join("src/parser.rs");
     let mut symbol = "extract_symbols_from_tree".to_string();
     let mut samples = 9usize;
     let mut iterations = 100usize;

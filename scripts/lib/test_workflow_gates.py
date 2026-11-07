@@ -336,10 +336,11 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertIn("--fetch-retry-mintimeout=10000", command)
         self.assertIn("--fetch-retry-maxtimeout=60000", command)
 
-    def test_library_does_not_embed_per_commit_build_script_environment(self) -> None:
+    def test_library_does_not_embed_binary_build_revision(self) -> None:
         root = Path(__file__).resolve().parents[2] / "crates/aft"
-        emitted = set(re.findall(r"cargo:rustc-env=([A-Z0-9_]+)=", (root / "build.rs").read_text()))
-        self.assertIn("AFT_BUILD_GIT_SHA", emitted)
+        self.assertFalse((root / "build.rs").exists(), "build scripts disable content-keyed shared builds")
+        emitted = {"AFT_BUILD_GIT_SHA"}
+        self.assertIn('option_env!("AFT_BUILD_GIT_SHA")', (root / "src/main.rs").read_text())
         violations = []
         for source in (root / "src").rglob("*.rs"):
             if source == root / "src/main.rs":
@@ -348,6 +349,14 @@ class CISpeedWorkflowTests(unittest.TestCase):
                 if re.search(rf'(?:option_env|env)\s*!\s*\(\s*"{re.escape(name)}"', source.read_text()):
                     violations.append(f"{source.relative_to(root)}: {name}")
         self.assertEqual(violations, [], "per-commit build data belongs in the binary, not the library")
+
+    def test_stage_card_supplies_the_binary_build_revision(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        stage_card = (root / "scripts/stage-card.sh").read_text()
+        export = 'export AFT_BUILD_GIT_SHA="$(git rev-parse HEAD)"'
+        build = "cargo build --release -p agent-file-tools --bin aft"
+        self.assertIn(export, stage_card)
+        self.assertLess(stage_card.index(export), stage_card.index(build))
 
     def test_test_builds_keep_symbolication_without_full_debug_types(self) -> None:
         workflow = workflow_gates.parse_workflow(str(

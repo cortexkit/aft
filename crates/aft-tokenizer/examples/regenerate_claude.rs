@@ -1,14 +1,15 @@
 //! Optional regenerator for `src/claude_data.rs`.
 //!
 //! The generated file is checked into the repo so the crate builds from a clean
-//! clone without any extra setup. This build script is only used by developers
+//! clone without any extra setup. This command is only used by developers
 //! who want to refresh the data from a newer `ai-tokenizer` release:
 //!
 //!   mkdir -p tmp/ai-tokenizer-pkg && cd tmp/ai-tokenizer-pkg
 //!   npm pack ai-tokenizer && tar xzf ai-tokenizer-*.tgz
 //!
-//! When that directory (or `AFT_TOKENIZER_CLAUDE_JS`) is absent, this script
-//! does nothing — Cargo proceeds against the vendored file.
+//! Run `cargo run -p aft-tokenizer --example regenerate_claude` to regenerate.
+//! When that directory (or `AFT_TOKENIZER_CLAUDE_JS`) is absent, the command
+//! does nothing. Ordinary Cargo builds never run it.
 
 use regex::Regex;
 use std::env;
@@ -69,7 +70,7 @@ fn main() {
     // Build the whole file in memory, then publish it with an atomic
     // temp-in-same-dir + rename. A non-atomic in-place `File::create` here once
     // let an orphaned concurrent build truncate claude_data.rs mid-write, which
-    // a release chain's `git add` then snapshotted (v0.38.0 first retag). The
+    // a later `git add` then snapshotted as a truncated source file. The
     // rename makes any reader (cargo, git) see either the old or new file whole,
     // never a partial one.
     let mut out: Vec<u8> = Vec::new();
