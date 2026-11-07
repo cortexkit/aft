@@ -5495,6 +5495,17 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    #[cfg(target_os = "macos")]
+    match shared_app.open_db(&storage_dir.join("aft.db")) {
+        Ok(db) => {
+            if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
+                log::warn!("macOS permission card startup cleanup failed: {error:?}");
+            }
+        }
+        Err(error) => {
+            log::warn!("macOS permission card startup cleanup could not open database: {error}")
+        }
+    }
     rich_ui::display::start(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
