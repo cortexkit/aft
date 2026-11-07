@@ -1,0 +1,1 @@
+- After a broad edit, AFT's index store keeps the call-graph files it re-resolved encoded until the changes are published, so a busy worktree's call graph holds about a tenth of the memory it did (on AFT's own repository, typically about 120 MB instead of 1 GB).

@@ -217,6 +217,13 @@ impl Parses {
         if let Some((key, _)) = &slot.encoded {
             return Some(key.clone());
         }
+        if let Some(key) = slot
+            .stored
+            .as_ref()
+            .and_then(|stored| stored.record_key_of(path))
+        {
+            return Some(key.to_string());
+        }
         self.get(path).map(|(key, _)| key.clone())
     }
 
@@ -346,29 +353,108 @@ impl ResolutionLookup for BTreeMap<String, FileResolution> {
 /// absent, and whoever reads through a publication fails on any recorded
 /// failure.
 ///
-/// Each resolution sits behind an `Arc`, so a holder of
-/// [`Self::get_shared`] keeps the resolution as it was without a copy; a
-/// later [`Self::get_mut`] copies it only while such a holder exists.
+/// An entry an update resolves again or changes ([`Self::insert`],
+/// [`Self::get_mut`]) is held decoded while the update runs.
+/// [`Self::encode_changed`] then encodes it, in the fragment encoding a
+/// publication writes, so that, like an entry read from the publication, it
+/// can be let go ([`Self::release_decoded`]) and decoded again when next
+/// read. Decoded, a resolution takes many times its encoded size, since
+/// every reference row owns its strings; one broad edit re-resolves over a
+/// thousand files.
+///
+/// Each decoded resolution sits behind an `Arc`, so letting it go never
+/// copies it.
 #[derive(Default)]
 pub(crate) struct Resolutions {
     map: BTreeMap<String, ResolutionSlot>,
+    /// Entries inserted or changed since the last [`Self::encode_changed`]:
+    /// decoded, and not encoded yet.
+    changed: BTreeSet<String>,
 }
 
 struct ResolutionSlot {
     value: std::sync::OnceLock<Option<Arc<FileResolution>>>,
-    stored: Option<Arc<StoredSlices>>,
+    /// What `value` is decoded from again once it is let go.
+    source: ResolutionSource,
+}
+
+/// Where an entry of [`Resolutions`] is decoded from.
+enum ResolutionSource {
+    /// Nowhere: the entry is built in memory, or changed and not encoded
+    /// yet, so its decoded value is all there is and is never let go.
+    Memory,
+    /// The publication the entry was read from, unchanged since.
+    Stored(Arc<StoredSlices>),
+    /// The entry's encoding, made after an update changed it.
+    Encoded(Arc<EncodedResolution>),
 }
 
 impl ResolutionSlot {
     fn read(&self, path: &str) -> Option<&FileResolution> {
         self.value
-            .get_or_init(|| {
-                self.stored
-                    .as_ref()
-                    .and_then(|stored| stored.resolution_of(path))
-                    .map(Arc::new)
+            .get_or_init(|| match &self.source {
+                // A slot built in memory is made with its value, and never
+                // lets it go, so this is never reached.
+                ResolutionSource::Memory => None,
+                ResolutionSource::Stored(stored) => stored.resolution_of(path).map(Arc::new),
+                ResolutionSource::Encoded(encoded) => Some(Arc::new(encoded.decode(path))),
             })
             .as_deref()
+    }
+
+    /// Whether the value can be let go and decoded again.
+    fn releasable(&self) -> bool {
+        !matches!(self.source, ResolutionSource::Memory)
+    }
+}
+
+/// One file's resolution kept encoded in memory, in the fragment encoding
+/// a publication writes ([`super::fragment`]), with the parse key its rows
+/// are decoded with.
+#[derive(Debug)]
+pub(crate) struct EncodedResolution {
+    record_key: Box<str>,
+    bytes: Box<[u8]>,
+}
+
+impl EncodedResolution {
+    /// Encodes `resolution`, a resolution of the file whose parse key is
+    /// `record_key`.
+    #[must_use]
+    pub(crate) fn encode(record_key: &str, resolution: &FileResolution) -> Self {
+        debug_assert!(
+            resolution
+                .rows
+                .iter()
+                .all(|row| row.caller_blob_key == record_key),
+            "a resolution's rows carry its parse key"
+        );
+        Self {
+            record_key: record_key.into(),
+            bytes: super::fragment::encode(resolution).into_boxed_slice(),
+        }
+    }
+
+    /// The resolution of the file at `path` this encodes.
+    ///
+    /// # Panics
+    ///
+    /// When the bytes do not decode. This process encoded them, so that is
+    /// a defect in the fragment codec, which its tests check.
+    #[must_use]
+    pub(crate) fn decode(&self, path: &str) -> FileResolution {
+        super::fragment::decode(&self.record_key, path, &self.bytes).unwrap_or_else(|error| {
+            panic!(
+                "{path}: a resolution encoded in memory does not decode: {}",
+                error.0
+            )
+        })
+    }
+
+    /// The parse key of the file whose resolution this encodes.
+    #[must_use]
+    pub(crate) fn record_key(&self) -> &str {
+        &self.record_key
     }
 }
 
@@ -383,11 +469,12 @@ impl Resolutions {
                         path.clone(),
                         ResolutionSlot {
                             value: std::sync::OnceLock::new(),
-                            stored: Some(Arc::clone(stored)),
+                            source: ResolutionSource::Stored(Arc::clone(stored)),
                         },
                     )
                 })
                 .collect(),
+            changed: BTreeSet::new(),
         }
     }
 
@@ -395,47 +482,82 @@ impl Resolutions {
         self.map.get(path)?.read(path)
     }
 
-    /// The resolution of `path`, shared rather than copied.
-    pub(crate) fn get_shared(&self, path: &str) -> Option<Arc<FileResolution>> {
+    /// The encoding of `path`'s resolution, whose parse key is
+    /// `record_key`: the one [`Self::encode_changed`] kept, shared, or for
+    /// an entry that has none, its value encoded now.
+    pub(crate) fn encoded(&self, path: &str, record_key: &str) -> Option<Arc<EncodedResolution>> {
         let slot = self.map.get(path)?;
-        slot.read(path)?;
-        slot.value.get()?.clone()
+        if let ResolutionSource::Encoded(encoded) = &slot.source {
+            return Some(Arc::clone(encoded));
+        }
+        let resolution = slot.read(path)?;
+        Some(Arc::new(EncodedResolution::encode(record_key, resolution)))
     }
 
     pub(crate) fn get_mut(&mut self, path: &str) -> Option<&mut FileResolution> {
-        let slot = self.map.get_mut(path)?;
+        let Self { map, changed } = self;
+        let slot = map.get_mut(path)?;
         slot.read(path);
-        // Changed here, the entry no longer matches what the publication
-        // stored, so it is never let go (see `release_unchanged`).
-        slot.stored = None;
+        // Changed here, the entry no longer matches what it was decoded
+        // from, so it stays decoded until `encode_changed` encodes it.
+        slot.source = ResolutionSource::Memory;
+        if !changed.contains(path) {
+            changed.insert(path.to_string());
+        }
         slot.value.get_mut()?.as_mut().map(Arc::make_mut)
     }
 
-    /// How many entries still as the publication stored them are decoded.
-    pub(crate) fn decoded_unchanged_count(&self) -> usize {
+    /// Encodes every entry inserted or changed since the last call, reading
+    /// each file's parse key from `record_key`, so that
+    /// [`Self::release_decoded`] can let it go. Runs on the current rayon
+    /// pool.
+    pub(crate) fn encode_changed(&mut self, record_key: impl Fn(&str) -> Option<String> + Sync) {
+        let changed = std::mem::take(&mut self.changed);
+        let map = &self.map;
+        let encoded = changed
+            .par_iter()
+            .filter_map(|path| {
+                let resolution = map.get(path)?.value.get()?.as_deref()?;
+                let key = record_key(path)?;
+                Some((path, EncodedResolution::encode(&key, resolution)))
+            })
+            .collect::<Vec<_>>();
+        for (path, encoded) in encoded {
+            if let Some(slot) = self.map.get_mut(path) {
+                slot.source = ResolutionSource::Encoded(Arc::new(encoded));
+            }
+        }
+    }
+
+    /// How many entries that can be decoded again, from the publication or
+    /// their encoding, are decoded now.
+    pub(crate) fn decoded_count(&self) -> usize {
         self.map
             .values()
-            .filter(|slot| slot.stored.is_some() && slot.value.get().is_some())
+            .filter(|slot| slot.releasable() && slot.value.get().is_some())
             .count()
     }
 
-    /// Lets go of every decoded resolution still as the publication stored
-    /// it; the next read decodes it again. A resolution changed since, or
-    /// built in memory, stays.
-    pub(crate) fn release_unchanged(&mut self) {
+    /// Lets go of every decoded resolution that can be decoded again, from
+    /// the publication or its encoding; the next read decodes it again. An
+    /// entry built in memory, or changed and not encoded yet, stays.
+    pub(crate) fn release_decoded(&mut self) {
         for slot in self.map.values_mut() {
-            if slot.stored.is_some() {
+            if slot.releasable() {
                 slot.value.take();
             }
         }
     }
 
     pub(crate) fn insert(&mut self, path: String, resolution: FileResolution) {
+        if !self.changed.contains(&path) {
+            self.changed.insert(path.clone());
+        }
         self.map.insert(
             path,
             ResolutionSlot {
                 value: std::sync::OnceLock::from(Some(Arc::new(resolution))),
-                stored: None,
+                source: ResolutionSource::Memory,
             },
         );
     }
@@ -446,6 +568,7 @@ impl Resolutions {
     }
 
     pub(crate) fn remove(&mut self, path: &str) -> Option<FileResolution> {
+        self.changed.remove(path);
         let slot = self.map.remove(path)?;
         slot.read(path);
         let resolution = slot.value.into_inner().flatten()?;
@@ -491,13 +614,25 @@ impl std::ops::Index<&str> for Resolutions {
     }
 }
 
+/// Entries built in memory, each held decoded for as long as it lasts: a
+/// cold build's resolutions, which nothing encodes.
 impl From<BTreeMap<String, FileResolution>> for Resolutions {
     fn from(map: BTreeMap<String, FileResolution>) -> Self {
-        let mut resolutions = Self::default();
-        for (path, resolution) in map {
-            resolutions.insert(path, resolution);
+        Self {
+            map: map
+                .into_iter()
+                .map(|(path, resolution)| {
+                    (
+                        path,
+                        ResolutionSlot {
+                            value: std::sync::OnceLock::from(Some(Arc::new(resolution))),
+                            source: ResolutionSource::Memory,
+                        },
+                    )
+                })
+                .collect(),
+            changed: BTreeSet::new(),
         }
-        resolutions
     }
 }
 
@@ -1765,8 +1900,19 @@ aft_store::heap_bytes_of_fields!(ParseSlot {
     stored,
     encoded
 });
-aft_store::heap_bytes_of_fields!(Resolutions { map });
-aft_store::heap_bytes_of_fields!(ResolutionSlot { value, stored });
+aft_store::heap_bytes_of_fields!(Resolutions { map, changed });
+aft_store::heap_bytes_of_fields!(ResolutionSlot { value, source });
+aft_store::heap_bytes_of_fields!(EncodedResolution { record_key, bytes });
+
+impl aft_store::heap::HeapBytes for ResolutionSource {
+    fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
+        match self {
+            Self::Memory => 0,
+            Self::Stored(stored) => stored.heap_bytes(seen),
+            Self::Encoded(encoded) => encoded.heap_bytes(seen),
+        }
+    }
+}
 aft_store::heap_bytes_of_fields!(FileResolution {
     rows,
     binding,

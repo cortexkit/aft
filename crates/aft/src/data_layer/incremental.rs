@@ -617,9 +617,21 @@ impl LiveCheckout {
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
-        let mut stats = pool.install(|| self.update_in_pool(next, changed))?;
+        let mut stats = pool.install(|| {
+            let stats = self.update_in_pool(next, changed)?;
+            // Every resolution the update made or changed is encoded, so
+            // that it can be let go between updates like a stored one.
+            let parses = &self.inputs.parses;
+            self.resolved.encode_changed(|path| parses.key(path));
+            Ok::<_, ManifestJoinError>(stats)
+        })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
+    }
+
+    /// Runs `op` on the engine's thread pool.
+    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(op)
     }
 
     #[expect(

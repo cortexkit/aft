@@ -29,12 +29,13 @@ use aft_store::text::{
     TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
-use super::callgraph::{CheckoutInputs, FileResolution};
+use super::callgraph::{CheckoutInputs, EncodedResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
-use super::graph_store::{write_sections, Held, StoredSlices};
+use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
-use super::overlay::OverlaySlices;
+use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
 use super::query::{SliceReader, SliceSource};
+use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 /// The name status gives the data layer's family store when it refuses a
@@ -320,8 +321,8 @@ pub struct Failure {
 #[derive(Clone)]
 struct Refreshed {
     state: CheckoutState,
-    /// Each re-resolved file's record key, parse and resolution.
-    replaced: BTreeMap<String, (String, Arc<ParseBlob>, Arc<FileResolution>)>,
+    /// Each re-resolved file's resolution, encoded, and its parse.
+    replaced: BTreeMap<String, RefreshedFile>,
     /// Files the publication has that the checkout no longer parses.
     removed: BTreeSet<String>,
     /// The content record of each file whose content changed since the
@@ -331,6 +332,18 @@ struct Refreshed {
     records: BTreeMap<String, Arc<ContentRecord>>,
     /// The dead-code snapshot of this call graph, built on first use.
     dead_code: DeadCodeMemo,
+}
+
+/// One file resolved again since a publication, as [`Refreshed`] keeps it.
+#[derive(Clone)]
+struct RefreshedFile {
+    /// Its resolution, encoded as a publication stores it, with its parse
+    /// key; shared with the engine that resolved it.
+    resolution: Arc<EncodedResolution>,
+    /// Its parse, when the publication holds no parse of that key for its
+    /// path because its content changed since; the changed path's record
+    /// holds the same parse. `None` when the publication's parse is it.
+    parse: Option<Arc<ParseBlob>>,
 }
 
 /// Each published path's [`PathText`] once read, by position: a lexical query
@@ -407,13 +420,14 @@ impl DeadCodeMemo {
 /// writer before it gives up and reports the store busy.
 const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How many unchanged files' parses, and separately resolutions, the
-/// call-graph engine keeps decoded between updates (see `update_engine`).
-/// A decoded resolution of a large repository's file is about half a
-/// megabyte: at 1,024 files each worktree an agent was editing held 0.5 to
-/// 3 GB, and four prefrontal worktrees took the daemon past 20 GB. The next
-/// update decodes again what it reads, at a fraction of a millisecond a
-/// file.
+/// How many parses, and separately resolutions, the call-graph engine
+/// keeps decoded between updates when it can decode them again: from the
+/// publication, or for a resolution an update made, from its encoding (see
+/// `update_engine`). A decoded resolution of a large repository's file is
+/// about half a megabyte: at 1,024 files each worktree an agent was editing
+/// held 0.5 to 3 GB, and four such worktrees took the daemon past 20 GB.
+/// The next update decodes again what it reads, at a fraction of a
+/// millisecond a file.
 const ENGINE_DECODED_FILES: usize = 64;
 
 /// One path changed since the publication.
@@ -1903,28 +1917,41 @@ impl Checkout {
                 }
             };
             // Only the files this update touched get new slices; every file
-            // touched by an earlier update keeps the slice it got then.
-            for file in &update.touched {
-                match (
-                    engine.live.resolved.get_shared(file),
-                    engine.live.inputs.parses.get(file),
-                ) {
-                    (Some(resolution), Some((key, parse))) => {
-                        engine.overlay.replace_lazy(
-                            file,
-                            key,
-                            Arc::clone(parse),
-                            Arc::clone(&resolution),
-                        );
+            // touched by an earlier update keeps the slice it got then. Each
+            // is laid over the publication encoded, as a publication stores
+            // it, and the refreshed files keep each resolution encoded, so
+            // what an edit resolved again costs its encoded size until the
+            // next publication. The slices and encodings are made on the
+            // engine's threads.
+            let cached_as = CacheKey::new();
+            let files = update.touched.iter().collect::<Vec<_>>();
+            let (resolved, parses) = (&engine.live.resolved, &engine.live.inputs.parses);
+            let graph = &published.graph;
+            let made = engine.live.install(|| {
+                use rayon::prelude::*;
+                files
+                    .par_iter()
+                    .map(|file| {
+                        let resolution = resolved.get(file)?;
+                        let (key, parse) = parses.get(file)?;
+                        let slice = FileSlice::build(file, key, parse, resolution);
+                        let refreshed = RefreshedFile {
+                            resolution: resolved.encoded(file, key)?,
+                            parse: (graph.record_key_of(file) != Some(key.as_str()))
+                                .then(|| Arc::clone(parse)),
+                        };
+                        Some((PreparedSlice::of(&slice, key, &cached_as), refreshed))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (file, made) in files.into_iter().zip(made) {
+                match made {
+                    Some((slice, refreshed)) => {
+                        engine.overlay.replace_encoded(file, slice);
                         engine.refreshed.removed.remove(file);
-                        // Shared with the engine: a later update that changes
-                        // this file copies it then, and only then.
-                        engine
-                            .refreshed
-                            .replaced
-                            .insert(file.clone(), (key.clone(), Arc::clone(parse), resolution));
+                        engine.refreshed.replaced.insert(file.clone(), refreshed);
                     }
-                    _ => {
+                    None => {
                         engine.overlay.remove(file);
                         engine.refreshed.replaced.remove(file);
                         engine.refreshed.removed.insert(file.clone());
@@ -1952,14 +1979,17 @@ impl Checkout {
             stats = Some(update);
             // An update keeps every parse and resolution it decoded. A broad
             // one reads thousands (every file declaring a method named `new`,
-            // say), so past a budget the unchanged ones go and a later update
-            // decodes again what it reads. The changed ones stay, since only
-            // the engine holds them until the next publication.
+            // say), and resolves a thousand again after a widely read change,
+            // so past a budget every one that can be decoded again goes: from
+            // the publication, or for a resolution an update made, from the
+            // encoding it got above. A later update decodes again what it
+            // reads. A changed file's parse stays, since only the changes
+            // hold it until the next publication.
             if engine.live.inputs.parses.decoded_count() > ENGINE_DECODED_FILES {
                 engine.live.inputs.parses.release_decoded();
             }
-            if engine.live.resolved.decoded_unchanged_count() > ENGINE_DECODED_FILES {
-                engine.live.resolved.release_unchanged();
+            if engine.live.resolved.decoded_count() > ENGINE_DECODED_FILES {
+                engine.live.resolved.release_decoded();
             }
         }
         // A refresh that applied nothing keeps the served graph, and with it
@@ -2024,13 +2054,18 @@ impl Checkout {
                 .cloned()
                 .collect::<BTreeSet<_>>();
             files.extend(engine.live.refiled());
+            // Each file's resolution encoded, decoded again one at a time as
+            // its fragment is written, so publishing never holds every
+            // re-resolved file decoded at once.
+            let parses = &engine.live.inputs.parses;
             let resolved = files
                 .iter()
                 .filter_map(|file| {
+                    let key = parses.key(file)?;
                     engine
                         .live
                         .resolved
-                        .get_shared(file)
+                        .encoded(file, &key)
                         .map(|resolution| (file.clone(), resolution))
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -2107,16 +2142,19 @@ impl Checkout {
         text_units
             .write(pending.writer())
             .map_err(DataError::store)?;
-        let fragments = write_sections(
-            pending.writer(),
-            &inputs,
-            &resolved,
-            &records,
-            false,
-            None,
-            None,
-        )
-        .map_err(DataError::Store)?;
+        let fragments = {
+            // As `write_sections` writes them, from each file's resolution
+            // decoded in turn.
+            let mut sections = SectionsWriter::new(&inputs.state, &records, false, None);
+            for (file, resolution) in &resolved {
+                sections
+                    .add(&inputs, file, &resolution.decode(file))
+                    .map_err(DataError::Store)?;
+            }
+            sections
+                .finish(pending.writer(), None)
+                .map_err(DataError::Store)?
+        };
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let per_path = inputs
             .state
@@ -3011,9 +3049,20 @@ impl CheckoutView {
                     parses.remove(file);
                     resolved.remove(file);
                 }
-                for (file, (key, parse, resolution)) in &refreshed.replaced {
-                    parses.insert(file.clone(), (key.clone(), Arc::clone(parse)));
-                    resolved.insert(file.clone(), FileResolution::clone(resolution));
+                for (file, refreshed_file) in &refreshed.replaced {
+                    let key = refreshed_file.resolution.record_key();
+                    match &refreshed_file.parse {
+                        Some(parse) => {
+                            parses.insert(file.clone(), (key.to_string(), Arc::clone(parse)));
+                        }
+                        // The publication's parse of this path, read above,
+                        // has the key the file was resolved with.
+                        None => debug_assert_eq!(
+                            parses.get(file).map(|(stored, _)| stored.as_str()),
+                            Some(key)
+                        ),
+                    }
+                    resolved.insert(file.clone(), refreshed_file.resolution.decode(file));
                 }
                 refreshed.state.clone()
             }
@@ -3773,6 +3822,8 @@ impl aft_store::heap::HeapBytes for PathTextMemo {
     }
 }
 
+aft_store::heap_bytes_of_fields!(RefreshedFile { resolution, parse });
+
 impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
         match self {
@@ -3854,6 +3905,52 @@ impl Checkout {
     #[must_use]
     pub fn family_dir(&self) -> &Path {
         self.family.dir()
+    }
+
+    /// The call-graph bytes of [`Self::memory`]'s live part, part by part,
+    /// walked in the same order so each part counts what it counts there.
+    /// For finding what the served call graph holds between publications;
+    /// `None` while another thread holds the checkout's live state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn callgraph_memory_parts(&self) -> Option<Vec<(&'static str, usize)>> {
+        use aft_store::heap::HeapBytes as _;
+        let live = self.live.try_read().ok()?;
+        let seen = &mut aft_store::heap::Seen::new();
+        let mut published = MemoryParts::default();
+        if let Some(graph) = &live.published {
+            published.published(graph, seen);
+        }
+        // What the census counts as the text plane's and as shared first.
+        live.text.heap_bytes(seen);
+        live.text_members.heap_bytes(seen);
+        live.state.heap_bytes(seen);
+        for (path, change) in &live.changes {
+            path.heap_bytes(seen);
+            change.record.heap_bytes(seen);
+        }
+        let extracted = live
+            .changes
+            .values()
+            .map(|change| change.extracted.heap_bytes(seen))
+            .sum();
+        let pending = live.unparsed.heap_bytes(seen) + live.callgraph_pending.heap_bytes(seen);
+        let served = live.graph.heap_bytes(seen);
+        let (replaced, other) = live.refreshed.as_ref().map_or((0, 0), |refreshed| {
+            refreshed.state.heap_bytes(seen);
+            (
+                refreshed.replaced.heap_bytes(seen),
+                refreshed.removed.heap_bytes(seen) + refreshed.dead_code.heap_bytes(seen),
+            )
+        });
+        Some(vec![
+            ("published", published.callgraph),
+            ("changes_extracted", extracted),
+            ("pending_and_unparsed", pending),
+            ("served_graph", served),
+            ("refreshed_replaced", replaced),
+            ("refreshed_other", other),
+        ])
     }
 
     /// What this checkout holds in memory now, for the memory census (see

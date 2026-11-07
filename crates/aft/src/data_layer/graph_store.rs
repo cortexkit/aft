@@ -753,6 +753,13 @@ impl StoredSlices {
             .map(|(file, located)| (file, located.record_key.as_str()))
     }
 
+    /// The record key of `file`'s stored parse, read without decoding it.
+    pub(crate) fn record_key_of(&self, file: &str) -> Option<&str> {
+        self.paths
+            .get(file)
+            .map(|located| located.record_key.as_str())
+    }
+
     /// `file`'s record key and parse, read and decoded now. A read that
     /// fails is recorded in [`Self::failures`].
     pub(crate) fn parse_of(

@@ -15,7 +15,7 @@ use super::incremental::LiveCheckout;
 use crate::callgraph_store::join::{CallgraphBlob, ResolutionStatus};
 
 /// A checkout of text `files` and symlinks `links` (path, target).
-fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> CheckoutInputs {
+pub(super) fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> CheckoutInputs {
     let mut records = Vec::new();
     let mut parses = BTreeMap::new();
     let mut configs = HashMap::new();
@@ -108,6 +108,10 @@ fn update_checked(
         .map(|path| (*path).to_string())
         .collect::<BTreeSet<_>>();
     let stats = live.update(after, &changed).unwrap();
+    // What the update resolved is kept encoded: let go of every decoded
+    // copy, so the comparison below reads each back from its encoding.
+    live.resolved.release_decoded();
+    assert_eq!(live.resolved.decoded_count(), 0);
     let cold = resolve_checkout(&live.inputs, 1).unwrap();
     assert_eq!(
         live.resolved.keys().collect::<Vec<_>>(),
@@ -121,6 +125,45 @@ fn update_checked(
         assert_eq!(ours.binding, theirs.binding, "{path}: recorded reads");
     }
     (stats, cold)
+}
+
+#[test]
+fn what_an_update_resolves_is_encoded_and_reads_back_the_same() {
+    let caller = (
+        "main.ts",
+        "import { run } from './lib';\nexport function main() { run(); }\n",
+    );
+    let before = checkout(
+        &[caller, ("lib.ts", "export function run() { return 1; }\n")],
+        &[],
+    );
+    let after = checkout(
+        &[
+            caller,
+            (
+                "lib.ts",
+                "export function run() { return 2; }\nexport function stop() {}\n",
+            ),
+        ],
+        &[],
+    );
+    let mut live = LiveCheckout::cold(before, 1).unwrap();
+    // Built in memory by a cold build, nothing can be let go.
+    assert_eq!(live.resolved.decoded_count(), 0);
+    let stats = live
+        .update(after, &BTreeSet::from(["lib.ts".to_string()]))
+        .unwrap();
+    assert!(stats.touched.contains("lib.ts"), "{stats:?}");
+    let decoded = live.resolved.to_map();
+    // The update's own resolutions are encoded, so each can be let go.
+    assert!(live.resolved.decoded_count() >= 1);
+    live.resolved.release_decoded();
+    assert_eq!(live.resolved.decoded_count(), 0);
+    assert_eq!(live.resolved.to_map(), decoded);
+    // Changed again, an entry stays decoded until the next update ends.
+    live.resolved.get_mut("lib.ts").unwrap().sites.clear();
+    live.resolved.release_decoded();
+    assert!(live.resolved.get("lib.ts").unwrap().sites.is_empty());
 }
 
 #[test]

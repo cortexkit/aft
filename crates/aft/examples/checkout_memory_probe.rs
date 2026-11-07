@@ -18,7 +18,11 @@
 //! allocator's in-use bytes every 100 ms, so each line reports the peak
 //! between two samples as well as the value at the sample. One JSON line
 //! per edit, and per build and commit end, goes to stdout; a summary to
-//! stderr.
+//! stderr. Each edit's line also says how long recording it took
+//! (`record_ms`). With PROBE_PARTS=1 a line breaks the call graph's memory
+//! down part by part, the engine's and the rest's; with PROBE_ALLOC=1 it
+//! says how many bytes recording the edit and refreshing the call graph
+//! allocated.
 //!
 //! ```text
 //! cargo run --profile ci-storm -p agent-file-tools --example checkout_memory_probe -- <pack.jsonl.gz> [threads]
@@ -39,6 +43,52 @@ use aft_store::ids::{Digest128, FamilyId};
 const PUBLISH_AT: usize = 64;
 /// Segments past which the runtime builds a checkout again whole.
 const COMPACT_AT: usize = 8;
+
+/// Whether [`Counting`] counts: with PROBE_ALLOC=1, each edit's line says
+/// how many bytes recording it and refreshing the call graph allocated.
+static COUNTING: AtomicBool = AtomicBool::new(false);
+/// Bytes allocated since the process started, while counting.
+static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// The system allocator, counting the bytes each allocation asks for.
+struct Counting;
+
+impl Counting {
+    fn count(size: usize) {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+// SAFETY: every call is passed to the system allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::count(layout.size());
+        // SAFETY: the caller's contract is the system allocator's.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::count(layout.size());
+        // SAFETY: as above.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        Self::count(new_size.saturating_sub(layout.size()));
+        // SAFETY: as above.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: as above.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 /// The process's resident memory in MiB, from `/proc/self/status`.
 fn rss_mib() -> u64 {
@@ -138,8 +188,20 @@ fn sample(
                 .map(|(name, bytes)| (name.to_string(), serde_json::json!(bytes >> 20)))
                 .collect::<serde_json::Map<_, _>>()
         });
+    // Likewise the call graph's part of what the checkout holds apart from
+    // its engine (`callgraph_mib`), part by part.
+    let callgraph_parts = (std::env::var_os("PROBE_PARTS").is_some_and(|value| value == "1"))
+        .then(|| checkout.callgraph_memory_parts())
+        .flatten()
+        .map(|parts| {
+            parts
+                .into_iter()
+                .map(|(name, bytes)| (name.to_string(), serde_json::json!(bytes >> 20)))
+                .collect::<serde_json::Map<_, _>>()
+        });
     serde_json::json!({
         "engine_parts_mib": parts,
+        "callgraph_parts_mib": callgraph_parts,
         "label": label,
         "commit": commit,
         "path": path,
@@ -174,6 +236,10 @@ fn publish(checkout: &Checkout) -> Option<String> {
 }
 
 fn main() {
+    COUNTING.store(
+        std::env::var_os("PROBE_ALLOC").is_some_and(|value| value == "1"),
+        Ordering::Relaxed,
+    );
     let mut args = std::env::args().skip(1);
     let pack = args.next().unwrap();
     let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
@@ -278,9 +344,13 @@ fn main() {
             write(path, edit["text"].as_str().unwrap_or_default());
         }
         let edit_started = std::time::Instant::now();
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
         checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+        let record_ms = edit_started.elapsed().as_secs_f64() * 1000.0;
+        let record_allocated = ALLOCATED.load(Ordering::Relaxed) - allocated;
         checkout.refresh_callgraph().unwrap();
         let refresh_ms = edit_started.elapsed().as_secs_f64() * 1000.0;
+        let refresh_allocated = ALLOCATED.load(Ordering::Relaxed) - allocated - record_allocated;
         refresh_times.push(refresh_ms);
         let mut label = "edit".to_string();
         if checkout.changed_paths() > PUBLISH_AT {
@@ -290,6 +360,11 @@ fn main() {
         }
         let mut line = sample(&label, commit, path, &peaks, &checkout, &layer);
         line["refresh_ms"] = serde_json::json!((refresh_ms * 10.0).round() / 10.0);
+        line["record_ms"] = serde_json::json!((record_ms * 100.0).round() / 100.0);
+        if COUNTING.load(Ordering::Relaxed) {
+            line["record_alloc_kib"] = serde_json::json!(record_allocated >> 10);
+            line["refresh_alloc_kib"] = serde_json::json!(refresh_allocated >> 10);
+        }
         let peak = line["peak_rss_mib"].as_u64().unwrap_or_default();
         if peak > worst_edit.0 {
             worst_edit = (peak, path.to_string());
