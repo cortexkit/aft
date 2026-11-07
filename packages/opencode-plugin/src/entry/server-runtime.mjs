@@ -1,5 +1,5 @@
-import { acquireBridge, releaseBridge } from "@cortexkit/aft-bridge";
-import { Cause, Effect } from "effect";
+import { acquireBridge, releaseBridge, withLocationExecution } from "@cortexkit/aft-bridge";
+import { Cause, Effect, Exit, Scope } from "effect";
 
 import {
   applyToolSurfaceOverrides,
@@ -125,6 +125,14 @@ async function bootLocation(context, location, dependencies) {
     ...consumers.transportOptions,
     ...subcWakes?.handlers,
   });
+  const executions = new Set();
+  consumers.withExecution = (operation) => {
+    const execution = withLocationExecution(pool, operation);
+    executions.add(execution);
+    const finished = () => executions.delete(execution);
+    void execution.then(finished, finished);
+    return execution;
+  };
   environment.attach(pool);
   const toolContext = {
     pool,
@@ -166,7 +174,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes };
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes, executions };
   } catch (error) {
     // Boot failures precede finalizer ownership, so unwind every acquired resource here.
     await Promise.allSettled([
@@ -239,20 +247,51 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
+      let runtime;
+      // Release the Location before tearing down registrations, so admission closes
+      // before asynchronous cleanup. Draining calls keep the session records they
+      // need to record or kill a late background task.
+      const registrationScope = yield* Effect.acquireRelease(
+        Scope.make(),
+        (scope) => Effect.promise(async () => {
+          const cleanup = async () => {
+            try {
+              await runtime?.consumers.dispose?.();
+            } finally {
+              await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
+            }
+          };
+          if (runtime?.executions?.size) {
+            // A replacement may keep the owner alive after this Location's bounded
+            // drain. Its admitted calls still need permissions and task tracking.
+            void Promise.allSettled([...runtime.executions]).then(cleanup).catch((cleanupError) => {
+              error(`AFT retired Location cleanup failed: ${String(cleanupError)}`);
+            });
+          } else {
+            await cleanup();
+          }
+        }),
+      );
+      const register = (effect) =>
+        effect.pipe(Effect.provideService(Scope.Scope, registrationScope));
       // The host runs this program under Effect.ignoreCause, so a rejected boot
       // would otherwise leave the Location without AFT and without any log.
       // Interruption is the host disposing the Location mid-boot, not a failure.
-      const runtime = yield* Effect.acquireRelease(
-        Effect.promise(() => bootLocation(context, location, dependencies)),
+      runtime = yield* Effect.acquireRelease(
+        Effect.promise(async () => {
+          runtime = await bootLocation(context, location, dependencies);
+          return runtime;
+        }),
         (runtime) => Effect.promise(async () => {
+          // Close admission immediately, but retain consumers until admitted calls
+          // finish: background spawn replies can still need their tracking RPCs.
+          const released = runtime.pool
+            ? dependencies.releaseBridge(runtime.pool)
+            : Promise.resolve();
           try {
             runtime.liveConfigReload?.stop();
           } finally {
-            try {
-              runtime.consumers.dispose?.();
-            } finally {
-              if (runtime.pool) await dependencies.releaseBridge(runtime.pool);
-            }
+            await released;
           }
         }),
       ).pipe(
@@ -268,15 +307,19 @@ export function makeServerEffect(overrides = {}) {
       if (!runtime) return;
 
       if (runtime.configError !== undefined) {
-        const rpc = yield* dependencies.registerConfigErrorRpc(context, runtime.configError);
-        yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-        yield* dependencies.registerTools(context, location, runtime.tools, runtime.consumers);
+        const rpc = yield* register(
+          dependencies.registerConfigErrorRpc(context, runtime.configError),
+        );
+        yield* register(Effect.addFinalizer(() => Effect.promise(() => rpc.dispose())));
+        yield* register(
+          dependencies.registerTools(context, location, runtime.tools, runtime.consumers),
+        );
         return;
       }
 
-      const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
-      yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-      yield* registerV2SessionLifecycle(context, runtime.toolContext);
+      const rpc = yield* register(dependencies.registerRpc(context, location, runtime.pool));
+      yield* register(Effect.addFinalizer(() => Effect.promise(() => rpc.dispose())));
+      yield* register(registerV2SessionLifecycle(context, runtime.toolContext));
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.
@@ -284,31 +327,34 @@ export function makeServerEffect(overrides = {}) {
       // Location's own directory; for a Location in a linked git worktree that
       // is the worktree, not the canonical main checkout. Other bridges are
       // still tried after it.
-      yield* dependencies.registerPromptHook(context, {
-        pool: runtime.pool,
-        projectRoot: runtime.directory,
-        getConfig: () => runtime.toolContext.config,
-        registerSession: runtime.consumers.registerSession,
-      });
-      yield* dependencies.registerTools(
-        context,
-        location,
-        runtime.tools,
-        runtime.consumers,
+      yield* register(
+        dependencies.registerPromptHook(context, {
+          pool: runtime.pool,
+          projectRoot: runtime.directory,
+          getConfig: () => runtime.toolContext.config,
+          registerSession: runtime.consumers.registerSession,
+        }),
       );
-      yield* dependencies.registerToolHooks(
-        context,
-        runtime.toolContext,
-        new Set(Object.keys(runtime.tools)),
-        runtime.tools.bash?.description,
+      yield* register(
+        dependencies.registerTools(context, location, runtime.tools, runtime.consumers),
       );
-      yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
-      if (runtime.subcWakes) {
-        yield* Effect.forkScoped(recoverV2SubcSessions(
+      yield* register(
+        dependencies.registerToolHooks(
           context,
-          runtime.directory,
-          runtime.subcWakes.restoreSession,
-        ));
+          runtime.toolContext,
+          new Set(Object.keys(runtime.tools)),
+          runtime.tools.bash?.description,
+        ),
+      );
+      yield* register(dependencies.registerWorkflowHints(context, runtime.hintsBlock));
+      if (runtime.subcWakes) {
+        yield* register(
+          Effect.forkScoped(recoverV2SubcSessions(
+            context,
+            runtime.directory,
+            runtime.subcWakes.restoreSession,
+          )),
+        );
       }
     });
   };
