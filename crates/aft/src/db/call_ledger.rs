@@ -726,18 +726,88 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
 /// Drops one custodian's oldest late entries beyond [`UNACKED_RESULTS_MAX`]
 /// unacked results and [`EXPIRED_ENTRIES_MAX`] expired entries (the
 /// tool-provider contract's retention bounds), deleting their rows as an ack
-/// would.
+/// would, and clears held-update payloads beyond [`UNACKED_RESULTS_MAX`].
+/// Every settle and held update runs this in its own transaction, so the
+/// bounds hold after each of them; `late_results` runs it again before
+/// reading, because expiry ([`reduce_expired`]) can push the expired count
+/// over its bound between settles.
+///
+/// Its cost must not follow the size of the stored results, since a late
+/// entry can carry a whole tool result. A custodian with no more rows than
+/// either bound is skipped after reading only its index. Otherwise one pass
+/// visits each late entry, newest first, and reads its frame type from the
+/// row's first page. Only a row with an `Error` frame can hold an `expired`
+/// entry, because [`reduce_expired`] writes that frame and that kind in one
+/// update; every other late entry counts as unexpired without being read.
+/// The entries of `Error` rows are small (a not-started, not-retained or
+/// protocol error body) and are classified by their `kind`, with the same
+/// SQL comparison as before, so an entry whose kind is missing still counts
+/// against neither bound.
 fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
-    for (expired, max) in [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)] {
-        conn.execute(
-            "DELETE FROM call_ledger WHERE rowid IN (SELECT rowid FROM call_ledger
-                WHERE custodian=?1 AND late_entry IS NOT NULL
-                AND (json_extract(late_entry,'$.kind')='expired')=?2
-                ORDER BY seq DESC LIMIT -1 OFFSET ?3)",
-            params![custodian, expired, max as i64],
-        )?;
+    let fewest_kept = UNACKED_RESULTS_MAX.min(EXPIRED_ENTRIES_MAX) as i64;
+    let over_either_bound = conn
+        .query_row(
+            "SELECT 1 FROM call_ledger WHERE custodian=?1 LIMIT 1 OFFSET ?2",
+            params![custodian, fewest_kept],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if over_either_bound {
+        drop_late_entries_over_bounds(conn, custodian)?;
     }
-    conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
+    let over_update_bound = conn
+        .query_row(
+            "SELECT 1 FROM call_ledger_updates WHERE custodian=?1 LIMIT 1 OFFSET ?2",
+            params![custodian, UNACKED_RESULTS_MAX as i64],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if over_update_bound {
+        conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
+    }
+    Ok(())
+}
+
+/// The row deletions of [`enforce_retention_bounds`]: newest first, the
+/// unexpired entries past the first [`UNACKED_RESULTS_MAX`] and the expired
+/// entries past the first [`EXPIRED_ENTRIES_MAX`].
+fn drop_late_entries_over_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
+    let over_bounds = {
+        // `late_entry IS NOT NULL` reads only the row header, and the CASE
+        // reads the entry itself only for `Error` rows.
+        let mut stmt = conn.prepare(
+            "SELECT rowid, CASE WHEN frame_type='Error'
+                 THEN json_extract(late_entry,'$.kind')='expired' ELSE 0 END
+             FROM call_ledger WHERE custodian=?1 AND late_entry IS NOT NULL
+             ORDER BY seq DESC",
+        )?;
+        let mut rows = stmt.query([custodian])?;
+        let (mut unexpired, mut expired) = (0, 0);
+        let mut over_bounds = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kept = match row.get::<_, Option<bool>>(1)? {
+                Some(false) => {
+                    unexpired += 1;
+                    unexpired <= UNACKED_RESULTS_MAX
+                }
+                Some(true) => {
+                    expired += 1;
+                    expired <= EXPIRED_ENTRIES_MAX
+                }
+                None => true,
+            };
+            if !kept {
+                over_bounds.push(row.get::<_, i64>(0)?);
+            }
+        }
+        over_bounds
+    };
+    let mut delete = conn.prepare("DELETE FROM call_ledger WHERE rowid=?1")?;
+    for rowid in over_bounds {
+        delete.execute([rowid])?;
+    }
     Ok(())
 }
 
@@ -2620,5 +2690,418 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(expired["entries"][0]["kind"], "expired");
+    }
+
+    fn text_result(text: &str) -> RecordedFrame {
+        RecordedFrame {
+            ty: FrameType::Response,
+            body: serde_json::to_vec(&json!({
+                "isError": false,
+                "content": [{"type": "text", "text": text}],
+            }))
+            .unwrap(),
+        }
+    }
+
+    /// Pad characters that add exactly one overflow page to a settled row. A
+    /// result's text is stored twice, in the recorded body and in the late
+    /// entry, and an overflow page of a 4096-byte database page holds 4092
+    /// bytes. Rows whose sizes differ by whole overflow pages keep identical
+    /// bytes on their table page, so ledgers built with such pads have the
+    /// same tree shape and differ only in each result's overflow chain.
+    const PAD_PER_OVERFLOW_PAGE: usize = 2046;
+
+    /// Builds an on-disk ledger for the custodian `owner`: `expired` expired
+    /// entries with the oldest seqs, then `results` unexpired results that
+    /// each carry `text`. The rows are copies of rows that `settle` and
+    /// `reduce_expired` wrote. Returns how many overflow pages the ledger
+    /// table uses.
+    fn build_ledger_file(
+        path: &std::path::Path,
+        results: usize,
+        expired: usize,
+        text: &str,
+    ) -> i64 {
+        let conn = crate::db::open(path).unwrap();
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            page_size, 4096,
+            "PAD_PER_OVERFLOW_PAGE assumes 4096-byte pages"
+        );
+        // The templates belong to another custodian, so they never count
+        // against the bounds of `owner`.
+        let template = scope("template");
+        for name in ["template-result", "template-expired"] {
+            admit(
+                &conn,
+                &key(name),
+                "digest",
+                Some(&template),
+                State::DispatchStarted,
+            )
+            .unwrap();
+        }
+        settle(
+            &conn,
+            &key("template-result"),
+            &text_result(text),
+            "ok",
+            None,
+            100,
+        )
+        .unwrap();
+        settle(&conn, &key("template-expired"), &success(), "ok", None, 100).unwrap();
+        reduce_expired(&conn, &key("template-expired"), 100 + RETENTION_MS).unwrap();
+        for (template, prefix, first_seq, count) in [
+            ("template-expired", "expired-", 0, expired),
+            ("template-result", "result-", expired, results),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?4)
+                 INSERT INTO call_ledger(carrier,call_key,digest,state,owner,scope_ref,scope_epoch,
+                     custodian,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry)
+                 SELECT 'carrier',?2||i,digest,state,'owner',scope_ref,scope_epoch,'owner',
+                     frame_type,frame_body,outcome,?2||i,settled_at,?3+i,late_entry
+                 FROM call_ledger, n WHERE carrier=?1",
+                params![template, prefix, first_seq as i64, count as i64],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO call_ledger_ack(custodian,last_seq) VALUES ('owner',?1)",
+            [(expired + results) as i64],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM dbstat WHERE name='call_ledger' AND pagetype='overflow'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[derive(Debug)]
+    struct SettleCost {
+        /// Pages the settle pulled from the database file.
+        pages_read: i32,
+        /// Late entries of kind `result` that SQL parsed during the settle.
+        result_entries_parsed: usize,
+    }
+
+    /// Settles one more result for `owner` on a fresh connection to `path`,
+    /// whose page cache starts empty, and reports what that settle read.
+    fn cold_settle_cost(path: &std::path::Path) -> SettleCost {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let conn = crate::db::open(path).unwrap();
+        // Large enough that no page is evicted and read a second time.
+        conn.pragma_update(None, "cache_size", -262_144).unwrap();
+        // An application function overrides SQLite's built-in json_extract
+        // on this connection, so every entry SQL parses is counted here.
+        let parsed = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = parsed.clone();
+        conn.create_scalar_function(
+            "json_extract",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let entry: String = ctx.get(0)?;
+                let path: String = ctx.get(1)?;
+                let member = path
+                    .strip_prefix("$.")
+                    .expect("the ledger reads top-level members");
+                let value: Value = serde_json::from_str(&entry)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                let found = value.get(member).cloned().unwrap_or(Value::Null);
+                if member == "kind" && found == "result" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(found.as_str().map(str::to_owned))
+            },
+        )
+        .unwrap();
+        let kind: String = conn
+            .query_row(
+                r#"SELECT json_extract('{"kind":"result"}','$.kind')"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "result");
+        assert_eq!(
+            parsed.swap(0, Ordering::SeqCst),
+            1,
+            "SQL must call the counting json_extract"
+        );
+        let next = key("next");
+        admit(
+            &conn,
+            &next,
+            "digest",
+            Some(&scope("owner")),
+            State::DispatchStarted,
+        )
+        .unwrap();
+        let cache_misses = |reset: bool| {
+            let (mut current, mut highwater) = (0, 0);
+            let status = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    &mut current,
+                    &mut highwater,
+                    i32::from(reset),
+                )
+            };
+            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        cache_misses(true);
+        settle(&conn, &next, &success(), "ok", None, 100).unwrap();
+        SettleCost {
+            pages_read: cache_misses(false),
+            result_entries_parsed: parsed.load(Ordering::SeqCst),
+        }
+    }
+
+    /// A settle enforces the retention bounds over all of the custodian's late
+    /// entries. Its reads must not depend on how large the stored results
+    /// are: each unexpired result here is either about 8 KB or 18 KB, and the
+    /// settle must read exactly the same pages and parse none of them.
+    #[test]
+    fn settle_cost_does_not_depend_on_the_size_of_stored_results() {
+        const RESULTS: usize = 200;
+        // Keeps every result's body and entry above 8,185 bytes, so their
+        // length prefixes in the row header have the same width in both sizes.
+        const SMALL_PAD: usize = 8_300;
+        const ADDED_PAGES: usize = 5;
+        let dir = tempfile::tempdir().unwrap();
+        // Fewer late entries than either bound, then more than the bounds
+        // allow: one expired entry too many, which this settle must drop.
+        for expired in [0, EXPIRED_ENTRIES_MAX + 1] {
+            let mut measured = Vec::new();
+            for (size, pad) in [
+                ("small", SMALL_PAD),
+                ("large", SMALL_PAD + ADDED_PAGES * PAD_PER_OVERFLOW_PAGE),
+            ] {
+                let path = dir.path().join(format!("{size}-{expired}.db"));
+                let overflow_pages = build_ledger_file(&path, RESULTS, expired, &"x".repeat(pad));
+                let cost = cold_settle_cost(&path);
+                let conn = crate::db::open(&path).unwrap();
+                let owner_rows: usize = conn
+                    .query_row(
+                        "SELECT count(*) FROM call_ledger WHERE custodian='owner'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    owner_rows,
+                    RESULTS + 1 + expired.min(EXPIRED_ENTRIES_MAX),
+                    "{size}: the settle kept every result and dropped only the expired entry over its bound"
+                );
+                if expired > EXPIRED_ENTRIES_MAX {
+                    let oldest = Key {
+                        carrier: "carrier".into(),
+                        call_key: "expired-1".into(),
+                    };
+                    assert!(get(&conn, &oldest).unwrap().is_none(), "{size}");
+                }
+                measured.push((overflow_pages, cost));
+            }
+            let [(small_overflow, small), (large_overflow, large)] = &measured[..] else {
+                unreachable!()
+            };
+            // Every result row, the template included, really is larger.
+            assert_eq!(
+                large_overflow - small_overflow,
+                ((RESULTS + 1) * ADDED_PAGES) as i64
+            );
+            assert_eq!(
+                (small.result_entries_parsed, large.result_entries_parsed),
+                (0, 0),
+                "a settle parsed stored result entries ({expired} expired)"
+            );
+            assert_eq!(
+                small.pages_read, large.pages_read,
+                "settle page reads grew with the size of stored results ({expired} expired): {small:?} vs {large:?}"
+            );
+        }
+    }
+
+    /// The retention query every settle ran before the bounds stopped parsing
+    /// result entries. The test below checks that the current enforcement
+    /// drops exactly the rows this query drops.
+    fn drop_over_bounds_by_parsing_every_entry(conn: &Connection, custodian: &str) {
+        for (expired, max) in [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)] {
+            conn.execute(
+                "DELETE FROM call_ledger WHERE rowid IN (SELECT rowid FROM call_ledger
+                    WHERE custodian=?1 AND late_entry IS NOT NULL
+                    AND (json_extract(late_entry,'$.kind')='expired')=?2
+                    ORDER BY seq DESC LIMIT -1 OFFSET ?3)",
+                params![custodian, expired, max as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn retention_bounds_drop_the_rows_that_parsing_every_entry_drops() {
+        let build = || {
+            let conn = database();
+            for (owner, rows) in [("owner", 2_600), ("other", 40)] {
+                for seq in 1..=rows {
+                    let key = Key {
+                        carrier: "carrier".into(),
+                        call_key: format!("{owner}-{seq}"),
+                    };
+                    // Expired entries interleave with unexpired results,
+                    // results reduced to their outcome and calls that never
+                    // started; the last two are error frames like expired ones.
+                    let (kind, frame) = match seq % 13 {
+                        0..=5 => ("expired", not_retained(&key, "ok")),
+                        6 | 7 => ("not_started", not_started(&key, "denied")),
+                        8 => ("result", not_retained(&key, "ok")),
+                        _ => ("result", success()),
+                    };
+                    let entry = json!({"kind": kind, "owner": owner, "ref": "same-ref",
+                        "scope_epoch": 7, "custodian": owner, "call_key": key.call_key,
+                        "event_id": key.call_key, "settled_at": 100});
+                    conn.execute(
+                        "INSERT INTO call_ledger(carrier,call_key,digest,state,owner,scope_ref,
+                            scope_epoch,custodian,frame_type,frame_body,outcome,event_id,
+                            settled_at,seq,late_entry)
+                         VALUES (?1,?2,'digest','Settled',?3,'same-ref',7,?3,?4,?5,'ok',?2,100,?6,?7)",
+                        params![
+                            key.carrier,
+                            key.call_key,
+                            owner,
+                            frame.type_name(),
+                            frame.body,
+                            seq,
+                            entry.to_string()
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            // A running call has no late entry and counts against neither bound.
+            admit(
+                &conn,
+                &key("running"),
+                "digest",
+                Some(&scope("owner")),
+                State::DispatchStarted,
+            )
+            .unwrap();
+            conn
+        };
+        let remaining = |conn: &Connection| -> Vec<(String, String)> {
+            let mut stmt = conn
+                .prepare("SELECT carrier,call_key FROM call_ledger ORDER BY rowid")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let expected = build();
+        drop_over_bounds_by_parsing_every_entry(&expected, "owner");
+        let actual = build();
+        enforce_retention_bounds(&actual, "owner").unwrap();
+        assert_eq!(remaining(&actual), remaining(&expected));
+        // Both bounds were exceeded, so the comparison covers each of them.
+        let kept: Vec<(bool, usize)> = {
+            let mut stmt = actual
+                .prepare(
+                    "SELECT json_extract(late_entry,'$.kind')='expired', count(*) FROM call_ledger
+                     WHERE custodian='owner' AND late_entry IS NOT NULL GROUP BY 1 ORDER BY 1",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(
+            kept,
+            [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)]
+        );
+        assert!(get(&actual, &key("running")).unwrap().is_some());
+    }
+
+    /// Wall-clock settle time on ledgers of 20 KB results, printed for a
+    /// manual before-and-after comparison. Run it with
+    /// `cargo test -p agent-file-tools --lib -- --ignored --nocapture settle_time_on_large_ledgers`.
+    #[test]
+    #[ignore = "manual settle-time measurement"]
+    fn settle_time_on_large_ledgers() {
+        // Plain padding, and source-like text whose stored JSON has escapes
+        // as tool output does.
+        let line = "    let value = map.get(\"key\").unwrap_or(&default);\t// \u{2192} cached\n";
+        let mut escaped = String::new();
+        while serde_json::to_string(&escaped).unwrap().len() < 20_000 {
+            escaped.push_str(line);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (kind, text) in [("padded", "x".repeat(20_000)), ("escaped", escaped)] {
+            for (results, expired) in [(1_000, 0), (1_000, 1_000), (2_000, 0)] {
+                settle_timing(dir.path(), kind, &text, results, expired);
+            }
+        }
+    }
+
+    /// Times 20 settles after a first one on a ledger of `results` results
+    /// carrying `text` and `expired` expired entries, and prints the result.
+    fn settle_timing(
+        dir: &std::path::Path,
+        kind: &str,
+        text: &str,
+        results: usize,
+        expired: usize,
+    ) {
+        let path = dir.join(format!("bench-{kind}-{results}-{expired}.db"));
+        eprintln!("building {}", path.display());
+        build_ledger_file(&path, results, expired, text);
+        let conn = crate::db::open(&path).unwrap();
+        let entry_bytes: i64 = conn
+            .query_row(
+                "SELECT max(octet_length(late_entry)) FROM call_ledger WHERE custodian='owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut times = Vec::new();
+        for i in 0..21 {
+            let next = Key {
+                carrier: "carrier".into(),
+                call_key: format!("next-{i}"),
+            };
+            admit(
+                &conn,
+                &next,
+                "digest",
+                Some(&scope("owner")),
+                State::DispatchStarted,
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            settle(&conn, &next, &text_result(text), "ok", None, 100).unwrap();
+            times.push(started.elapsed());
+        }
+        let first = times.remove(0);
+        times.sort();
+        eprintln!(
+                "{kind}: settle on {results} results ({entry_bytes}-byte late entries) + {expired} expired: \
+                 first {first:?}, then median {:?}, max {:?} over {} settles",
+                times[times.len() / 2],
+                times[times.len() - 1],
+                times.len()
+            );
     }
 }
