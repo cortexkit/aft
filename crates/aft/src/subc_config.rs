@@ -305,7 +305,7 @@ mod tests {
     /// Reading migrates the user file off retired keys and reads the new text;
     /// the project file is shared through its repository, so its bytes stay
     /// exactly as they were, and the names it still uses that were retired in
-    /// 0.62 or earlier are refused.
+    /// 0.62 or earlier are translated with a notice rather than refused.
     #[test]
     fn reading_migrates_the_user_file_and_never_writes_the_project_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -334,13 +334,9 @@ mod tests {
         assert_eq!(tiers[1].doc, project_text);
 
         let resolved = crate::config_resolve::resolve_config(&tiers);
-        assert_eq!(
-            resolved.errors,
-            [
-                "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
-                "removed_config_key:semantic_search; run npx @cortexkit/aft doctor --fix",
-            ]
-        );
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        // The project's `semantic_search: false` applies as `indexes.semantic`.
+        assert!(!resolved.config.indexes.semantic);
         let user_only = crate::config_resolve::resolve_config(&tiers[..1]);
         assert!(user_only.errors.is_empty(), "{:?}", user_only.errors);
         assert!(!user_only.config.indexes.trigram);
@@ -377,10 +373,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
         assert_eq!(tiers[1].doc, project_text);
         let resolved = crate::config_resolve::resolve_config(&tiers);
-        assert_eq!(
-            resolved.errors,
-            ["removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix"]
-        );
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
         let user_only = crate::config_resolve::resolve_config(&tiers[..1]);
         assert!(user_only.errors.is_empty(), "{:?}", user_only.errors);
         assert!(user_only.config.experimental_lsp_ty);
@@ -490,11 +483,9 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
             assert_eq!(tiers[0].tier, "project");
             assert_eq!(tiers[0].source, path.to_string_lossy());
             assert_eq!(tiers[0].doc, text);
+            // A project file's long-retired names load with a notice.
             let resolved = crate::config_resolve::resolve_config(&tiers);
-            assert_eq!(
-                resolved.errors,
-                ["removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix"]
-            );
+            assert!(resolved.errors.is_empty(), "{}: {:?}", fixture["name"], resolved.errors);
         }
         for file in files {
             assert_eq!(
