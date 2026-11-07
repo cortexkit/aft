@@ -717,8 +717,14 @@ pub fn resolve_config_for_harness(
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
 
+    // Only the user config is refused for a name retired two or more releases
+    // ago: AFT rewrites that file itself. A project config belongs to its
+    // repository, where a refusal would leave everyone who opens it without
+    // AFT until a tracked file is edited, so its old names are translated
+    // below with a notice instead.
     let errors: Vec<String> = tiers
         .iter()
+        .filter(|tier| tier.tier == "user")
         .map(|tier| {
             serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
                 .ok()
@@ -1440,9 +1446,13 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     let Value::Object(mut map) = value else {
         return Some(format!("{} is not a JSON object", tier.source));
     };
-    let removed = feature_config::removed_config_key_errors(&map);
-    if !removed.is_empty() {
-        return Some(removed.join(", "));
+    // As in resolution, only the user config is refused for a long-retired
+    // name; a project config's old names are translated below.
+    if tier.tier == "user" {
+        let removed = feature_config::removed_config_key_errors(&map);
+        if !removed.is_empty() {
+            return Some(removed.join(", "));
+        }
     }
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
@@ -4239,8 +4249,10 @@ mod tests {
     }
 
     /// A name retired in 0.62 or earlier is refused with `removed_config_key`
-    /// in either tier and in a harness block, and `doctor --fix` rewrites the
-    /// file into one that loads.
+    /// in the user config, also inside a harness block, and `doctor --fix`
+    /// rewrites the file into one that loads. A project config with the same
+    /// name loads, with the name translated exactly as `doctor --fix` would
+    /// rewrite it.
     #[test]
     fn names_retired_two_releases_ago_are_refused_and_doctor_fix_repairs_them() {
         let documents = refused_retired_documents();
@@ -4259,15 +4271,33 @@ mod tests {
             ] {
                 let text = document.to_string();
                 for tier_name in ["user", "project"] {
-                    let refused =
+                    let resolved =
                         resolve_config_for_harness(&[tier(tier_name, &text)], Some(&Harness::Pi));
-                    assert_eq!(
-                        refused.errors,
-                        [format!(
-                            "removed_config_key:{prefix}{name}; run npx @cortexkit/aft doctor --fix"
-                        )],
-                        "{tier_name}: {text}"
-                    );
+                    if tier_name == "user" {
+                        assert_eq!(
+                            resolved.errors,
+                            [format!(
+                                "removed_config_key:{prefix}{name}; run npx @cortexkit/aft doctor --fix"
+                            )],
+                            "{tier_name}: {text}"
+                        );
+                        assert!(
+                            strict_tier_error(&tier(tier_name, &text), Some(&Harness::Pi))
+                                .is_some_and(|error| error.contains("removed_config_key:")),
+                            "{tier_name}: {text}"
+                        );
+                    } else {
+                        assert!(
+                            resolved.errors.is_empty(),
+                            "a project config loads: {text}: {:?}",
+                            resolved.errors
+                        );
+                        assert_eq!(
+                            strict_tier_error(&tier(tier_name, &text), Some(&Harness::Pi)),
+                            None,
+                            "{tier_name}: {text}"
+                        );
+                    }
 
                     let fix_tier = if tier_name == "user" {
                         crate::config_fix::FixTier::User
@@ -4287,6 +4317,16 @@ mod tests {
                         fixed.text,
                         repaired.errors
                     );
+                    if tier_name == "project" {
+                        // The loaded project config means what the rewritten
+                        // file means.
+                        assert_eq!(
+                            serde_json::to_value(&resolved.config).unwrap(),
+                            serde_json::to_value(&repaired.config).unwrap(),
+                            "{text} -> {}",
+                            fixed.text
+                        );
+                    }
                 }
             }
         }
