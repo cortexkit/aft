@@ -2589,6 +2589,12 @@ pub fn index_refusal_response(
     ctx: &AppContext,
     access: &CallgraphStoreAccess,
 ) -> Response {
+    // Configure switches the call graph off for a home root, so the home-root
+    // cause must be named before the switch: telling the user to turn the
+    // index on would not help there.
+    if ctx.is_home_root() {
+        return home_root_disabled_response(req_id, operation);
+    }
     match access {
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {

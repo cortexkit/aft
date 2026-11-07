@@ -15878,7 +15878,6 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    #[ignore = "callers on a HOME root answers callgraph_off: HOME forces indexes.callgraph off, and callgraph_store_for_ops checks that switch before the home-root gate, so the reply never names home_root as the cause"]
     fn home_root_callers_name_the_home_root_as_the_cause() {
         let home = TempDir::new().expect("home tempdir");
         let storage = TempDir::new().expect("storage tempdir");
