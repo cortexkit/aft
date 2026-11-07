@@ -13,11 +13,6 @@ on:
       - ".github/workflows/beta-pin-gate.yml"
   workflow_dispatch: {}
 
-env:
-  # Every CI run builds from scratch, where incremental state only costs time
-  # and cache space; the repository leaves it on for local edit-compile loops.
-  CARGO_INCREMENTAL: "0"
-
 concurrency:
   group: beta-pin-gate-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
