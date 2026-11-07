@@ -8819,8 +8819,10 @@ impl AppContext {
 
     /// Why this root's checkout is never bound in the data layer, as
     /// configure leaves today's indexes off for it: the root is a
-    /// filesystem, volume or drive root, or the home folder, or both of the
-    /// data layer's indexes are switched off.
+    /// filesystem, volume or drive root, or the home folder, or every index
+    /// is switched off. Semantic search alone still binds it: the meaning
+    /// plane fills from the checkout's file list, which a build publishes
+    /// even with the text index and call graph off.
     pub(crate) fn data_layer_withheld(&self) -> Option<crate::data_layer::surfaces::Withheld> {
         use crate::data_layer::surfaces::Withheld;
         let planes = self.data_layer_planes();
@@ -8828,7 +8830,7 @@ impl AppContext {
             Some(Withheld::TooBroad)
         } else if self.is_home_root() {
             Some(Withheld::Home)
-        } else if !planes.text && !planes.callgraph {
+        } else if !planes.text && !planes.callgraph && self.data_meaning_config().is_none() {
             Some(Withheld::IndexesOff)
         } else {
             None
