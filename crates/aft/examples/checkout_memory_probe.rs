@@ -262,6 +262,9 @@ fn main() {
     let mut worst_edit = (0u64, String::new());
     let mut worst_in_use = 0u64;
     let mut most_after_relief = 0u64;
+    // Each edit's record-and-refresh time, without its publication, for
+    // comparing builds of the read path.
+    let mut refresh_times = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
         let path = edit["path"].as_str().unwrap_or_default();
         if !safe(path) {
@@ -273,15 +276,19 @@ fn main() {
         } else {
             write(path, edit["text"].as_str().unwrap_or_default());
         }
+        let edit_started = std::time::Instant::now();
         checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
         checkout.refresh_callgraph().unwrap();
+        let refresh_ms = edit_started.elapsed().as_secs_f64() * 1000.0;
+        refresh_times.push(refresh_ms);
         let mut label = "edit".to_string();
         if checkout.changed_paths() > PUBLISH_AT {
             if let Some(done) = publish(&checkout) {
                 label = format!("edit, then {done}");
             }
         }
-        let line = sample(&label, commit, path, &peaks, &checkout, &layer);
+        let mut line = sample(&label, commit, path, &peaks, &checkout, &layer);
+        line["refresh_ms"] = serde_json::json!((refresh_ms * 10.0).round() / 10.0);
         let peak = line["peak_rss_mib"].as_u64().unwrap_or_default();
         if peak > worst_edit.0 {
             worst_edit = (peak, path.to_string());
@@ -320,6 +327,22 @@ fn main() {
         }
     }
     peaks.stop.store(true, Ordering::Release);
+    refresh_times.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        refresh_times
+            .get(((refresh_times.len().saturating_sub(1)) as f64 * fraction).round() as usize)
+            .copied()
+            .unwrap_or_default()
+    };
+    eprintln!(
+        "refresh: {} edits, total {:.0} ms, p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms, max {:.1} ms",
+        refresh_times.len(),
+        refresh_times.iter().sum::<f64>(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        at(1.0)
+    );
     eprintln!(
         "cold build: peak {} MiB resident, {} MiB in use, {} MiB after; edits: peak {} MiB resident (at {}), {} MiB in use; \
          at commit ends after allocator relief, at most {} MiB resident",
