@@ -279,12 +279,32 @@ fn secret_bash_windows_refuses_all_profiles_without_a_job() {
 
 #[cfg(unix)]
 fn native_launcher(root: &Path) -> impl Drop {
+    // The test executable runs from `<profile>/deps/`, and `aft` is built
+    // into `<profile>/`. With Cargo's `build.build-dir` set, test
+    // executables move under the build folder while binaries stay in the
+    // target folder, so the same profile folder there is looked in too.
     let executable = std::env::current_exe().unwrap();
-    let launcher = executable.parent().unwrap().parent().unwrap().join("aft");
-    assert!(
-        launcher.is_file(),
-        "build the real aft binary before running native secret-bash tests"
-    );
+    let profile_dir = executable.parent().unwrap().parent().unwrap();
+    let profile = profile_dir.file_name().unwrap();
+    let mut candidates = vec![profile_dir.join("aft")];
+    if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+        candidates.push(std::path::PathBuf::from(target).join(profile).join("aft"));
+    }
+    if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        candidates.push(
+            std::path::PathBuf::from(manifest)
+                .join("../../target")
+                .join(profile)
+                .join("aft"),
+        );
+    }
+    let launcher = candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("build the real aft binary before running native secret-bash tests; looked in {candidates:?}")
+        });
     crate::sandbox_spawn::install_sandbox_launcher_for_test(root, launcher)
 }
 
