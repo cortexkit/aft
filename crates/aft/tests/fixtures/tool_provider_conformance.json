@@ -118,7 +118,7 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1"]
+      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1", "session-notices/v1"]
     },
     "presets": {
       "head": {
