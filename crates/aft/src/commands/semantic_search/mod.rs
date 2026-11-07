@@ -12977,7 +12977,14 @@ mod tests {
             .expect("callers of target");
         assert!(callers.total_callers >= 1, "fixture has callers");
 
-        let mut hit = snippet_hit(root.join("lib.rs"), "target", SymbolKind::Function, 0, 0, 0.5);
+        let mut hit = snippet_hit(
+            root.join("lib.rs"),
+            "target",
+            SymbolKind::Function,
+            0,
+            0,
+            0.5,
+        );
         hit.source = "semantic";
         let annotation = blast_radius_annotation_for_result(&view.callgraph(), &view, &hit)
             .expect("a symbol hit with callers is annotated");

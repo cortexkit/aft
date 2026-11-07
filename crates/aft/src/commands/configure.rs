@@ -6631,8 +6631,7 @@ mod tests {
                 .any(|warning| warning["kind"] == "config_migrated")));
         assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
 
-        let long_retired_text =
-            r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        let long_retired_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
         write_config(&project_path, long_retired_text);
         let loaded = handle_configure_for_test(&request(), &ctx);
         assert!(loaded.success, "{loaded:?}");
@@ -6648,7 +6647,10 @@ mod tests {
                     .any(|key| key["key"] == "github" && key["tier"] == "project")),
             "{loaded:?}"
         );
-        assert_eq!(fs::read_to_string(&project_path).unwrap(), long_retired_text);
+        assert_eq!(
+            fs::read_to_string(&project_path).unwrap(),
+            long_retired_text
+        );
     }
 
     #[test]
@@ -9915,4 +9917,3 @@ mod tests {
         );
     }
 }
-
