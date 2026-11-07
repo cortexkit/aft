@@ -164,7 +164,10 @@ fn dead_code_graph(project_root: &Path) -> DeadCodeGraph {
                 panic!("the call graph failed to build: {reason}")
             }
             aft::data_layer::surfaces::WarmState::Pending(state) => {
-                assert!(Instant::now() < deadline, "the call graph never published: {state}");
+                assert!(
+                    Instant::now() < deadline,
+                    "the call graph never published: {state}"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         }

@@ -1805,7 +1805,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        for (name, body) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n"), ("c.rs", "fn c() {}\n")] {
+        for (name, body) in [
+            ("a.rs", "fn a() {}\n"),
+            ("b.rs", "fn b() {}\n"),
+            ("c.rs", "fn c() {}\n"),
+        ] {
             std::fs::write(root.join("src").join(name), body).unwrap();
         }
         let ctx = AppContext::new(
@@ -1825,7 +1829,11 @@ mod tests {
         .unwrap();
         let response = handle_grep(&req, &ctx);
         assert!(response.success, "{:?}", response.data);
-        assert_eq!(response.data["index_status"], "Building", "{:?}", response.data);
+        assert_eq!(
+            response.data["index_status"], "Building",
+            "{:?}",
+            response.data
+        );
         assert_eq!(
             response.data["text"],
             "Found 0 matches in 0 files [index: building; searched all 3 files directly]",
@@ -1833,7 +1841,11 @@ mod tests {
             response.data
         );
         assert_eq!(response.data["complete"], true, "{:?}", response.data);
-        assert_eq!(response.data["files_read_directly"], 3, "{:?}", response.data);
+        assert_eq!(
+            response.data["files_read_directly"], 3,
+            "{:?}",
+            response.data
+        );
     }
 
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {

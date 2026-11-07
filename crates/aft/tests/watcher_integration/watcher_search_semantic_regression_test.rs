@@ -676,7 +676,12 @@ fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
     .expect("write initial source");
 
     let server = BlockingEmbeddingServer::start();
-    let mut aft = AftProcess::spawn_with_real_watcher();
+    // The index store embeds an edit once the checkout has gone quiet, two
+    // minutes after the last change; this test shortens that to a second.
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "AFT_TEST_DATA_QUIET_MS",
+        std::ffi::OsStr::new("1000"),
+    )]);
     configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
     wait_for_semantic_ready(&mut aft, "initial build");
 
@@ -691,15 +696,18 @@ fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
     )
     .expect("write aftignore");
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut attempts = 0usize;
     while !server.saw_corpus_refresh() && Instant::now() < deadline {
-        if attempts.is_multiple_of(5) {
-            // Unique content each retouch so the content-hash freshness check
-            // can't dedup it away if the watcher dropped/coalesced the first
-            // event under parallel-suite load (the root cause of the flake).
-            // The asserted `alpha_anchor` symbol is preserved; only a trailing
-            // comment varies the hash.
+        attempts += 1;
+        // Every change restarts the quiet period, so retouch only every five
+        // seconds: often enough to recover an event the watcher dropped or
+        // coalesced under parallel-suite load, rarely enough for the store to
+        // go quiet in between. Unique content each retouch keeps the
+        // content-hash freshness check from deduplicating it; the asserted
+        // `alpha_anchor` symbol is preserved and only a trailing comment
+        // varies the hash.
+        if attempts.is_multiple_of(50) {
             fs::write(
                 &source,
                 format!(
@@ -713,7 +721,6 @@ fn semantic_corpus_refresh_replays_file_created_while_in_flight() {
             )
             .expect("retouch aftignore");
         }
-        attempts += 1;
         let _ = status(&mut aft);
         thread::sleep(Duration::from_millis(100));
     }

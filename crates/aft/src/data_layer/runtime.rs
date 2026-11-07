@@ -62,6 +62,20 @@ fn family_of(root: &Path) -> Result<FamilyId, DataError> {
 /// them, never refresh in between.
 pub(crate) const QUIET: Duration = Duration::from_secs(120);
 
+/// [`QUIET`], or in a debug build the period `AFT_TEST_DATA_QUIET_MS` names,
+/// so an end-to-end test that runs the binary and edits a file need not wait
+/// two minutes for the edit to be refreshed. Release builds ignore it.
+fn quiet_period() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("AFT_TEST_DATA_QUIET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    QUIET
+}
+
 /// How long a root whose checkout could not be bound waits before the next
 /// bind is tried, at first; each failure in a row doubles it, up to
 /// [`BIND_RETRY_MAX`].
@@ -797,7 +811,7 @@ impl DataCheckout {
         });
         let quiet = {
             let work = Arc::downgrade(&work);
-            Arc::new(QuietTimer::new(QUIET, move || {
+            Arc::new(QuietTimer::new(quiet_period(), move || {
                 if let Some(work) = work.upgrade() {
                     work.start_refresh(Publish::Always);
                     // Edited files wait for vectors of their new content.

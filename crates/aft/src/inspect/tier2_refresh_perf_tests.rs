@@ -208,14 +208,18 @@ fn dead_code_store_read_does_not_retry_an_expired_lock() {
         attempts += 1;
         // A lock that consumes the whole budget stays pending, even with the
         // controlled clock used by the transient-lock fixtures.
-        CALLGRAPH_READ_RETRY_CLOCK.with(|clock| clock.set(Some(start + Duration::from_millis(100))));
+        CALLGRAPH_READ_RETRY_CLOCK
+            .with(|clock| clock.set(Some(start + Duration::from_millis(100))));
         Err::<(), _>(CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             None,
         )))
     });
     assert!(result.unwrap_err().is_transient_lock_contention());
-    assert_eq!(attempts, 1, "an expired read must not start another attempt");
+    assert_eq!(
+        attempts, 1,
+        "an expired read must not start another attempt"
+    );
 }
 
 #[test]

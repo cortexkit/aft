@@ -215,9 +215,17 @@ fn subfolder_session_never_narrows_the_repository_artifact() {
     // Returning to sub1 after sub2 still answers for sub1 alone.
     let step6 = run_session(&fixture, &sub1);
     eprintln!("6 home/sub1 again: {step6:?}");
-    assert_eq!(step6.counts, [0, 1, 0], "sibling subfolders overwrote each other");
+    assert_eq!(
+        step6.counts,
+        [0, 1, 0],
+        "sibling subfolders overwrote each other"
+    );
 
     let step7 = run_session(&fixture, &fixture.home);
     eprintln!("7 home again: {step7:?}");
-    assert_eq!(step7.counts, [1, 1, 1], "a subfolder session narrowed the repository");
+    assert_eq!(
+        step7.counts,
+        [1, 1, 1],
+        "a subfolder session narrowed the repository"
+    );
 }

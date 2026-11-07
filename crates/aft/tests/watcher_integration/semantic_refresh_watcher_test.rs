@@ -869,7 +869,10 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
 
     let ready = wait_for_semantic_status(&mut aft, "initial ready", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["files_embedded"].as_u64().unwrap_or(0) >= 3
+            && response["semantic_index"]["files_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 3
             && response["semantic_index"]["refreshing_count"] == 0
     });
     assert_eq!(ready["semantic_index"]["refreshing_count"], 0);
@@ -1152,7 +1155,10 @@ fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
 
     let ready = wait_for_semantic_status(&mut aft, "recovered ready", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["files_embedded"].as_u64().unwrap_or(0) >= 1
+            && response["semantic_index"]["files_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
     });
     assert_eq!(ready["semantic_index"]["status"], "ready");
 
