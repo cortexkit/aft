@@ -118,14 +118,6 @@ pub struct SyntaxTree {
     language: LangId,
 }
 
-#[cfg(test)]
-impl SyntaxTree {
-    /// The tree-sitter tree, for tests that extract from it directly.
-    pub(crate) fn tree_for_test(&self) -> &tree_sitter::Tree {
-        &self.tree
-    }
-}
-
 /// The text the extractor parses for `source`. A source that is not valid
 /// UTF-8 cannot be parsed; like checkout assembly today, it gets the call
 /// graph of an empty file.

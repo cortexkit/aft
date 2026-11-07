@@ -683,6 +683,9 @@ pub(crate) mod stat_probe {
 mod tests {
     use super::*;
     use crate::db::TrackedConnection;
+    // Only the POSIX-only tests below open raw connections.
+    #[cfg(unix)]
+    use rusqlite::Connection;
 
     #[cfg(unix)]
     #[test]

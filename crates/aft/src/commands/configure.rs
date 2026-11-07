@@ -1727,9 +1727,6 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
-mod nested_worktree_semantic_tests {}
-
 #[cfg(not(debug_assertions))]
 fn delay_search_rebuild_publish_for_debug() {}
 
@@ -9990,8 +9987,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod inspect_orphan_sweep_tests {}
-
-#[cfg(test)]
-mod startup_view_sweep_tests {}
