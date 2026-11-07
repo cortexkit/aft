@@ -1,6 +1,65 @@
 use super::*;
 use crate::log_redact::SECRET_PLACEHOLDER;
 
+fn restart_placeholder_preview(command: &str, legacy: bool) -> BgCompletion {
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(
+        &original,
+        &fixture,
+        command,
+        "opaque-placeholder-result\n",
+        "",
+        false,
+    );
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
+    let mut record = serde_json::to_value(&metadata).unwrap();
+    if legacy {
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_has_secret_placeholders");
+    }
+    std::fs::write(&task.paths.json, serde_json::to_vec(&record).unwrap()).unwrap();
+    let metadata = persistence::read_task(&task.paths.json).unwrap();
+    drop(original);
+    let restarted = BgTaskRegistry::default();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let (matched, context) =
+        restarted.render_watch_preview(&id, b"opaque-placeholder-result\n", 0..6);
+    assert_eq!(matched, SECRET_PLACEHOLDER);
+    assert!(context.starts_with(completion_preview::RESTART_WATCH_PREVIEW_WITHHELD));
+    restarted
+        .completion_snapshot_for_task(&restarted.task(&id).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn bash_background_restart_placeholder_task_withholds_completion_without_environment_secrets() {
+    let completion = restart_placeholder_preview("echo '{{ck-secret:test}}'", false);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
+    assert!(!completion
+        .output_preview
+        .contains("opaque-placeholder-result"));
+}
+
+#[test]
+fn bash_background_restart_record_without_placeholder_flag_withholds_completion() {
+    let completion = restart_placeholder_preview("echo plain-output", true);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
+    assert!(!completion
+        .output_preview
+        .contains("opaque-placeholder-result"));
+}
+
 #[test]
 fn bash_background_restart_hex_watch_redaction_is_bounded_and_unlocked() {
     const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";

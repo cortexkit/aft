@@ -1,0 +1,1 @@
+- Background build-server tasks without secrets retain their output previews after AFT restarts.
