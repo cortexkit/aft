@@ -3,7 +3,7 @@ use super::prepare_cache_root_for_test as prepare_cache_root;
 use super::*;
 use crate::config::Config;
 use crate::context::AppContext;
-use crate::parser::{SymbolCache, TreeSitterProvider};
+use crate::parser::TreeSitterProvider;
 
 #[cfg(unix)]
 #[test]

@@ -640,43 +640,6 @@ pub fn separator() -> char {
         assert_eq!(cache.read().unwrap().len(), 0);
     }
 
-    fn trace_data(ctx: &AppContext, file: &Path, symbol: &str, expression: &str) -> Response {
-        crate::commands::trace_data::handle_trace_data(
-            &request(
-                "trace_data",
-                serde_json::json!({
-                    "file": file,
-                    "symbol": symbol,
-                    "expression": expression,
-                    "depth": 5,
-                }),
-            ),
-            ctx,
-        )
-    }
-
-    /// The answer's own fields, without the list envelope around them.
-    fn trace_fields(value: &serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "expression": value["expression"],
-            "origin_file": value["origin_file"],
-            "origin_symbol": value["origin_symbol"],
-            "hops": value["hops"],
-            "depth_limited": value["depth_limited"],
-        })
-    }
-
-    fn impact_fields(
-        store: &impl crate::callgraph_store::CallGraphRead,
-        file: &Path,
-        symbol: &str,
-    ) -> serde_json::Value {
-        let result =
-            crate::commands::callgraph_store_adapter::impact_result(store, file, symbol, 5, true)
-                .unwrap_or_else(|error| panic!("impact of {symbol}: {error}"));
-        serde_json::to_value(&result).unwrap()
-    }
-
     /// The whole path a configure takes: the bind's prewarm fills the cache
     /// once for the root and generation, and a later bind changes nothing.
     #[test]
@@ -703,36 +666,5 @@ pub fn separator() -> char {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(cache.read().unwrap().len(), sources.len());
-    }
-
-    /// The process's resident memory in KiB, where the system reports it.
-    fn resident_kib() -> u64 {
-        std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|status| {
-                status
-                    .lines()
-                    .find_map(|line| line.strip_prefix("VmRSS:"))
-                    .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
-            })
-            .unwrap_or(0)
-    }
-
-    fn zlib_fast(bytes: &[u8]) -> usize {
-        use std::io::Write;
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(bytes).unwrap();
-        let packed = encoder.finish().unwrap().len();
-        // The store keeps a body packed only when that saves a tenth.
-        if packed * 10 <= bytes.len() * 9 {
-            packed
-        } else {
-            bytes.len()
-        }
-    }
-
-    /// The tree-sitter tree of an extraction's syntax tree.
-    fn tree_of(tree: &crate::data_layer::content::SyntaxTree) -> &tree_sitter::Tree {
-        tree.tree_for_test()
     }
 }

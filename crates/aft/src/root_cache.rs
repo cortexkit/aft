@@ -1084,16 +1084,6 @@ thread_local! {
     static HOSTNAME_RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn hostname_resolutions_for_test() -> u64 {
-    HOSTNAME_RESOLUTIONS.with(|count| count.get())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_hostname_resolutions_for_test() {
-    HOSTNAME_RESOLUTIONS.with(|count| count.set(0));
-}
-
 // Test hook counting process-start-time resolutions on this thread: cache
 // misses while attributing markers, not liveness probes (which are never
 // cached). Reset before a marker pass and read after it to prove repeated
@@ -1102,16 +1092,6 @@ pub(crate) fn reset_hostname_resolutions_for_test() {
 thread_local! {
     static PROCESS_START_RESOLUTIONS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn process_start_resolutions_for_test() -> u64 {
-    PROCESS_START_RESOLUTIONS.with(|count| count.get())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_process_start_resolutions_for_test() {
-    PROCESS_START_RESOLUTIONS.with(|count| count.set(0));
 }
 
 fn read_marker_protection(
@@ -1162,21 +1142,6 @@ fn read_marker_protection(
 #[cfg(test)]
 thread_local! {
     static READER_CENSUS: std::cell::RefCell<Option<std::collections::BTreeMap<(PathBuf, String), usize>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct ReaderCensusProbe;
-
-#[cfg(test)]
-impl ReaderCensusProbe {
-    pub(crate) fn start() -> Self {
-        READER_CENSUS.with(|reads| *reads.borrow_mut() = Some(Default::default()));
-        Self
-    }
-
-    pub(crate) fn finish(self) -> std::collections::BTreeMap<(PathBuf, String), usize> {
-        READER_CENSUS.with(|reads| reads.borrow_mut().take().unwrap())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

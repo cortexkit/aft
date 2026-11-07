@@ -417,13 +417,6 @@ fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
     POOL.get_or_init(build_strict_verify_pool).as_ref()
 }
 
-/// Start the process-wide verification pool now, so a test that counts
-/// threads can take its baseline after it exists.
-#[cfg(test)]
-pub(crate) fn warm_strict_verify_pool_for_test() {
-    let _ = strict_verify_pool();
-}
-
 fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {
     #[cfg(test)]
     STRICT_VERIFY_POOL_BUILDS.fetch_add(1, Ordering::Relaxed);

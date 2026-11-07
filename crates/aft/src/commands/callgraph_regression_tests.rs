@@ -1,57 +1,88 @@
 use super::*;
-use crate::callgraph_store::CallGraphStore;
+use crate::callgraph_store::CallGraphRead;
 
-fn fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, CallGraphStore) {
+fn fixture(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, crate::data_layer::checkout::CheckoutView) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(root).unwrap();
-    let mut paths = Vec::new();
     for (file, source) in files {
         let path = root.join(file);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, source).unwrap();
-        paths.push(path);
     }
-    let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
-    store.cold_build(&paths).unwrap();
-    (temp, store)
+    let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
+        &root,
+        &temp.path().join("store"),
+        None,
+        crate::data_layer::checkout::Planes {
+            text: false,
+            callgraph: true,
+        },
+    )
+    .unwrap();
+    let view = match checkout.fresh_view(std::time::Duration::from_secs(60)) {
+        crate::data_layer::runtime::Fresh::Ready(view) => view,
+        crate::data_layer::runtime::Fresh::Building => panic!("call graph did not publish"),
+        crate::data_layer::runtime::Fresh::Failed(reason) => panic!("call graph failed: {reason}"),
+    };
+    (temp, view)
 }
 
-fn callers(store: &CallGraphStore, file: &str, symbol: &str, tests: bool) -> String {
-    let result = callers_result(store, Path::new(file), symbol, 5, tests).unwrap();
+fn callers(
+    store: &crate::data_layer::checkout::CheckoutView,
+    file: &str,
+    symbol: &str,
+    tests: bool,
+) -> String {
+    let result = callers_result(&store.callgraph(), Path::new(file), symbol, 5, tests).unwrap();
     crate::subc_format::format_callgraph("callers", &serde_json::to_value(result).unwrap(), false)
 }
 
-fn impact(store: &CallGraphStore, file: &str, symbol: &str, tests: bool) -> String {
-    let result = impact_result(store, Path::new(file), symbol, 5, tests).unwrap();
+fn impact(
+    store: &crate::data_layer::checkout::CheckoutView,
+    file: &str,
+    symbol: &str,
+    tests: bool,
+) -> String {
+    let result = impact_result(&store.callgraph(), Path::new(file), symbol, 5, tests).unwrap();
     crate::subc_format::format_callgraph("impact", &serde_json::to_value(result).unwrap(), false)
 }
 
 #[test]
 fn callgraph_empty_receiver_note_exact_counts_and_test_filtering() {
     let (_temp, store) = fixture(&[("lib.rs", "fn target() {}\n")]);
-    let target = store.node_for(Path::new("lib.rs"), "target").unwrap();
+    let target = store
+        .callgraph()
+        .node_for(Path::new("lib.rs"), "target")
+        .unwrap();
     for include_tests in [false, true] {
-        assert!(empty_receiver_note(&store, &target, 0, include_tests)
-            .unwrap()
-            .is_none());
+        assert!(
+            empty_receiver_note(&store.callgraph(), &target, 0, include_tests)
+                .unwrap()
+                .is_none()
+        );
     }
 
     let (_temp, store) = fixture(&[
         ("lib.rs", "fn target() {}\nfn caller() { unknown(); }\n#[test]\nfn inline_test() { unknown(); }\n"),
         ("tests/integration.rs", "fn test_caller() { unknown(); }\n"),
     ]);
-    let target = store.node_for(Path::new("lib.rs"), "target").unwrap();
+    let target = store
+        .callgraph()
+        .node_for(Path::new("lib.rs"), "target")
+        .unwrap();
     for (include_tests, count, expected) in [
         (false, 1, "Incomplete: 1 call site in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`."),
         (true, 3, "Incomplete: 3 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`."),
     ] {
-        let note = empty_receiver_note(&store, &target, 0, include_tests).unwrap().unwrap();
+        let note = empty_receiver_note(&store.callgraph(), &target, 0, include_tests).unwrap().unwrap();
         assert_eq!(note.unresolved_call_sites, count);
         assert_eq!(note.incomplete_reason, expected);
         assert!(!note.complete);
-        assert!(empty_receiver_note(&store, &target, 1, include_tests).unwrap().is_none());
+        assert!(empty_receiver_note(&store.callgraph(), &target, 1, include_tests).unwrap().is_none());
     }
 }
 
@@ -61,13 +92,25 @@ fn callgraph_empty_receiver_note_reports_lower_bound_at_cap() {
     let source = format!("fn target() {{}}\nfn caller() {{\n{calls}}}\n");
     let (_temp, store) = fixture(&[("lib.rs", &source)]);
     for include_tests in [false, true] {
-        let result =
-            callers_result(&store, Path::new("lib.rs"), "target", 1, include_tests).unwrap();
+        let result = callers_result(
+            &store.callgraph(),
+            Path::new("lib.rs"),
+            "target",
+            1,
+            include_tests,
+        )
+        .unwrap();
         let note = result.incomplete.unwrap();
         assert_eq!(note.unresolved_call_sites, 1_000);
         assert_eq!(note.incomplete_reason, "Incomplete: at least 1000 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`.");
-        let result =
-            impact_result(&store, Path::new("lib.rs"), "target", 1, include_tests).unwrap();
+        let result = impact_result(
+            &store.callgraph(),
+            Path::new("lib.rs"),
+            "target",
+            1,
+            include_tests,
+        )
+        .unwrap();
         assert_eq!(
             result.incomplete.unwrap().incomplete_reason,
             note.incomplete_reason
@@ -104,7 +147,7 @@ fn callgraph_python_import_reporter_fixture() {
         ("caller_toplevel.py", "run_toplevel"),
         ("caller_local.py", "run_local"),
     ] {
-        let tree = call_tree_result(&store, Path::new(file), symbol, 3, false).unwrap();
+        let tree = call_tree_result(&store.callgraph(), Path::new(file), symbol, 3, false).unwrap();
         let text = crate::subc_format::format_callgraph(
             "call_tree",
             &serde_json::to_value(tree).unwrap(),
@@ -193,13 +236,13 @@ fn callgraph_nonzero_callers_disclose_only_matching_unresolved_names() {
         (false, 1, "Incomplete: 1 call site named `target` in the analyzed Python code could not be resolved; additional callers may be missing."),
         (true, 2, "Incomplete: 2 call sites named `target` in the analyzed Python code could not be resolved; additional callers may be missing."),
     ] {
-        let result = callers_result(&store, Path::new("mod.py"), "target", 1, tests).unwrap();
+        let result = callers_result(&store.callgraph(), Path::new("mod.py"), "target", 1, tests).unwrap();
         assert_eq!(result.total_callers, 1);
         let note = result.incomplete.unwrap();
         assert!(!note.complete);
         assert_eq!(note.unresolved_call_sites, count);
         assert_eq!(note.incomplete_reason, expected);
-        let result = impact_result(&store, Path::new("mod.py"), "target", 1, tests).unwrap();
+        let result = impact_result(&store.callgraph(), Path::new("mod.py"), "target", 1, tests).unwrap();
         assert_eq!(result.incomplete.unwrap().incomplete_reason, expected);
         assert!(callers(&store, "mod.py", "target", tests).starts_with(expected));
     }
@@ -208,7 +251,7 @@ fn callgraph_nonzero_callers_disclose_only_matching_unresolved_names() {
         "def target():\n    pass\n\ndef known():\n    target()\n    unrelated()\n",
     )]);
     assert!(
-        callers_result(&store, Path::new("mod.py"), "target", 1, false)
+        callers_result(&store.callgraph(), Path::new("mod.py"), "target", 1, false)
             .unwrap()
             .incomplete
             .is_none()
@@ -226,7 +269,8 @@ fn callgraph_nonzero_matching_unresolved_count_is_a_lower_bound_at_cap() {
         ),
         ("unknown.py", &source),
     ]);
-    let result = callers_result(&store, Path::new("mod.py"), "target", 1, false).unwrap();
+    let result =
+        callers_result(&store.callgraph(), Path::new("mod.py"), "target", 1, false).unwrap();
     assert_eq!(result.total_callers, 1);
     let note = result.incomplete.unwrap();
     assert_eq!(note.unresolved_call_sites, 1_000);
@@ -261,7 +305,8 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
         );
         // `process` is a root: nothing calls it.
         assert_eq!(impact(&store, file, "transform", false), format!("1 affected site (1 by callback reference) · 1 file\nReaches 1 function with no caller found\n{file}:2\n  ↳ process{entry} (callback reference)\n  {}", source.lines().nth(1).unwrap()));
-        let tree = call_tree_result(&store, Path::new(file), "process", 3, false).unwrap();
+        let tree =
+            call_tree_result(&store.callgraph(), Path::new(file), "process", 3, false).unwrap();
         let text = crate::subc_format::format_callgraph(
             "call_tree",
             &serde_json::to_value(tree).unwrap(),
@@ -274,7 +319,7 @@ fn callgraph_callback_references_are_labelled_in_ts_js_and_rust() {
         // A callback reference is not a call, so the reverse trace does not
         // follow it: `transform` itself is the root, with no caller found.
         let reverse_trace =
-            trace_to_result(&store, Path::new(file), "transform", 5, false).unwrap();
+            trace_to_result(&store.callgraph(), Path::new(file), "transform", 5, false).unwrap();
         assert_eq!(reverse_trace.paths.len(), 1);
         assert_eq!(
             reverse_trace.paths[0].root,
@@ -301,7 +346,14 @@ fn callgraph_callback_import_alias_arrow_and_direct_call_stay_distinct() {
         "main.ts",
         "function transform() {}\nfunction process(transform) { items.map(transform); }\n",
     )]);
-    let result = callers_result(&store, Path::new("main.ts"), "transform", 5, false).unwrap();
+    let result = callers_result(
+        &store.callgraph(),
+        Path::new("main.ts"),
+        "transform",
+        5,
+        false,
+    )
+    .unwrap();
     assert!(
         result.callers.is_empty(),
         "a parameter must not bind to the same-named function"
@@ -457,7 +509,7 @@ fn callgraph_approved_test_status_note_includes_unknown_macro_callers() {
     ] {
         let source = format!("fn target() {{}}\nmacro_rules! invoke_target {{ () => {{ target() }} }}\nfn caller() {{ invoke_target!(); }}\n{direct}fn broken(\n");
         let (_temp, store) = fixture(&[("lib.rs", &source)]);
-        let result = callers_result(&store, Path::new("lib.rs"), "target", 5, false).unwrap();
+        let result = callers_result(&store.callgraph(), Path::new("lib.rs"), "target", 5, false).unwrap();
         assert_eq!(result.test_filter_note.as_deref(), Some(expected));
     }
 }
@@ -490,4 +542,78 @@ fn callgraph_class_initializer_keeps_its_owner_inside_an_enclosing_function() {
             .collect::<Vec<_>>(),
         vec![5]
     );
+}
+
+#[test]
+fn layered_diamond_call_tree_has_total_node_budget() {
+    let mut source = String::new();
+    for level in 0..14 {
+        source.push_str(&format!(
+            "function layer{level}() {{ layer{}(); layer{}(); }}\n",
+            level + 1,
+            level + 1
+        ));
+    }
+    source.push_str("function layer14() {}\n");
+    let (dir, store) = fixture(&[("main.ts", &source)]);
+    fn count(node: &crate::callgraph::CallTreeNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    let started = std::time::Instant::now();
+    let tree = store
+        .callgraph()
+        .call_tree(Path::new("main.ts"), "layer0", 20)
+        .unwrap();
+    eprintln!(
+        "diamond: nodes={}, elapsed={:?}",
+        count(&tree),
+        started.elapsed()
+    );
+    assert!(
+        count(&tree) <= 1000,
+        "total expansion must be bounded independently of depth"
+    );
+    assert!(tree.truncated > 0);
+    drop((store, dir));
+}
+
+#[test]
+fn adapter_call_tree_shares_store_node_budget_and_gap() {
+    let mut source = String::new();
+    for level in 0..14 {
+        source.push_str(&format!(
+            "function layer{level}() {{\n layer{}();\n layer{}();\n }}\n",
+            level + 1,
+            level + 1
+        ));
+    }
+    source.push_str("function layer14() {}\n");
+    let (dir, store) = fixture(&[("main.ts", &source)]);
+    let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+        &store.callgraph(),
+        Path::new("main.ts"),
+        "layer0",
+        20,
+        true,
+    )
+    .unwrap();
+    fn count(node: &crate::commands::callgraph_store_adapter::StoreCallTreeNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    assert!(count(&tree) <= 1000);
+    let adapter = serde_json::to_value(tree).unwrap();
+    let direct = serde_json::to_value(
+        store
+            .callgraph()
+            .call_tree(Path::new("main.ts"), "layer0", 20)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(adapter["complete"], false);
+    assert_eq!(adapter["gap"], direct["gap"]);
+    assert_eq!(adapter["nodes_examined"], 1000);
+    let response = crate::protocol::Response::success("budget", adapter);
+    let text = crate::subc_format::format_response("call_tree", &response, false);
+    assert!(text.contains(crate::callgraph::CALL_TREE_WORK_GAP));
+    drop((store, dir));
 }

@@ -154,12 +154,6 @@ impl Entry {
 pub struct Counter(Arc<Entry>);
 
 impl Counter {
-    /// Unlike pending bytes, this total is unchanged by concurrent minute folds.
-    #[cfg(test)]
-    pub(crate) fn physical_total_for_test(&self) -> u64 {
-        self.0.physical.load(Ordering::Relaxed)
-    }
-
     pub fn credit(&self, logical_bytes: u64, physical_bytes: u64) {
         saturating_add(&self.0.logical, logical_bytes);
         saturating_add(&self.0.physical, physical_bytes);

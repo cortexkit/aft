@@ -1830,15 +1830,6 @@ fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
     options.open(path)
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn write_storage_permission_fixture(dir: &Path) {
-    create_private_log_dir(dir).unwrap();
-    open_private_log_file(&dir.join("test.log"), false)
-        .unwrap()
-        .write_all(b"private log\n")
-        .unwrap();
-}
-
 /// Drop group/other permission bits from `path` when the current user owns it.
 /// Best effort: a path owned by someone else (a shared storage root) or one
 /// that cannot be changed is left as it is rather than failing log setup.
@@ -4318,30 +4309,6 @@ mod tests {
     }
 
     #[test]
-    fn callgraph_cold_build_emits_started_progress_ready() {
-        let (_temp, root) = tiny_project("cg", "lib.rs", "pub fn marker() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let callgraph_dir = _temp.path().join("callgraph").join(&key);
-        crate::root_cache::configure_artifact_access(&root, &key, false);
-        let source = root.join("lib.rs");
-        let (built, lines) = capture_index_events(|| {
-            crate::callgraph_store::CallGraphStore::cold_build_with_lease(
-                callgraph_dir,
-                root.clone(),
-                std::slice::from_ref(&source),
-            )
-        });
-        built.expect("callgraph cold build");
-        assert_lifecycle_sequence(
-            &lines,
-            "callgraph",
-            &normalize_index_root(&root),
-            &key,
-            true,
-        );
-    }
-
-    #[test]
     fn search_cold_build_emits_started_progress_ready() {
         let (_temp, root) = tiny_project("search", "file.txt", "alpha token\n");
         let key = crate::search_index::artifact_cache_key(&root);
@@ -4402,70 +4369,5 @@ mod tests {
             }),
             "tier2 must not emit synthetic build_progress: {lines:?}"
         );
-    }
-
-    #[test]
-    fn superseded_cold_build_keeps_build_id_and_skips_ready() {
-        let (_temp, root) = tiny_project("sup", "lib.rs", "pub fn marker() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let callgraph_dir = _temp.path().join("callgraph").join(&key);
-        crate::root_cache::configure_artifact_access(&root, &key, false);
-        let source = root.join("lib.rs");
-        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
-        let stale_epoch = epoch.current();
-        epoch.next();
-        let (failed, lines) = capture_index_events(|| {
-            crate::callgraph_store::with_publish_epoch(epoch, stale_epoch, || {
-                crate::callgraph_store::CallGraphStore::cold_build_with_lease(
-                    callgraph_dir,
-                    root.clone(),
-                    std::slice::from_ref(&source),
-                )
-            })
-        });
-        assert!(matches!(
-            failed,
-            Err(crate::callgraph_store::CallGraphStoreError::Superseded)
-        ));
-        let root_s = normalize_index_root(&root);
-        let events: Vec<_> = lines
-            .iter()
-            .filter(|line| event_matches(line, "callgraph", &root_s, &key))
-            .cloned()
-            .collect();
-        assert_index_event_grammar(&events);
-        let kinds: Vec<_> = events
-            .iter()
-            .filter_map(|line| index_event_fields(line).get("kind").cloned())
-            .collect();
-        assert!(
-            kinds.contains(&"build_started".to_string()),
-            "{kinds:?} {events:?}"
-        );
-        assert!(
-            kinds.contains(&"build_superseded".to_string()),
-            "{kinds:?} {events:?}"
-        );
-        assert!(
-            !kinds.contains(&"build_ready".to_string()),
-            "superseded build must not emit build_ready: {kinds:?}"
-        );
-        let started_id = events
-            .iter()
-            .find(|line| line.contains("kind=build_started"))
-            .and_then(|line| index_event_fields(line).get("build_id").cloned());
-        let superseded_id = events
-            .iter()
-            .find(|line| line.contains("kind=build_superseded"))
-            .and_then(|line| index_event_fields(line).get("build_id").cloned());
-        assert_eq!(started_id, superseded_id);
-        for line in &events {
-            let fields = index_event_fields(line);
-            assert_eq!(
-                fields.get("root").map(String::as_str),
-                Some(root_s.as_str())
-            );
-            assert_eq!(fields.get("key").map(String::as_str), Some(key.as_str()));
-        }
     }
 }

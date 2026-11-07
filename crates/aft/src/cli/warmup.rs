@@ -1,9 +1,5 @@
-use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
-use aft::context::{
-    AppContext, CallGraphStoreBuildEvent, CallgraphStoreAccess, SemanticIndexEvent,
-    SemanticIndexStatus,
-};
+use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
 use serde_json::json;
@@ -84,13 +80,7 @@ fn run_with_storage(
         Some(SubsystemState::Disabled)
     };
 
-    wait_until_ready(
-        &ctx,
-        args.areas,
-        callgraph_override,
-        args.timeout_ms,
-        args.quiet,
-    )
+    wait_until_ready(&ctx, callgraph_override, args.timeout_ms, args.quiet)
 }
 
 #[derive(Debug)]
@@ -350,8 +340,8 @@ fn configure(
 
 fn wait_until_ready(
     ctx: &AppContext,
-    areas: WarmupAreas,
-    mut callgraph_override: Option<SubsystemState>,
+
+    callgraph_override: Option<SubsystemState>,
     timeout_ms: u64,
     quiet: bool,
 ) -> Result<(), WarmupError> {
@@ -523,20 +513,6 @@ fn print_transition(name: &str, current: &str, previous: &mut String) {
     }
 }
 
-fn search_index_state(ctx: &AppContext) -> SubsystemState {
-    if let Some(reason) = ctx.cache_unavailable_reason() {
-        return SubsystemState::Failed(format!("cache_dir_unavailable: {reason}"));
-    }
-    if !ctx.config().indexes.trigram {
-        return SubsystemState::Disabled;
-    }
-    match aft::data_layer::surfaces::text_plane_ready(ctx) {
-        Some(true) => SubsystemState::Ready,
-        Some(false) => SubsystemState::Pending("building".to_string()),
-        None => SubsystemState::Pending("loading".to_string()),
-    }
-}
-
 fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return SubsystemState::Failed(format!("cache_dir_unavailable: {reason}"));
@@ -593,15 +569,8 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
     }
 }
 
-/// Kick the callgraph-store build. `callgraph_store_for_ops` warm-opens an
-/// existing on-disk store synchronously, or starts a background cold build and
-/// returns `Building`. Returns `None` to mean "poll for readiness" (Ready or a
-/// cold build in flight), or `Some(state)` for a terminal outcome that won't
-/// change by polling (configured-disabled, worktree/unconfigured = terminal no-op,
-/// or a hard build error).
-/// The search index and call-graph store as the data layer builds them,
-/// when it runs: its checkout's text and call-graph planes. Binding the
-/// checkout starts both, so it is bound only when either is wanted.
+/// The data layer's text and call-graph data for the checkout. Warming the
+/// checkout starts both, so do so only when either is wanted.
 fn data_layer_states(
     ctx: &AppContext,
     callgraph_override: &Option<SubsystemState>,
@@ -638,207 +607,6 @@ fn data_layer_states(
             None => SubsystemState::Disabled,
         },
     )
-}
-
-fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
-    if let Some(reason) = ctx.cache_unavailable_reason() {
-        return Some(SubsystemState::Failed(format!(
-            "cache_dir_unavailable: {reason}"
-        )));
-    }
-    // A disabled subsystem is terminal. In particular, HOME is never a project
-    // root, so its disabled callgraph configuration must not be represented as a retryable miss.
-    if !ctx.config().indexes.callgraph {
-        return Some(SubsystemState::Disabled);
-    }
-    match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(_) if ctx.callgraph_store_rx().lock().is_some() => None,
-        CallgraphStoreAccess::Ready(_) => Some(SubsystemState::Ready),
-        // Building (or just-started cold build) -> drive to completion via the
-        // wait loop draining `callgraph_store_rx`.
-        CallgraphStoreAccess::Building => None,
-        CallgraphStoreAccess::Off => Some(SubsystemState::Disabled),
-        CallgraphStoreAccess::Suspended(suspension) => Some(SubsystemState::Failed(format!(
-            "build_suspended domain={} deaths={}",
-            suspension.domain.as_str(),
-            suspension.death_count
-        ))),
-        // Read-only worktree or not configured: nothing to build here.
-        CallgraphStoreAccess::Unavailable => Some(SubsystemState::Ready),
-        CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => None,
-        CallgraphStoreAccess::Error(error) => Some(SubsystemState::Failed(error.to_string())),
-    }
-}
-
-// These warmup drain copies are intentionally separate from `runtime_drain`: the
-// warmup CLI is a one-shot with no live status consumer or mid-build edit
-// stream, so it keeps leaner drains without status-emitter signals. Do not
-// deduplicate them unless that behavior changes.
-fn drain_callgraph_store_events(ctx: &AppContext) {
-    let (
-        latest,
-        denied,
-        suspended,
-        settled,
-        disconnected,
-        fulfilled_force_token,
-        receiver_generation,
-        receiver_epoch,
-        reopen_epoch,
-    ) = {
-        let rx_ref = ctx.callgraph_store_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-        let mut latest = None;
-        let mut denied = None;
-        let mut suspended = None;
-        let mut settled = false;
-        let mut fulfilled_force_token = None;
-        let mut disconnected = false;
-        let mut reopen_epoch = None;
-        loop {
-            match rx.try_recv() {
-                Ok(CallGraphStoreBuildEvent::Ready {
-                    store,
-                    fulfilled_force_token: token,
-                    publication_epoch,
-                }) => {
-                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
-                        latest = Some(store);
-                        fulfilled_force_token = token;
-                        reopen_epoch = Some(publication_epoch);
-                    } else {
-                        drop(store);
-                        settled = true;
-                    }
-                }
-                Ok(CallGraphStoreBuildEvent::Reopen {
-                    fulfilled_force_token: token,
-                    publication_epoch,
-                }) => {
-                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
-                        reopen_epoch = Some(publication_epoch);
-                        fulfilled_force_token = token;
-                    } else {
-                        settled = true;
-                    }
-                }
-                Ok(CallGraphStoreBuildEvent::Denied { reason }) => denied = Some(reason),
-                Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
-                    suspended = Some(suspension)
-                }
-                Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (
-            latest,
-            denied,
-            suspended,
-            settled,
-            disconnected,
-            fulfilled_force_token,
-            ctx.callgraph_store_rx_generation(),
-            ctx.callgraph_store_rx_epoch(),
-            reopen_epoch,
-        )
-    };
-
-    let terminal = reopen_epoch.is_some()
-        || denied.is_some()
-        || suspended.is_some()
-        || settled
-        || disconnected;
-    if !terminal {
-        return;
-    }
-    let mut reopened = None;
-    let mut busy_reopen = false;
-    if reopen_epoch.is_some() {
-        drop(latest);
-        if let Some(project_root) = ctx.callgraph_project_root() {
-            // Today's call-graph store is retired: no build publishes one.
-            let _ = project_root;
-            match Ok::<
-                Option<aft::callgraph_store::ReadonlyCallGraphStore>,
-                aft::callgraph_store::CallGraphStoreError,
-            >(None)
-            {
-                Ok(Some(store)) => reopened = Some(std::sync::Arc::new(store)),
-                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
-                _ => {}
-            }
-        }
-    }
-
-    let mut pending = Vec::new();
-    let installed =
-        ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
-            let installed = if let Some(store) = reopened {
-                ctx.clear_callgraph_store_build_denied();
-                *ctx.callgraph_store()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
-                pending = ctx.take_pending_callgraph_store_paths();
-                true
-            } else {
-                false
-            };
-            if let Some(reason) = denied {
-                ctx.record_callgraph_store_build_denied(receiver_generation, reason);
-            }
-            if let Some(suspension) = suspended {
-                ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
-            }
-            *receiver = None;
-            if busy_reopen {
-                ctx.defer_callgraph_store_reopen(
-                    receiver,
-                    fulfilled_force_token,
-                    reopen_epoch.expect("completed publication"),
-                );
-            }
-            if installed {
-                if let Some(force_token) = fulfilled_force_token {
-                    ctx.fulfill_callgraph_store_force_token(force_token);
-                }
-            }
-            installed
-        });
-    if installed == Some(true) && !pending.is_empty() {
-        let _ = ctx.enqueue_callgraph_store_refresh(pending);
-    }
-}
-
-fn callgraph_store_state(
-    ctx: &AppContext,
-    override_state: &Option<SubsystemState>,
-) -> SubsystemState {
-    if !ctx.config().indexes.callgraph {
-        return SubsystemState::Disabled;
-    }
-    if let Some(state) = override_state {
-        return state.clone();
-    }
-    if ctx.callgraph_store_rx().lock().is_some() {
-        return SubsystemState::Pending("building".to_string());
-    }
-    if ctx
-        .callgraph_store()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some()
-    {
-        return SubsystemState::Ready;
-    }
-    // The previous attempt terminated without a usable pointer. The wait loop
-    // retriggers the cold build and eventually reports its hard error or timeout.
-    SubsystemState::Pending("retrying".to_string())
 }
 
 fn drain_semantic_index_events(ctx: &AppContext) {
@@ -1048,8 +816,8 @@ mod tests {
             },
         );
 
-        assert_eq!(trigger_callgraph_warm(&ctx), Some(SubsystemState::Disabled));
-        assert_eq!(callgraph_store_state(&ctx, &None), SubsystemState::Disabled);
+        assert_eq!(data_layer_states(&ctx, &None).1, SubsystemState::Disabled);
+        assert!(WarmupSnapshot::from_context(&ctx, &None).is_terminal());
     }
 
     #[test]

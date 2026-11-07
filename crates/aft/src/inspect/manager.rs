@@ -27,10 +27,6 @@ use super::oxc_engine::{
     ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-#[cfg(test)]
-use crate::callgraph_store::{
-    project_dead_code_snapshot, project_dead_code_snapshot_with_revision, CallGraphStore,
-};
 use crate::callgraph_store::{
     CallGraphStoreError, ProjectionCostEstimates, ProjectionKind, ProjectionVerdict,
     MAX_DELTA_BYTES,
@@ -8535,15 +8531,8 @@ export function bannerUnused() {}
             }
             let project_key = crate::search_index::artifact_cache_key(&root);
             crate::root_cache::configure_artifact_access(&root, &project_key, false);
-            let (store, _) = CallGraphStore::cold_build_with_lease(
-                storage.join("callgraph").join(&project_key),
-                root.clone(),
-                &files,
-            )
-            .unwrap();
-            let snapshot = Arc::new(
-                crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
-            );
+            let snapshot =
+                Arc::new(crate::callgraph_store::dead_code_projection::snapshot_for_test(&root));
             let mut job = snapshot_job(&root, &storage.join("inspect").join(&project_key), true);
             job.scope_files = files.clone();
             job.callgraph_snapshot = Some(snapshot.clone());
@@ -8689,7 +8678,7 @@ export function bannerUnused() {}
     /// views database.
     fn views_snapshot_job(root: &Path, inspect_dir: &Path) -> InspectJob {
         let mut job = snapshot_job(root, inspect_dir, true);
-        let mut config = (*job.config).clone();
+        let config = (*job.config).clone();
         job.config = Arc::new(config);
         job
     }
@@ -9776,10 +9765,8 @@ export const shared = 1;
 mod dead_code_projection_tests {
     use super::*;
     use crate::callgraph::walk_project_files;
-    use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
     use crate::config::Config;
-    use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
-    use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
+
     use crate::parser::SymbolCache;
     use filetime::FileTime;
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
@@ -9977,66 +9964,6 @@ mod dead_code_projection_tests {
         );
         assert_live_item(&unavailable_payload, "src/live.ts", "knownLive");
     }
-    #[derive(Debug, PartialEq, Eq)]
-    struct ComparableSnapshot {
-        files: BTreeSet<PathBuf>,
-        exported_symbols: BTreeSet<(PathBuf, String, String, u32)>,
-        outbound_calls: BTreeSet<(PathBuf, String, String, u32)>,
-        entry_points: BTreeSet<PathBuf>,
-        entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
-    }
-
-    #[test]
-    fn dead_code_projection_contains_expected_fixture_surface() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_projection_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let projected = store_projected_snapshot(&root, ".store-dead-code-surface");
-
-        assert_projection_fixture_coverage(&root, &projected);
-    }
-
-    #[test]
-    fn dead_code_projection_incremental_scenario_matrix_matches_cold_rebuild() {
-        run_projection_scenario("rename", setup_projection_rename, edit_projection_rename);
-        run_projection_scenario("delete", setup_projection_delete, edit_projection_delete);
-        run_projection_scenario("new-file", setup_projection_delete, |root| {
-            let path = root.join("new.ts");
-            write_file(
-                &path,
-                "import { foo } from './foo'; export function added() { foo(); }\n",
-            );
-            vec![path]
-        });
-        run_projection_scenario(
-            "barrel delete",
-            setup_projection_barrel,
-            edit_projection_barrel_delete,
-        );
-        run_projection_scenario(
-            "dispatch edit",
-            setup_projection_dispatch,
-            edit_projection_dispatch,
-        );
-        run_projection_scenario(
-            "body-only edit",
-            setup_projection_body_only,
-            edit_projection_body_only,
-        );
-        run_projection_scenario(
-            "Go initializer target edit",
-            |root| {
-                write_file(&root.join("go.mod"), "module example.com/app\n");
-                write_file(&root.join("main.go"), "package main\nimport _ \"example.com/app/lib\"\nfunc main() { control() }\nfunc control() {}\n");
-                write_file(&root.join("lib/lib.go"), "package lib\nvar Boot = Used()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
-            },
-            |root| {
-                let file = root.join("lib/lib.go");
-                write_file(&file, "package lib\nvar Changed = Spare()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
-                vec![file]
-            },
-        );
-    }
 
     #[test]
     fn dead_code_projection_dead_code_scan_reports_expected_verdicts() {
@@ -10044,7 +9971,7 @@ mod dead_code_projection_tests {
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let files = project_files(&root);
-        let projected = store_projected_snapshot(&root, ".store-dead-code-e2e");
+        let projected = fixture_callgraph_snapshot(&root);
 
         let projected_aggregate = dead_code_aggregate(&root, files, projected);
         assert_dead_item(&projected_aggregate, "src/dead.ts", "knownDead");
@@ -10059,25 +9986,7 @@ mod dead_code_projection_tests {
         write_rust_attribute_entry_fixture(dir.path());
         let root = canonical_root(dir.path());
         let files = project_files(&root);
-        let store = CallGraphStore::open(root.join(".store-tauri-commands"), root.clone())
-            .expect("open store");
-        store.cold_build(&files).expect("cold build store");
-        let command = store
-            .node_for(Path::new("src/commands.rs"), "get_primers")
-            .expect("command node");
-        assert!(
-            command.is_entry_point,
-            "attribute-rooted commands must be labeled as callgraph entry points"
-        );
-        let private_command = store
-            .node_for(Path::new("src/commands.rs"), "private_command")
-            .expect("private command node");
-        assert!(
-            private_command.is_entry_point,
-            "private attribute-rooted commands must also be callgraph entry points"
-        );
-
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let projected = fixture_callgraph_snapshot(&root);
         let aggregate = dead_code_aggregate(&root, files, projected);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");
@@ -10090,58 +9999,38 @@ mod dead_code_projection_tests {
     }
 
     #[test]
-    fn dead_code_projection_rust_attribute_roots_are_cold_deterministic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_rust_attribute_entry_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let first = store_projected_snapshot(&root, ".store-tauri-cold-a");
-        let second = store_projected_snapshot(&root, ".store-tauri-cold-b");
-
-        assert_snapshot_parts_eq("rust attribute roots cold", &first, &second);
-    }
-
-    #[test]
     fn dead_code_projection_rust_attribute_roots_survive_unrelated_incremental_edit() {
+        use crate::data_layer::runtime::{DataCheckout, Fresh};
         let dir = tempfile::tempdir().expect("tempdir");
         write_rust_attribute_entry_fixture(dir.path());
         let root = canonical_root(dir.path());
-        let files_before = project_files(&root);
-        let incremental_store =
-            CallGraphStore::open(root.join(".store-tauri-incremental"), root.clone())
-                .expect("open incremental store");
-        incremental_store
-            .cold_build(&files_before)
-            .expect("initial cold build");
-
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = DataCheckout::open_planes(
+            &root,
+            storage.path(),
+            None,
+            crate::data_layer::checkout::Planes {
+                text: false,
+                callgraph: true,
+            },
+        )
+        .expect("bind checkout");
+        assert!(matches!(
+            checkout.fresh_view(Duration::from_secs(60)),
+            Fresh::Ready(_)
+        ));
+        let changed = root.join("src/unrelated.rs");
         write_file(
-            &root.join("src/unrelated.rs"),
-            r#"// unrelated edit should not refresh command attribute facts
-pub fn unrelated() -> u32 { 2 }
-"#,
+            &changed,
+            "// unrelated edit\npub fn unrelated() -> u32 { 2 }\n",
         );
-        let stats = incremental_store
-            .refresh_files(&[root.join("src/unrelated.rs")])
-            .expect("refresh unrelated file");
-        assert_eq!(stats.refreshed_own_files, 1);
-        assert_eq!(stats.changed_files, vec!["src/unrelated.rs".to_string()]);
-        assert!(
-            !stats
-                .surface_changed
-                .iter()
-                .any(|file| file == "src/commands.rs"),
-            "unrelated edit must not refresh the command module: {stats:#?}"
-        );
-        let incremental = project_dead_code_snapshot(incremental_store.sqlite_path())
-            .expect("project incremental snapshot");
-
-        let cold_store = CallGraphStore::open(root.join(".store-tauri-cold"), root.clone())
-            .expect("open cold store");
-        cold_store
-            .cold_build(&project_files(&root))
-            .expect("cold rebuild");
-        let cold = project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold");
-        assert_snapshot_parts_eq("rust attribute roots unrelated edit", &cold, &incremental);
-
+        checkout.note_paths(&[changed]);
+        let view = match checkout.fresh_view(Duration::from_secs(60)) {
+            Fresh::Ready(view) => view,
+            Fresh::Building => panic!("edited call graph did not publish"),
+            Fresh::Failed(reason) => panic!("edited call graph failed: {reason}"),
+        };
+        let incremental = view.dead_code_snapshot().expect("snapshot");
         let aggregate = dead_code_aggregate(&root, project_files(&root), incremental);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");
@@ -10149,198 +10038,8 @@ pub fn unrelated() -> u32 { 2 }
         assert_dead_item(&aggregate, "src/commands.rs", "planted_dead");
     }
 
-    fn assert_projection_fixture_coverage(root: &Path, snapshot: &CallgraphSnapshot) {
-        let comparable = comparable_snapshot(snapshot);
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("ts")),
-            "fixture must include TypeScript files: {:#?}",
-            comparable.files
-        );
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("js")),
-            "fixture must include JavaScript files: {:#?}",
-            comparable.files
-        );
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("rs")),
-            "fixture must include Rust files: {:#?}",
-            comparable.files
-        );
-
-        let main_file = canonicalize_for_snapshot(&root.join("src/main.ts"));
-        let private_dispatch_target = format!("{}::dispatch", main_file.display());
-        assert!(
-            comparable
-                .outbound_calls
-                .iter()
-                .any(
-                    |(caller_file, caller_symbol, target, _)| caller_file == &main_file
-                        && caller_symbol == "main"
-                        && target == &private_dispatch_target
-                ),
-            "fixture must cover same-file private fallback target {private_dispatch_target}: {:#?}",
-            comparable.outbound_calls
-        );
-        assert!(
-            comparable
-                .outbound_calls
-                .iter()
-                .any(|(_, _, target, _)| target.contains(DISPATCHED_CALLEE_SEPARATOR)),
-            "fixture must cover method-dispatch suffixes: {:#?}",
-            comparable.outbound_calls
-        );
-        assert!(
-            comparable
-                .exported_symbols
-                .iter()
-                .any(|(_, symbol, kind, _)| symbol == "runDefault"
-                    && kind == DEFAULT_EXPORT_MARKER_KIND),
-            "fixture must cover default-export marker rows: {:#?}",
-            comparable.exported_symbols
-        );
-    }
-
-    fn run_projection_scenario(name: &str, setup: fn(&Path), edit: fn(&Path) -> Vec<PathBuf>) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        setup(dir.path());
-        let root = canonical_root(dir.path());
-        let files_before = project_files(&root);
-        let incremental_store = CallGraphStore::open(
-            root.join(format!(".store-dead-code-projection-{name}-incremental")),
-            root.clone(),
-        )
-        .expect("open incremental store");
-        incremental_store
-            .cold_build(&files_before)
-            .expect("initial cold build");
-
-        let (revision, previous) =
-            project_dead_code_snapshot_with_revision(incremental_store.sqlite_path())
-                .expect("initial projection");
-        let changed = edit(&root);
-        incremental_store
-            .refresh_files(&changed)
-            .expect("refresh changed files");
-        let (_, incremental, verdict) =
-            crate::callgraph_store::project_dead_code_snapshot_incremental(
-                incremental_store.sqlite_path(),
-                Some((revision.unwrap(), &previous)),
-            )
-            .expect("project incremental snapshot");
-        assert_eq!(
-            verdict.reason, None,
-            "{name}: a spliced projection carries no full-projection reason"
-        );
-        assert_eq!(
-            verdict.kind,
-            ProjectionKind::Spliced,
-            "{name}: a clean journal bridge must splice the previous snapshot"
-        );
-        let full =
-            project_dead_code_snapshot(incremental_store.sqlite_path()).expect("full projection");
-        let files = project_files(&root);
-        assert_eq!(
-            serde_json::to_vec(&dead_code_aggregate(
-                &root,
-                files.clone(),
-                incremental.clone()
-            ))
-            .unwrap(),
-            serde_json::to_vec(&dead_code_aggregate(&root, files, full)).unwrap(),
-            "{name}: incremental and full projection aggregates must be byte-identical",
-        );
-
-        let cold_store = CallGraphStore::open(
-            root.join(format!(".store-dead-code-projection-{name}-cold")),
-            root.clone(),
-        )
-        .expect("open cold store");
-        cold_store
-            .cold_build(&project_files(&root))
-            .expect("cold rebuild");
-        let cold =
-            project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold snapshot");
-
-        assert_snapshot_parts_eq(name, &cold, &incremental);
-    }
-
-    /// Store-backed dead_code benchmark. Measures, on a real checkout, the
-    /// persisted-store cold build, the warm SQLite projection cost, and the
-    /// remaining `run_dead_code_scan` cost (per-file reexport/type-ref reparse +
-    /// BFS roll-up). Production Tier-2 reads a warm store; cold_build is included
-    /// here only to make end-to-end store cost visible.
-    /// Ignored by default; run with:
-    ///   AFT_BENCH_REPO=/path/to/large/repo cargo test -p agent-file-tools --lib \
-    ///     -- --ignored --nocapture --test-threads=1 dead_code_decision_b_benchmark
-    #[test]
-    #[ignore = "manual benchmark; needs AFT_BENCH_REPO pointing at a large checkout"]
-    fn dead_code_decision_b_benchmark() {
-        let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {
-            eprintln!("AFT_BENCH_REPO unset; skipping");
-            return;
-        };
-        // Each phase flushes immediately so a file-redirected run shows live progress.
-        macro_rules! mark {
-            ($($a:tt)*) => {{ eprintln!($($a)*); let _ = std::io::Write::flush(&mut std::io::stderr()); }};
-        }
-        let root = canonical_root(Path::new(&repo));
-        let files = project_files(&root);
-        mark!(
-            "\n=== Store-backed dead_code benchmark ===\nrepo: {}\nsource files (walk_project_files): {}\nstarted store cold_build...",
-            root.display(),
-            files.len()
-        );
-
-        // Store cold_build + projection. Production warm runs skip cold_build and
-        // pay only the projection below.
-        let store_dir = root.join(".aft-bench-store");
-        let _ = std::fs::remove_dir_all(&store_dir);
-        let store = CallGraphStore::open(store_dir.clone(), root.clone()).expect("open store");
-        let t = Instant::now();
-        let cold_stats = store.cold_build(&files).expect("store cold build");
-        let store_build_ms = t.elapsed().as_millis();
-        let t = Instant::now();
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("projection");
-        let proj_ms = t.elapsed().as_millis();
-        mark!(
-            "store cold_build: {} ms ({:?}) + projection: {} ms = {} ms  (exports={}, outbound={})\nstarted scan...",
-            store_build_ms, cold_stats, proj_ms, store_build_ms + proj_ms,
-            projected.exported_symbols.len(), projected.outbound_calls.len()
-        );
-
-        // Remaining scanner cost: run_dead_code_scan given a ready snapshot.
-        let t = Instant::now();
-        let _result = dead_code_aggregate(&root, files.clone(), projected.clone());
-        let scan_ms = t.elapsed().as_millis();
-        mark!("run_dead_code_scan (cold contributions): {} ms", scan_ms);
-
-        mark!(
-            "\nSUMMARY  files={}  store_cold_plus_projection={}ms  projection={}ms  scan_cold={}ms  total={}ms",
-            files.len(),
-            store_build_ms + proj_ms,
-            proj_ms,
-            scan_ms,
-            store_build_ms + proj_ms + scan_ms
-        );
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    fn store_projected_snapshot(root: &Path, store_name: &str) -> CallgraphSnapshot {
-        let store =
-            CallGraphStore::open(root.join(store_name), root.to_path_buf()).expect("open store");
-        store
-            .cold_build(&project_files(root))
-            .expect("store cold build");
-        project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot")
+    fn fixture_callgraph_snapshot(root: &Path) -> CallgraphSnapshot {
+        crate::callgraph_store::dead_code_projection::snapshot_for_test(root)
     }
 
     fn dead_code_aggregate(
@@ -10368,51 +10067,6 @@ pub fn unrelated() -> u32 { 2 }
             .outcome
             .expect("dead_code scan succeeds")
             .aggregate
-    }
-
-    fn assert_snapshot_parts_eq(
-        label: &str,
-        expected: &CallgraphSnapshot,
-        actual: &CallgraphSnapshot,
-    ) {
-        let expected = comparable_snapshot(expected);
-        let actual = comparable_snapshot(actual);
-        assert_eq!(
-            actual, expected,
-            "{label} store-projected snapshot must match cold store snapshot"
-        );
-    }
-
-    fn comparable_snapshot(snapshot: &CallgraphSnapshot) -> ComparableSnapshot {
-        ComparableSnapshot {
-            files: snapshot.files.iter().cloned().collect(),
-            exported_symbols: snapshot
-                .exported_symbols
-                .iter()
-                .map(|export| {
-                    (
-                        export.file.clone(),
-                        export.symbol.clone(),
-                        export.kind.clone(),
-                        export.line,
-                    )
-                })
-                .collect(),
-            outbound_calls: snapshot
-                .expanded_outbound_calls()
-                .iter()
-                .map(|call| {
-                    (
-                        call.caller_file.clone(),
-                        call.caller_symbol.clone(),
-                        call.target.clone(),
-                        call.line,
-                    )
-                })
-                .collect(),
-            entry_points: snapshot.entry_points.clone(),
-            entry_point_symbols: snapshot.entry_point_symbols.clone(),
-        }
     }
 
     fn assert_dead_item(aggregate: &Value, file: &str, symbol: &str) {
@@ -10458,10 +10112,6 @@ pub fn unrelated() -> u32 { 2 }
     fn bump_mtime(path: &Path) {
         let secs = NEXT_MTIME.fetch_add(1, AtomicOrdering::SeqCst);
         filetime::set_file_mtime(path, FileTime::from_unix_time(secs, 0)).expect("bump mtime");
-    }
-
-    fn remove_file(path: &Path) {
-        std::fs::remove_file(path).expect("remove fixture");
     }
 
     fn write_projection_fixture(root: &Path) {
@@ -10621,120 +10271,6 @@ pub fn false_helper() -> String { "dead".to_string() }
         );
     }
 
-    fn setup_projection_rename(root: &Path) {
-        write_file(
-            &root.join("a.ts"),
-            r#"export function outer() {
-  inner();
-}
-
-export function inner() {}
-"#,
-        );
-    }
-
-    fn edit_projection_rename(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("a.ts");
-        write_file(
-            &path,
-            r#"export function outer() {
-  renamed();
-}
-
-export function renamed() {}
-"#,
-        );
-        vec![path]
-    }
-
-    fn setup_projection_delete(root: &Path) {
-        write_file(&root.join("other.ts"), "export function foo() {}\n");
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./foo";
-export function main() { foo(); }
-"#,
-        );
-        write_file(&root.join("foo.ts"), "export function foo() {}\n");
-    }
-
-    fn edit_projection_delete(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("foo.ts");
-        remove_file(&path);
-        vec![path]
-    }
-
-    fn setup_projection_barrel(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./barrel";
-export function main() { foo(); }
-"#,
-        );
-        write_file(&root.join("barrel.ts"), "export { foo } from \"./foo\";\n");
-        write_file(&root.join("foo.ts"), "export function foo() {}\n");
-    }
-
-    fn edit_projection_barrel_delete(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("barrel.ts");
-        remove_file(&path);
-        vec![path]
-    }
-
-    fn setup_projection_dispatch(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"export function main() {
-  const service = { render() {}, paint() {} };
-  service.render();
-}
-"#,
-        );
-        write_file(&root.join("render.ts"), "export function render() {}\n");
-        write_file(&root.join("paint.ts"), "export function paint() {}\n");
-    }
-
-    fn edit_projection_dispatch(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("main.ts");
-        write_file(
-            &path,
-            r#"export function main() {
-  const service = { render() {}, paint() {} };
-  service.paint();
-}
-"#,
-        );
-        vec![path]
-    }
-
-    fn setup_projection_body_only(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./foo";
-export function main() { foo(); }
-"#,
-        );
-        write_file(
-            &root.join("foo.ts"),
-            r#"export function foo() {
-  return 1;
-}
-"#,
-        );
-    }
-
-    fn edit_projection_body_only(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("foo.ts");
-        write_file(
-            &path,
-            r#"export function foo() {
-  return 2;
-}
-"#,
-        );
-        vec![path]
-    }
-
     #[test]
     fn forced_paths_downgrade_only_when_strict_hash_matches_cached_fact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10890,92 +10426,6 @@ export function main() { foo(); }
         assert_eq!(
             reused, " projection=reused journal_bytes=0 changed_files=0",
             "a cache hit is not a full projection and must not read as one"
-        );
-    }
-
-    #[test]
-    fn spill_backed_171_file_delta_splices_where_old_bound_was_full() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_projection_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let store =
-            CallGraphStore::open(root.join(".store-spill"), root.clone()).expect("open store");
-        store
-            .cold_build(&project_files(&root))
-            .expect("cold build fixture");
-        let (revision, previous) = project_dead_code_snapshot_with_revision(store.sqlite_path())
-            .expect("initial projection");
-        let revision = revision.expect("new stores write a projection revision");
-        let next = revision + 1;
-        let callers = (0..171)
-            .map(|index| format!("src/{index:03}-{}.ts", "x".repeat(1_600)))
-            .collect::<BTreeSet<_>>();
-        let payload = serde_json::to_string(&(next, &callers)).expect("serialize caller batch");
-        assert!(
-            payload.len() > MAX_DELTA_BYTES,
-            "fixture must exceed the former absolute journal bound"
-        );
-
-        let conn = rusqlite::Connection::open(store.sqlite_path()).expect("open write conn");
-        conn.execute(
-            "INSERT INTO meta(k, v) VALUES('projection_write_revision', '1')
-             ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
-            [],
-        )
-        .expect("advance write revision");
-        let journal_key = format!("projection_delta_{}", next % 64);
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            rusqlite::params![journal_key, format!("oversize:{next}")],
-        )
-        .expect("plant legacy oversize marker");
-
-        let (_, _, old_verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            store.sqlite_path(),
-            Some((revision, &previous)),
-        )
-        .expect("project legacy oversize marker");
-        assert_eq!(old_verdict.kind, ProjectionKind::Full);
-        assert_eq!(old_verdict.reason, Some("journal_gap"));
-        assert_eq!(
-            render_projection_suffix(old_verdict),
-            " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
-        );
-
-        conn.execute_batch(
-            "CREATE TABLE projection_delta_spill (
-                 revision INTEGER PRIMARY KEY,
-                 payload TEXT NOT NULL
-             )",
-        )
-        .expect("create spill table");
-        conn.execute(
-            "INSERT INTO projection_delta_spill(revision, payload) VALUES(?1, ?2)",
-            rusqlite::params![next, payload],
-        )
-        .expect("store spill payload");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            rusqlite::params![journal_key, format!("spill:{next}")],
-        )
-        .expect("replace legacy marker with spill marker");
-        drop(conn);
-
-        let (_, _, verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            store.sqlite_path(),
-            Some((revision, &previous)),
-        )
-        .expect("project spill-backed delta");
-        assert_eq!(verdict.kind, ProjectionKind::Spliced);
-        assert_eq!(verdict.reason, None);
-        assert_eq!(verdict.changed_files, 171);
-        assert_eq!(verdict.journal_bytes, payload.len() as u64);
-        assert_eq!(
-            render_projection_suffix(verdict),
-            format!(
-                " projection=spliced journal_bytes={} changed_files=171",
-                payload.len()
-            )
         );
     }
 }

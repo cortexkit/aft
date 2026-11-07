@@ -11,18 +11,11 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use aft::build_breaker::{BreakerAdmission, BreakerKey, BuildDeathBreaker, BuildDomain};
 use aft::callgraph;
-use aft::callgraph_store::CallGraphStore;
 use aft::config::{Config, IndexKind};
 use aft::config_resolve::{resolve_config, ConfigWarning, ResolveResult};
-use aft::root_cache::{
-    configure_artifact_access, ArtifactPublishEpoch, RootCacheDomain, WriterLease,
-};
-use aft::search_index::{resolve_cache_dir_with_key, SearchIndex};
-use aft::semantic_index::{SemanticEmbeddingModel, SemanticIndex};
+use aft::semantic_index::SemanticEmbeddingModel;
 use aft::standing_roots::{StandingRootEntry, StandingRoots};
 
 /// A finite snapshot has three observable aggregate outcomes.
@@ -95,35 +88,16 @@ struct SnapshotUnit {
     entry: StandingRootEntry,
     kind: IndexKind,
     writer: UnitWriter,
-    semantic_files: Option<Vec<PathBuf>>,
 }
 
 /// What builds one unit, and what fences its publication.
 enum UnitWriter {
-    /// Today's stores: a writer lease shared with standing work, a publish
-    /// epoch, and the build breaker's admission.
-    Leased(LeasedWriter),
     /// The data layer, whose family store orders publications with its own
     /// writer.
     DataLayer(DataLayerBuild),
     /// The data layer's meaning plane, filled under the lock in the
     /// repository's data-layer store that one fill at a time holds.
     DataLayerFill(DataLayerFill),
-}
-
-struct LeasedWriter {
-    writer_lease: Arc<WriterLease>,
-    publish_epoch: ArtifactPublishEpoch,
-    publication_epoch: u64,
-    admission: UnitAdmission,
-}
-
-enum UnitAdmission {
-    Admitted {
-        breaker: BuildDeathBreaker,
-        key: BreakerKey,
-    },
-    Suspended(String),
 }
 
 struct UnitResult {
@@ -177,17 +151,15 @@ fn run_with_paths(
     paths: SnapshotPaths,
     output: &mut impl Write,
 ) -> Result<IndexExit, IndexError> {
-    let data_layer = Some(aft::data_layer::surfaces::index_root as DataLayerBuild);
+    let data_layer = aft::data_layer::surfaces::index_root as DataLayerBuild;
     run_snapshot(args, paths, data_layer, output)
 }
 
-/// Runs the snapshot, building the kinds the data layer builds with
-/// `data_layer` when it is on, and every kind with today's stores when it
-/// is `None`.
+/// Runs the snapshot using the index store's text and call-graph data and semantic index.
 fn run_snapshot(
     args: Vec<OsString>,
     paths: SnapshotPaths,
-    data_layer: Option<DataLayerBuild>,
+    data_layer: DataLayerBuild,
     output: &mut impl Write,
 ) -> Result<IndexExit, IndexError> {
     parse_args(args)?;
@@ -245,23 +217,7 @@ fn run_snapshot(
                 build_data_layer_unit(&plan.config, unit, *build, &mut data_layer_builds)
             }
             UnitWriter::DataLayerFill(fill) => fill_data_layer_unit(&plan.config, unit, *fill),
-            UnitWriter::Leased(writer) => match &writer.admission {
-                UnitAdmission::Suspended(reason) => UnitResult::gap(reason.clone()),
-                UnitAdmission::Admitted { .. } => build_unit(&plan.config, unit, writer),
-            },
         };
-
-        if result.usable {
-            if let UnitWriter::Leased(LeasedWriter {
-                admission: UnitAdmission::Admitted { breaker, key },
-                ..
-            }) = &unit.writer
-            {
-                if let Err(error) = breaker.record_ready_publication(key) {
-                    result.gap = Some(format!("could not record breaker publication: {error}"));
-                }
-            }
-        }
 
         // A full snapshot build reads every participating source file while it is
         // constructing the artifact, so this is the strict-current-state proof
@@ -327,126 +283,42 @@ fn index_notices(warnings: &[ConfigWarning]) -> Vec<String> {
 fn prepare_snapshot(
     config: Config,
     notices: Vec<String>,
-    data_layer: Option<DataLayerBuild>,
+    data_layer: DataLayerBuild,
 ) -> Result<SnapshotPlan, IndexError> {
     let roots = StandingRoots::default();
-    // Reconciliation resolves every configured entry, rejects duplicate artifact
-    // identities, and pins all paths in shared aft.db before any build admission.
+    // Resolve configured roots and pin their paths before admitting any build.
     let report = roots
         .reconcile(&config)
         .map_err(|error| IndexError::validation(error.to_string()))?;
-
-    let cache_root = aft::root_cache::cache_root(&config);
-    let storage_dir = cache_root.as_path();
-    let has_semantic = report
+    if report
         .active_entries
         .iter()
-        .any(|entry| entry.indexes.contains(&IndexKind::Semantic));
-    if has_semantic {
-        // Construction checks backend configuration and credential availability
-        // without admitting an artifact build. A bad semantic configuration must
-        // therefore reject the complete snapshot before another unit can build.
+        .any(|entry| entry.indexes.contains(&IndexKind::Semantic))
+    {
         SemanticEmbeddingModel::from_config(&config.semantic).map_err(|error| {
             IndexError::validation(format!("semantic validation refusal: {error}"))
         })?;
     }
-
-    // The data layer builds a kind when it is on and builds that kind, and
-    // fills the meaning (`semantic`) kind; today's stores build the rest.
-    let data_layer_for =
-        |kind: IndexKind| data_layer.filter(|_| aft::data_layer::standing::builds(kind));
-    let data_layer_fill = data_layer
-        .is_some()
-        .then_some(aft::data_layer::surfaces::fill_root as DataLayerFill);
-    let data_layer_handles = |kind: IndexKind| {
-        data_layer_for(kind).is_some() || (kind == IndexKind::Semantic && data_layer_fill.is_some())
-    };
-    let mut semantic_files = BTreeMap::new();
     for entry in &report.active_entries {
-        // The write capability only today's writer leases need.
-        if entry.indexes.iter().any(|kind| !data_layer_handles(*kind)) {
-            configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
-        }
-        // Also a validation: a root with more files than `semantic.max_files`
-        // refuses the whole snapshot, whichever store embeds it.
         if entry.indexes.contains(&IndexKind::Semantic) {
-            semantic_files.insert(
-                entry.literal_path.clone(),
-                collect_semantic_files(&entry.resolved_target, config.semantic.max_files)?,
-            );
+            collect_semantic_files(&entry.resolved_target, config.semantic.max_files)?;
         }
     }
-
     let mut units = Vec::new();
     for entry in report.active_entries {
         for kind in &entry.indexes {
-            if let (IndexKind::Semantic, Some(fill)) = (*kind, data_layer_fill) {
-                units.push(SnapshotUnit {
-                    entry: entry.clone(),
-                    kind: *kind,
-                    writer: UnitWriter::DataLayerFill(fill),
-                    semantic_files: None,
-                });
-                continue;
-            }
-            if let Some(build) = data_layer_for(*kind) {
-                units.push(SnapshotUnit {
-                    entry: entry.clone(),
-                    kind: *kind,
-                    writer: UnitWriter::DataLayer(build),
-                    semantic_files: None,
-                });
-                continue;
-            }
-            let cache_dir = cache_dir_for(storage_dir, &entry.artifact_key, *kind);
-            let domain = if *kind == IndexKind::Callgraph {
-                RootCacheDomain::Callgraph
+            let writer = if *kind == IndexKind::Semantic {
+                UnitWriter::DataLayerFill(aft::data_layer::surfaces::fill_root)
             } else {
-                RootCacheDomain::Index
+                UnitWriter::DataLayer(data_layer)
             };
-            // Holding the lease across this finite build applies the same local
-            // filesystem refusal and cross-process writer fencing as standing work.
-            let writer_lease = WriterLease::acquire_shared(
-                domain,
-                &cache_dir,
-                &entry.artifact_key,
-                &entry.resolved_target,
-            )
-            .map_err(|error| {
-                IndexError::validation(format!(
-                    "index writer-lease refusal for {:?} ({}): {error}",
-                    entry.literal_path,
-                    kind.as_str()
-                ))
-            })?
-            .ok_or_else(|| {
-                IndexError::validation(format!(
-                    "index writer capability refusal for {:?} ({})",
-                    entry.literal_path,
-                    kind.as_str()
-                ))
-            })?;
-            let admission = admit_breaker(&cache_dir, &entry, *kind)?;
-            let publish_epoch = ArtifactPublishEpoch::default();
-            let publication_epoch = publish_epoch.next();
             units.push(SnapshotUnit {
-                semantic_files: (*kind == IndexKind::Semantic).then(|| {
-                    semantic_files
-                        .remove(&entry.literal_path)
-                        .unwrap_or_default()
-                }),
                 entry: entry.clone(),
                 kind: *kind,
-                writer: UnitWriter::Leased(LeasedWriter {
-                    writer_lease,
-                    publish_epoch,
-                    publication_epoch,
-                    admission,
-                }),
+                writer,
             });
         }
     }
-
     Ok(SnapshotPlan {
         config,
         roots,
@@ -469,72 +341,6 @@ fn collect_semantic_files(root: &Path, max_files: usize) -> Result<Vec<PathBuf>,
         )));
     }
     Ok(files)
-}
-
-fn admit_breaker(
-    cache_dir: &Path,
-    entry: &StandingRootEntry,
-    kind: IndexKind,
-) -> Result<UnitAdmission, IndexError> {
-    let files = callgraph::walk_project_files(&entry.resolved_target).collect::<Vec<_>>();
-    let fingerprint = snapshot_fingerprint(&entry.resolved_target, kind, &files);
-    let key = BreakerKey::new(
-        entry.artifact_key.clone(),
-        breaker_domain(kind),
-        fingerprint,
-    );
-    let breaker =
-        BuildDeathBreaker::open(cache_dir.join("build-breaker.sqlite")).map_err(|error| {
-            IndexError::validation(format!("could not open index breaker: {error}"))
-        })?;
-    match breaker.admit(&key, 0).map_err(|error| {
-        IndexError::validation(format!("could not check index breaker: {error}"))
-    })? {
-        BreakerAdmission::Admitted(_) => Ok(UnitAdmission::Admitted { breaker, key }),
-        BreakerAdmission::Suspended(suspension) => Ok(UnitAdmission::Suspended(format!(
-            "build suspended for {}: {}",
-            suspension.domain.as_str(),
-            suspension.reason
-        ))),
-    }
-}
-
-fn breaker_domain(kind: IndexKind) -> BuildDomain {
-    match kind {
-        IndexKind::Search => BuildDomain::SearchCold,
-        IndexKind::Semantic => BuildDomain::SemanticSeed,
-        IndexKind::Callgraph => BuildDomain::CallgraphCold,
-    }
-}
-
-fn snapshot_fingerprint(root: &Path, kind: IndexKind, files: &[PathBuf]) -> String {
-    let mut files = files.to_vec();
-    files.sort();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(kind.as_str().as_bytes());
-    hasher.update(&[0]);
-    for file in files {
-        let relative = file.strip_prefix(root).unwrap_or(&file);
-        hasher.update(relative.to_string_lossy().as_bytes());
-        if let Ok(metadata) = std::fs::metadata(&file) {
-            hasher.update(&metadata.len().to_le_bytes());
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    hasher.update(&duration.as_nanos().to_le_bytes());
-                }
-            }
-        }
-        hasher.update(&[0]);
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-fn cache_dir_for(storage_dir: &Path, artifact_key: &str, kind: IndexKind) -> PathBuf {
-    match kind {
-        IndexKind::Search => resolve_cache_dir_with_key(artifact_key, Some(storage_dir)),
-        IndexKind::Semantic => storage_dir.join("semantic").join(artifact_key),
-        IndexKind::Callgraph => storage_dir.join("callgraph").join(artifact_key),
-    }
 }
 
 /// Each entry's data-layer build, by literal path: one build publishes both
@@ -600,149 +406,6 @@ fn fill_data_layer_unit(config: &Config, unit: &SnapshotUnit, fill: DataLayerFil
     }
 }
 
-fn build_unit(config: &Config, unit: &SnapshotUnit, writer: &LeasedWriter) -> UnitResult {
-    let result = match unit.kind {
-        IndexKind::Search => build_search(config, unit, writer),
-        IndexKind::Semantic => build_semantic(config, unit, writer),
-        IndexKind::Callgraph => build_callgraph(config, unit, writer),
-    };
-    match result {
-        Ok(result) => result,
-        Err(error) => UnitResult::gap(error),
-    }
-}
-
-fn build_search(
-    config: &Config,
-    unit: &SnapshotUnit,
-    writer: &LeasedWriter,
-) -> Result<UnitResult, String> {
-    let cache_root = aft::root_cache::cache_root(config);
-    let storage_dir = cache_root.as_path();
-    let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
-    let mut index = SearchIndex::build_with_limit_to_cache_dir(
-        &unit.entry.resolved_target,
-        config.search_index_max_file_size,
-        &cache_dir,
-    );
-    let head = index.stored_git_head().map(str::to_string);
-    let persisted = publish_if_current(unit, writer, || {
-        Ok(index.write_to_disk(&cache_dir, head.as_deref()))
-    })?;
-    if !persisted {
-        return Err("could not persist search snapshot".to_string());
-    }
-    Ok(UnitResult::success(index.file_count()))
-}
-
-fn build_semantic(
-    config: &Config,
-    unit: &SnapshotUnit,
-    writer: &LeasedWriter,
-) -> Result<UnitResult, String> {
-    let cache_root = aft::root_cache::cache_root(config);
-    let storage_dir = cache_root.as_path();
-    let files = unit.semantic_files.as_deref().unwrap_or_default();
-    let mut model = SemanticEmbeddingModel::from_config(&config.semantic)?;
-    let fingerprint = model.fingerprint(&config.semantic)?;
-    let embed_text_caps = fingerprint.embed_text_caps;
-    let mut embed = |texts: Vec<String>| model.embed(texts);
-    let mut index = SemanticIndex::build_with_caps_for_key(
-        &unit.entry.resolved_target,
-        files,
-        &mut embed,
-        config.semantic.max_batch_size.max(1),
-        embed_text_caps,
-        &unit.entry.artifact_key,
-    )?;
-    index.set_fingerprint(fingerprint);
-    let persisted = publish_if_current(unit, writer, || {
-        Ok(index.write_to_disk(storage_dir, &unit.entry.artifact_key))
-    })?;
-    if !persisted {
-        return Err("could not persist semantic snapshot".to_string());
-    }
-    Ok(UnitResult::success(index.entry_count()))
-}
-
-fn build_callgraph(
-    config: &Config,
-    unit: &SnapshotUnit,
-    writer: &LeasedWriter,
-) -> Result<UnitResult, String> {
-    let cache_root = aft::root_cache::cache_root(config);
-    let storage_dir = cache_root.as_path();
-    let files = callgraph::walk_project_files(&unit.entry.resolved_target).collect::<Vec<_>>();
-    let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
-    let (_store, stats) = publish_if_current(unit, writer, || {
-        CallGraphStore::cold_build_with_lease_chunked(
-            cache_dir,
-            unit.entry.resolved_target.clone(),
-            &files,
-            config.callgraph_chunk_size,
-        )
-        .map_err(|error| error.to_string())
-    })?;
-    if stats.failed_files.is_empty() {
-        Ok(UnitResult::success(stats.files))
-    } else {
-        Ok(UnitResult::usable_gap(
-            stats.files,
-            format!(
-                "callgraph skipped {} unreadable file(s)",
-                stats.failed_files.len()
-            ),
-        ))
-    }
-}
-
-/// Hold the publish mutex across the lease/freshness check and final artifact
-/// write. Snapshot workers do not schedule a successor, but using the same lock
-/// and publication order as standing work prevents races with another in-process
-/// caller publishing the same artifact.
-fn publish_if_current<R>(
-    unit: &SnapshotUnit,
-    writer: &LeasedWriter,
-    publish: impl FnOnce() -> Result<R, String>,
-) -> Result<R, String> {
-    writer
-        .publish_epoch
-        .run_if_current(writer.publication_epoch, || {
-            verify_writer_lease(unit, writer)?;
-            let result = publish()?;
-            verify_writer_lease(unit, writer)?;
-            Ok(result)
-        })
-        .ok_or_else(|| {
-            format!(
-                "publication epoch changed for {:?} ({})",
-                unit.entry.literal_path,
-                unit.kind.as_str()
-            )
-        })?
-}
-
-fn verify_writer_lease(unit: &SnapshotUnit, writer: &LeasedWriter) -> Result<(), String> {
-    writer
-        .writer_lease
-        .verify()
-        .map_err(|error| {
-            format!(
-                "writer lease verification failed for {:?} ({}): {error}",
-                unit.entry.literal_path,
-                unit.kind.as_str()
-            )
-        })?
-        .then_some(())
-        .ok_or_else(|| {
-            format!(
-                "writer lease epoch changed for {:?} ({})",
-                unit.entry.literal_path,
-                unit.kind.as_str()
-            )
-        })
-}
-
 fn write_disclosure(
     output: &mut impl Write,
     unit: &SnapshotUnit,
@@ -793,6 +456,16 @@ impl SnapshotAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_dir_for(storage_dir: &Path, artifact_key: &str, kind: IndexKind) -> PathBuf {
+        match kind {
+            IndexKind::Search => {
+                aft::search_index::resolve_cache_dir_with_key(artifact_key, Some(storage_dir))
+            }
+            IndexKind::Semantic => storage_dir.join("semantic").join(artifact_key),
+            IndexKind::Callgraph => storage_dir.join("callgraph").join(artifact_key),
+        }
+    }
     use aft::data_layer::surfaces::IndexOutcome;
     use aft::db::standing_roots::needs_strict_verify;
     use aft::scoped_key::resolve_standing_root;
@@ -990,7 +663,7 @@ mod tests {
         let exit = run_snapshot(
             Vec::new(),
             paths(fixture.path(), &user, &storage),
-            Some(aft::data_layer::surfaces::index_root),
+            aft::data_layer::surfaces::index_root,
             &mut output,
         )
         .unwrap();
@@ -1040,7 +713,7 @@ mod tests {
         let exit = run_snapshot(
             Vec::new(),
             paths(fixture.path(), &user, &storage),
-            Some(one_unparsed),
+            one_unparsed,
             &mut output,
         )
         .unwrap();
@@ -1083,7 +756,7 @@ mod tests {
         let exit = run_snapshot(
             Vec::new(),
             paths(fixture.path(), &user, &storage),
-            Some(aft::data_layer::surfaces::index_root),
+            aft::data_layer::surfaces::index_root,
             &mut output,
         )
         .unwrap();

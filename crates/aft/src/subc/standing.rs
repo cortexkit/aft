@@ -259,23 +259,6 @@ impl StandingActor {
         self.startup.is_completed()
     }
 
-    /// Whether standing maintenance may currently build `literal_path`: false
-    /// once a session bind has paused the entry.
-    #[cfg(test)]
-    pub(super) fn admits_build_for_test(&self, literal_path: &str) -> bool {
-        self.roots.admit_build(literal_path).is_some()
-    }
-
-    /// The artifact key standing maintenance resolved for `literal_path`.
-    #[cfg(test)]
-    pub(super) fn entry_artifact_key_for_test(&self, literal_path: &str) -> Option<String> {
-        self.roots
-            .entries()
-            .into_iter()
-            .find(|entry| entry.literal_path == literal_path)
-            .map(|entry| entry.artifact_key)
-    }
-
     pub(super) fn new(app: Arc<App>, executor: Arc<Executor>) -> Self {
         let config = Config::default();
         #[cfg(test)]

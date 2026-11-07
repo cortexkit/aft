@@ -657,21 +657,6 @@ pub(crate) mod stat_probe {
         }
     }
 
-    /// Count lstat candidates without counting stat calls that refresh SQLite
-    /// sidecar identities. Their warm-up state must not look like a walker gain.
-    #[cfg(unix)]
-    pub(crate) fn count_candidates(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                CANDIDATES_ONLY.with(|only| only.set(false));
-            }
-        }
-        let _reset = Reset;
-        CANDIDATES_ONLY.with(|only| only.set(true));
-        count(f)
-    }
-
     pub(crate) fn record(path: &Path) {
         COUNTS.with(|counts| {
             if let Some(counts) = counts.borrow_mut().as_mut() {
@@ -698,7 +683,6 @@ pub(crate) mod stat_probe {
 mod tests {
     use super::*;
     use crate::db::TrackedConnection;
-    use rusqlite::Connection;
 
     #[cfg(unix)]
     #[test]

@@ -460,11 +460,6 @@ impl BuildDeathBreaker {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.get())
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_active_suspensions_for_test() {
-        FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.with(|fail| fail.set(true));
-    }
-
     fn with_connection<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let mut connection = self
             .connection
@@ -666,23 +661,6 @@ mod tests {
                 },
             )
             .unwrap()
-    }
-
-    #[test]
-    fn cancelled_attempt_ignores_late_death_without_resetting_prior_history() {
-        let (_dir, breaker) = breaker();
-        let key = key(BuildDomain::CallgraphCold);
-        let dead = admitted(&breaker, &key, 1);
-        breaker
-            .record_attributed_death_at(&key, &dead.attempt_id, 0, 0, 2)
-            .unwrap();
-        let cancelled = admitted(&breaker, &key, 3);
-        breaker.cancel_attempt(&key, &cancelled.attempt_id).unwrap();
-        assert!(breaker
-            .record_attributed_death_at(&key, &cancelled.attempt_id, 0, 100_000, 4)
-            .unwrap()
-            .is_none());
-        assert_eq!(durable_tallies(&breaker, &key), (1, 0, 0));
     }
 
     #[test]

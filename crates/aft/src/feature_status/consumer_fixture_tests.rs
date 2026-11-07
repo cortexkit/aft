@@ -48,7 +48,6 @@ struct Scenario {
     ctx: AppContext,
     root: tempfile::TempDir,
     _search_tx: Option<crossbeam_channel::Sender<crate::search_index::SearchIndex>>,
-    _callgraph_tx: Option<crossbeam_channel::Sender<crate::context::CallGraphStoreBuildEvent>>,
     /// Keeps the index store's build from starting, so its text index stays
     /// building for the whole call.
     _build_hold: Option<crate::data_layer::runtime::BuildHold>,
@@ -84,7 +83,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         },
     );
     let search_tx = None;
-    let mut callgraph_tx = None;
     let mut build_hold = None;
     let mut call_graph_hold = None;
     match name {
@@ -100,9 +98,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
                 entries_done: None,
                 entries_total: None,
             };
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(rx);
-            callgraph_tx = Some(tx);
             // The index store binds and starts its first build, which waits.
             build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(
                 &project_root,
@@ -117,9 +112,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             ));
             crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
             ctx.trip_semantic_refresh_circuit(1, "embedding backend refused the connection");
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(rx);
-            callgraph_tx = Some(tx);
         }
         other => panic!("unknown scenario {other}"),
     }
@@ -127,7 +119,6 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         ctx,
         root,
         _search_tx: search_tx,
-        _callgraph_tx: callgraph_tx,
         _build_hold: build_hold,
         _call_graph_hold: call_graph_hold,
     }
@@ -306,10 +297,6 @@ fn aft_callgraph_matches_the_shared_fixtures() {
             project(&actual, &expected),
             expected,
             "aft_callgraph/{name}"
-        );
-        assert!(
-            scenario.ctx.callgraph_store().read().unwrap().is_none(),
-            "aft_callgraph/{name}: a refusal must not install a store"
         );
     }
 }

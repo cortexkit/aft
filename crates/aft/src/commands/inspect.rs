@@ -8165,8 +8165,6 @@ mod deferred_terminal_tests {
         fn inspect_request_deadline_unscoped_callgraph_stays_building() {
             let (_root, ctx, mut request) = fixture();
             request.params = serde_json::json!({});
-            let (_sender, receiver) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(receiver);
             let manager = ctx.inspect_manager();
             manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
             manager.hold_in_flight_lock_for_test(|| {
@@ -8175,7 +8173,6 @@ mod deferred_terminal_tests {
                     assert_eq!(response.data["summary"][category]["complete"], false);
                     assert!(response.data["summary"][category].get("count").is_none());
                 }
-                assert!(ctx.callgraph_cold_build_active());
             });
             manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
         }
@@ -8344,7 +8341,6 @@ mod deferred_terminal_tests {
             crate::inspect::job::canonicalize_normalized(&root)
         );
         assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
-        let _ = ctx.callgraph_store_for_query_without_wait();
         let scope = JobScope::for_project(root.clone());
         for category in InspectCategory::active().iter().copied() {
             eprintln!("inspect profile seed starting: {category}");

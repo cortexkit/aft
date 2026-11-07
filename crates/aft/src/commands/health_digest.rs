@@ -229,7 +229,6 @@ mod tests {
         let ctx = AppContext::new(Box::new(StubProvider), config);
         let request = request();
         let server_count_before = ctx.lsp().server_count();
-        let cold_build_count_before = ctx.callgraph_cold_build_spawn_count_for_test();
         let started = Instant::now();
 
         let response = handle_health_digest(&request, &ctx);
@@ -239,10 +238,6 @@ mod tests {
             "a passive digest must not wait for quiescence"
         );
         assert_eq!(ctx.lsp().server_count(), server_count_before);
-        assert_eq!(
-            ctx.callgraph_cold_build_spawn_count_for_test(),
-            cold_build_count_before
-        );
         assert_eq!(response.data, json!({}));
         assert!(response.data.get("diagnostics").is_none());
     }

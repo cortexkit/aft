@@ -2484,20 +2484,6 @@ fn read_last_probe(paths: &StatePaths) -> Option<LastProbeReport> {
     serde_json::from_slice(&fs::read(&paths.last_probe).ok()?).ok()
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn write_storage_permission_fixture(root: &Path) {
-    let paths = StatePaths::from_root(root.to_path_buf());
-    write_last_probe_silently(
-        &paths,
-        &LastProbeReport {
-            stage: "connect".to_string(),
-            elapsed_ms: 1,
-            outcome: "ok".to_string(),
-        },
-    );
-    assert!(paths.last_probe.is_file());
-}
-
 /// Resolve the one process-state directory used by every gh-shim reader and
 /// writer. The dedicated absolute override is for embedding callers and tests;
 /// otherwise the ladder is XDG state-home, then `$HOME/.local/state`.

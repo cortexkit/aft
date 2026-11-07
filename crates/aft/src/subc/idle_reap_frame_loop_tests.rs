@@ -12,12 +12,7 @@ use super::*;
 use crate::context::pending_restore_work;
 use std::collections::BTreeSet;
 
-type PendingSnapshot = (
-    BTreeSet<PathBuf>,
-    BTreeSet<PathBuf>,
-    BTreeSet<PathBuf>,
-    bool,
-);
+type PendingSnapshot = (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool);
 
 /// A small deterministic generator, so a failing sequence replays from its
 /// seed.
@@ -58,12 +53,7 @@ fn relative_snapshot(root: &Path, snapshot: PendingSnapshot) -> PendingSnapshot 
             })
             .collect::<BTreeSet<_>>()
     };
-    (
-        strip(snapshot.0),
-        strip(snapshot.1),
-        strip(snapshot.2),
-        snapshot.3,
-    )
+    (strip(snapshot.0), strip(snapshot.1), snapshot.2)
 }
 
 /// Unbound, quiesced, TTL-aged roots, each registered with one executor and
@@ -102,7 +92,7 @@ impl BlockedUnboundRoots {
     }
 
     /// Replace every root's pending sets with `per_set` paths in each of the
-    /// search, callgraph, Tier-2 and semantic sets. The paths share the root
+    /// Tier-2 and semantic sets. The paths share the root
     /// prefix and nest a few directories deep, as watcher events do, so
     /// ordering them compares several leading components first.
     fn fill_pending(&self, per_set: usize) {
@@ -117,7 +107,6 @@ impl BlockedUnboundRoots {
                     ))
                 })
             };
-            ctx.add_pending_callgraph_store_paths(paths());
             ctx.add_pending_tier2_paths(paths());
             ctx.add_pending_semantic_index_paths(paths());
         }
@@ -317,9 +306,8 @@ impl ReapWorld {
             .iter()
             .map(|relative| self.roots[index].as_path().join(relative))
             .collect::<Vec<_>>();
-        match set % 3 {
-            0 => ctx.add_pending_callgraph_store_paths(paths),
-            1 => ctx.add_pending_tier2_paths(paths),
+        match set % 2 {
+            0 => ctx.add_pending_tier2_paths(paths),
             _ => ctx.add_pending_semantic_index_paths(paths),
         }
         if corpus {

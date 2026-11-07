@@ -4432,12 +4432,3 @@ mod trace_to_tests {
 #[cfg(test)]
 #[path = "callgraph_regression_tests.rs"]
 mod callgraph_regression_tests;
-
-#[cfg(test)]
-pub(crate) fn store_diet_trace_data_origin(
-    file: &Path,
-    symbol: &str,
-    cache: &SharedSymbolCache,
-) -> bool {
-    resolve_symbol_query_with_cache(file, symbol, cache).is_ok()
-}

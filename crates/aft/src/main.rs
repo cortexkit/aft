@@ -1017,7 +1017,6 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::config_live::drain_config_reload(runtime);
-        aft::runtime_drain::drain_callgraph_store_events(runtime);
         aft::runtime_drain::drain_inspect_events(runtime);
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
@@ -1055,7 +1054,6 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     // Advance build channels before watcher deltas, then diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);
     aft::config_live::drain_config_reload(runtime);
-    aft::runtime_drain::drain_callgraph_store_events(runtime);
     aft::runtime_drain::drain_inspect_events(runtime);
     aft::runtime_drain::drain_watcher_events(runtime);
     aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
@@ -2255,9 +2253,7 @@ fn input_queue_full_response(id: &str) -> Response {
 }
 
 #[cfg(test)]
-mod mutation_index_membership_tests {
-    use super::*;
-}
+mod mutation_index_membership_tests {}
 
 #[cfg(test)]
 mod core_framing_tests {
@@ -3787,68 +3783,17 @@ mod signal_handler_tests {
 }
 
 #[cfg(test)]
-mod graceful_shutdown_search_index_tests {
-    use super::{global_gitignore_env_test_lock, App, AppContext, Config, RuntimeRegistry};
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant, SystemTime};
-
-    fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
-        let app = App::default_shared();
-        let ctx = Arc::new(
-            AppContext::from_app(
-                Arc::clone(&app),
-                Config {
-                    project_root: Some(root.to_path_buf()),
-                    storage_dir: Some(storage.to_path_buf()),
-                    ..Config::default()
-                },
-            )
-            .with_test_checkpoint_store(),
-        );
-        ctx.set_canonical_cache_root(std::fs::canonicalize(root).expect("canonical root"));
-        RuntimeRegistry::standalone(app, ctx)
-    }
-
-    fn wait_for_next_directory_write_mtime(dir: &Path, baseline: SystemTime) {
-        let probe = dir.join("mtime-probe");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut counter = 0u64;
-        loop {
-            std::fs::write(&probe, counter.to_string()).expect("write mtime probe");
-            let modified = std::fs::metadata(&probe)
-                .expect("mtime probe metadata")
-                .modified()
-                .expect("mtime probe modified time");
-            if modified != baseline {
-                let _ = std::fs::remove_file(&probe);
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for a later directory write mtime"
-            );
-            counter += 1;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    fn stable_global_gitignore_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        global_gitignore_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
+mod graceful_shutdown_search_index_tests {}
 
 #[cfg(test)]
 mod watcher_filter_tests {
     use super::{dispatch, dispatch_panic_response, write_push_frame_or_request_shutdown};
     use aft::config::{BackupConfig, Config};
     use aft::context::{
-        AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
-        SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+        AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
+        SemanticRefreshWorkerSlot,
     };
-    use aft::harness::Harness;
+
     use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use aft::lsp::registry::ServerKind;
     use aft::lsp::roots::ServerKey;
@@ -3884,7 +3829,7 @@ mod watcher_filter_tests {
         RenameMode,
     };
     use notify::EventKind;
-    use std::time::Duration;
+
     use tempfile::TempDir;
 
     /// Wait budget for an async dispatch (semantic-refresh request / status

@@ -3,6 +3,7 @@ use super::*;
 use crate::commands::callgraph_store_adapter as adapter;
 use crate::parser::SymbolCache;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::RwLock;
 
@@ -54,60 +55,6 @@ fn read_capture(path: impl AsRef<Path>) -> Vec<u8> {
         decoded
     } else {
         bytes
-    }
-}
-
-fn write_capture(path: &Path, bytes: &[u8]) {
-    // The recorder already runs in Python. Use its canonical gzip writer for
-    // both Rust and Python captures, so re-recording uses identical headers/codecs.
-    let python = std::env::var_os("AFT_STORE_DIET_PYTHON")
-        .expect("record.py must supply its Python interpreter");
-    let mut child = std::process::Command::new(python)
-        .arg(assets().join("capture_io.py"))
-        .arg("write")
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    std::io::Write::write_all(&mut input, bytes).unwrap();
-    drop(input);
-    assert!(child.wait().unwrap().success());
-}
-
-fn golden(name: &str, bytes: &[u8]) {
-    let path = assets().join(name);
-    if std::env::var_os("AFT_STORE_DIET_RECORD").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        // Recording is allowed only in the named main checkout prepared by the
-        // recorder, never in an encoding candidate that inherited this switch.
-        static RECORD_BASELINE: OnceLock<()> = OnceLock::new();
-        RECORD_BASELINE.get_or_init(|| {
-            let expected = std::env::var("AFT_STORE_DIET_BASELINE")
-                .expect("record.py --baseline SHA is required");
-            let metadata: Value =
-                serde_json::from_slice(&fs::read(assets().join("baseline.json")).unwrap()).unwrap();
-            assert_eq!(metadata["code_revision"].as_str(), Some(expected.as_str()));
-            let output = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(assets())
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
-        });
-        write_capture(&path, bytes);
-    } else {
-        let recorded = read_capture(&path);
-        // A candidate's differing capture can be kept for review (never as a
-        // golden): AFT_STORE_DIET_CANDIDATE_DIR names a folder to write it to.
-        if recorded != bytes {
-            if let Some(directory) = std::env::var_os("AFT_STORE_DIET_CANDIDATE_DIR") {
-                let directory = PathBuf::from(directory);
-                fs::create_dir_all(&directory).unwrap();
-                fs::write(directory.join(name.trim_end_matches(".gz")), bytes).unwrap();
-            }
-        }
-        assert_eq!(recorded, bytes, "{} differs", path.display());
     }
 }
 

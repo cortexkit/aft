@@ -13,7 +13,13 @@ pub(crate) mod method_call_facts;
 #[cfg(target_os = "macos")]
 mod readiness_watch_macos;
 pub(crate) mod resolution_facts;
+#[cfg(test)]
+use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use crate::callgraph::{self, FileCallData, TraceToSymbolCandidate};
 use crate::error::AftError;
@@ -21,8 +27,6 @@ use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{parse_source_with_cached_parser, LangId};
 use crate::symbols::SymbolKind;
 use join::syntax_index::{Direct, Nav};
-#[cfg(test)]
-use join::Parser;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -44,16 +48,6 @@ pub(crate) const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
 pub(crate) const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 pub(crate) const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-/// A root removed from `cache-keys.json` cannot be reached by a future checkout.
-/// Wait the same seven-day grace period as cache-key eviction before deleting its
-/// callgraph directory so an interrupted configuration never loses recent data.
-#[cfg(test)]
-const CALLGRAPH_ROOT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Fixture deadline prevents a slow artifact store from monopolizing a sweep pass.
-#[cfg(test)]
-const CALLGRAPH_ROOT_SWEEP_BUDGET: Duration = Duration::from_secs(5);
-#[cfg(test)]
-static CALLGRAPH_ROOT_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 /// Work counters for measurement tests: source parses by the store and
 /// resolution-config reads (`package.json`, `tsconfig.json`, `Cargo.toml`).
@@ -77,25 +71,6 @@ pub(crate) mod work_counts {
     static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CORPUS_LOOKUPS: OnceLock<Mutex<HashMap<PathBuf, (usize, usize, u128)>>> =
         OnceLock::new();
-
-    pub(super) fn note_corpus_lookup(path: &Path, realpaths: usize, elapsed_ns: u128) {
-        let mut counts = CORPUS_LOOKUPS.get_or_init(Default::default).lock().unwrap();
-        let entry = counts.entry(path.to_path_buf()).or_default();
-        entry.0 += 1;
-        entry.1 += realpaths;
-        entry.2 += elapsed_ns;
-    }
-
-    pub(super) fn corpus_lookups_under(root: &Path) -> Vec<(usize, usize, u128)> {
-        CORPUS_LOOKUPS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .map(|(_, counts)| *counts)
-            .collect()
-    }
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -122,30 +97,8 @@ pub(crate) mod work_counts {
             .sum()
     }
 
-    pub(crate) fn note_parse(path: &Path) {
-        note(&PARSES, path);
-    }
-
-    pub(super) fn note_fingerprint_read(path: &Path) {
-        note(&FINGERPRINT_READS, path);
-    }
-
-    pub(super) fn fingerprint_reads(path: &Path) -> usize {
-        FINGERPRINT_READS
-            .get_or_init(Default::default)
-            .lock()
-            .expect("work counter mutex poisoned")
-            .get(path)
-            .copied()
-            .unwrap_or(0)
-    }
-
     pub(crate) fn note_config_read(path: &Path) {
         note(&CONFIG_READS, path);
-    }
-
-    pub(crate) fn note_staging_read(path: &Path) {
-        note(&STAGING_READS, path);
     }
 
     pub(crate) fn note_directory_read(path: &Path) {
@@ -162,10 +115,6 @@ pub(crate) mod work_counts {
 
     pub(crate) fn note_realpath(path: &Path) {
         note(&REALPATHS, path);
-    }
-
-    pub(crate) fn realpaths_under(root: &Path) -> usize {
-        under(&REALPATHS, root, None)
     }
 
     pub(crate) fn note_workspace_directory(path: &Path) {
@@ -193,35 +142,6 @@ pub(crate) mod work_counts {
 
     pub(crate) fn note_go_package_build(path: &Path) {
         note(&GO_PACKAGE_BUILDS, path);
-    }
-
-    pub(crate) fn go_package_builds_under(root: &Path) -> usize {
-        under(&GO_PACKAGE_BUILDS, root, None)
-    }
-
-    pub(crate) fn staging_reads_under(root: &Path) -> usize {
-        under(&STAGING_READS, root, None)
-    }
-
-    pub(crate) fn parses_under(root: &Path) -> usize {
-        under(&PARSES, root, None)
-    }
-
-    /// Highest parse count of any single file under `root`.
-    pub(crate) fn max_parses_of_one_file_under(root: &Path) -> usize {
-        PARSES
-            .get_or_init(Default::default)
-            .lock()
-            .expect("work counter mutex poisoned")
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .map(|(_, count)| *count)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn config_reads_under(root: &Path, file_name: Option<&str>) -> usize {
-        under(&CONFIG_READS, root, file_name)
     }
 
     pub(crate) fn reset_under(root: &Path) {
@@ -1150,30 +1070,6 @@ mod rust_module_work {
         });
     }
 
-    pub(super) struct Session;
-
-    impl Session {
-        pub fn start(disabled: bool) -> Self {
-            ACTIVE.with(|active| {
-                assert!(active.borrow().is_none(), "nested module profiling session");
-                *active.borrow_mut() = Some(Work::default());
-            });
-            DISABLED.with(|flag| flag.set(disabled));
-            Self
-        }
-
-        pub fn finish(self) -> Work {
-            ACTIVE.with(|active| active.borrow_mut().take().unwrap())
-        }
-    }
-
-    impl Drop for Session {
-        fn drop(&mut self) {
-            ACTIVE.with(|active| active.borrow_mut().take());
-            DISABLED.with(|flag| flag.set(false));
-        }
-    }
-
     pub(super) struct Timing {
         started: Option<Instant>,
         parent: bool,
@@ -1873,11 +1769,6 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     ) -> Result<callgraph::TraceToSymbolResult> {
         (**self).trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static RETAINED_CALLER_BUDGET_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// A node's id: its class prefix and the first 64 bits of a BLAKE3 digest of
@@ -4147,26 +4038,6 @@ fn note_workspace_crate_prefix_build(project_root: &Path) {
 #[cfg(not(test))]
 fn note_workspace_crate_prefix_build(_project_root: &Path) {}
 
-#[cfg(test)]
-fn reset_workspace_crate_prefix_build_count(project_root: &Path) {
-    WORKSPACE_CRATE_PREFIX_BUILD_COUNTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("workspace crate prefix build counts mutex poisoned")
-        .remove(project_root);
-}
-
-#[cfg(test)]
-fn workspace_crate_prefix_build_count(project_root: &Path) -> usize {
-    WORKSPACE_CRATE_PREFIX_BUILD_COUNTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("workspace crate prefix build counts mutex poisoned")
-        .get(project_root)
-        .copied()
-        .unwrap_or(0)
-}
-
 /// Walk the project tree once and map every Rust crate name (package name with
 /// `-` normalized to `_`, plus any explicit `[lib] name`) to its `src` prefix.
 /// Replaces the previous per-ref tree walk: resolving 600k+ qualified refs no
@@ -4834,19 +4705,6 @@ fn last_name_segment(value: &str) -> &str {
         .rsplit(['.', ':', '/', '\\', '-', '>'])
         .find(|segment| !segment.is_empty())
         .unwrap_or(value)
-}
-
-#[cfg(test)]
-fn infer_receiver_type(
-    project_root: &Path,
-    reference: &NameMatchRef,
-    source_cache: &mut DispatchSourceCache,
-) -> Option<String> {
-    match infer_receiver_type_state(project_root, reference, source_cache) {
-        ReceiverTypeInference::Known(receiver_type)
-        | ReceiverTypeInference::RustDirectSelfField { receiver_type, .. } => Some(receiver_type),
-        ReceiverTypeInference::Unknown | ReceiverTypeInference::KnownButUnresolved => None,
-    }
 }
 
 fn node_text<'source>(node: tree_sitter::Node<'_>, source: &'source str) -> &'source str {
@@ -6168,7 +6026,6 @@ mod crate_scan_memo_tests {
     //! order, and show that a changed file set (a new index) never reuses an
     //! earlier index's answers.
     use super::*;
-    use std::fs;
 
     fn rust_file(declared: &[(&str, &str)], scoped: &[&str]) -> DbFileIndex {
         let mut index = DbFileIndex::empty(Some(LangId::Rust));
@@ -6233,29 +6090,6 @@ mod crate_scan_memo_tests {
 
     fn segments(path: &[&str]) -> Vec<String> {
         path.iter().map(|segment| segment.to_string()).collect()
-    }
-
-    fn copy_rust_corpus(from: &Path, to: &Path, files: &mut Vec<PathBuf>) {
-        fs::create_dir_all(to).unwrap();
-        let mut entries = fs::read_dir(from)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>();
-        entries.sort();
-        for source in entries {
-            let name = source.file_name().unwrap();
-            if source.is_dir() {
-                if name != "target" && name != ".git" {
-                    copy_rust_corpus(&source, &to.join(name), files);
-                }
-            } else if source.extension().is_some_and(|ext| ext == "rs") {
-                let destination = to.join(name);
-                fs::copy(&source, &destination).unwrap();
-                files.push(destination);
-            } else if name == "Cargo.toml" {
-                fs::copy(&source, to.join(name)).unwrap();
-            }
-        }
     }
 
     /// Compares every memo answer with the scan over the same index and
@@ -6623,5 +6457,24 @@ mod canonicalize_path_tests {
             canonicalize_path(&root.join("linked/tsconfig.json")),
             deep.join("tsconfig.json")
         );
+    }
+}
+
+#[cfg(test)]
+impl DbFileIndex {
+    fn empty(lang: Option<LangId>) -> Self {
+        Self {
+            lang,
+            exports: HashSet::new(),
+            default_export: None,
+            export_aliases: HashMap::new(),
+            node_by_scoped: HashMap::new(),
+            node_by_bare: HashMap::new(),
+            node_kind_by_id: HashMap::new(),
+            module_targets: HashMap::new(),
+            declared_module_targets: HashMap::new(),
+            macro_use_module_targets: BTreeSet::new(),
+            reexports: Vec::new(),
+        }
     }
 }

@@ -632,17 +632,6 @@ fn record_child_failure(
     }
 }
 
-/// Test seam for [`record_child_failure`], so tests need no running worker.
-#[cfg(test)]
-pub(crate) fn record_child_failure_for_test(
-    root: &Path,
-    child: &str,
-    plane: &'static str,
-    error: &str,
-) {
-    record_child_failure(root, child, plane, error, None);
-}
-
 fn child_reserve_key(child: &str, plane: &str) -> String {
     format!("{plane}/{}", blake3::hash(child.as_bytes()).to_hex())
 }

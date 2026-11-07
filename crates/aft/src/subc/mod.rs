@@ -15908,20 +15908,6 @@ mod tests {
         }
     }
 
-    fn cpu_hunt_process_cpu_us() -> u64 {
-        #[cfg(unix)]
-        {
-            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-            // getrusage initializes the output on success; no pointer escapes.
-            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
-                let usage = unsafe { usage.assume_init() };
-                return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
-                    + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
-            }
-        }
-        0
-    }
-
     #[test]
     fn channel_zero_health_response_does_not_wait_for_bash_background_db() {
         let (dir, root) = test_root("health-does-not-lock-bash-db");
@@ -16184,42 +16170,6 @@ mod tests {
     thread_local! {
         static EXIT_INDEX_FLUSH_WORKERS: std::cell::RefCell<Vec<std::thread::JoinHandle<()>>> =
             const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    pub(super) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
-        EXIT_INDEX_FLUSH_WORKERS.with(|workers| workers.borrow_mut().push(worker));
-    }
-
-    #[test]
-    fn a_held_callgraph_flush_is_abandoned_within_the_exit_budget() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let drained_at = Instant::now();
-        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            finished_tx.send(()).unwrap();
-            true
-        });
-        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        // An unfinished flush must be abandoned because its deadline expired,
-        // not because the flush completed. Runner scheduling can delay observation.
-        assert!(matches!(
-            finished_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        assert!(Instant::now() >= crate::callgraph_store::exit_index_flush_deadline(drained_at));
-        let flush_window = crate::callgraph_store::exit_index_flush_deadline(drained_at)
-            .saturating_duration_since(drained_at);
-        // The rest of the exit, LSP shutdown, still fits in the exit budget.
-        assert!(
-            flush_window + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
-                <= crate::callgraph_store::EXIT_BUDGET_AFTER_DRAIN
-        );
-        assert!(line.contains("callgraph=abandoned"), "{line}");
-        release_tx.send(()).unwrap();
-        finished_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     }
 
     #[test]
@@ -18018,8 +17968,7 @@ mod tests {
                 MaintenanceProbeLock::LspManager => MaintenanceDrainKind::Lsp,
                 MaintenanceProbeLock::ConfigureMaintenanceJobs
                 | MaintenanceProbeLock::ParkedConfigureTail => MaintenanceDrainKind::ConfigureTail,
-                MaintenanceProbeLock::CallgraphStoreReceiver
-                | MaintenanceProbeLock::SemanticIndexReceiver
+                MaintenanceProbeLock::SemanticIndexReceiver
                 | MaintenanceProbeLock::SemanticRefreshEvents
                 | MaintenanceProbeLock::SemanticRefreshWorker => {
                     MaintenanceDrainKind::CompletionDrains
@@ -20863,40 +20812,6 @@ mod tests {
             "standing maintenance asked Git about a session folder whose Git identity is unreadable"
         );
         assert!(ctx.artifact_identity_provisional());
-    }
-
-    /// Run the configure-tail maintenance job on the root's actor, as the module
-    /// loop's tick does, until the identity retry hands back a bind to replay.
-    fn pump_until_identity_replay(
-        executor: &Executor,
-        root_id: &ProjectRootId,
-    ) -> crate::provisional_identity_retry::PreparedReplay {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
-            let tail = executor.submit_maintenance_async(
-                root_id.clone(),
-                Lane::MaintenanceCommit,
-                "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
-                Box::new(move |ctx| {
-                    let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
-                    Response::success("tail", json!({}))
-                }),
-            );
-            let _ = tail.blocking_recv();
-            if let Some(replay) = outcome_rx
-                .try_recv()
-                .ok()
-                .and_then(|outcome| outcome.identity_replay)
-            {
-                return replay;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the identity retry never found aft.db free"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 
     /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is

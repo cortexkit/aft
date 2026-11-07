@@ -1,6 +1,4 @@
 use crate as aft;
-#[cfg(test)]
-use crate::callgraph_store::CallGraphStore;
 use crate::context::{
     AppContext, SemanticIndexStatus, SemanticRefreshRequest, WatcherDrainApplyPhase,
     WatcherDrainPhase, WatcherDrainSliceState,
@@ -90,16 +88,6 @@ impl Drop for WatcherDrainTestClock {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_legacy_watcher_refreshes_for_test() {
-    LEGACY_WATCHER_REFRESHES.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn legacy_watcher_refreshes_for_test() -> usize {
-    LEGACY_WATCHER_REFRESHES.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
 fn reset_ignore_rule_refreshes_for_test() {
     IGNORE_RULE_REFRESHES.with(|count| count.set(0));
     IGNORE_RULE_CORPUS_REBUILDS.with(|count| count.set(0));
@@ -154,28 +142,7 @@ fn set_ignore_rule_refresh_now_for_test(now: Option<Instant>) {
 }
 
 #[cfg(test)]
-struct ArtifactDrainCommitGate {
-    context_id: usize,
-    reached_tx: crossbeam_channel::Sender<()>,
-    release_rx: crossbeam_channel::Receiver<()>,
-}
-
-#[cfg(test)]
-static ARTIFACT_DRAIN_COMMIT_GATE: OnceLock<Mutex<Option<ArtifactDrainCommitGate>>> =
-    OnceLock::new();
-#[cfg(test)]
 static ARTIFACT_DRAIN_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-#[cfg(test)]
-struct SemanticRefreshRecoveryGate {
-    context_id: usize,
-    reached_tx: crossbeam_channel::Sender<()>,
-    release_rx: crossbeam_channel::Receiver<()>,
-}
-
-#[cfg(test)]
-static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshRecoveryGate>>> =
-    OnceLock::new();
 
 #[cfg(any(test, feature = "test-timing-hooks"))]
 struct WatcherPhaseCommitGate {
@@ -282,67 +249,6 @@ fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
 
 #[cfg(not(any(test, feature = "test-timing-hooks")))]
 fn wait_on_watcher_phase_commit_gate_for_test(_path: &Path) {}
-
-#[cfg(test)]
-fn install_artifact_drain_commit_gate_for_test(
-    ctx: &AppContext,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *ARTIFACT_DRAIN_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("artifact drain commit gate mutex poisoned") = Some(ArtifactDrainCommitGate {
-        context_id: ctx as *const AppContext as usize,
-        reached_tx,
-        release_rx,
-    });
-    (reached_rx, release_tx)
-}
-
-#[cfg(test)]
-fn install_semantic_refresh_recovery_gate_for_test(
-    ctx: &AppContext,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *SEMANTIC_REFRESH_RECOVERY_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("semantic refresh recovery gate mutex poisoned") =
-        Some(SemanticRefreshRecoveryGate {
-            context_id: ctx as *const AppContext as usize,
-            reached_tx,
-            release_rx,
-        });
-    (reached_rx, release_tx)
-}
-
-#[cfg(test)]
-fn wait_on_semantic_refresh_recovery_gate_for_test(ctx: &AppContext) {
-    let mut slot = SEMANTIC_REFRESH_RECOVERY_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("semantic refresh recovery gate mutex poisoned");
-    if !slot
-        .as_ref()
-        .is_some_and(|gate| gate.context_id == ctx as *const AppContext as usize)
-    {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
-    if let Some(gate) = gate {
-        let _ = gate.reached_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
-    }
-}
 
 struct WatcherDrainUnitGuard<'a> {
     phase: &'static str,
@@ -3344,95 +3250,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_forced_callgraph_build_preserves_durable_demand() {
-        let root = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
-            default_language_provider_factory(),
-            Config {
-                project_root: Some(root.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let force_token = ctx.mark_callgraph_store_force_rebuild("test");
-        assert_eq!(ctx.pending_callgraph_store_force_token(), Some(force_token));
-
-        let generation = ctx.configure_generation();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.note_callgraph_store_rx_generation(generation);
-        ctx.next_callgraph_store_rx_epoch();
-        *ctx.callgraph_store_rx().lock() = Some(rx);
-        tx.send(CallGraphStoreBuildEvent::Settled).unwrap();
-        drain_callgraph_store_events(&ctx);
-
-        assert!(
-            ctx.pending_callgraph_store_force_token().is_some(),
-            "the current failed forced build must preserve retry demand"
-        );
-        assert!(ctx.callgraph_store_rx().lock().is_none());
-    }
-
-    #[test]
-    fn callgraph_ready_without_published_pointer_settles_and_preserves_pending_paths() {
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let source = root.path().join("lib.rs");
-        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
-        let project_root = std::fs::canonicalize(root.path()).unwrap();
-        let ctx = AppContext::new(
-            default_language_provider_factory(),
-            Config {
-                project_root: Some(project_root.clone()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_chunk_size: 1,
-                ..Config::default()
-            },
-        );
-        ctx.set_canonical_cache_root(project_root.clone());
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
-        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
-        let callgraph_dir = ctx.callgraph_store_dir();
-        let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
-            callgraph_dir.clone(),
-            project_root,
-            &[source],
-            1,
-        )
-        .unwrap();
-        let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
-        std::fs::remove_file(pointer).unwrap();
-
-        let pending = root.path().join("pending.rs");
-        ctx.add_pending_callgraph_store_paths([pending.clone()]);
-        let generation = ctx.configure_generation();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        {
-            let mut receiver = ctx.callgraph_store_rx().lock();
-            ctx.note_callgraph_store_rx_generation(generation);
-            ctx.next_callgraph_store_rx_epoch();
-            *receiver = Some(rx);
-        }
-        tx.send(CallGraphStoreBuildEvent::Ready {
-            store,
-            fulfilled_force_token: None,
-            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
-        })
-        .unwrap();
-        drop(tx);
-
-        drain_callgraph_store_events(&ctx);
-
-        assert!(
-            ctx.callgraph_store_rx().lock().is_none(),
-            "Ready is terminal even when reopening the pointer fails"
-        );
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![pending],
-            "failed reopen must preserve pending watcher paths for the retry"
-        );
-    }
-
-    #[test]
     fn rescan_arriving_while_unbound_executes_fully_after_rebind() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -3736,14 +3553,6 @@ mod tests {
         assert!(!semantic_refresh_circuit_is_open(&ctx));
     }
 
-    fn installed_semantic_entries(ctx: &AppContext) -> Option<usize> {
-        ctx.semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(crate::semantic_index::SemanticIndex::entry_count)
-    }
-
     #[test]
     fn delayed_semantic_retry_targets_same_generation_replacement_worker() {
         let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
@@ -4045,107 +3854,6 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn callgraph_phase_batches_all_indexed_paths_into_one_refresh() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        let generated = temp.path().join("compiled.ts");
-        std::fs::write(&generated, "// @generated\nexport const compiled = true;\n").unwrap();
-        let mut paths = VecDeque::from([
-            temp.path().join("a.rs"),
-            temp.path().join("b.ts"),
-            generated,
-            temp.path().join("ignored.txt"),
-            temp.path().join("Cargo.toml"),
-        ]);
-        let mut remaining = paths.len();
-        let mut refreshed = Vec::new();
-
-        let completed = apply_callgraph_watcher_phase(
-            &ctx,
-            &mut paths,
-            &mut remaining,
-            Instant::now(),
-            WATCHER_DRAIN_SLICE_BUDGET,
-            true,
-            |_, changed| refreshed.push(changed.clone()),
-        );
-
-        assert!(completed);
-        assert_eq!(remaining, 0);
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].len(), 3);
-        assert!(refreshed[0].contains(&temp.path().join("Cargo.toml")));
-    }
-
-    #[test]
-    fn callgraph_phase_includes_manifest_before_budget_yield() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        let source = temp.path().join("first.rs");
-        let manifest = temp.path().join("Cargo.toml");
-        let mut paths = VecDeque::from([source.clone(), manifest.clone()]);
-        let mut remaining = paths.len();
-        let mut refreshed = Vec::new();
-        set_watcher_unit_test_seam(Duration::from_millis(2), None);
-
-        let completed = apply_callgraph_watcher_phase(
-            &ctx,
-            &mut paths,
-            &mut remaining,
-            Instant::now(),
-            Duration::from_millis(1),
-            true,
-            |_, changed| refreshed.push(changed.clone()),
-        );
-        clear_watcher_unit_test_seam();
-
-        assert!(!completed);
-        assert_eq!(remaining, 1);
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0], HashSet::from([source, manifest]));
-    }
-
-    #[test]
-    fn callgraph_phase_flushes_once_per_slice_before_requeue() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        let mut paths =
-            VecDeque::from([temp.path().join("first.rs"), temp.path().join("second.rs")]);
-        let mut remaining = paths.len();
-        let mut refreshed = Vec::new();
-        set_watcher_unit_test_seam(Duration::from_millis(2), None);
-
-        let first_completed = apply_callgraph_watcher_phase(
-            &ctx,
-            &mut paths,
-            &mut remaining,
-            Instant::now(),
-            Duration::from_millis(1),
-            true,
-            |_, changed| refreshed.push(changed.clone()),
-        );
-        assert!(!first_completed);
-        assert_eq!(remaining, 1);
-        assert_eq!(refreshed.len(), 1, "the yielded slice must flush its batch");
-
-        let second_completed = apply_callgraph_watcher_phase(
-            &ctx,
-            &mut paths,
-            &mut remaining,
-            Instant::now(),
-            Duration::from_millis(1),
-            true,
-            |_, changed| refreshed.push(changed.clone()),
-        );
-        clear_watcher_unit_test_seam();
-
-        assert!(!second_completed);
-        assert_eq!(remaining, 0);
-        assert_eq!(refreshed.len(), 2);
-        assert!(refreshed.iter().all(|batch| batch.len() == 1));
-    }
-
-    #[test]
     fn watcher_unit_watchdog_names_slow_phase_and_path() {
         let temp = tempfile::tempdir().unwrap();
         let slow_path = temp.path().join("slow.rs");
@@ -4428,20 +4136,6 @@ mod watcher_slice_tests {
             5,
             "every path survives the lifecycle-only generation change"
         );
-    }
-
-    fn cache_bin_hash(path: &Path) -> blake3::Hash {
-        blake3::hash(&std::fs::read(path).expect("read cache.bin"))
-    }
-
-    fn mark_borrow_only(ctx: &AppContext, canonical: &Path, cache_dir: &Path) {
-        let project_key = cache_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("cache key")
-            .to_string();
-        crate::root_cache::configure_artifact_access(canonical, &project_key, true);
-        ctx.set_cache_role(true, None);
     }
 
     #[test]

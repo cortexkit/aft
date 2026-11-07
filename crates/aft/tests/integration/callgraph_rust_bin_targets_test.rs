@@ -1,13 +1,10 @@
 use aft::callgraph_store::join::{
     CallgraphBlob, ManifestBlobReader, ManifestJoinError, ResolutionStatus,
 };
-use aft::callgraph_store::CallGraphStore;
-use aft::commands::callgraph_store_adapter;
 use aft::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::tempdir;
 
 #[derive(Default)]
 struct MemoryBlobs(BTreeMap<String, Vec<u8>>);
@@ -21,22 +18,9 @@ impl ManifestBlobReader for MemoryBlobs {
 #[test]
 fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
     let root = crate::helpers::fixture_path("callgraph/rust_bin_targets");
-    let storage = tempdir().unwrap();
-    let files = rust_files(&root);
-    let store = CallGraphStore::open(storage.path().join("store"), root.clone()).unwrap();
-    store.cold_build(&files).unwrap();
+    let (manifest, blobs) = manifest_fixture(&root);
+    let joined = aft::callgraph_store::join::JoinResult::from_manifest(&manifest, &blobs).unwrap();
 
-    let callers = serde_json::to_value(
-        callgraph_store_adapter::callers_result(
-            &store,
-            &root.join("src/bin/support/route_client.rs"),
-            "error_reason",
-            1,
-            true,
-        )
-        .unwrap(),
-    )
-    .unwrap();
     let exact_tool_sites = BTreeSet::from([
         (
             "src/bin/support/admin_client.rs".to_string(),
@@ -65,30 +49,23 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         ),
     ]);
     assert_eq!(
-        resolved_sites(&store, "src/bin/support/route_client.rs", "error_reason"),
+        resolved_sites(
+            &joined,
+            &blobs,
+            "src/bin/support/route_client.rs",
+            "error_reason"
+        ),
         exact_tool_sites,
         "qualified bin calls must become precise resolver edges"
     );
-    let entries = callers["callers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|group| group["callers"].as_array().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 5, "callers output: {callers:#}");
     assert!(
-        entries
-            .iter()
-            .all(|entry| { entry["approximate"].is_null() && entry["resolved_by"].is_null() }),
-        "bin callers must be resolved rather than name-only: {callers:#}"
-    );
-    assert!(
-        resolved_sites(&store, "src/route_client.rs", "error_reason").is_empty(),
+        resolved_sites(&joined, &blobs, "src/route_client.rs", "error_reason").is_empty(),
         "the library decoy must not receive bin-target calls"
     );
 
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "src/bin/other/nested.rs",
         "nested_target",
         "src/bin/other/main.rs",
@@ -96,7 +73,8 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "crate::nested::nested_target",
     );
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "tools/custom_support.rs",
         "custom_target",
         "tools/custom.rs",
@@ -104,7 +82,8 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "custom_support::custom_target",
     );
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "examples/demo_support.rs",
         "example_target",
         "examples/demo.rs",
@@ -112,7 +91,8 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "demo_support::example_target",
     );
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "tests/test_support.rs",
         "integration_target",
         "tests/standalone.rs",
@@ -120,7 +100,8 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "test_support::integration_target",
     );
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "benches/bench_support.rs",
         "bench_target",
         "benches/perf.rs",
@@ -128,29 +109,16 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "bench_support::bench_target",
     );
     assert_unresolved_site(
-        &store,
+        &joined,
+        &blobs,
         "src/binx/caller.rs",
         2,
         "crate::support::route_client::error_reason",
     );
 
-    let lib_callers = serde_json::to_value(
-        callgraph_store_adapter::callers_result(
-            &store,
-            &root.join("src/lib.rs"),
-            "lib_target",
-            1,
-            true,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        lib_callers["total_callers"], 1,
-        "lib cfg(test) caller must stay in the lib crate tree: {lib_callers:#}"
-    );
     assert_target_site(
-        &store,
+        &joined,
+        &blobs,
         "src/lib.rs",
         "lib_target",
         "src/lib.rs",
@@ -158,8 +126,6 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
         "super::lib_target",
     );
 
-    let (manifest, blobs) = manifest_fixture(&root);
-    let joined = aft::callgraph_store::join::JoinResult::from_manifest(&manifest, &blobs).unwrap();
     let view_sites = joined
         .rows
         .iter()
@@ -195,7 +161,8 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
 }
 
 fn assert_target_site(
-    store: &CallGraphStore,
+    joined: &aft::callgraph_store::join::JoinResult,
+    blobs: &MemoryBlobs,
     target_file: &str,
     target_symbol: &str,
     caller_file: &str,
@@ -203,39 +170,71 @@ fn assert_target_site(
     call_text: &str,
 ) {
     assert_eq!(
-        resolved_sites(store, target_file, target_symbol),
+        resolved_sites(joined, blobs, target_file, target_symbol),
         BTreeSet::from([(caller_file.to_string(), line, call_text.to_string())]),
         "expected precise caller for {target_file}:{target_symbol}"
     );
 }
 
-fn assert_unresolved_site(store: &CallGraphStore, caller_file: &str, line: i64, call_text: &str) {
-    let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
-    let row: (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, target_file FROM refs WHERE caller_file = ?1 AND line = ?2 AND full_ref = ?3",
-            rusqlite::params![caller_file, line, call_text],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(row, ("unresolved".to_string(), None));
+fn assert_unresolved_site(
+    joined: &aft::callgraph_store::join::JoinResult,
+    blobs: &MemoryBlobs,
+    caller_file: &str,
+    line: i64,
+    call_text: &str,
+) {
+    let row = joined
+        .rows
+        .iter()
+        .find(|row| {
+            if row.caller_path != caller_file.as_bytes() {
+                return false;
+            }
+            let blob = CallgraphBlob::from_bytes(&blobs.0[&row.caller_blob_key]).unwrap();
+            let raw = blob
+                .parse()
+                .unwrap()
+                .refs
+                .iter()
+                .find(|raw| raw.ordinal == row.ref_ordinal)
+                .unwrap();
+            i64::from(raw.line) == line && raw.full_ref.as_deref() == Some(call_text)
+        })
+        .expect("reference row");
+    assert_eq!(row.status, ResolutionStatus::Unresolved);
+    assert_eq!(row.target_path, None);
 }
 
 fn resolved_sites(
-    store: &CallGraphStore,
+    joined: &aft::callgraph_store::join::JoinResult,
+    blobs: &MemoryBlobs,
     target_file: &str,
     target_symbol: &str,
 ) -> BTreeSet<(String, i64, String)> {
-    let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT r.caller_file, r.line, r.full_ref FROM refs r JOIN edges e ON e.ref_id = r.ref_id WHERE e.target_file = ?1 AND e.target_symbol = ?2 AND r.status IN ('resolved', 'resolved_local') AND e.provenance = 'treesitter+resolver' ORDER BY r.caller_file, r.line",
-    ).unwrap();
-    stmt.query_map([target_file, target_symbol], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })
-    .unwrap()
-    .map(Result::unwrap)
-    .collect()
+    joined
+        .rows
+        .iter()
+        .filter(|row| {
+            row.target_path.as_deref() == Some(target_file.as_bytes())
+                && row.target_symbol.as_deref() == Some(target_symbol)
+                && row.status == ResolutionStatus::Resolved
+        })
+        .map(|row| {
+            let blob = CallgraphBlob::from_bytes(&blobs.0[&row.caller_blob_key]).unwrap();
+            let raw = blob
+                .parse()
+                .unwrap()
+                .refs
+                .iter()
+                .find(|raw| raw.ordinal == row.ref_ordinal)
+                .unwrap();
+            (
+                String::from_utf8(row.caller_path.clone()).unwrap(),
+                i64::from(raw.line),
+                raw.full_ref.clone().unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn rust_files(root: &Path) -> Vec<PathBuf> {

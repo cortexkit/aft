@@ -64,6 +64,4 @@ pub(crate) fn is_message(message: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-}
+mod tests {}

@@ -4,11 +4,6 @@ use std::sync::Arc;
 
 use aft::commands::semantic_search::evidence_descriptor::{EvidenceKind, EvidenceTier};
 use aft::commands::semantic_search::generation_token::GenerationToken;
-use aft::commands::semantic_search::handle_semantic_search;
-use aft::config::Config;
-use aft::context::AppContext;
-use aft::parser::TreeSitterProvider;
-use aft::protocol::RawRequest;
 use aft::search_index::exact_lane::{e2_window_scan_needed, ExactLane, FallbackExactOptions};
 use aft::search_index::memo::ExactMemoStore;
 use aft::search_index::SearchIndex;

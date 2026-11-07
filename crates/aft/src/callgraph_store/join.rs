@@ -280,19 +280,6 @@ impl CallgraphBlob {
         single_walk::extract(source, language, extractor_version.into())
     }
 
-    /// Extracts the parse output of `source` from `tree`, its syntax tree
-    /// in `language`, without the outline [`Self::extract_tree_with_outline`]
-    /// also returns: for measuring what keeping the outline costs.
-    #[cfg(test)]
-    pub(crate) fn extract_tree(
-        source: &str,
-        language: &str,
-        extractor_version: impl Into<String>,
-        tree: &tree_sitter::Tree,
-    ) -> Result<Self, ManifestJoinError> {
-        single_walk::extract_tree(source, language, extractor_version.into(), tree, None)
-    }
-
     /// [`Self::extract_tree`], also returning the file's symbols as the
     /// parser extracts them for outline: the same table, from the same walk,
     /// before the call graph qualifies, adds or merges any.

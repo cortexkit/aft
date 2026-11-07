@@ -783,10 +783,6 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(canonical_root);
     ctx.set_cache_role(false, None);
-    *ctx.callgraph_store()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *ctx.callgraph_store_rx().lock() = None;
 
     Response::success(
         &req.id,

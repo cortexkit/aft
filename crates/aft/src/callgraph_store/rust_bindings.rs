@@ -152,6 +152,16 @@ fn identity<'tree>(
 }
 
 impl RustBindings {
+    #[cfg(test)]
+    pub fn new(source: &str, root: Node<'_>) -> Self {
+        Self::new_with(source, root, super::join::syntax_index::Direct)
+    }
+
+    #[cfg(test)]
+    pub fn unit_struct(&self, symbol: &str) -> bool {
+        self.unit_structs.get(symbol).copied() == Some(true)
+    }
+
     /// [`RustBindings::new`], walking and looking up with `nav`.
     pub fn new_with<'tree>(source: &str, root: Node<'tree>, nav: impl Nav<'tree>) -> Self {
         let mut result = Self::default();

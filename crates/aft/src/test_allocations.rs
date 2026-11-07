@@ -74,10 +74,6 @@ pub(crate) fn heap_marker(prefix: &str, phase: &str) {
     }
 }
 
-pub(crate) fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
 pub(crate) fn live_allocations() -> usize {
     LIVE_ALLOCATIONS.load(Ordering::Relaxed)
 }

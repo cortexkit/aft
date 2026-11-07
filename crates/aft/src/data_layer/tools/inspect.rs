@@ -155,12 +155,4 @@ impl DeadCodeSources {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
-    use aft_store::ids::{Digest128, FamilyId};
-
-    use crate::data_layer::checkout::{Checkout, DataLayer};
-    use crate::inspect::job::CallgraphSnapshot;
-}
+mod tests {}

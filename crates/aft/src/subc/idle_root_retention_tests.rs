@@ -1088,29 +1088,6 @@ fn heap_in_use() -> Option<u64> {
     None
 }
 
-/// Give detached teardown threads (watcher and LSP reapers) time to exit:
-/// polls the thread count every 100 ms and returns once it is at most
-/// `at_most`, has not changed for five samples, or 10 seconds have passed.
-/// A settling heuristic, not proof that teardown finished.
-fn settled_thread_total(at_most: u64) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut previous = thread_total();
-    let mut stable_samples = 0;
-    loop {
-        if previous <= at_most || stable_samples >= 5 || Instant::now() >= deadline {
-            return previous;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        let total = thread_total();
-        stable_samples = if total == previous {
-            stable_samples + 1
-        } else {
-            0
-        };
-        previous = total;
-    }
-}
-
 #[test]
 fn evicted_idle_roots_release_their_per_context_threads() {
     if std::env::var_os(CHILD_ENV).is_none() {
@@ -1212,78 +1189,8 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     );
 }
 
-const WORKED_ROOTS: usize = 6;
-const SOURCE_FILES: usize = 40;
+#[cfg(unix)]
 const SESSION: &str = "retention-session";
-
-fn request(command: &str, params: serde_json::Value) -> crate::protocol::RawRequest {
-    crate::protocol::RawRequest {
-        id: format!("{command}-retention"),
-        command: command.to_string(),
-        lsp_hints: None,
-        session_id: Some(SESSION.to_string()),
-        params,
-    }
-}
-
-/// A Git checkout with enough Rust source that its search index, callgraph
-/// and symbol cache hold real entries.
-fn worked_fixture(name: &str) -> (tempfile::TempDir, ProjectRootId) {
-    let (dir, root) = test_support::test_root(name);
-    for index in 0..SOURCE_FILES {
-        let mut source = String::new();
-        for function in 0..20 {
-            source.push_str(&format!(
-                "/// Function {function} of module {index}.\npub fn item_{index}_{function}(value: u64) -> u64 {{\n    let doubled = value * 2;\n    helper_{index}(doubled) + {function}\n}}\n\n"
-            ));
-        }
-        source.push_str(&format!(
-            "fn helper_{index}(value: u64) -> u64 {{\n    value + 1\n}}\n"
-        ));
-        std::fs::write(dir.path().join(format!("module_{index}.rs")), source).unwrap();
-    }
-    // A legacy project config location: the project watcher never covers it,
-    // so the root keeps a config file watch of its own.
-    std::fs::create_dir_all(dir.path().join(".opencode")).unwrap();
-    std::fs::write(dir.path().join(".opencode/aft.jsonc"), "{}\n").unwrap();
-    for args in [
-        &["init", "--quiet"][..],
-        &["add", "."][..],
-        &[
-            "-c",
-            "user.name=AFT Tests",
-            "-c",
-            "user.email=aft-tests@example.com",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ][..],
-    ] {
-        let mut command = std::process::Command::new("git");
-        crate::test_env::apply_hermetic_git_env(command.current_dir(dir.path()));
-        assert!(command.args(args).status().unwrap().success());
-    }
-    (dir, root)
-}
-
-/// Give detached teardown work (LSP and watcher reapers, semantic lane
-/// release) time to free its memory: samples allocator usage every 100 ms
-/// and returns once two readings differ by less than 16 KiB, or after 50
-/// samples. A settling heuristic; `None` where allocator statistics are
-/// unavailable.
-fn settled_heap() -> Option<u64> {
-    let mut previous = heap_in_use()?;
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        let current = heap_in_use()?;
-        if current.abs_diff(previous) < 16 * 1024 {
-            return Some(current);
-        }
-        previous = current;
-    }
-    Some(previous)
-}
 
 /// Make output that the builtin `make` filter rewrites: its directory lines
 /// are stripped.

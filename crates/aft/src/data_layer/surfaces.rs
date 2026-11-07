@@ -261,8 +261,6 @@ pub struct DataStoreFailure {
     pub at_ms: u64,
 }
 
-/// How `ctx`'s checkout stands in the data layer, without binding it or
-/// waiting for a bind; `None` when the data layer is off.
 #[cfg(test)]
 thread_local! {
     /// Storage folders handed out by `serve_text_index_for_test`, removed when

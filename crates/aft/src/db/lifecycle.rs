@@ -939,28 +939,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_connections_limit_retained_wal_without_enabling_autocheckpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let connection = TrackedConnection::open(
-            &dir.path().join("refresh.sqlite"),
-            SqliteStore::CallgraphGeneration,
-        )
-        .unwrap();
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .unwrap();
-        connection.configure_refresh_wal().unwrap();
-        let limit: i64 = connection
-            .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
-            .unwrap();
-        assert_eq!(limit, WAL_JOURNAL_SIZE_LIMIT);
-        assert_eq!(connection.wal_autocheckpoint_pages(), 0);
-        assert!(connection
-            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
-            .unwrap());
-    }
-
-    #[test]
     fn callgraph_refresh_credits_physical_pages_in_wal_frame_order_of_magnitude() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("callgraph.sqlite");

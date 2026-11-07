@@ -1,9 +1,3 @@
-use std::fs;
-use std::path::Path;
-use tempfile::tempdir;
-
-use aft::commands::trace_data::handle_trace_data;
-use aft::commands::trace_to::handle_trace_to;
 use aft::commands::trace_to::trace::{
     attach_trace_data_envelope, attach_trace_to_envelope, build_trace_data_envelope,
     build_trace_to_envelope, TRACE_DATA_LIST_ID, TRACE_DATA_WIRE_KEY, TRACE_TO_LIST_ID,
@@ -12,7 +6,7 @@ use aft::commands::trace_to::trace::{
 use aft::list_envelope::{derive_wire_key, render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::find_surface;
 use aft::ndjson_text::build_ndjson_text;
-use aft::protocol::{RawRequest, Response};
+use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
 use serde_json::Value;
 
@@ -547,22 +541,4 @@ fn test_adapter_attachment_functions() {
     let env_td_complete = build_trace_data_envelope(1, false);
     attach_trace_data_envelope(&mut val_td_complete, env_td_complete.as_ref());
     assert!(val_td_complete.get(TRACE_DATA_WIRE_KEY).is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Producer Tests over Real Callgraph Store
-// ---------------------------------------------------------------------------
-
-fn copy_dir_all(src: &Path, dst: &Path) {
-    fs::create_dir_all(dst).unwrap();
-    for entry in fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_all(&path, &dest_path);
-        } else {
-            fs::copy(&path, &dest_path).unwrap();
-        }
-    }
 }

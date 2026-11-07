@@ -282,11 +282,6 @@ thread_local! {
     static SEMANTIC_FAMILY_ARENA_MEASUREMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn semantic_family_arena_measurements_for_test() -> u64 {
-    SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(std::cell::Cell::get)
-}
-
 thread_local! {
     /// Set while this thread runs a closure under the configuration write
     /// lock (`update_config`). Reading the configuration there would wait on
@@ -1480,11 +1475,6 @@ pub(crate) fn memory_estimate_walks_for_test() -> usize {
     MEMORY_ESTIMATE_WALKS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
-pub(crate) fn memory_index_walks_for_test() -> [usize; 3] {
-    MEMORY_INDEX_WALKS.with(|walks| *walks.borrow())
-}
-
 /// Reuse one index's cached memory walk while its shape is unchanged and the
 /// walk is younger than [`HEALTH_MEMORY_REUSE_INTERVAL`]; otherwise walk it
 /// again. `shape` is `None` when the index was locked. Returns the estimate,
@@ -2237,8 +2227,6 @@ pub struct QueryPendingChanges {
 pub(crate) enum PendingCaptureBoundary {
     /// After the flush-window set, before the dispatch channel and drain.
     AfterFlushWindow,
-    /// After the first pending-sink read, before the refresh worker's queue.
-    BeforeWorkerQueue,
 }
 
 #[cfg(test)]
@@ -2423,45 +2411,6 @@ struct UnboundTeardownPersistGate {
 static UNBOUND_TEARDOWN_PERSIST_GATE: std::sync::OnceLock<
     parking_lot::Mutex<Option<UnboundTeardownPersistGate>>,
 > = std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct UnboundTeardownPersistGateGuard;
-
-#[cfg(test)]
-impl Drop for UnboundTeardownPersistGateGuard {
-    fn drop(&mut self) {
-        if let Some(slot) = UNBOUND_TEARDOWN_PERSIST_GATE.get() {
-            *slot.lock() = None;
-        }
-    }
-}
-
-/// Install the gate for `root`. Returns a guard that removes it, a receiver
-/// that fires when the persist reaches the gate, and a sender that releases it.
-#[cfg(test)]
-pub(crate) fn gate_unbound_teardown_persist_for_test(
-    root: PathBuf,
-) -> (
-    UnboundTeardownPersistGateGuard,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let mut slot = UNBOUND_TEARDOWN_PERSIST_GATE
-        .get_or_init(Default::default)
-        .lock();
-    assert!(
-        slot.is_none(),
-        "unbound teardown persist gate already installed"
-    );
-    *slot = Some(UnboundTeardownPersistGate {
-        root,
-        reached: reached_tx,
-        release: release_rx,
-    });
-    (UnboundTeardownPersistGateGuard, reached_rx, release_tx)
-}
 
 #[cfg(test)]
 fn wait_on_unbound_teardown_persist_gate_for_test(root: Option<&Path>) {
@@ -4502,29 +4451,6 @@ fn install_callgraph_build_start_gate(
     (reached_rx, release_tx)
 }
 
-#[cfg(test)]
-pub(crate) fn install_callgraph_build_start_gate_for_test(
-    root: PathBuf,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    install_callgraph_build_start_gate(root)
-}
-
-#[cfg(test)]
-pub(crate) struct CallgraphBuildWaitMsGuard<'a> {
-    context: &'a AppContext,
-    previous: Option<Duration>,
-}
-
-#[cfg(test)]
-impl Drop for CallgraphBuildWaitMsGuard<'_> {
-    fn drop(&mut self) {
-        *self.context.callgraph_build_wait_override.lock() = self.previous;
-    }
-}
-
 /// `try_read` that uses a poisoned lock's data, as the blocking paths in this
 /// module do, and returns `None` only when another thread holds the lock.
 fn try_read_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
@@ -4556,7 +4482,6 @@ pub(crate) enum MaintenanceProbeLock {
     LspManager,
     ConfigureMaintenanceJobs,
     ParkedConfigureTail,
-    CallgraphStoreReceiver,
     SemanticIndexReceiver,
     SemanticRefreshEvents,
     SemanticRefreshWorker,
@@ -4564,32 +4489,17 @@ pub(crate) enum MaintenanceProbeLock {
 
 #[cfg(test)]
 impl MaintenanceProbeLock {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::WatcherReceiver,
         Self::WatcherDrainSlice,
         Self::Tier2RefreshScheduler,
         Self::LspManager,
         Self::ConfigureMaintenanceJobs,
         Self::ParkedConfigureTail,
-        Self::CallgraphStoreReceiver,
         Self::SemanticIndexReceiver,
         Self::SemanticRefreshEvents,
         Self::SemanticRefreshWorker,
     ];
-}
-
-/// Override only this context's inline wait, including queries on helper threads.
-/// Mutating the environment would also change unrelated roots' query outcomes.
-#[cfg(test)]
-pub(crate) fn override_callgraph_build_wait_ms_for_test(
-    context: &AppContext,
-    ms: u64,
-) -> CallgraphBuildWaitMsGuard<'_> {
-    let previous = context
-        .callgraph_build_wait_override
-        .lock()
-        .replace(Duration::from_millis(ms));
-    CallgraphBuildWaitMsGuard { context, previous }
 }
 
 #[cfg(test)]
@@ -4604,57 +4514,6 @@ fn wait_on_callgraph_build_start_gate(root: &Path) {
         let _ = gate.reached.send(());
         let _ = gate.release.recv();
     }
-}
-
-#[cfg(test)]
-static CALLGRAPH_POINTER_REMOVAL_ARMS: std::sync::OnceLock<parking_lot::Mutex<BTreeSet<PathBuf>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-struct RemoveCallgraphPointerBeforeInlineReopenGuard {
-    pointer: PathBuf,
-}
-
-#[cfg(test)]
-impl Drop for RemoveCallgraphPointerBeforeInlineReopenGuard {
-    fn drop(&mut self) {
-        CALLGRAPH_POINTER_REMOVAL_ARMS
-            .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
-            .lock()
-            .remove(&self.pointer);
-    }
-}
-
-#[cfg(test)]
-fn install_callgraph_pointer_removal_arm(
-    pointer: PathBuf,
-) -> RemoveCallgraphPointerBeforeInlineReopenGuard {
-    let inserted = CALLGRAPH_POINTER_REMOVAL_ARMS
-        .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
-        .lock()
-        .insert(pointer.clone());
-    assert!(inserted, "callgraph pointer removal arm already installed");
-    RemoveCallgraphPointerBeforeInlineReopenGuard { pointer }
-}
-
-#[cfg(test)]
-fn remove_armed_callgraph_pointer_for_test(pointer: &Path) {
-    let armed = CALLGRAPH_POINTER_REMOVAL_ARMS
-        .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
-        .lock()
-        .remove(pointer);
-    if armed {
-        std::fs::remove_file(pointer).expect("remove callgraph pointer before inline reopen");
-    }
-}
-
-#[cfg(test)]
-fn remove_callgraph_pointer_before_inline_reopen_for_test(
-    callgraph_dir: &Path,
-    store: &CallGraphStore,
-) {
-    let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
-    remove_armed_callgraph_pointer_for_test(&pointer);
 }
 
 // Retain the aggregate for integration harnesses compiled without cfg(test).
@@ -6472,10 +6331,6 @@ impl AppContext {
                 let _held = self.parked_configure_tail.lock();
                 while_held();
             }
-            MaintenanceProbeLock::CallgraphStoreReceiver => {
-                let _held = self.callgraph_store_rx.lock();
-                while_held();
-            }
             MaintenanceProbeLock::SemanticIndexReceiver => {
                 let _held = self.semantic_index_rx.lock();
                 while_held();
@@ -6532,11 +6387,6 @@ impl AppContext {
 
     pub(crate) fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {
         self.configure_maintenance_jobs.lock().drain(..).collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_maintenance_job_count_for_test(&self) -> usize {
-        self.configure_maintenance_jobs.lock().len()
     }
 
     /// Peek the memoized artifact key without deriving it. Passive readers
@@ -8672,11 +8522,6 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn view_load_failure_total_for_test(&self) -> u64 {
-        self.view_load_health.lock().total
-    }
-
     /// Suppressed error-log repeats for `plane` since its last emission.
     /// Tests use it to prove the per-minute throttle without wall-clock waits.
     #[cfg(test)]
@@ -8883,19 +8728,13 @@ impl AppContext {
         std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock())
     }
 
-    /// Copies of the pending callgraph, Tier-2 and semantic path sets
-    /// and the corpus-refresh flag, unfiltered and left in place.
+    /// Copies of the pending Tier-2 and semantic path sets and the
+    /// corpus-refresh flag, unfiltered and left in place.
     #[cfg(test)]
     pub(crate) fn pending_reconciliation_snapshot_for_test(
         &self,
-    ) -> (
-        BTreeSet<PathBuf>,
-        BTreeSet<PathBuf>,
-        BTreeSet<PathBuf>,
-        bool,
-    ) {
+    ) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool) {
         (
-            self.pending_callgraph_store_paths.lock().clone(),
             self.pending_tier2_paths.lock().clone(),
             self.pending_semantic_index_paths.lock().clone(),
             *self.pending_semantic_corpus_refresh.lock(),
@@ -13438,9 +13277,7 @@ mod readonly_artifact_cache_key_tests {
 }
 
 #[cfg(test)]
-mod git_entry_signature_tests {
-    use super::*;
-}
+mod git_entry_signature_tests {}
 
 #[cfg(test)]
 mod subc_lifecycle_admission_tests {
@@ -13616,7 +13453,6 @@ mod subc_lifecycle_admission_tests {
             .expect("health snapshot worker should start");
 
         let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(2));
-        let callgraph_receiver_available = ctx.callgraph_store_rx.try_lock().is_some();
         drop(lifecycle_guard);
         worker.join().unwrap();
 
@@ -13629,10 +13465,6 @@ mod subc_lifecycle_admission_tests {
                 })
             ),
             "health snapshots must report busy instead of waiting for lifecycle admission"
-        );
-        assert!(
-            callgraph_receiver_available,
-            "health snapshots must not hold the callgraph receiver while lifecycle admission is busy"
         );
     }
 
@@ -14283,14 +14115,6 @@ mod callgraph_store_for_ops_tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn callgraph_build_wait_ms(ctx: &AppContext, ms: u64) -> super::CallgraphBuildWaitMsGuard<'_> {
-        super::override_callgraph_build_wait_ms_for_test(ctx, ms)
-    }
-
-    fn force_async_callgraph_builds(ctx: &AppContext) -> super::CallgraphBuildWaitMsGuard<'_> {
-        callgraph_build_wait_ms(ctx, 0)
-    }
-
     /// Returns the project and storage directories with the context that uses
     /// them. Callers bind the directories for the whole test, first, so they
     /// are removed when it ends and only after the context is dropped.
@@ -14315,207 +14139,6 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
-    }
-
-    fn published_callgraph_for_log_test(ctx: &AppContext) -> PathBuf {
-        let root = ctx.callgraph_project_root().unwrap();
-        let dir = ctx.callgraph_store_dir();
-        let key = dir.file_name().unwrap().to_str().unwrap();
-        crate::root_cache::configure_artifact_access(&root, key, false);
-        let (store, _) = CallGraphStore::cold_build_with_lease(
-            ctx.callgraph_store_dir(),
-            root.clone(),
-            &[root.join("src/lib.rs")],
-        )
-        .unwrap();
-        store.sqlite_path().to_path_buf()
-    }
-
-    #[test]
-    #[ignore = "manual 60,000-file startup reconciliation measurement"]
-    #[cfg(target_os = "linux")]
-    fn measure_startup_reconcile_on_sixty_thousand_files() {
-        let (dirs, first) = cold_build_context();
-        let root = first.callgraph_project_root().unwrap();
-        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
-        let file_count = std::env::var("AFT_STARTUP_RECONCILE_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(60_000);
-        let files = crate::callgraph_store::perf_tests::write_scaling_fixture(&root, file_count);
-        let dir = first.callgraph_store_dir();
-        crate::root_cache::configure_artifact_access(
-            &root,
-            dir.file_name().unwrap().to_str().unwrap(),
-            false,
-        );
-        let build_started = Instant::now();
-        let (store, _) =
-            CallGraphStore::cold_build_with_lease_chunked(dir, root.clone(), &files, 100).unwrap();
-        let generation = store.sqlite_path().to_path_buf();
-        println!(
-            "startup measurement preparation: files={} cold_build_ms={}",
-            files.len(),
-            build_started.elapsed().as_millis()
-        );
-        drop(store);
-        let mut config = first.config().as_ref().clone();
-        config.indexes.trigram = false;
-        config.indexes.semantic = false;
-        config.project_root = None;
-        drop(first);
-        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
-        let request: RawRequest = serde_json::from_value(json!({
-            "id": "measure-bind", "command": "configure", "project_root": root,
-            "storage_dir": dirs[1].path(), "harness": "opencode",
-            "config": [{"tier": "user", "source": "/u/aft.jsonc", "doc": json!({
-                "indexes": {"trigram": false, "semantic": false, "callgraph": true},
-                "views": {"enabled": false}
-            }).to_string()}]
-        }))
-        .unwrap();
-        let bind_started = Instant::now();
-        let response = crate::commands::configure::handle_configure(&request, &ctx);
-        let bind_wall = bind_started.elapsed();
-        assert!(response.success, "{response:?}");
-        // Bind timing is separate from the comparison: use a fresh legacy
-        // reader context, without running unrelated configure-tail workers.
-        let config = ctx.config().as_ref().clone();
-        drop(ctx);
-        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
-        ctx.advance_configure_generation();
-        assert!(!false, "measurement must use the legacy store");
-        println!(
-            "startup measurement paths: store={} original={}",
-            ctx.callgraph_store_dir().display(),
-            generation.display()
-        );
-        let _wait = force_async_callgraph_builds(&ctx);
-        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
-        let access_started = Instant::now();
-        let reader = match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(reader) => reader,
-            CallgraphStoreAccess::Building => panic!("published graph unexpectedly Building"),
-            CallgraphStoreAccess::Off => panic!("callgraph unexpectedly configured off"),
-            CallgraphStoreAccess::Unavailable => panic!(
-                "callgraph unexpectedly unavailable; heavy={} writer={}",
-                ctx.heavy_root_work_allowed(),
-                ctx.callgraph_writer()
-            ),
-            CallgraphStoreAccess::Suspended(reason) => panic!("callgraph suspended: {reason:?}"),
-            CallgraphStoreAccess::Error(error) => panic!("callgraph open failed: {error}"),
-        };
-        let install_wall = access_started.elapsed();
-        assert_eq!(reader.sqlite_path(), generation);
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        let held_read_started = Instant::now();
-        reader
-            .callers_of(Path::new("src/m0000/f000.ts"), "f0a", 1)
-            .unwrap();
-        let held_read_wall = held_read_started.elapsed();
-        let io_before = std::fs::read_to_string("/proc/self/io").unwrap();
-        let source_bytes_before = crate::io_accounting::WORK
-            .content_read_bytes
-            .load(Ordering::Relaxed);
-        let hash_bytes_before = crate::io_accounting::WORK
-            .source_hash_bytes
-            .load(Ordering::Relaxed);
-        let scan_started = Instant::now();
-        drop(release);
-        let mut read_us = Vec::new();
-        while ctx.callgraph_reconcile.outstanding() {
-            let started = Instant::now();
-            let CallgraphStoreAccess::Ready(reader) = ctx.callgraph_store_for_ops() else {
-                panic!("scan blocked published graph access")
-            };
-            reader
-                .callers_of(Path::new("src/m0000/f000.ts"), "f0a", 1)
-                .unwrap();
-            read_us.push(started.elapsed().as_micros());
-            assert!(
-                scan_started.elapsed() < Duration::from_secs(120),
-                "comparison timed out"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let scan_wall = ctx
-            .callgraph_reconcile
-            .finished_at_for_test()
-            .duration_since(scan_started);
-        let io_after = std::fs::read_to_string("/proc/self/io").unwrap();
-        let source_bytes = crate::io_accounting::WORK
-            .content_read_bytes
-            .load(Ordering::Relaxed)
-            - source_bytes_before;
-        let hash_bytes = crate::io_accounting::WORK
-            .source_hash_bytes
-            .load(Ordering::Relaxed)
-            - hash_bytes_before;
-        let outcome = ctx.callgraph_reconcile.last().unwrap();
-        assert!(matches!(
-            outcome.action,
-            crate::callgraph_maintenance::CallgraphReconcileAction::Unchanged
-        ));
-        let report = outcome.report.unwrap();
-        assert_eq!(report.examined_files, file_count);
-        assert_eq!(report.hashed_files, 0);
-        assert_eq!(
-            source_bytes, 0,
-            "unchanged startup must not read source contents"
-        );
-        assert_eq!(
-            hash_bytes, 0,
-            "unchanged startup must not hash source contents"
-        );
-        assert_eq!(report.changed_count(), 0);
-        assert!(
-            !ctx.pending_changes_for_query(true)
-                .callgraph
-                .resolved()
-                .whole_store
-        );
-        read_us.sort_unstable();
-        println!("startup measurement: bind_us={} install_us={} held_read_us={} scan_ms={} examined={} hashed={} changed={} read_samples={} read_p50_us={} read_max_us={}",
-            bind_wall.as_micros(), install_wall.as_micros(), held_read_wall.as_micros(), scan_wall.as_millis(),
-            report.examined_files, report.hashed_files, report.changed_count(), read_us.len(),
-            read_us[read_us.len()/2], read_us.last().unwrap());
-        println!("startup process io before:\n{io_before}startup process io after:\n{io_after}");
-        println!(
-            "startup source I/O: content_read_bytes={source_bytes} source_hash_bytes={hash_bytes}"
-        );
-    }
-
-    #[test]
-    fn callgraph_cold_build_logs_root_mismatch() {
-        let (_dirs, ctx) = cold_build_context();
-        let other = TempDir::new().unwrap();
-        let path = published_callgraph_for_log_test(&ctx);
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute(
-            "UPDATE backend_file_state SET workspace_root = ?1",
-            [other.path().to_str().unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            conn.execute(
-                "UPDATE meta SET v = ?1 WHERE k = 'workspace_roots'",
-                [json!([other.path().to_str().unwrap()]).to_string()],
-            )
-            .unwrap(),
-            1,
-            "schema-two root metadata must match the conflicting file rows"
-        );
-        drop(conn);
-        let (_, lines) = crate::logging::capture_log_lines(|| {});
-        let log = lines
-            .iter()
-            .find(|line| line.contains("callgraph cold-build decision:"))
-            .expect("root decision log");
-        assert!(log.contains("reason=root mismatch;"), "{log}");
-        assert!(
-            log.contains(&format!("from={};", other.path().display())),
-            "{log}"
-        );
     }
 
     /// Build a successful call-graph answer and attach its pending-changes
@@ -14669,31 +14292,6 @@ mod callgraph_store_for_ops_tests {
             ctx.config(),
             ctx.symbol_cache(),
         )
-    }
-
-    fn empty_semantic_index_for_ctx(ctx: &AppContext) -> SemanticIndex {
-        let project_root = ctx
-            .config()
-            .project_root
-            .clone()
-            .expect("test context has a project root");
-        let files: Vec<PathBuf> = Vec::new();
-        let mut embed = |_texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> { Ok(Vec::new()) };
-        SemanticIndex::build(&project_root, &files, &mut embed, 1)
-            .expect("empty semantic index should build")
-    }
-
-    #[test]
-    fn home_root_gate_blocks_callgraph_store_entry_points() {
-        let home = TempDir::new().expect("home tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        let source_dir = home.path().join("src");
-        std::fs::create_dir_all(&source_dir).expect("source dir");
-        std::fs::write(
-            source_dir.join("lib.rs"),
-            "pub fn caller() { callee(); }\npub fn callee() {}\n",
-        )
-        .expect("source file");
     }
 
     #[test]
@@ -14875,149 +14473,6 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
-    /// The ninety-second warm timer and a long callgraph cold build can overlap:
-    /// on a large repository the build is still running when the timer comes
-    /// due, and a five-category scan then reads the store the build is still
-    /// writing while its peak memory adds to the build's. Hold the scan until
-    /// the build publishes instead.
-    #[test]
-    fn callgraph_cold_build_defers_the_tier2_warm_scan_for_the_same_root() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let other_root = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let base = Instant::now();
-        ctx.reset_tier2_refresh_scheduler_at(base);
-        other_root.reset_tier2_refresh_scheduler_at(base);
-        let warm = base + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
-
-        let (_build_events, receiver) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
-        assert!(ctx.callgraph_cold_build_active());
-
-        assert_eq!(
-            ctx.tick_tier2_refresh_scheduler_at(warm, 0),
-            None,
-            "the warm scan must not start while this root's callgraph cold build runs"
-        );
-        assert!(
-            ctx.tier2_trigger_reason().is_none(),
-            "a deferred scan must leave no recorded trigger: it has not run yet"
-        );
-        assert_eq!(
-            other_root.tick_tier2_refresh_scheduler_at(warm, 0),
-            Some(Tier2TriggerReason::ConfigureWarm),
-            "one root's callgraph build must not hold another root's refresh"
-        );
-
-        assert_eq!(
-            ctx.tick_tier2_refresh_scheduler_at(warm + Duration::from_secs(1), 0),
-            Some(Tier2TriggerReason::ConfigureWarm),
-            "the held scan must dispatch as soon as the callgraph build completes"
-        );
-    }
-
-    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
-        let connection =
-            rusqlite::Connection::open(ctx.callgraph_store_dir().join("build-breaker.sqlite"))
-                .unwrap();
-        let charges: i64 = connection
-            .query_row(
-                "SELECT COALESCE(SUM(zero_credit_deaths + credited_deaths + in_build_burn_ms), 0)
-                 FROM breaker_records WHERE domain = 'callgraph_cold'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            charges, 0,
-            "ordinary edits must not charge the death breaker"
-        );
-        let attempts: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM breaker_attempts WHERE domain = 'callgraph_cold'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            attempts, published_attempts,
-            "only the existing successful-publication attempt may remain; cancelled attempts must be retired"
-        );
-    }
-
-    fn wait_for_no_cold_build_holders(ctx: &AppContext) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ctx.cold_build_limiter().census().holders.is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "cold-build permit was not released: {:?}",
-                ctx.cold_build_limiter().census().holders
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn pointer_removal_arm_is_scoped_to_its_callgraph_pointer() {
-        let temp = TempDir::new().expect("pointer tempdir");
-        let target = temp.path().join("target.current");
-        let unrelated = temp.path().join("unrelated.current");
-        std::fs::write(&target, "target-generation\n").expect("target pointer");
-        std::fs::write(&unrelated, "unrelated-generation\n").expect("unrelated pointer");
-        let _arm = install_callgraph_pointer_removal_arm(target.clone());
-
-        // The test hook must remove only its target pointer. Completing another
-        // callgraph build must leave that pointer and the target hook intact.
-        remove_armed_callgraph_pointer_for_test(&unrelated);
-        assert!(
-            unrelated.exists(),
-            "unrelated pointer must remain published"
-        );
-        assert!(target.exists(), "target arm must remain pending");
-
-        remove_armed_callgraph_pointer_for_test(&target);
-        assert!(!target.exists(), "target pointer should consume its arm");
-        assert!(
-            unrelated.exists(),
-            "unrelated pointer must remain published"
-        );
-    }
-
-    #[test]
-    fn take_pending_callgraph_store_paths_drops_paths_outside_current_root() {
-        let project = TempDir::new().expect("project tempdir");
-        let foreign = TempDir::new().expect("foreign tempdir");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let inside = project.path().join("kept.rs");
-        // A late-deferring batch from a superseded root writes into the shared
-        // pending sink; replaying it into the NEW root's store would index a
-        // foreign project's files.
-        let outside = foreign.path().join("previous-root-file.rs");
-        // Lexical escape: starts_with(project) is true on the raw spelling but
-        // the path resolves outside the root.
-        let dotdot_escape = project
-            .path()
-            .join("..")
-            .join(
-                foreign
-                    .path()
-                    .file_name()
-                    .expect("foreign tempdir has a name"),
-            )
-            .join("escaped.rs");
-        ctx.add_pending_callgraph_store_paths([inside.clone(), outside, dotdot_escape]);
-
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![inside],
-            "pending replay must drop foreign and dot-dot-escaping paths"
-        );
-    }
-
     #[test]
     fn watcher_gap_invalidation_keeps_semantic_reloadable_and_skips_readonly_force_token() {
         let project = TempDir::new().expect("project tempdir");
@@ -15053,16 +14508,6 @@ mod callgraph_store_for_ops_tests {
             ),
             "semantic-enabled root must stay reloadable (Disabled has no self-healing path)"
         );
-        assert_eq!(
-            ctx.pending_callgraph_store_force_token(),
-            None,
-            "read-only root must not be stuck behind an unfulfillable force token"
-        );
-        assert_eq!(
-            ctx.pending_callgraph_reconcile_reason(),
-            None,
-            "read-only root cannot apply a reconcile; it follows the owner's store"
-        );
     }
 
     #[test]
@@ -15086,18 +14531,6 @@ mod callgraph_store_for_ops_tests {
 
         ctx.invalidate_artifacts_after_watcher_gap();
 
-        // The gap only means edits were missed, so the store is compared with
-        // the disk on its next use instead of being rebuilt from scratch.
-        assert_eq!(
-            ctx.pending_callgraph_reconcile_reason().as_deref(),
-            Some("watcher gap"),
-            "writer roots must still reconcile the store after the unobserved interval"
-        );
-        assert_eq!(
-            ctx.pending_callgraph_store_force_token(),
-            None,
-            "a watcher gap must not force a full rebuild"
-        );
         assert!(
             matches!(
                 &*ctx
@@ -15107,165 +14540,6 @@ mod callgraph_store_for_ops_tests {
                 SemanticIndexStatus::Disabled
             ),
             "semantic-disabled config maps to Disabled status"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn take_pending_callgraph_store_paths_drops_symlink_dotdot_escape() {
-        let project = TempDir::new().expect("project tempdir");
-        let foreign = TempDir::new().expect("foreign tempdir");
-        std::fs::create_dir_all(foreign.path().join("dir")).expect("foreign dir");
-        std::fs::write(foreign.path().join("secret.rs"), "pub fn s() {}\n").expect("secret");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        // `root/link` targets a foreign directory; `root/link/../secret.rs`
-        // therefore resolves to `foreign/secret.rs` under filesystem-first
-        // semantics (matching the store's normalize_file_path). A lexical-first
-        // filter would erase `link/..` and wrongly keep it as `root/secret.rs`.
-        std::os::unix::fs::symlink(foreign.path().join("dir"), project.path().join("link"))
-            .expect("plant symlink");
-        let escape = project.path().join("link").join("..").join("secret.rs");
-        // Dead component below the symlink: full canonicalization fails, so
-        // the ancestor walk must reach and resolve `link` BEFORE any lexical
-        // `..` resolution — a lexical-first pass would erase `dead/../..` and
-        // wrongly keep this as `root/deep-secret.rs`.
-        let dead_component_escape = project
-            .path()
-            .join("link")
-            .join("dead")
-            .join("..")
-            .join("..")
-            .join("deep-secret.rs");
-        // Re-entry: `dead/..` drains back to the project root, then `link`
-        // (an EXISTING symlink) must resolve through the filesystem — a
-        // one-shot lexical pass over the dead tail would erase `link/..` too
-        // and wrongly keep this as `root/reentry-secret.rs`.
-        std::fs::write(foreign.path().join("reentry-secret.rs"), "pub fn r() {}\n")
-            .expect("reentry secret");
-        let reentry_escape = project
-            .path()
-            .join("dead")
-            .join("..")
-            .join("link")
-            .join("..")
-            .join("reentry-secret.rs");
-        // Dangling symlink whose `..` re-enters the root: the store cannot
-        // canonicalize it either and keeps the raw absolute spelling as an
-        // out-of-root key, so containment must fail closed (a repaired-target
-        // race could otherwise index outside the root).
-        std::os::unix::fs::symlink(
-            foreign.path().join("nonexistent-target"),
-            project.path().join("dangling"),
-        )
-        .expect("plant dangling symlink");
-        let dangling_reentry = project
-            .path()
-            .join("dangling")
-            .join("..")
-            .join("via-dangling.rs");
-        // `..` traversal through a regular file: realpath rejects with
-        // ENOTDIR; lexically popping the file would fabricate containment.
-        std::fs::write(project.path().join("plain.rs"), "pub fn p() {}\n").expect("plain file");
-        let through_file = project
-            .path()
-            .join("plain.rs")
-            .join("..")
-            .join("via-file.rs");
-        let kept = project.path().join("kept.rs");
-        ctx.add_pending_callgraph_store_paths([
-            escape,
-            dead_component_escape,
-            reentry_escape,
-            dangling_reentry,
-            through_file,
-            kept.clone(),
-        ]);
-
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![kept],
-            "symlink-plus-dotdot escapes must be dropped with filesystem-first semantics"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn take_pending_callgraph_store_paths_drops_drive_relative_paths() {
-        // Guard-sensitivity: exercise the classifier directly against a root
-        // ON THE DRIVE CWD's drive, where join() replaces the root and the
-        // joined path can genuinely resolve under the drive CWD — without the
-        // early Prefix/RootDir rejection, a `C:file-under-cwd` spelling whose
-        // drive CWD happens to sit inside the root would pass the post-join
-        // prefix check.
-        let cwd = std::env::current_dir().expect("drive cwd");
-        let cwd_file = PathBuf::from(format!(
-            "{}under-drive-cwd.rs",
-            cwd.components()
-                .next()
-                .map(|prefix| prefix.as_os_str().to_string_lossy().into_owned())
-                .expect("drive prefix")
-        ));
-        assert!(cwd_file.is_relative(), "C:foo must classify as relative");
-        assert!(
-            !pending_path_in_roots(&cwd_file, &[cwd.clone()]),
-            "drive-relative spelling must be rejected even when the drive CWD is inside the root"
-        );
-        assert!(
-            !pending_path_in_roots(Path::new(r"\root-relative.rs"), &[cwd]),
-            "root-relative spelling must be rejected"
-        );
-
-        let project = TempDir::new().expect("project tempdir");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let kept = project.path().join("kept.rs");
-        ctx.add_pending_callgraph_store_paths([
-            PathBuf::from("C:drive-relative.rs"),
-            PathBuf::from(r"\root-relative.rs"),
-            kept.clone(),
-        ]);
-
-        assert_eq!(
-            ctx.take_pending_callgraph_store_paths(),
-            vec![kept],
-            "drive-relative and root-relative spellings must be rejected"
-        );
-    }
-
-    #[test]
-    fn take_pending_callgraph_store_paths_keeps_relative_and_deleted_paths() {
-        let project = TempDir::new().expect("project tempdir");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        // Relative paths are project-root-relative by the callgraph store's
-        // contract, and pending paths legitimately reference deleted files.
-        let relative = PathBuf::from("src/relative.rs");
-        let deleted = project.path().join("never-created.rs");
-        ctx.add_pending_callgraph_store_paths([relative.clone(), deleted.clone()]);
-
-        let mut taken = ctx.take_pending_callgraph_store_paths();
-        taken.sort();
-        let mut expected = vec![relative, deleted];
-        expected.sort();
-        assert_eq!(
-            taken, expected,
-            "root-relative and deleted in-root paths must survive the filter"
         );
     }
 
@@ -15974,11 +15248,6 @@ mod view_load_health_tests {
 
     fn ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
-    }
-
-    fn degraded(ctx: &AppContext) -> bool {
-        ctx.degraded_reasons()
-            .contains(&VIEW_LOAD_DEGRADED_REASON.to_string())
     }
 
     #[test]
@@ -16730,20 +15999,11 @@ mod harness_path_tests {
         ctx.set_canonical_cache_root(root.clone());
 
         assert_eq!(
-            ctx.callgraph_store_dir(),
-            storage
-                .join("callgraph")
-                .join(crate::search_index::artifact_cache_key(&root))
-        );
-        assert_eq!(
             ctx.inspect_dir(),
             ctx.storage_dir()
                 .join("inspect")
                 .join(crate::path_identity::project_scope_key(&root))
         );
-        assert!(!ctx
-            .callgraph_store_dir()
-            .starts_with(storage.join("opencode")));
         assert!(!ctx.inspect_dir().starts_with(storage.join("opencode")));
     }
 
@@ -18212,9 +17472,7 @@ mod gitignore_tests {
 }
 
 #[cfg(test)]
-mod verify_memo_watcher_tests {
-    use super::*;
-}
+mod verify_memo_watcher_tests {}
 
 #[cfg(test)]
 mod watcher_runtime_state_tests {

@@ -14,7 +14,6 @@ use crate::config::{Config, RerankConfig};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
-use crate::search_index::SearchIndex;
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };

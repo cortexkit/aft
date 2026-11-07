@@ -7,15 +7,14 @@ use std::time::{Duration, Instant};
 use aft::cache_freshness;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
-    handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call,
-    handle_inspect_warm_for_test,
+    handle_inspect, handle_inspect_tool_call, handle_inspect_warm_for_test,
 };
 use aft::commands::tool_call::handle_with_dispatch;
 use aft::config::Config;
-use aft::context::{AppContext, CallgraphStoreAccess};
+use aft::context::AppContext;
 use aft::inspect::{
     inspect_phase_log_for_request, FileContribution, InspectCache, InspectCategory, InspectManager,
-    InspectPhaseId, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
 use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
@@ -364,61 +363,6 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
 fn inspect_warm_event_driven(ctx: &AppContext, payload: Value) -> Value {
     let response = handle_inspect_warm_for_test(&request(payload), ctx);
     serde_json::to_value(response).expect("event-driven warm inspect response serializes")
-}
-
-fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
-    let response = handle_inspect_tier2_run(
-        &request(json!({
-            "id": "tier2-run",
-            "command": "inspect_tier2_run",
-            "categories": categories,
-        })),
-        ctx,
-    );
-    let value = serde_json::to_value(response).expect("tier2_run response serializes");
-    assert_eq!(value["success"], true, "tier2_run failed: {value:#}");
-    value
-}
-
-fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
-    let manager = ctx.inspect_manager();
-    // The in-flight registry is installed before the worker starts and removed
-    // only after its terminal outcome is published. Wait on that lifecycle
-    // event instead of using an unrelated inspect request's one-second Tier-1
-    // soft deadline as a proxy for Tier-2 completion.
-    let hang_deadline = Instant::now() + Duration::from_secs(90);
-    while manager.tier2_any_in_flight() {
-        assert!(
-            Instant::now() < hang_deadline,
-            "timed out waiting for Tier-2 completion event for {categories:?}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let config = ctx.config();
-    let root = config
-        .project_root
-        .clone()
-        .expect("configured project root");
-    let snapshot = InspectSnapshot::new_with_capabilities(
-        root.clone(),
-        ctx.inspect_dir(),
-        config,
-        ctx.symbol_cache(),
-        ctx.inspect_writer(),
-        ctx.callgraph_writer(),
-    );
-    let scope = JobScope::for_project(root);
-    for category in categories {
-        let category = category
-            .parse::<InspectCategory>()
-            .unwrap_or_else(|error| panic!("invalid Tier-2 category {category}: {error}"));
-        let outcome = manager.tier2_read_cached(snapshot.clone(), category, scope.clone());
-        assert!(
-            matches!(outcome, JobOutcome::Fresh { .. }),
-            "completed Tier-2 category {category} must be fresh: {outcome:?}"
-        );
-    }
 }
 
 fn assert_summary_count(response: &Value, category: &str, count: u64) {
@@ -1602,40 +1546,6 @@ fn inspect_command_tier2_aggregate_hash_mismatch_is_cache_miss() {
     );
 }
 
-fn dead_code_items(response: &Value) -> Vec<(String, String)> {
-    response["details"]["dead_code"]
-        .as_array()
-        .expect("dead_code details array")
-        .iter()
-        .map(|item| {
-            (
-                item["file"].as_str().expect("dead file").to_string(),
-                item["symbol"].as_str().expect("dead symbol").to_string(),
-            )
-        })
-        .collect()
-}
-
-fn unused_export_items(response: &Value) -> Vec<(String, String)> {
-    response["details"]["unused_exports"]
-        .as_array()
-        .expect("unused_exports details array")
-        .iter()
-        .map(|item| {
-            (
-                item["file"]
-                    .as_str()
-                    .expect("unused export file")
-                    .to_string(),
-                item["symbol"]
-                    .as_str()
-                    .expect("unused export symbol")
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
 fn alternate_duplicate_fixture_source() -> &'static str {
     r#"
 export function formatRecords(items: string[]) {
@@ -1739,41 +1649,6 @@ fn inspect_tool_call_refuses_mixed_scope_array_with_missing_element() {
             .is_some_and(|message| message.contains("crates/missing/src")),
         "response: {response:#}"
     );
-}
-
-/// 130 literal-distinct functions shared across files (the real cross-file
-/// duplicate groups) plus a trailing marker function whose statement count is
-/// unique per `unique_stmts`. The unique marker makes each file's top-level
-/// (program) node structurally distinct, so the WHOLE FILE is not itself a
-/// cross-file duplicate that would (correctly) subsume the 130 inner groups
-/// under the nested-overlap collapse. Each caller passes a distinct
-/// `unique_stmts` so every file's program node appears exactly once.
-fn many_duplicate_groups_source(unique_stmts: usize) -> String {
-    let mut source = String::new();
-    for index in 0..130 {
-        source.push_str(&format!(
-            r#"export function duplicate_group_{index:03}(input: number) {{
-  const first = input + {index};
-  const second = first * {};
-  const third = second - {};
-  const label = "group_{index:03}";
-  if (third > {}) {{
-    return label + third.toString();
-  }}
-  return label + first.toString();
-}}
-"#,
-            index + 3,
-            index + 7,
-            index + 11
-        ));
-    }
-    source.push_str("function file_unique_marker() {\n");
-    for n in 0..unique_stmts {
-        source.push_str(&format!("  const marker_{n} = {n} * 2 + 1;\n"));
-    }
-    source.push_str("  return 0;\n}\n");
-    source
 }
 
 #[test]
@@ -1927,30 +1802,6 @@ fn open_with_server_status_mode(ctx: &AppContext, file: &Path, mode: &str) {
     ctx.lsp()
         .notify_file_changed(file, "fn main() {}\n", &config)
         .expect("start fake rust-analyzer");
-}
-
-fn wait_for_inspect_phase_start(request_id: &str, phase: InspectPhaseId) {
-    let hang_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(snapshot) = inspect_phase_log_for_request(request_id) {
-            if let Some(record) = snapshot
-                .records
-                .iter()
-                .find(|record| record.entry.id == phase)
-            {
-                assert!(
-                    !record.is_completed() && record.terminal_error().is_none(),
-                    "inspect phase {phase:?} terminated before its release event: {snapshot:?}"
-                );
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < hang_deadline,
-            "timed out waiting for inspect phase {phase:?} to start for {request_id}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
@@ -2421,15 +2272,6 @@ fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
         .active_server_keys()
         .into_iter()
         .map(|key| key.kind)
-        .collect()
-}
-
-fn not_applicable_producers(response: &Value) -> Vec<String> {
-    response["summary"]["diagnostics"]["not_applicable"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry["producer"].as_str().map(str::to_owned))
         .collect()
 }
 
@@ -5272,30 +5114,6 @@ fn edit_match_as_opencode(ctx: &AppContext, id: &str, file: &Path, from: &str, t
     assert!(response.success, "{response:?}");
 }
 
-/// Fail when `response` certifies diagnostics for `file` that do not describe
-/// its current text. A stale result marked incomplete is acceptable; one
-/// counted as authoritative is not.
-fn assert_not_certified_stale(response: &Value, file: &Path, expected_errors: u64) {
-    let messages = diagnostic_messages_for(response, &diagnostic_path(file));
-    let reported = messages
-        .iter()
-        .filter(|message| message.as_str() == CONTENT_PULL_ERROR)
-        .count() as u64;
-    if response["complete"] == false {
-        assert!(
-            uncovered_files(response)
-                .iter()
-                .any(|(gap, _)| gap == &diagnostic_path(file)),
-            "an incomplete result must name the file it could not certify: {response:#}"
-        );
-        return;
-    }
-    assert_eq!(
-        reported, expected_errors,
-        "diagnostics certified as authoritative must describe the file's current text: {response:#}"
-    );
-}
-
 /// The same sequence as the out-of-project edit, inside the project. In a
 /// running session the project watcher sees AFT's own write and marks the old
 /// analysis stale, which hides the defect; without that event (these tests run
@@ -7957,15 +7775,6 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         .as_object()
         .expect("producer counts")
         .contains_key("rust"));
-}
-
-fn generate_fixture_lockfile(root: &Path) {
-    let generated = std::process::Command::new("cargo")
-        .args(["generate-lockfile", "--offline"])
-        .current_dir(root)
-        .output()
-        .expect("cargo is required for real Rust fixtures");
-    assert!(generated.status.success(), "{generated:?}");
 }
 
 #[test]

@@ -163,27 +163,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `action` with `hook` installed as the trigram-load wait hook on this
-/// thread, and removes it (dropping anything it captured) when `action` ends.
-#[cfg(test)]
-fn with_search_index_load_wait_hook_for_test<T>(
-    hook: impl FnMut() + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            // Assign rather than `Option::take`: the list-envelope scanner treats
-            // `.take(` as a list-cutting site, and this only clears a test hook.
-            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
-}
-
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
 
 /// The opening line of a reply served while a shared (borrowed) semantic index
@@ -3036,24 +3015,6 @@ fn rank_regex_collection(
 thread_local! {
     static REGEX_ROUTE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(bool)>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The hook runs before the index read with `false`, and after a lock timeout
-/// with `true`, so tests can release a contended writer before the fallback.
-#[cfg(test)]
-pub(crate) fn with_regex_route_lock_hook_for_test<T>(
-    hook: impl FnMut(bool) + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-    REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
 }
 
 #[cfg(test)]
@@ -8883,15 +8844,14 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::walk_project_files;
-    use crate::callgraph_store::CallGraphStore;
+
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::{
         with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
     };
-    use serde_json::Value;
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -8933,18 +8893,6 @@ mod tests {
             "hint": hint,
         }))
         .expect("build semantic search request")
-    }
-
-    fn semantic_page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
-        serde_json::from_value(serde_json::json!({
-            "id": "semantic-search-page-test",
-            "command": "semantic_search",
-            "query": query,
-            "top_k": top_k,
-            "offset": offset,
-            "hint": "literal",
-        }))
-        .expect("build paged semantic search request")
     }
 
     fn response_value(response: Response) -> serde_json::Value {
@@ -12852,7 +12800,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_warm_callgraph_emits_no_blast_radius_and_starts_no_build() {
+    fn absent_warm_callgraph_emits_no_blast_radius() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_context(dir.path());
         let results = vec![write_symbol_hit(dir.path(), "target.rs", "target", 1)];
@@ -12863,8 +12811,6 @@ mod tests {
             !text.contains("↩"),
             "cold store should not annotate rows: {text}"
         );
-        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
-        assert!(ctx.callgraph_store_rx().lock().is_none());
     }
 
     #[test]
@@ -12941,20 +12887,6 @@ mod tests {
             crate::list_envelope::render_trailer(&page_cut).as_deref(),
             Some("shown 3 of ≥4 results (cap) · narrow: offset, topK, path, includeTests")
         );
-    }
-
-    #[test]
-    fn contended_callgraph_receiver_does_not_block_search_formatting() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let ctx = test_context(project.path());
-        let receiver_guard = ctx.callgraph_store_rx().lock();
-        let started = std::time::Instant::now();
-        assert!(warm_callgraph_store(&ctx).is_none());
-        assert!(
-            started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET,
-            "callgraph receiver contention exceeded artifact budget"
-        );
-        drop(receiver_guard);
     }
 }
 

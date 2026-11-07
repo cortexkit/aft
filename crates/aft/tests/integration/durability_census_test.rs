@@ -731,10 +731,6 @@ const CHILD_ENV: &str = "AFT_DURABILITY_CENSUS_CHILD";
 /// the failed rename, and the parent splits the trace there.
 const MARK_PREFIX: &str = "/aft-durability-census-mark/";
 
-fn census_mark(label: &str) {
-    let _ = std::fs::rename(format!("{MARK_PREFIX}{label}"), format!("{MARK_PREFIX}-"));
-}
-
 /// Stores the daemon scenario cannot reach in the test harness (semantic
 /// indexing is off there, and no production request creates a views pin), run
 /// in a child copy of this test binary that carries the tracer.

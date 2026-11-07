@@ -58,33 +58,6 @@ pub(super) fn budgets() -> Budgets {
     })
 }
 
-/// Run `run` with the walk and re-read budgets replaced on this thread. The
-/// reuse window is zero so every query checks the disk afresh.
-#[cfg(test)]
-pub(crate) fn with_budgets_for_test<R>(
-    walk: Duration,
-    reread: Duration,
-    run: impl FnOnce() -> R,
-) -> R {
-    with_all_budgets_for_test(Budgets { walk, reread }, run)
-}
-
-#[cfg(test)]
-pub(crate) fn with_all_budgets_for_test<R>(budgets: Budgets, run: impl FnOnce() -> R) -> R {
-    BUDGETS_FOR_TEST.with(|slot| {
-        let previous = slot.replace(Some(budgets));
-        let result = run();
-        slot.set(previous);
-        result
-    })
-}
-
-/// How many project walks [`check_against_disk`] has started on this thread.
-#[cfg(test)]
-pub(crate) fn walks_for_test() -> usize {
-    WALKS_FOR_TEST.with(Cell::get)
-}
-
 /// What comparing a saved index with the files on disk found. Every count
 /// describes the checked copy that answers the query, measured against the
 /// saved index, so a copy completed over several passes reports all of them.
@@ -164,22 +137,6 @@ thread_local! {
     /// re-read deadline in tests that need a pass to stop at a known point.
     static WORK_LIMIT_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
     static REINDEXES_FOR_TEST: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_work_limit_for_test<R>(limit: usize, run: impl FnOnce() -> R) -> R {
-    WORK_LIMIT_FOR_TEST.with(|slot| {
-        let previous = slot.replace(Some(limit));
-        let result = run();
-        slot.set(previous);
-        result
-    })
-}
-
-/// How many files [`check_against_disk`] has re-indexed on this thread.
-#[cfg(test)]
-pub(crate) fn reindexes_for_test() -> usize {
-    REINDEXES_FOR_TEST.with(Cell::get)
 }
 
 fn work_limit() -> usize {
@@ -494,13 +451,6 @@ mod tests {
         (dir, root)
     }
 
-    fn backdate(path: &Path) {
-        // Equal sizes with different mtimes must still count as a change, so
-        // give the original file an mtime the rewrite cannot share.
-        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-        filetime::set_file_mtime(path, old).expect("backdate file");
-    }
-
     #[test]
     fn unchanged_project_is_verified_and_keeps_the_saved_index() {
         let (_dir, root) = project(&[("src/lib.rs", "pub fn kept_needle() {}\n")]);
@@ -513,50 +463,5 @@ mod tests {
         assert_eq!(checked.check.changed + checked.check.added, 0);
         assert!(Arc::ptr_eq(&checked.index, &index));
         assert!(checked.applied_digest.is_none());
-    }
-
-    fn borrowed_search_fixture() -> (
-        tempfile::TempDir,
-        PathBuf,
-        tempfile::TempDir,
-        tempfile::TempDir,
-        crate::context::AppContext,
-    ) {
-        let (dir, root) = project(&[(
-            "src/lib.rs",
-            "// Assemble the zephyrine quokkalith.\npub fn assemble() {}\n",
-        )]);
-        let mut git = std::process::Command::new("git");
-        crate::test_env::apply_hermetic_git_env(git.current_dir(&root));
-        assert!(git
-            .args(["init", "-q"])
-            .status()
-            .expect("git init")
-            .success());
-        let storage = tempfile::tempdir().expect("storage");
-        let cache_dir = crate::search_index::resolve_cache_dir(&root, Some(storage.path()));
-        SearchIndex::build(&root).write_to_disk(&cache_dir, None);
-        let session = tempfile::tempdir().expect("session");
-        let ctx = crate::context::AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config {
-                project_root: Some(session.path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        (dir, root, storage, session, ctx)
-    }
-
-    fn prose_search(ctx: &crate::context::AppContext, root: &Path) -> serde_json::Value {
-        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "disk-check-reuse",
-            "command": "semantic_search",
-            "query": "where is the zephyrine quokkalith assembled",
-            "top_k": 5,
-            "path": root.display().to_string(),
-        }))
-        .expect("request");
-        serde_json::to_value(super::super::handle_semantic_search(&request, ctx)).expect("response")
     }
 }

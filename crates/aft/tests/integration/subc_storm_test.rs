@@ -1879,34 +1879,6 @@ fn build_route_specs(scale: &StormScale, roots: &[PathBuf]) -> Vec<RouteSpec> {
     routes
 }
 
-fn create_parent_and_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let fixture = tempfile::tempdir().expect("worktree storm fixture");
-    let parent_root = fixture.path().join("parent");
-    let worktree_root = fixture.path().join("linked-worktree");
-    std::fs::create_dir_all(parent_root.join("src")).expect("parent source dir");
-    std::fs::write(
-        parent_root.join("src/lib.rs"),
-        "pub fn root_alpha() -> usize { 1 }\npub fn root_beta() -> usize { root_alpha() + 1 }\n",
-    )
-    .expect("parent source");
-    std::fs::write(parent_root.join("README.md"), "# parent root\n").expect("parent readme");
-    init_git(&parent_root);
-
-    let mut worktree = Command::new("git");
-    assert!(
-        crate::test_helpers::apply_hermetic_git_env(worktree.current_dir(&parent_root))
-            .args(["worktree", "add", "--quiet", "--detach"])
-            .arg(&worktree_root)
-            .arg("HEAD")
-            .status()
-            .expect("git worktree add")
-            .success(),
-        "failed to create linked git worktree"
-    );
-
-    (fixture, parent_root, worktree_root)
-}
-
 fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
     let mut dirs = Vec::new();
     let mut paths = Vec::new();
@@ -2133,15 +2105,6 @@ fn write_user_semantic_config(path: &Path, base_url: &str) {
         .to_string(),
     )
     .expect("write user semantic config");
-}
-
-fn artifact_storm_config(storage_dir: &Path) -> Value {
-    json!({
-        "storage_dir": storage_dir,
-        "indexes": { "trigram": true, "semantic": false, "callgraph": true },
-        "inspect": { "enabled": true },
-        "disabled_tools": [],
-    })
 }
 
 pub(super) fn storm_project_config(

@@ -983,23 +983,6 @@ mod tests {
         assert_eq!(crate::subc_format::rendered_glob_file_count(&data), shown);
     }
 
-    fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let project = std::fs::canonicalize(dir.path()).unwrap();
-        let file = project.join("src/main.ts");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "export const main = 1;\n").unwrap();
-        std::fs::write(project.join("src/other.ts"), "export const other = 2;\n").unwrap();
-        let ctx = AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config {
-                project_root: Some(project.clone()),
-                ..Default::default()
-            },
-        );
-        (dir, ctx, project, file)
-    }
-
     #[test]
     fn named_ignored_glob_walk_stops_at_cap_and_deadline() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,14 +1,7 @@
 use aft::commands::semantic_search::extensions::{QueryFacts, RawQuery, Span};
-use aft::commands::semantic_search::handle_semantic_search;
 use aft::commands::semantic_search::plan_table::SearchShape;
-use aft::config::Config;
-use aft::context::AppContext;
-use aft::parser::TreeSitterProvider;
-use aft::protocol::{RawRequest, Response};
 use aft::search_b2::router;
-use aft::search_index::SearchIndex;
 use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 struct ExpectedSpan {
@@ -32,20 +25,6 @@ struct RouterCase {
 fn cases() -> Vec<RouterCase> {
     serde_json::from_str(include_str!("fixtures/search_b2/router/cases.json"))
         .expect("parse router cases")
-}
-
-fn request(id: &str, query: &str) -> RawRequest {
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "command": "semantic_search",
-        "query": query,
-        "top_k": 5
-    }))
-    .expect("build search request")
-}
-
-fn response_value(response: Response) -> Value {
-    serde_json::to_value(response).expect("serialize response")
 }
 
 #[test]

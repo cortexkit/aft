@@ -404,49 +404,6 @@ pub(crate) mod pause_test_support {
     pub(crate) const PAUSE_MS: u64 = 45 * 60 * 1_000;
     pub(crate) type Requests = Arc<Mutex<Vec<(u64, Value)>>>;
 
-    /// Records an announced pause for `root` as a refused embedding request
-    /// would, without a fake daemon.
-    pub(crate) fn record_pause_for_root(root: &Path) {
-        lane_pauses()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.to_path_buf(),
-                LanePause {
-                    lane_id: MODEL.into(),
-                    fingerprint: Some("pinned".into()),
-                    retry_after_ms: Some(PAUSE_MS),
-                    paused_until_ms: START + PAUSE_MS,
-                    reason: "scheduled maintenance".into(),
-                    cause: Default::default(),
-                    safe_to_retry_same_request: true,
-                    record_id: 0,
-                },
-            );
-    }
-
-    /// Records, as a refused embedding request would, that the model of
-    /// `root` is compiling a new input shape until `ready_at` on the test
-    /// clock.
-    pub(crate) fn record_warm_up_for_root(root: &Path, ready_at: u64) {
-        lane_pauses()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.to_path_buf(),
-                LanePause {
-                    lane_id: MODEL.into(),
-                    fingerprint: Some("pinned".into()),
-                    retry_after_ms: Some(ready_at - START),
-                    paused_until_ms: ready_at,
-                    reason: "shape_compiling: compiling".into(),
-                    cause: PauseCause::WarmingUp,
-                    safe_to_retry_same_request: true,
-                    record_id: 0,
-                },
-            );
-    }
-
     pub(crate) fn pause_reply(retry_after_ms: Value) -> Value {
         json!({"error": {"code": "lane_paused", "transient": true,
             "retry_after_ms": retry_after_ms,

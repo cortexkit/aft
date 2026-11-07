@@ -5,6 +5,7 @@
 //! that moved to another disk, and speech process identities to tell one
 //! boot's process ids from another's.
 
+#[cfg(not(windows))]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -166,11 +167,6 @@ pub(crate) fn boot_id() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn boot_id() -> Option<String> {
-    None
 }
 
 /// The root of the mounted filesystem holding `root`, with that
