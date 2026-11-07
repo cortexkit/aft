@@ -259,6 +259,153 @@ impl IndexedFile {
     }
 }
 
+/// Bytes `start..start + len` of a [`TargetIndex`]'s text.
+type TextSpan = (u32, u32);
+
+/// No node: a key that resolves to none in one of its two ways.
+const NO_NODE: u32 = u32::MAX;
+
+/// What a call into a file reads of the file: the node a name or scoped name
+/// resolves to, the earliest stored node with a scoped name, and the plain
+/// name and kind of such a node. Worked out from the file's
+/// [`IndexedFile`], which is then dropped: a patched rollup that projects a
+/// few files calls into hundreds, and holding each of those files' whole
+/// symbol index cost hundreds of megabytes.
+struct TargetIndex {
+    /// The text of every key, node id, name and kind; spans index it.
+    text: Box<str>,
+    /// Each key, sorted by its text: the node id [`IndexedFile::lookup`]
+    /// resolves it to and the node [`IndexedFile::by_scoped_name`] gives
+    /// for it, as numbers into `ids` ([`NO_NODE`] for none).
+    keys: Box<[(TextSpan, u32, u32)]>,
+    /// Each node id a key names, sorted by its text, with the plain name and
+    /// kind of the stored node it identifies (`None` for an id whose node
+    /// another symbol's range replaced).
+    ids: Box<[(TextSpan, Option<(TextSpan, TextSpan)>)]>,
+}
+
+impl TargetIndex {
+    fn of(file: &IndexedFile) -> Self {
+        fn span(text: &mut String, value: &str) -> TextSpan {
+            let start = text.len() as u32;
+            text.push_str(value);
+            (start, value.len() as u32)
+        }
+        let mut text = String::new();
+        // Every id a key resolves to, with its node when one is stored.
+        let mut ids = BTreeMap::<&str, Option<&IndexedNode>>::new();
+        for id in file.lookup.values() {
+            ids.insert(&**id, file.node(id));
+        }
+        for index in file.by_scoped_name.values() {
+            let node = &file.nodes[*index as usize];
+            ids.insert(&*node.id, Some(node));
+        }
+        let numbers = ids
+            .keys()
+            .enumerate()
+            .map(|(number, id)| (*id, number as u32))
+            .collect::<HashMap<_, _>>();
+        let ids_table = ids
+            .iter()
+            .map(|(id, node)| {
+                let id = span(&mut text, id);
+                let node =
+                    node.map(|node| (span(&mut text, &node.name), span(&mut text, &node.kind)));
+                (id, node)
+            })
+            .collect::<Vec<_>>();
+        let mut keys = BTreeMap::<&str, (u32, u32)>::new();
+        for (key, id) in &file.lookup {
+            keys.entry(&**key).or_insert((NO_NODE, NO_NODE)).0 = numbers[&**id];
+        }
+        for (key, index) in &file.by_scoped_name {
+            keys.entry(&**key).or_insert((NO_NODE, NO_NODE)).1 =
+                numbers[&*file.nodes[*index as usize].id];
+        }
+        let keys = keys
+            .into_iter()
+            .map(|(key, (lookup, scoped))| (span(&mut text, key), lookup, scoped))
+            .collect::<Vec<_>>();
+        Self {
+            text: text.into_boxed_str(),
+            keys: keys.into_boxed_slice(),
+            ids: ids_table.into_boxed_slice(),
+        }
+    }
+
+    fn text(&self, (start, len): TextSpan) -> &str {
+        &self.text[start as usize..(start + len) as usize]
+    }
+
+    fn key(&self, key: &str) -> Option<(u32, u32)> {
+        let found = self
+            .keys
+            .binary_search_by(|(span, _, _)| self.text(*span).cmp(key))
+            .ok()?;
+        let (_, lookup, scoped) = self.keys[found];
+        Some((lookup, scoped))
+    }
+
+    fn id(&self, number: u32) -> Option<&str> {
+        (number != NO_NODE).then(|| self.text(self.ids[number as usize].0))
+    }
+}
+
+/// A file's symbols as a call into it reads them: in full when the file's
+/// own calls were projected too, else its [`TargetIndex`]. Both give the
+/// same answers.
+#[derive(Clone, Copy)]
+enum Target<'g> {
+    Full(&'g IndexedFile),
+    Index(&'g TargetIndex),
+}
+
+impl<'g> Target<'g> {
+    /// The node id references to `symbol` resolve to.
+    fn lookup(self, symbol: &str) -> Option<&'g str> {
+        match self {
+            Self::Full(file) => file.lookup.get(symbol).map(|id| &**id),
+            Self::Index(index) => index.id(index.key(symbol)?.0),
+        }
+    }
+
+    /// The id of the earliest stored node with scoped name `symbol`.
+    fn scoped(self, symbol: &str) -> Option<&'g str> {
+        match self {
+            Self::Full(file) => file
+                .by_scoped_name
+                .get(symbol)
+                .map(|index| &*file.nodes[*index as usize].id),
+            Self::Index(index) => index.id(index.key(symbol)?.1),
+        }
+    }
+
+    /// The plain name and kind of the stored node `id`.
+    fn node(self, id: &str) -> Option<(&'g str, &'g str)> {
+        match self {
+            Self::Full(file) => file.node(id).map(|node| (&*node.name, &*node.kind)),
+            Self::Index(index) => {
+                let found = index
+                    .ids
+                    .binary_search_by(|(span, _)| index.text(*span).cmp(id))
+                    .ok()?;
+                let (name, kind) = index.ids[found].1?;
+                Some((index.text(name), index.text(kind)))
+            }
+        }
+    }
+}
+
+/// One parsed file's symbols, each form read when first asked for.
+#[derive(Default)]
+struct FileCell {
+    /// In full, for a file whose own calls are projected.
+    full: std::sync::OnceLock<Option<IndexedFile>>,
+    /// What calls into it read, for a file only called into.
+    target: std::sync::OnceLock<Option<TargetIndex>>,
+}
+
 /// Every parsed file's symbols, and what the dead-code snapshot derives
 /// from symbols alone. A file's symbols are read from its parse when first
 /// asked for, so a rollup that reads only a few files (a patched one) parses
@@ -267,7 +414,10 @@ pub(crate) struct DeadCodeGraph<'f> {
     root: PathBuf,
     source: &'f dyn CallGraphFiles,
     /// Every parsed file, with its symbols once read.
-    files: BTreeMap<String, std::sync::OnceLock<Option<IndexedFile>>>,
+    files: BTreeMap<String, FileCell>,
+    /// Whether a file only called into is read into its [`TargetIndex`]
+    /// alone (see [`Self::compact_targets`]).
+    compact_targets: std::sync::atomic::AtomicBool,
     /// Go package directories to their files, in path order, once worked
     /// out (it reads every file's language).
     go_packages: std::sync::OnceLock<BTreeMap<PathBuf, Vec<String>>>,
@@ -364,6 +514,16 @@ impl<'f> DeadCodeGraph<'f> {
         }
     }
 
+    /// Whether files only called into are read as their [`TargetIndex`]
+    /// alone: on for a rollup that projects a few files, since their
+    /// callees' full symbols would otherwise stay in memory for the whole
+    /// rollup; off for one that projects every file, which reads every file
+    /// in full anyway and would otherwise read most files twice.
+    pub(crate) fn compact_targets(&self, compact: bool) {
+        self.compact_targets
+            .store(compact, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A graph of `source`'s files that reads each file's symbols when first
     /// asked for. A parse that cannot be read leaves the file without
     /// symbols and is reported by [`Self::failure`].
@@ -374,8 +534,9 @@ impl<'f> DeadCodeGraph<'f> {
             files: source
                 .paths()
                 .into_iter()
-                .map(|path| (path, std::sync::OnceLock::new()))
+                .map(|path| (path, FileCell::default()))
                 .collect(),
+            compact_targets: std::sync::atomic::AtomicBool::new(false),
             go_packages: std::sync::OnceLock::new(),
             failure: parking_lot::Mutex::new(None),
             paths: parking_lot::Mutex::new(HashMap::new()),
@@ -397,6 +558,7 @@ impl<'f> DeadCodeGraph<'f> {
     fn file(&self, path: &str) -> Option<&IndexedFile> {
         self.files
             .get(path)?
+            .full
             .get_or_init(|| match self.source.parse(path) {
                 Ok(parse) => Some(IndexedFile::build(path, &parse)),
                 Err(error) => {
@@ -555,6 +717,33 @@ impl<'f> DeadCodeGraph<'f> {
         self.file(path)
     }
 
+    /// `path`'s symbols as a call into it reads them, recording the read as
+    /// [`Self::indexed`] does. A file whose symbols were read in full answers
+    /// from them; any other is read into its [`TargetIndex`] alone.
+    fn target(&self, path: &str) -> Option<Target<'_>> {
+        if !self
+            .compact_targets
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return self.indexed(path).map(Target::Full);
+        }
+        record(Lookup::GraphFile, path);
+        let cell = self.files.get(path)?;
+        if let Some(full) = cell.full.get() {
+            return full.as_ref().map(Target::Full);
+        }
+        cell.target
+            .get_or_init(|| match self.source.parse(path) {
+                Ok(parse) => Some(TargetIndex::of(&IndexedFile::build(path, &parse))),
+                Err(error) => {
+                    self.failure.lock().get_or_insert(error);
+                    None
+                }
+            })
+            .as_ref()
+            .map(Target::Index)
+    }
+
     fn node(&self, file: &str, id: &str) -> Option<&IndexedNode> {
         self.indexed(file)?.node(id)
     }
@@ -641,7 +830,7 @@ impl<'f> DeadCodeGraph<'f> {
             let target_node = target_path
                 .as_deref()
                 .zip(row.target_symbol.as_deref())
-                .and_then(|(path, symbol)| self.lookup(path, symbol))
+                .and_then(|(path, symbol)| self.target(path)?.lookup(symbol))
                 .map(str::to_string);
             let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
             let macro_body = macro_body_call(row.kind, reference);
@@ -660,8 +849,8 @@ impl<'f> DeadCodeGraph<'f> {
                     BlobRefKind::Construction
                         if !target_node
                             .as_deref()
-                            .and_then(|id| self.node(&target_file, id))
-                            .is_some_and(|node| matches!(&*node.kind, "function" | "method")) =>
+                            .and_then(|id| self.target(&target_file)?.node(id))
+                            .is_some_and(|(_, kind)| matches!(kind, "function" | "method")) =>
                     {
                         "value_ref"
                     }
@@ -760,10 +949,10 @@ impl<'f> DeadCodeGraph<'f> {
                     "dispatch:{path}:{}:{}:{}",
                     site.ordinal, target.file, target.symbol
                 );
-                let target_node = self.indexed(&target.file).and_then(|file| {
-                    let index = file.by_scoped_name.get(target.symbol.as_str())?;
-                    Some(file.nodes[*index as usize].id.to_string())
-                });
+                let target_node = self
+                    .target(&target.file)
+                    .and_then(|file| file.scoped(target.symbol.as_str()))
+                    .map(str::to_string);
                 rows.insert_edge(EdgeRow {
                     edge_id,
                     ref_id: ref_id.clone(),
@@ -857,9 +1046,9 @@ impl<'f> DeadCodeGraph<'f> {
         let target_symbol = edge
             .and_then(|edge| {
                 let id = edge.target_node.as_deref()?;
-                self.node(&edge.target_file, id)
+                self.target(&edge.target_file)?.node(id)
             })
-            .map(|node| &*node.name)
+            .map(|(name, _)| name)
             .or(reference.target_symbol.as_deref())
             .or_else(|| edge.map(|edge| edge.target_symbol.as_str()));
         let mut target = if is_resolved_edge(status, Some(provenance)) {

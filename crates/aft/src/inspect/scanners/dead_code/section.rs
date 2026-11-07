@@ -1037,6 +1037,8 @@ impl Rollup<'_, '_> {
         mut probe: Option<&mut Probe>,
     ) -> Result<Value, String> {
         let root = self.root;
+        // Every file is projected, so every file is read in full.
+        self.graph.compact_targets(false);
         let snapshot = timed(timings, "read every file's symbols", || {
             with_exports(self.snapshot, self.graph)
         });
@@ -1271,6 +1273,9 @@ impl Rollup<'_, '_> {
         let root = self.root;
         let force = probe.as_ref().is_some_and(|probe| probe.force_patch);
         let too_many = |files: usize| !force && too_many(files, self.scope.len());
+        // Only a few files are projected; the many files they call into are
+        // read for their lookups alone.
+        self.graph.compact_targets(true);
         let started = std::time::Instant::now();
         let old = kept.state();
 
