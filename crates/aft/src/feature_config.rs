@@ -166,14 +166,36 @@ pub fn removed_config_key_errors(map: &Map<String, Value>) -> Vec<String> {
     removed_config_key_errors_at(map, running_release())
 }
 
+/// [`removed_config_key_errors`] for one config file. Names retired in 0.62
+/// or earlier ([`REFUSED_RETIRED_PATHS`] and the prefixed tool names) refuse
+/// only the user file, which AFT rewrites itself. A project file belongs to
+/// its repository, where a refusal would leave everyone who opens it without
+/// AFT until a tracked file is edited, so those names are translated with a
+/// notice there. Settings removed outright still refuse either file. Mirrors
+/// the plugins' `removedConfigKeyErrors(..., refuseRetired)`.
+pub fn removed_config_key_errors_for_file(
+    map: &Map<String, Value>,
+    user_file: bool,
+) -> Vec<String> {
+    removed_errors(map, running_release(), user_file)
+}
+
 /// [`removed_config_key_errors`] as the release `release` judges it: the
 /// data-layer keys fail only from [`DATA_LAYER_KEYS_REFUSED_FROM`].
 pub fn removed_config_key_errors_at(map: &Map<String, Value>, release: (u64, u64)) -> Vec<String> {
-    let mut errors = removed_block_key_errors(map, release);
+    removed_errors(map, release, true)
+}
+
+fn removed_errors(
+    map: &Map<String, Value>,
+    release: (u64, u64),
+    refuse_retired: bool,
+) -> Vec<String> {
+    let mut errors = removed_block_key_errors(map, release, refuse_retired);
     if let Some(harnesses) = map.get("harnesses").and_then(Value::as_object) {
         for (name, block) in harnesses {
             if let Some(block) = block.as_object() {
-                for error in removed_block_key_errors(block, release) {
+                for error in removed_block_key_errors(block, release, refuse_retired) {
                     errors.push(error.replacen(
                         "removed_config_key:",
                         &format!("removed_config_key:harnesses.{name}."),
@@ -186,13 +208,19 @@ pub fn removed_config_key_errors_at(map: &Map<String, Value>, release: (u64, u64
     errors
 }
 
-fn removed_block_key_errors(map: &Map<String, Value>, release: (u64, u64)) -> Vec<String> {
+fn removed_block_key_errors(
+    map: &Map<String, Value>,
+    release: (u64, u64),
+    refuse_retired: bool,
+) -> Vec<String> {
     let mut errors = removed_opencode_key_errors(map);
-    errors.extend(
-        refused_retired_names(map)
-            .into_iter()
-            .map(|name| format!("removed_config_key:{name}; run npx @cortexkit/aft doctor --fix")),
-    );
+    if refuse_retired {
+        errors.extend(
+            refused_retired_names(map).into_iter().map(|name| {
+                format!("removed_config_key:{name}; run npx @cortexkit/aft doctor --fix")
+            }),
+        );
+    }
     if release >= DATA_LAYER_KEYS_REFUSED_FROM {
         for path in DATA_LAYER_RETIRED_PATHS {
             if has_path(map, path) {

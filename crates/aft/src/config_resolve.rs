@@ -717,21 +717,21 @@ pub fn resolve_config_for_harness(
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
 
-    // Only the user config is refused for a name retired two or more releases
-    // ago: AFT rewrites that file itself. A project config belongs to its
-    // repository, where a refusal would leave everyone who opens it without
-    // AFT until a tracked file is edited, so its old names are translated
-    // below with a notice instead.
+    // A name retired two or more releases ago refuses only the user config,
+    // which AFT rewrites itself; a project config's old names are translated
+    // below with a notice (see `removed_config_key_errors_for_file`).
     let errors: Vec<String> = tiers
         .iter()
-        .filter(|tier| tier.tier == "user")
         .map(|tier| {
             serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
                 .ok()
                 .and_then(|value| {
-                    value
-                        .as_object()
-                        .map(feature_config::removed_config_key_errors)
+                    value.as_object().map(|map| {
+                        feature_config::removed_config_key_errors_for_file(
+                            map,
+                            tier.tier == "user",
+                        )
+                    })
                 })
                 .unwrap_or_default()
         })
@@ -1446,13 +1446,10 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     let Value::Object(mut map) = value else {
         return Some(format!("{} is not a JSON object", tier.source));
     };
-    // As in resolution, only the user config is refused for a long-retired
-    // name; a project config's old names are translated below.
-    if tier.tier == "user" {
-        let removed = feature_config::removed_config_key_errors(&map);
-        if !removed.is_empty() {
-            return Some(removed.join(", "));
-        }
+    // As in resolution, a long-retired name refuses only the user config.
+    let removed = feature_config::removed_config_key_errors_for_file(&map, tier.tier == "user");
+    if !removed.is_empty() {
+        return Some(removed.join(", "));
     }
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
