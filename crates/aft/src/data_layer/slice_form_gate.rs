@@ -56,6 +56,13 @@ pub fn run(
         legacy.insert(LegacyFileSlice::build(path, key, parse, resolution));
         compact.insert(path.clone(), FileSlice::build(path, key, parse, resolution));
     }
+    let mut text = std::collections::BTreeMap::<&str, usize>::new();
+    for slice in compact.values() {
+        for (part, bytes) in slice.probe_strings() {
+            *text.entry(part).or_default() += bytes;
+        }
+    }
+    writeln!(out, "string table by part: {text:?}").map_err(io)?;
 
     let records = built
         .records

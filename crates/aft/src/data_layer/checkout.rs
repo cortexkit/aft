@@ -3002,8 +3002,8 @@ impl CheckoutView {
     /// Sums [`FileSlice::probe_breakdown`] over every file of the call
     /// graph, for a measurement probe.
     #[doc(hidden)]
-    pub fn probe_breakdown(&self) -> [usize; 9] {
-        let mut total = [0usize; 9];
+    pub fn probe_breakdown(&self) -> [usize; 10] {
+        let mut total = [0usize; 10];
         for record in self.published.state.paths() {
             let Ok(path) = std::str::from_utf8(&record.path) else {
                 continue;

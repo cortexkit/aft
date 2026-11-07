@@ -939,13 +939,13 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         };
         let mut calls = Vec::new();
         for reference in slice.references() {
-            let targets_itself = reference
-                .target()
-                .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol);
+            // The cheap integer checks first; the target is a search.
             if reference.caller() != Some(caller)
                 || reference.kind() != "call"
                 || !reference.resolved()
-                || !targets_itself
+                || !reference
+                    .target()
+                    .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol)
                 || self.has_call_edge(&slice, reference.index())
             {
                 continue;

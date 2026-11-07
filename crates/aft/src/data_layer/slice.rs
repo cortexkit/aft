@@ -108,7 +108,9 @@ pub(crate) enum TargetLookup {
 pub(crate) struct Packed {
     len: u32,
     width: u8,
-    words: Vec<u64>,
+    // A boxed slice, not a vector: a slice holds dozens of columns, and
+    // the capacity a vector carries would cost a word each.
+    words: Box<[u64]>,
 }
 
 /// Words that hold `len` values of `width` bits.
@@ -135,7 +137,7 @@ impl Packed {
         Self {
             len: u32::try_from(values.len()).expect("fewer than 2^32 rows in a file"),
             width,
-            words,
+            words: words.into_boxed_slice(),
         }
     }
 
@@ -332,12 +334,16 @@ struct Refs {
     /// The caller's node handle, optional.
     caller: Packed,
     short_name: Packed,
-    full_ref: Packed,
     line: Packed,
     byte_start: Packed,
-    byte_end: Packed,
+    /// The span's end less its start.
+    byte_len: Packed,
     /// The kind's code, and [`RESOLVED`].
     code: Packed,
+    /// The references whose full name a lookup reads (see
+    /// [`RefView::full_ref`]): their positions, ascending, and the names.
+    full_at: Packed,
+    full_name: Packed,
     /// The few references with a local name: their positions, ascending,
     /// and the names.
     local_at: Packed,
@@ -540,8 +546,14 @@ impl<'s> RefView<'s> {
         self.slice.refs.short_name.get_option(self.index)
     }
 
+    /// The full name, kept only where a lookup reads it: for an unresolved
+    /// `call` or `construction` and for a `macro_body_call`. Every other
+    /// reference answers `None` whatever it was written with.
     pub(crate) fn full_ref(&self) -> Option<&'s str> {
-        self.optional_string(&self.slice.refs.full_ref)
+        let refs = &self.slice.refs;
+        refs.full_at
+            .search(self.index as u64)
+            .map(|at| self.slice.strings.get(refs.full_name.get32(at)))
     }
 
     /// The name the reference binds locally; for a call written in a
@@ -562,7 +574,8 @@ impl<'s> RefView<'s> {
     }
 
     pub(crate) fn byte_end(&self) -> u64 {
-        self.slice.refs.byte_end.get(self.index)
+        self.byte_start()
+            .wrapping_add(self.slice.refs.byte_len.get(self.index))
     }
 
     pub(crate) fn resolved(&self) -> bool {
@@ -725,11 +738,12 @@ impl FileSlice {
         self.node(handle).map(|node| node.kind())
     }
 
-    /// Heap bytes by part, for a measurement probe: the string table, nodes
-    /// (with every id), references, edges, the lookup arrays, and counts of
-    /// nodes, references, resolved references and edges.
+    /// Bytes by part, for a measurement probe: the string table, nodes (with
+    /// every id), references, edges, the lookup arrays, the slice itself
+    /// (its fixed-size part and its path, language and record key), and
+    /// counts of nodes, references, resolved references and edges.
     #[doc(hidden)]
-    pub(crate) fn probe_breakdown(&self) -> [usize; 9] {
+    pub(crate) fn probe_breakdown(&self) -> [usize; 10] {
         use aft_store::heap::HeapBytes as _;
         let mut seen = aft_store::heap::Seen::new();
         [
@@ -743,11 +757,69 @@ impl FileSlice {
                 + self.ordinary_node.heap_bytes(&mut seen)
                 + self.scoped_name.heap_bytes(&mut seen)
                 + self.scoped_node.heap_bytes(&mut seen),
+            std::mem::size_of::<Self>()
+                + self.path.heap_bytes(&mut seen)
+                + self.language.heap_bytes(&mut seen)
+                + self.record_key.heap_bytes(&mut seen),
             self.nodes.name.len(),
             self.refs.ordinal.len(),
             self.references().filter(RefView::resolved).count(),
             self.edges.source.len(),
         ]
+    }
+
+    /// The string table's bytes by the first part that names each string,
+    /// for a measurement: which parts the text is spent on, and how many
+    /// strings there are.
+    #[doc(hidden)]
+    pub(crate) fn probe_strings(&self) -> Vec<(&'static str, usize)> {
+        let mut owner = vec![None; self.strings.len()];
+        let mut claim = |index: u32, part: &'static str| {
+            owner[index as usize].get_or_insert(part);
+        };
+        for node in self.nodes() {
+            claim(self.nodes.name.get32(node.index), "node names");
+            claim(self.nodes.scoped_name.get32(node.index), "node names");
+            claim(self.nodes.kind.get32(node.index), "node kinds");
+        }
+        for edge in self.edges() {
+            claim(self.edges.target_file.get32(edge.index), "target files");
+            claim(self.edges.target_symbol.get32(edge.index), "target symbols");
+        }
+        for at in 0..self.refs.target_at.len() {
+            claim(self.refs.target_file.get32(at), "target files");
+            claim(self.refs.target_symbol.get32(at), "target symbols");
+        }
+        for reference in self.references() {
+            if let Some(index) = reference.short_name_index() {
+                claim(index, "short names");
+            }
+        }
+        for at in 0..self.refs.full_at.len() {
+            claim(self.refs.full_name.get32(at), "full names");
+        }
+        for node in self.nodes() {
+            if let Some(index) = self.nodes.signature.get_option(node.index) {
+                claim(index, "signatures");
+            }
+            if let Some(index) = self.nodes.entry_attribute.get_option(node.index) {
+                claim(index, "entry attributes");
+            }
+        }
+        for at in 0..self.refs.local_at.len() {
+            claim(self.refs.local_name.get32(at), "local names");
+        }
+        for at in 0..self.ordinary_name.len() {
+            claim(self.ordinary_name.get32(at), "linked names");
+        }
+        let mut bytes = BTreeMap::<&'static str, usize>::new();
+        for (index, part) in owner.iter().enumerate() {
+            *bytes.entry(part.unwrap_or("unclaimed")).or_default() +=
+                self.strings.get(index as u32).len();
+        }
+        let mut parts = bytes.into_iter().collect::<Vec<_>>();
+        parts.push(("string count", self.strings.len()));
+        parts
     }
 
     /// A slice of `path` with no symbols, references or edges.
@@ -822,6 +894,23 @@ struct RefRow<'p> {
     target: Option<(String, String)>,
 }
 
+impl<'p> RefRow<'p> {
+    /// The full name, when a query can read it: an unresolved call's or
+    /// construction's (the unresolved-call lookups name a call by it and
+    /// tell a member call by it) and a call written in a macro template's.
+    /// No lookup reads any other reference's full name, and most
+    /// references are of other kinds or resolved, so leaving theirs out
+    /// saves most of the text a slice would hold.
+    fn kept_full_ref(&self) -> Option<&'p str> {
+        let read = match self.kind {
+            CALL_CODE | CONSTRUCTION_CODE => !self.resolved,
+            MACRO_BODY_CALL_CODE => true,
+            _ => false,
+        };
+        self.full_ref.filter(|_| read)
+    }
+}
+
 /// An edge as assembly collects it, before the slice is packed.
 struct EdgeRow {
     ref_id: String,
@@ -850,6 +939,9 @@ const fn ref_kind_code(kind: BlobRefKind) -> u64 {
 
 /// The code of `macro_body_call` in [`REF_KINDS`].
 const MACRO_BODY_CALL_CODE: u64 = 9;
+/// The codes of `call` and `construction` in [`REF_KINDS`].
+const CALL_CODE: u64 = 0;
+const CONSTRUCTION_CODE: u64 = 2;
 
 impl FileSlice {
     /// Assembles the slice of the file at `path`.
@@ -1046,7 +1138,7 @@ impl FileSlice {
         }
         for reference in refs.values() {
             strings.extend(reference.short_name);
-            strings.extend(reference.full_ref);
+            strings.extend(reference.kept_full_ref());
             strings.extend(reference.local_name);
             if let Some((file, symbol)) = &reference.target {
                 strings.extend([file.as_str(), symbol.as_str()]);
@@ -1144,10 +1236,15 @@ impl FileSlice {
             .map(|(position, id)| (id.as_str(), position as u64))
             .collect::<HashMap<_, _>>();
         let rows = refs.values().collect::<Vec<_>>();
+        let (mut full_at, mut full_name) = (Vec::new(), Vec::new());
         let (mut local_at, mut local_name) = (Vec::new(), Vec::new());
         let (mut target_at, mut target_file, mut target_symbol) =
             (Vec::new(), Vec::new(), Vec::new());
         for (position, reference) in rows.iter().enumerate() {
+            if let Some(name) = reference.kept_full_ref() {
+                full_at.push(position as u64);
+                full_name.push(at(name));
+            }
             if let Some(name) = reference.local_name {
                 local_at.push(position as u64);
                 local_name.push(at(name));
@@ -1166,15 +1263,22 @@ impl FileSlice {
                     .collect(),
             ),
             short_name: column(rows.iter().map(|r| optional(r.short_name)).collect()),
-            full_ref: column(rows.iter().map(|r| optional(r.full_ref)).collect()),
             line: column(rows.iter().map(|r| u64::from(r.line)).collect()),
             byte_start: column(rows.iter().map(|r| r.byte_start).collect()),
-            byte_end: column(rows.iter().map(|r| r.byte_end).collect()),
+            // A span is short, so its length takes fewer bits than its end.
+            // Wrapping keeps any end exact, even one before its start.
+            byte_len: column(
+                rows.iter()
+                    .map(|r| r.byte_end.wrapping_sub(r.byte_start))
+                    .collect(),
+            ),
             code: column(
                 rows.iter()
                     .map(|r| r.kind | if r.resolved { RESOLVED } else { 0 })
                     .collect(),
             ),
+            full_at: column(full_at),
+            full_name: column(full_name),
             local_at: column(local_at),
             local_name: column(local_name),
             target_at: column(target_at),
@@ -1292,7 +1396,7 @@ impl<'b> Reader<'b> {
         let words = bytes
             .chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
-            .collect::<Vec<_>>();
+            .collect::<Box<[u64]>>();
         // Bits past the last value are zero as written, so equal columns
         // have equal words.
         let used = (len as usize * usize::from(width)) % 64;
@@ -1357,6 +1461,9 @@ fn check_ascending(column: &Packed, what: &'static str) -> Result<(), RecordErro
 
 const U32_BOUND: u64 = 1 << 32;
 
+/// How many columns a record holds after its string table and ids.
+const COLUMNS: usize = 35;
+
 impl FileSlice {
     /// The slice as a stored record: a format byte, a CRC-32 of everything
     /// after it, and the slice's columns. The path and record key are the
@@ -1382,7 +1489,7 @@ impl FileSlice {
     }
 
     /// Every column after the string table and the ids, in record order.
-    fn columns(&self) -> [&Packed; 34] {
+    fn columns(&self) -> [&Packed; COLUMNS] {
         let (n, r, e) = (&self.nodes, &self.refs, &self.edges);
         [
             &self.id_top,
@@ -1399,11 +1506,12 @@ impl FileSlice {
             &r.ordinal,
             &r.caller,
             &r.short_name,
-            &r.full_ref,
             &r.line,
             &r.byte_start,
-            &r.byte_end,
+            &r.byte_len,
             &r.code,
+            &r.full_at,
+            &r.full_name,
             &r.local_at,
             &r.local_name,
             &r.target_at,
@@ -1448,15 +1556,15 @@ impl FileSlice {
         let ids = (0..id_count)
             .map(|_| input.u64())
             .collect::<Result<Vec<_>, _>>()?;
-        let mut columns = Vec::with_capacity(34);
-        for _ in 0..34 {
+        let mut columns = Vec::with_capacity(COLUMNS);
+        for _ in 0..COLUMNS {
             columns.push(input.packed()?);
         }
         if !input.bytes.is_empty() {
             return Err(RecordError("bytes after the record"));
         }
         let mut columns = columns.into_iter();
-        let mut next = || columns.next().expect("34 columns were read");
+        let mut next = || columns.next().expect("every column was read");
         let id_top = next();
         let nodes = Nodes {
             name: next(),
@@ -1474,11 +1582,12 @@ impl FileSlice {
             ordinal: next(),
             caller: next(),
             short_name: next(),
-            full_ref: next(),
             line: next(),
             byte_start: next(),
-            byte_end: next(),
+            byte_len: next(),
             code: next(),
+            full_at: next(),
+            full_name: next(),
             local_at: next(),
             local_name: next(),
             target_at: next(),
@@ -1557,15 +1666,9 @@ impl FileSlice {
         check(&r.ordinal, refs, U32_BOUND, "a reference's ordinal")?;
         check(&r.caller, refs, ids_bound + 1, "a reference's caller")?;
         check(&r.short_name, refs, string_count + 1, "a reference's name")?;
-        check(
-            &r.full_ref,
-            refs,
-            string_count + 1,
-            "a reference's full name",
-        )?;
         check(&r.line, refs, U32_BOUND, "a reference's line")?;
-        // Any value is a valid byte offset.
-        if r.byte_start.len() != refs || r.byte_end.len() != refs {
+        // Any value is a valid byte offset or length.
+        if r.byte_start.len() != refs || r.byte_len.len() != refs {
             return Err(RecordError("a reference's byte range"));
         }
         check(&r.code, refs, RESOLVED << 1, "a reference's code")?;
@@ -1575,6 +1678,14 @@ impl FileSlice {
         {
             return Err(RecordError("a reference's kind"));
         }
+        check(
+            &r.full_at,
+            r.full_at.len(),
+            refs as u64,
+            "a full name's reference",
+        )?;
+        check_ascending(&r.full_at, "full names out of order")?;
+        check(&r.full_name, r.full_at.len(), string_count, "a full name")?;
         check(
             &r.local_at,
             r.local_at.len(),
@@ -1676,11 +1787,12 @@ aft_store::heap_bytes_of_fields!(Refs {
     ordinal,
     caller,
     short_name,
-    full_ref,
     line,
     byte_start,
-    byte_end,
+    byte_len,
     code,
+    full_at,
+    full_name,
     local_at,
     local_name,
     target_at,
@@ -1764,6 +1876,21 @@ mod tests {
         assert!(lib
             .references()
             .any(|reference| reference.local_name().is_some()));
+        // Full names are kept for unresolved calls and constructions and
+        // for calls in macro templates, the only references a lookup reads
+        // them of, and for no other.
+        assert!(lib.references().any(|reference| {
+            reference.kind() == "call" && !reference.resolved() && reference.full_ref().is_some()
+        }));
+        for reference in lib.references() {
+            let read = match reference.kind() {
+                "call" | "construction" => !reference.resolved(),
+                kind => kind == MACRO_BODY_CALL_REF_KIND,
+            };
+            if !read {
+                assert_eq!(reference.full_ref(), None, "{}", reference.ref_id());
+            }
+        }
         for slice in &slices {
             let bytes = slice.encode();
             let read = FileSlice::decode(slice.path(), slice.record_key(), &bytes).unwrap();

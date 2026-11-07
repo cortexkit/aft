@@ -106,17 +106,18 @@ fn main() {
         decodes.last().copied().unwrap_or(0),
         callgraph_mb(&checkout),
     );
-    let [strings, nodes, refs, edges, maps, node_count, ref_count, resolved, edge_count] =
+    let [strings, nodes, refs, edges, maps, headers, node_count, ref_count, resolved, edge_count] =
         view.probe_breakdown();
     println!(
         "decoded parts: strings {:.1} MB, nodes {:.1} MB ({node_count}), references {:.1} MB ({ref_count}, {resolved} resolved), \
-         edges {:.1} MB ({edge_count}), lookup maps {:.1} MB; total {:.1} MB",
+         edges {:.1} MB ({edge_count}), lookup maps {:.1} MB, slice headers {:.1} MB; total {:.1} MB",
         strings as f64 / 1e6,
         nodes as f64 / 1e6,
         refs as f64 / 1e6,
         edges as f64 / 1e6,
         maps as f64 / 1e6,
-        (strings + nodes + refs + edges + maps) as f64 / 1e6,
+        headers as f64 / 1e6,
+        (strings + nodes + refs + edges + maps + headers) as f64 / 1e6,
     );
     drop(view);
     drop(checkout);
