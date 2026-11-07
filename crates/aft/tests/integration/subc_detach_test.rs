@@ -850,7 +850,7 @@ fn drain_with_live_lsp_servers_and_writer(
         if phase_rendezvous {
             let events = std::fs::read_to_string(&phase_events_path)
                 .expect("shutdown phase event hook recorded its boundaries");
-            assert_shutdown_phases_overlap(&events);
+            assert_lsp_shutdown_phase_recorded(&events);
         }
         if writer_delay == "1000" {
             assert!(log.contains("phase=log_flush_done flushed=false"),
@@ -957,12 +957,11 @@ fn log_tail(log: &str) -> String {
     lines[lines.len().saturating_sub(20)..].join("\n")
 }
 
-fn assert_shutdown_phases_overlap(events: &str) {
+/// The LSP shutdown phase ran once, start before end. It is the only exit
+/// phase left that records boundaries; the index flush it used to overlap went
+/// with the retired text index.
+fn assert_lsp_shutdown_phase_recorded(events: &str) {
     let events = events.lines().collect::<Vec<_>>();
-    assert!(
-        !events.iter().any(|event| event.ends_with(":peer_timeout")),
-        "shutdown phases did not rendezvous within the LSP shutdown budget: {events:?}"
-    );
     let position = |event: &str| {
         let positions = events
             .iter()
@@ -973,23 +972,11 @@ fn assert_shutdown_phases_overlap(events: &str) {
         positions[0]
     };
 
-    let index_start = position("index_flush:start");
-    let index_end = position("index_flush:end");
-    let index_peer = position("index_flush:peer_started");
     let lsp_start = position("lsp_shutdown:start");
     let lsp_end = position("lsp_shutdown:end");
-    let lsp_peer = position("lsp_shutdown:peer_started");
     assert!(
-        index_start < index_peer && index_peer < index_end,
-        "invalid index flush interval: {events:?}"
-    );
-    assert!(
-        lsp_start < lsp_peer && lsp_peer < lsp_end,
+        lsp_start < lsp_end,
         "invalid LSP shutdown interval: {events:?}"
-    );
-    assert!(
-        index_start < lsp_end && lsp_start < index_end,
-        "index flush and LSP shutdown intervals did not intersect: {events:?}"
     );
 }
 
@@ -1183,15 +1170,10 @@ impl ModuleProcess {
         }
         if busy_index {
             command.env("AFT_CACHE_DIR", data_home);
-            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
             command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
         }
         if let Some(path) = phase_events_path {
-            // Prove simultaneous phase entry without keeping index flush open
-            // for an arbitrary sleep that can expire before its peer runs.
-            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "0");
             command.env("AFT_TEST_EXIT_PHASE_EVENTS", path);
-            command.env("AFT_TEST_EXIT_PHASE_RENDEZVOUS", "1");
         }
         if let Some(hold) = flush_hold {
             // A writer this slow cannot acknowledge a flush inside the exit

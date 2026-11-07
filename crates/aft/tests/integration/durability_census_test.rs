@@ -85,7 +85,6 @@ impl Tally {
 
 struct Event {
     pid: u32,
-    start_ns: u64,
     op: String,
     kind: String,
     duration_ns: u64,
@@ -103,7 +102,6 @@ fn parse_trace(text: &str) -> Vec<Event> {
             }
             Some(Event {
                 pid: fields[0].parse().ok()?,
-                start_ns: fields[2].parse().ok()?,
                 op: fields[3].to_string(),
                 kind: fields[4].to_string(),
                 duration_ns: fields[5].parse().ok()?,
@@ -722,110 +720,4 @@ fn durability_census_sync_flavour_costs() {
         );
     }
     println!("{report}");
-}
-
-/// Environment variable that turns `durability_census_in_process_child` from a
-/// no-op into the measured workload; its value is the scratch directory.
-const CHILD_ENV: &str = "AFT_DURABILITY_CENSUS_CHILD";
-/// Marker paths: the child renames a path that does not exist, the tracer logs
-/// the failed rename, and the parent splits the trace there.
-const MARK_PREFIX: &str = "/aft-durability-census-mark/";
-
-/// Stores the daemon scenario cannot reach in the test harness (semantic
-/// indexing is off there, and no production request creates a views pin), run
-/// in a child copy of this test binary that carries the tracer.
-#[test]
-#[ignore = "measurement: counts fsyncs for semantic, search-cache and pin writes; run alone with --nocapture"]
-fn durability_census_in_process_stores() {
-    trace_in_process_stores(false);
-}
-
-#[test]
-fn durability_syscall_in_process_counts() {
-    trace_in_process_stores(true);
-}
-
-fn trace_in_process_stores(verify_counts: bool) {
-    let scratch = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(scratch.path()).unwrap();
-    let library = build_interposer(&root);
-    let trace = root.join("trace.tsv");
-    let work = root.join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "durability_census_test::durability_census_in_process_child",
-            "--test-threads=1",
-        ])
-        .env(CHILD_ENV, &work)
-        .env("DYLD_INSERT_LIBRARIES", &library)
-        .env("AFT_SYNC_TRACE", &trace)
-        .status()
-        .unwrap();
-    assert!(status.success(), "census child failed");
-
-    let text = std::fs::read_to_string(&trace).unwrap();
-    let work_text = work.display().to_string();
-    let work_root = work_text.strip_prefix("/private").unwrap_or(&work_text);
-    let roots = [("work", work_root)];
-    let mut report = String::from("# durability census (in-process stores)\n");
-    let mut label: Option<(String, u64)> = None;
-    let mut events = Vec::new();
-    for event in parse_trace(&text) {
-        if let Some(name) = event.path.strip_prefix(MARK_PREFIX) {
-            if let Some((previous, started)) = label.take() {
-                let elapsed = (event.start_ns - started) as f64 / 1e6;
-                summarize(
-                    &mut report,
-                    &previous,
-                    &format!("elapsed {elapsed:.1} ms"),
-                    &events,
-                    &roots,
-                    "/nonexistent-project",
-                    event.pid,
-                );
-                if verify_counts {
-                    let expected = match previous.as_str() {
-                        "semantic: first persist (full snapshot)" | "pins: live pin create" => {
-                            Some(1)
-                        }
-                        "semantic: persist after one changed file (segment append)" => Some(0),
-                        name if name.starts_with("search index: cache write")
-                            || name.starts_with("pins: protect")
-                            || name == "pins: release" =>
-                        {
-                            Some(0)
-                        }
-                        _ => None,
-                    };
-                    if let Some(expected) = expected {
-                        assert_eq!(
-                            count_syncs(&events, |_| true),
-                            expected,
-                            "{previous}: real syscall count"
-                        );
-                    }
-                }
-            }
-            events.clear();
-            if name != "end" {
-                label = Some((name.to_string(), event.start_ns));
-            }
-            continue;
-        }
-        let path = event.path.strip_prefix("/private").unwrap_or(&event.path);
-        let path2 = event.path2.strip_prefix("/private").unwrap_or(&event.path2);
-        if label.is_some() && (path.starts_with(work_root) || path2.starts_with(work_root)) {
-            events.push(event);
-        }
-    }
-    println!("{report}");
-    if let Some(dir) = std::env::var_os("AFT_DURABILITY_CENSUS_OUT") {
-        let dir = PathBuf::from(dir).join("in-process");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(&trace, dir.join("full.trace")).unwrap();
-        std::fs::write(dir.join("report.txt"), &report).unwrap();
-    }
 }

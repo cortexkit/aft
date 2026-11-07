@@ -224,7 +224,17 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     match plane {
         IndexPlane::Trigram => observe_trigram(ctx),
         IndexPlane::Semantic => observe_semantic(ctx),
-        IndexPlane::Callgraph => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
+        IndexPlane::Callgraph => observe_callgraph(ctx),
+    }
+}
+
+fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
+    // A bound checkout's call-graph plane in the index store serves every
+    // call-graph reader; nothing else does. Same mapping as the text plane.
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.callgraph.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
+        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
+        _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
 }
 

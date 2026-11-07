@@ -171,7 +171,7 @@ fn idle_reap_sweep_cost_at_170_roots() {
         samples.sort();
         println!(
             "idle reap sweep: roots={ROOTS} pending_paths_per_root={} median={:?} min={:?} max={:?}",
-            per_set * 3,
+            per_set * 2,
             samples[SWEEPS / 2],
             samples[0],
             samples[SWEEPS - 1],
@@ -219,7 +219,8 @@ fn reap_sweep_restore_work_does_not_grow_with_roots_or_pending_paths() {
         // Control: the path-by-path re-insertion does grow with both, so the
         // counter above would have seen it.
         pending_restore_work::with_legacy_restore(|| fixture.sweep(&metrics));
-        assert_eq!(pending_restore_work::take_merged(), roots * per_set * 3);
+        // Two pending sets per root: Tier-2 and semantic.
+        assert_eq!(pending_restore_work::take_merged(), roots * per_set * 2);
         assert_eq!(fixture.pending_snapshots(), before);
     }
 }

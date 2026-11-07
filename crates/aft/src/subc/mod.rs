@@ -4694,19 +4694,10 @@ fn note_fatal_panic_response(response: &Response) -> bool {
 /// Record phase boundaries for process-level shutdown tests without relying on
 /// log timestamps, which are rounded and intended for diagnostics.
 #[cfg(debug_assertions)]
-static EXIT_PHASE_EVENT_LOCK: StdMutex<[bool; 2]> = StdMutex::new([false; 2]);
-
-#[cfg(debug_assertions)]
-static EXIT_PHASE_EVENT_READY: std::sync::Condvar = std::sync::Condvar::new();
-
-#[cfg(debug_assertions)]
 fn record_exit_phase_event(phase: &str, boundary: &str) {
     use std::io::Write;
 
     let Some(path) = std::env::var_os("AFT_TEST_EXIT_PHASE_EVENTS") else {
-        return;
-    };
-    let Ok(mut started) = EXIT_PHASE_EVENT_LOCK.lock() else {
         return;
     };
     if let Ok(mut events) = std::fs::OpenOptions::new()
@@ -4715,33 +4706,6 @@ fn record_exit_phase_event(phase: &str, boundary: &str) {
         .open(path)
     {
         let _ = writeln!(events, "{phase}:{boundary}");
-        if boundary == "start"
-            && std::env::var("AFT_TEST_EXIT_PHASE_RENDEZVOUS").as_deref() == Ok("1")
-        {
-            let phase_index = match phase {
-                "index_flush" => 0,
-                "lsp_shutdown" => 1,
-                _ => return,
-            };
-            // Hold both phases at entry until their peer arrives. A sequential
-            // teardown records a timeout instead of hanging the test process.
-            // Reuse the LSP shutdown budget to bound this test-only wait.
-            started[phase_index] = true;
-            EXIT_PHASE_EVENT_READY.notify_all();
-            let Ok((started, _)) = EXIT_PHASE_EVENT_READY.wait_timeout_while(
-                started,
-                crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET,
-                |started| !started.iter().all(|arrived| *arrived),
-            ) else {
-                return;
-            };
-            let outcome = if started.iter().all(|arrived| *arrived) {
-                "peer_started"
-            } else {
-                "peer_timeout"
-            };
-            let _ = writeln!(events, "{phase}:{outcome}");
-        }
     }
 }
 

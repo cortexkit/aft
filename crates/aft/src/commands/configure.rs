@@ -179,7 +179,6 @@ fn wait_on_configure_writer_gate_for_test(_root: &Path) {}
 thread_local! {
     static SEMANTIC_REFRESH_RESTART_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEMANTIC_REFRESH_RESTART_RESULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static WORKSPACE_MANIFEST_FINGERPRINT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[doc(hidden)]
@@ -826,24 +825,14 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if ctx.cached_worktree_bridge(canonical_root).is_none() {
         return false;
     }
-    // The full path re-reads the workspace manifest fingerprint because a bind
-    // may follow a window nobody observed; while the watcher is live every
-    // manifest edit reaches the callgraph through it, so the scan is redundant
+    // The full path rescans the index store's checkout against disk because a
+    // bind may follow a window nobody observed; while the watcher is live
+    // every edit reaches the checkout through it, so the rescan is redundant
     // only then. A root whose watcher is down takes the full path.
     if !ctx.watcher_runtime_active() {
         return false;
     }
     !config.indexes.callgraph
-}
-
-#[cfg(test)]
-fn reset_workspace_manifest_fingerprint_scans_for_test() {
-    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-fn workspace_manifest_fingerprint_scans_for_test() -> usize {
-    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(std::cell::Cell::get)
 }
 
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
@@ -7861,69 +7850,6 @@ mod tests {
         let frame =
             wait_for_configure_warnings(&ctx, ctx.configure_generation(), Duration::from_secs(5));
         assert_eq!(frame.frame_type, "configure_warnings");
-    }
-
-    #[test]
-    fn workspace_manifest_fingerprint_is_lazy_and_reused_per_configure() {
-        let _env_guard = home_env_mutex();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(root.path());
-        std::fs::create_dir_all(root.path().join("packages/pkg-a")).unwrap();
-        std::fs::write(root.path().join("packages/pkg-a/package.json"), "{}").unwrap();
-        let ctx = test_context();
-        super::reset_workspace_manifest_fingerprint_scans_for_test();
-
-        let disabled = configure_request_with_params(json!({
-            "project_root": root.path(),
-            "harness": "opencode",
-            "storage_dir": storage.path(),
-            "config": [user_tier(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
-            }))]
-        }));
-        assert!(handle_configure_for_test(&disabled, &ctx).success);
-        let disabled_generation = ctx.configure_generation();
-        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 0);
-        std::fs::write(
-            root.path().join("packages/pkg-a/package.json"),
-            "{\"disabled\":true}",
-        )
-        .unwrap();
-        assert!(handle_configure_for_test(&disabled, &ctx).success);
-        assert_eq!(ctx.configure_generation(), disabled_generation);
-        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 0);
-
-        let enabled = configure_request_with_params(json!({
-            "project_root": root.path(),
-            "harness": "opencode",
-            "storage_dir": storage.path(),
-            "config": [user_tier(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-            }))]
-        }));
-        assert!(handle_configure_for_test(&enabled, &ctx).success);
-        let enabled_generation = ctx.configure_generation();
-        assert_eq!(
-            super::workspace_manifest_fingerprint_scans_for_test(),
-            1,
-            "a full configure must reuse its preflight manifest fingerprint"
-        );
-        std::fs::write(
-            root.path().join("packages/pkg-a/package.json"),
-            "{\"enabled\":true,\"changed\":true}",
-        )
-        .unwrap();
-        assert!(handle_configure_for_test(&enabled, &ctx).success);
-        // Manifests are not part of the configure identity: a manifest change
-        // is handed to the incremental callgraph refresh instead, so the
-        // configure stays equivalent while the manifests are still read once.
-        assert_eq!(ctx.configure_generation(), enabled_generation);
-        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 2);
-        assert!(handle_configure_for_test(&enabled, &ctx).success);
-        assert_eq!(ctx.configure_generation(), enabled_generation);
-        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
     }
 
     #[test]

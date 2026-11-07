@@ -1947,7 +1947,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
         let ignore_changed = state.ignore_changed;
         if ignore_changed {
-            state.status_changed |= refresh_project_corpus(ctx);
+            state.status_changed |= refresh_corpus_after_ignore_change(ctx);
             // Same partial-sequence rule as the rescan path: acknowledge only
             // when the refresh ran fully under this lifecycle generation.
             if ctx
