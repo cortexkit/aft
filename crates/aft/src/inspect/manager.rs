@@ -9135,19 +9135,18 @@ export function bannerUnused() {}
         );
     }
 
-    fn assert_cached_dead_code_gap(payload: &Value, file: &str) {
-        assert_eq!(payload["complete"], false, "{payload:#}");
-        assert_eq!(
-            payload["parse_errors"],
-            json!([{
-                "file": file,
-                "message": "cached dead-code contribution could not be decoded",
-            }])
+    /// Dead code over the index store never reads the inspect cache's
+    /// per-file facts, so damage to them leaves its answer complete.
+    fn assert_no_dead_code_gap(payload: &Value) {
+        assert_eq!(payload["complete"], true, "{payload:#}");
+        assert!(
+            payload["parse_errors"].as_array().is_none_or(Vec::is_empty),
+            "{payload:#}"
         );
     }
 
     #[test]
-    fn dead_code_cache_gap_before_rollup_survives_project_reuse() {
+    fn damaged_cached_dead_code_rows_before_a_rollup_leave_it_complete() {
         for corruption in ["missing exports", "invalid exports"] {
             let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
             let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
@@ -9161,7 +9160,7 @@ export function bannerUnused() {}
                 .outcome
                 .expect("initial project rollup")
                 .aggregate;
-            assert_cached_dead_code_gap(&first, "src/main.rs");
+            assert_no_dead_code_gap(&first);
             assert!(aggregate_has_file_symbol(
                 &first,
                 "src/dead.rs",
@@ -9184,25 +9183,25 @@ export function bannerUnused() {}
                 (0, 0, 0),
                 "reuse must not decode contribution bodies"
             );
-            assert_cached_dead_code_gap(&reused.aggregate, "src/main.rs");
+            assert_no_dead_code_gap(&reused.aggregate);
             assert_eq!(reused.aggregate, first);
 
-            // Fresh describes source freshness, not analysis completeness. Both
-            // writer and read-only project lookups must retain the saved gap.
+            // Both writer and read-only project lookups return the saved
+            // answer.
             let scope = JobScope::for_project(root);
             for outcome in [
                 manager.tier2_read_cached(snapshot.clone(), job.category, scope.clone()),
                 manager.tier2_read_cached_readonly(snapshot.clone(), job.category, scope),
             ] {
                 let payload = fresh_payload(outcome);
-                assert_cached_dead_code_gap(&payload, "src/main.rs");
+                assert_no_dead_code_gap(&payload);
                 assert_eq!(payload, first);
             }
         }
     }
 
     #[test]
-    fn dead_code_cache_gap_after_rollup_waits_until_recompute() {
+    fn damaged_cached_dead_code_rows_after_a_rollup_leave_the_recompute_complete() {
         for corruption in ["missing exports", "invalid exports"] {
             let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
             let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
@@ -9247,7 +9246,8 @@ export function bannerUnused() {}
             );
 
             // A manifest change invalidates the aggregate key without reparsing
-            // the unchanged Rust file, so the next rollup must read its bad row.
+            // the unchanged Rust file. The next rollup works dead code out
+            // from the index store's facts, never from its bad row.
             let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
             write_fixture_file(
                 &root,
@@ -9286,8 +9286,9 @@ export function bannerUnused() {}
                 !scanned.contains(&canonicalize_for_snapshot(&root.join("src/dead.rs"))),
                 "the corrupted row must not be repaired by rescanning its unchanged source"
             );
-            assert_cached_dead_code_gap(&recomputed.aggregate, "src/dead.rs");
-            assert!(!aggregate_has_file_symbol(
+            assert_no_dead_code_gap(&recomputed.aggregate);
+            assert_eq!(recomputed.aggregate, first);
+            assert!(aggregate_has_file_symbol(
                 &recomputed.aggregate,
                 "src/dead.rs",
                 "planted_dead"

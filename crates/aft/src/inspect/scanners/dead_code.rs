@@ -971,13 +971,28 @@ fn caller_comparison_key(
         Err(_) => (comparison_path, true),
     };
     (
-        path.strip_prefix(canonical_root)
-            .or_else(|_| path.strip_prefix(lexical_root))
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/"),
+        caller_key_of_physical(lexical_root, canonical_root, &path),
         fallback,
     )
+}
+
+/// The key [`caller_comparison_key`] files a caller's calls under, given
+/// its physical path (canonical and normalized).
+fn caller_key_of_physical(lexical_root: &Path, canonical_root: &Path, path: &Path) -> String {
+    path.strip_prefix(canonical_root)
+        .or_else(|_| path.strip_prefix(lexical_root))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// [`relative_path`] of a path already canonical and normalized, which
+/// canonicalizing again would give back unchanged.
+fn relative_path_of_canonical(canonical_root: &Path, path: &Path) -> String {
+    path.strip_prefix(canonical_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn gather_file_contribution(

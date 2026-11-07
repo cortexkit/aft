@@ -1168,3 +1168,248 @@ pub fn run(
     drop(restore);
     Ok(summary)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspect::scanners::dead_code::section::DAMAGED_FACTS_FOR_TEST;
+
+    /// A small Rust crate with a dead function, and its checkout.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        storage: tempfile::TempDir,
+        root: PathBuf,
+        checkout: Arc<DataCheckout>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with(|_| {})
+        }
+
+        /// The fixture, with `setup` run on its root before the checkout is
+        /// built.
+        fn with(setup: impl FnOnce(&Path)) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "mod util;\npub fn api() { util::helper(); }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/util.rs"),
+                "pub fn helper() {}\npub fn orphan() {}\n",
+            )
+            .unwrap();
+            setup(&root);
+            let storage = tempfile::tempdir().unwrap();
+            let checkout = DataCheckout::open_planes(
+                &root,
+                storage.path(),
+                None,
+                Planes {
+                    text: false,
+                    callgraph: true,
+                },
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                storage,
+                root,
+                checkout,
+            }
+        }
+
+        /// Dead code as `aft_inspect` rolls it up, keeping its graph, and
+        /// the path the rollup took.
+        fn rollup(&self) -> (Result<Value, String>, &'static str) {
+            let view = fresh_view(&self.checkout).unwrap();
+            let (snapshot, _) = snapshots(
+                &mut std::io::sink(),
+                "test",
+                Mode::New,
+                &view,
+                self.storage.path(),
+            )
+            .unwrap();
+            let files = crate::inspect::tier2_scope_files(
+                &self.root,
+                &JobScope::for_project(self.root.clone()),
+            );
+            let mut probe = Probe::default();
+            let aggregate = aggregate_from_view(
+                &job(&self.root, self.storage.path()),
+                &files,
+                &[],
+                &snapshot,
+                &mut Vec::new(),
+                Use::Kept,
+                Some(&mut probe),
+            );
+            (aggregate, probe.path)
+        }
+
+        fn edit(&self, file: &str, addition: &str) {
+            let path = self.root.join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(addition);
+            std::fs::write(&path, text).unwrap();
+            self.checkout.note_paths(&[path]);
+        }
+
+        /// The one kept file with `extension`.
+        fn kept(&self, extension: &str) -> PathBuf {
+            let kept = std::fs::read_dir(self.storage.path().join("dead-code"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == extension))
+                .collect::<Vec<_>>();
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            kept.into_iter().next().unwrap()
+        }
+
+        fn damage_facts(&self, file: &str) {
+            DAMAGED_FACTS_FOR_TEST
+                .lock()
+                .unwrap()
+                .push((self.root.clone(), file.to_string()));
+        }
+    }
+
+    /// Changes one byte of the file at `path` at or after `from` that
+    /// `pick` accepts, to `replace(byte)`.
+    fn damage(path: &Path, from: usize, pick: impl Fn(u8) -> bool, replace: impl Fn(u8) -> u8) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = (from..bytes.len())
+            .find(|at| pick(bytes[*at]))
+            .expect("a byte to damage");
+        bytes[at] = replace(bytes[at]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The kept graph is a copy of what the stored facts give. A damaged
+    /// copy is never read: the rollup works the graph out again and answers
+    /// as it did before the damage.
+    #[test]
+    fn a_damaged_kept_graph_is_worked_out_again() {
+        let fixture = Fixture::new();
+        let (first, path) = fixture.rollup();
+        let first = first.unwrap();
+        assert_eq!(path, "full");
+        assert_eq!(fixture.rollup().1, "read");
+
+        // One byte in the middle of the base, where its blocks are.
+        let base = fixture.kept("dead-code");
+        let len = std::fs::metadata(&base).unwrap().len() as usize;
+        damage(&base, len / 2, |_| true, |byte| byte ^ 0x01);
+        let (again, path) = fixture.rollup();
+        assert_eq!(path, "full", "a damaged base must not be read");
+        assert_eq!(again.unwrap(), first);
+
+        // One digit of an overlay's body, which leaves it valid JSON.
+        fixture.edit("src/util.rs", "\npub fn added() {}\n");
+        let (patched, path) = fixture.rollup();
+        assert_eq!(path, "patched");
+        let patched = patched.unwrap();
+        let overlay = fixture.kept("dead-code-overlay");
+        let body = std::fs::read(&overlay)
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(3)
+            .map(|(at, _)| at + 1)
+            .unwrap();
+        damage(
+            &overlay,
+            body,
+            |byte| byte.is_ascii_digit(),
+            |byte| if byte == b'9' { b'8' } else { byte + 1 },
+        );
+        let (again, path) = fixture.rollup();
+        assert_ne!(path, "read", "a damaged overlay must not be read");
+        assert_eq!(again.unwrap(), patched);
+    }
+
+    /// The stored facts are what dead code is worked out from. Facts that
+    /// cannot be read fail the rollup with the file named, before a graph is
+    /// kept and when a kept graph is patched.
+    #[test]
+    fn damaged_stored_facts_fail_the_rollup() {
+        let fixture = Fixture::new();
+        fixture.damage_facts("src/util.rs");
+        let (failed, _) = fixture.rollup();
+        let error = failed.expect_err("damaged facts must fail the first rollup");
+        assert!(error.contains("src/util.rs"), "{error}");
+        DAMAGED_FACTS_FOR_TEST
+            .lock()
+            .unwrap()
+            .retain(|(root, _)| *root != fixture.root);
+
+        let (first, path) = fixture.rollup();
+        first.unwrap();
+        assert_eq!(path, "full");
+        fixture.edit("src/util.rs", "\npub fn added() {}\n");
+        fixture.damage_facts("src/util.rs");
+        let (failed, _) = fixture.rollup();
+        let error = failed.expect_err("damaged facts must fail a patched rollup");
+        assert!(error.contains("src/util.rs"), "{error}");
+        DAMAGED_FACTS_FOR_TEST
+            .lock()
+            .unwrap()
+            .retain(|(root, _)| *root != fixture.root);
+    }
+
+    /// Every file of the call graph resolves to the path canonicalizing it
+    /// gives, with a symlinked file and a symlinked folder in the project,
+    /// and only regular files resolve without asking the file system.
+    #[cfg(unix)]
+    #[test]
+    fn store_paths_resolve_as_canonicalizing_them_would() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("shared.rs"), "pub fn shared() {}\n").unwrap();
+        let fixture = Fixture::with(|root| {
+            std::fs::create_dir_all(root.join("src/real")).unwrap();
+            std::fs::write(root.join("src/real/inner.rs"), "pub fn inner() {}\n").unwrap();
+            std::os::unix::fs::symlink(root.join("src/real"), root.join("src/linked")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("shared.rs"),
+                root.join("src/shared.rs"),
+            )
+            .unwrap();
+        });
+        let view = fresh_view(&fixture.checkout).unwrap();
+        let files = view.dead_code_files();
+        let graph = super::super::dead_code_graph::DeadCodeGraph::open_lazy(view.root(), &files);
+        let paths = super::super::dead_code_graph::CallGraphFiles::paths(&files);
+        assert!(
+            paths.iter().any(|path| path == "src/real/inner.rs"),
+            "{paths:?}"
+        );
+        for path in paths.iter().map(String::as_str).chain([
+            "src/linked/inner.rs",
+            "src/shared.rs",
+            "src/../src/lib.rs",
+        ]) {
+            let canonical = super::super::dead_code::Paths {
+                root: view.root(),
+                cache: std::collections::HashMap::new(),
+            }
+            .resolve(path);
+            assert_eq!(graph.resolve(path), canonical, "{path}");
+        }
+        assert!(graph.resolves_lexically("src/real/inner.rs"));
+        assert!(!graph.resolves_lexically("src/shared.rs"));
+        assert!(!graph.resolves_lexically("src/linked/inner.rs"));
+        assert!(!graph.resolves_lexically("src/../src/lib.rs"));
+    }
+}

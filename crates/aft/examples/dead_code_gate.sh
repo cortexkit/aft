@@ -8,6 +8,9 @@
 # repository (a copy, since the gate edits files), and with network, the
 # repositories named after the baseline.
 #   dead_code_gate.sh <out-dir> <baseline-commit> [git-url...]
+# The baseline may also be a `.tar.gz` of that commit's tree (from
+# `git archive --format=tar.gz <commit>`), for a checkout whose history no
+# longer reaches the commit.
 # A baseline of `-` skips the earlier build: each project then runs only
 # this checkout's gate, which still checks every patched rollup against one
 # worked out from nothing.
@@ -22,7 +25,11 @@ git log -1 --oneline
 cargo build --profile ci-storm -p agent-file-tools --example dead_code_gate 2>&1 | grep -E "^error|Finished" | head -20
 if [ "$BASE" != - ]; then
   rm -rf "$TMPDIR/base" && mkdir -p "$TMPDIR/base"
-  git archive "$BASE" | (cd "$TMPDIR/base" && tar xf -)
+  if [ -f "$BASE" ]; then
+    tar xzf "$BASE" -C "$TMPDIR/base"
+  else
+    git archive "$BASE" | (cd "$TMPDIR/base" && tar xf -)
+  fi
   (cd "$TMPDIR/base" && CARGO_TARGET_DIR="$TMPDIR/base-target" cargo build --profile ci-storm -p agent-file-tools --example dead_code_gate 2>&1 | grep -E "^error|Finished" | head -20)
 fi
 
@@ -58,6 +65,20 @@ for d in crates/aft/tests/store_diet/corpus/*/; do
   rm -rf "$TMPDIR/c-$n"; cp -r "$d" "$TMPDIR/c-$n"
   gate "$n" "$TMPDIR/c-$n" 1
 done
+# A project with a symlinked file and a symlinked folder. The rollup
+# resolves regular files' paths without asking the file system, and must
+# answer as the baseline, which canonicalizes every path, does.
+S=$TMPDIR/symlinks
+rm -rf "$S" "$TMPDIR/symlinks-outside" && mkdir -p "$S/src/real" "$TMPDIR/symlinks-outside"
+printf '[package]\nname = "symlinks"\nversion = "0.1.0"\nedition = "2021"\n' > "$S/Cargo.toml"
+printf 'mod real;\nmod shared;\npub fn api() { real::inner(); shared::shared(); }\n' > "$S/src/lib.rs"
+printf 'pub fn inner() {}\npub fn unused_inner() {}\n' > "$S/src/real/mod.rs"
+printf 'pub fn shared() {}\npub fn unused_shared() {}\n' > "$TMPDIR/symlinks-outside/shared.rs"
+printf 'export function a() {}\nexport function unusedA() {}\n' > "$S/src/a.ts"
+ln -s real "$S/src/linked"
+ln -s "$TMPDIR/symlinks-outside/shared.rs" "$S/src/shared.rs"
+ln -s a.ts "$S/src/b.ts"
+gate symlinks "$S" 1
 rm -rf "$TMPDIR/aft" && mkdir -p "$TMPDIR/aft"
 tar --exclude=./target -cf - . | (cd "$TMPDIR/aft" && tar xf -)
 gate aft "$TMPDIR/aft" 3

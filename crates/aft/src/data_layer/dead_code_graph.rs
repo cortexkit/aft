@@ -122,6 +122,11 @@ pub(crate) trait CallGraphFiles: Sync {
     fn paths(&self) -> Vec<String>;
     /// Whether `path` is a parsed file.
     fn has_file(&self, path: &str) -> bool;
+    /// Whether the checkout records `path` as a regular file rather than a
+    /// symlink. The scan records a symlink as an entry of its own and never
+    /// descends into a symlinked folder, so no folder below the root on a
+    /// regular file's path is a symlink.
+    fn is_regular_file(&self, path: &str) -> bool;
     /// `path`'s parse.
     ///
     /// # Errors
@@ -425,6 +430,58 @@ pub(crate) struct DeadCodeGraph<'f> {
     /// incomplete.
     failure: parking_lot::Mutex<Option<String>>,
     paths: parking_lot::Mutex<HashMap<String, PathBuf>>,
+    /// The root made canonical once, which [`Self::resolve`] joins regular
+    /// files' paths to.
+    canonical_root: std::sync::OnceLock<PathBuf>,
+}
+
+/// Whether [`resolve_store_path`] makes `store_path` canonical without
+/// asking the file system: a plain relative path the checkout records as a
+/// regular file.
+fn resolves_lexically(source: &dyn CallGraphFiles, store_path: &str) -> bool {
+    plain_relative(store_path) && source.is_regular_file(store_path)
+}
+
+/// `store_path` (a path of `source`'s checkout at `root`) made absolute and
+/// canonical, as the snapshot names files. Canonicalizing costs several
+/// system calls a path on macOS and opens a file handle on Windows, and a
+/// rollup resolves every file: a regular file's path is joined to the root,
+/// made canonical once in `canonical_root`, which gives the same path since
+/// no folder below the root on it is a symlink (see
+/// [`CallGraphFiles::is_regular_file`]). Any other path is canonicalized.
+fn resolve_store_path(
+    root: &Path,
+    canonical_root: &std::sync::OnceLock<PathBuf>,
+    source: &dyn CallGraphFiles,
+    store_path: &str,
+) -> PathBuf {
+    if !resolves_lexically(source, store_path) {
+        return Paths {
+            root,
+            cache: HashMap::new(),
+        }
+        .resolve(store_path);
+    }
+    let mut path = canonical_root
+        .get_or_init(|| crate::inspect::job::canonicalize_normalized(root))
+        .clone();
+    for segment in store_path.split('/') {
+        path.push(segment);
+    }
+    crate::inspect::job::normalize_path(&path)
+}
+
+/// Whether `path` is a relative path of plain segments: none empty, `.`,
+/// `..`, or (on Windows) holding a separator or drive of its own.
+fn plain_relative(path: &str) -> bool {
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !(cfg!(windows) && segment.contains(['\\', ':']))
+        })
 }
 
 /// What one caller file contributes to the dead-code snapshot.
@@ -483,14 +540,11 @@ fn file_exports(file: &IndexedFile, resolved: PathBuf) -> Vec<CallgraphExport> {
 /// Every parsed file of `source` as a dead-code snapshot lists them:
 /// absolute under `root`, canonical, and sorted.
 pub(crate) fn snapshot_files_of(root: &Path, source: &dyn CallGraphFiles) -> Vec<PathBuf> {
-    let mut paths = Paths {
-        root,
-        cache: HashMap::new(),
-    };
+    let canonical_root = std::sync::OnceLock::new();
     let mut files = source
         .paths()
         .iter()
-        .map(|path| paths.resolve(path))
+        .map(|path| resolve_store_path(root, &canonical_root, source, path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| path_key(left).cmp(path_key(right)));
     files
@@ -540,6 +594,7 @@ impl<'f> DeadCodeGraph<'f> {
             go_packages: std::sync::OnceLock::new(),
             failure: parking_lot::Mutex::new(None),
             paths: parking_lot::Mutex::new(HashMap::new()),
+            canonical_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -579,16 +634,20 @@ impl<'f> DeadCodeGraph<'f> {
         self.files.keys().map(String::as_str)
     }
 
-    /// `store_path` made absolute and canonical, as the snapshot names files.
+    /// Whether [`Self::resolve`] makes `store_path` canonical without asking
+    /// the file system (see [`resolve_store_path`]).
+    pub(crate) fn resolves_lexically(&self, store_path: &str) -> bool {
+        resolves_lexically(self.source, store_path)
+    }
+
+    /// `store_path` made absolute and canonical, as the snapshot names files
+    /// (see [`resolve_store_path`]).
     pub(crate) fn resolve(&self, store_path: &str) -> PathBuf {
         if let Some(path) = self.paths.lock().get(store_path) {
             return path.clone();
         }
-        let resolved = Paths {
-            root: &self.root,
-            cache: HashMap::new(),
-        }
-        .resolve(store_path);
+        let resolved =
+            resolve_store_path(&self.root, &self.canonical_root, self.source, store_path);
         self.paths
             .lock()
             .insert(store_path.to_string(), resolved.clone());

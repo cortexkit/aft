@@ -912,6 +912,40 @@ fn config_unchanged(config: &[(PathBuf, String)]) -> bool {
     })
 }
 
+/// Stored facts a test damages: (project root, project-relative file).
+#[cfg(test)]
+pub(crate) static DAMAGED_FACTS_FOR_TEST: std::sync::Mutex<Vec<(PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The stored facts of `relative_file` in the project at `root`, as every
+/// rollup reads them.
+fn stored_facts_of(
+    root: &Path,
+    files: &crate::data_layer::checkout::ViewGraphFiles<'_>,
+    relative_file: &str,
+) -> Option<Result<Vec<u8>, String>> {
+    if facts_damaged_for_test(root, relative_file) {
+        return Some(Ok(b"damaged facts".to_vec()));
+    }
+    stored_facts(files, relative_file)
+}
+
+/// Whether a test damaged `relative_file`'s stored facts in the project at
+/// `root`.
+#[cfg(test)]
+fn facts_damaged_for_test(root: &Path, relative_file: &str) -> bool {
+    DAMAGED_FACTS_FOR_TEST.lock().is_ok_and(|damaged| {
+        damaged
+            .iter()
+            .any(|(damaged_root, file)| damaged_root.as_path() == root && file == relative_file)
+    })
+}
+
+#[cfg(not(test))]
+fn facts_damaged_for_test(_root: &Path, _relative_file: &str) -> bool {
+    false
+}
+
 impl Rollup<'_, '_> {
     /// The facts of `files` (project-relative), read from their content
     /// records with the Oxc engine's facts for those it analyzes. `None`
@@ -950,7 +984,7 @@ impl Rollup<'_, '_> {
             .into_iter()
             .flat_map(|path| self.graph.exported_symbols(path))
             .collect::<Vec<_>>();
-        let lookup = |relative_file: &str| stored_facts(self.files, relative_file);
+        let lookup = |relative_file: &str| stored_facts_of(self.root, self.files, relative_file);
         let contributions = super::scan_dead_code_facts_stored(
             &job,
             oxc_result.as_ref(),
@@ -1056,7 +1090,8 @@ impl Rollup<'_, '_> {
                 .is_none_or(|result| result.skipped_outside_root.is_empty())
         });
         let contributions = timed(timings, "read stored facts", || {
-            let lookup = |relative_file: &str| stored_facts(self.files, relative_file);
+            let lookup =
+                |relative_file: &str| stored_facts_of(self.root, self.files, relative_file);
             super::scan_dead_code_facts_stored(
                 self.job,
                 oxc_result.as_ref(),

@@ -3035,6 +3035,10 @@ impl CheckoutView {
         ViewGraphFiles {
             published: &self.published.graph,
             refreshed: self.refreshed.as_deref(),
+            state: self
+                .refreshed
+                .as_deref()
+                .map_or(&self.published.state, |refreshed| &refreshed.state),
         }
     }
 
@@ -3132,6 +3136,8 @@ impl CheckoutView {
 pub(crate) struct ViewGraphFiles<'v> {
     published: &'v StoredSlices,
     refreshed: Option<&'v Refreshed>,
+    /// The checkout's paths the call graph was resolved over.
+    state: &'v CheckoutState,
 }
 
 /// What identifies one file's facts in a view's call graph, so two views'
@@ -3192,6 +3198,12 @@ impl ViewGraphFiles<'_> {
 }
 
 impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
+    fn is_regular_file(&self, path: &str) -> bool {
+        self.state
+            .get(path.as_bytes())
+            .is_some_and(|record| record.kind != PathKind::Symlink)
+    }
+
     fn has_file(&self, path: &str) -> bool {
         match self.refreshed {
             Some(refreshed) if refreshed.removed.contains(path) => false,

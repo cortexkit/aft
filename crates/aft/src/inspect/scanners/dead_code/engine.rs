@@ -187,14 +187,24 @@ impl<'a, 'g> GraphSource<'a, 'g> {
         let mut facts = HashMap::<String, Vec<String>>::new();
         for path in graph.file_paths() {
             let resolved = graph.resolve(path);
-            let comparison =
-                caller_comparison_path(project_root, &lexical_root, &canonical_root, &resolved);
-            let (calls_key, _) = caller_comparison_key(&lexical_root, &canonical_root, comparison);
+            let (calls_key, facts_key) = if graph.resolves_lexically(path) {
+                // `resolved` is canonical already, so canonicalizing it again
+                // (as the keys below would) gives it back: work the keys out
+                // without asking the file system.
+                (
+                    super::caller_key_of_physical(&lexical_root, &canonical_root, &resolved),
+                    super::relative_path_of_canonical(&canonical_root, &resolved),
+                )
+            } else {
+                let comparison =
+                    caller_comparison_path(project_root, &lexical_root, &canonical_root, &resolved);
+                (
+                    caller_comparison_key(&lexical_root, &canonical_root, comparison).0,
+                    relative_path(project_root, &resolved),
+                )
+            };
             calls.entry(calls_key).or_default().push(path.to_string());
-            facts
-                .entry(relative_path(project_root, &resolved))
-                .or_default()
-                .push(path.to_string());
+            facts.entry(facts_key).or_default().push(path.to_string());
         }
         Self {
             graph,

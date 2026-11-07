@@ -33,11 +33,14 @@ use crate::data_layer::checkout::GraphIdentity;
 
 /// The first line of a base file. A change to what is kept or to how files
 /// are materialized changes it, so a file of another format is never read.
-pub(super) const BASE_HEADER: &str = "aft dead-code graph 6";
+pub(super) const BASE_HEADER: &str = "aft dead-code graph 7";
 /// The first line of an overlay file.
-pub(super) const OVERLAY_HEADER: &str = "aft dead-code overlay 6";
+pub(super) const OVERLAY_HEADER: &str = "aft dead-code overlay 7";
 /// The last bytes of a complete base file.
-const TRAILER_MAGIC: &[u8; 8] = b"AFTDCG06";
+const TRAILER_MAGIC: &[u8; 8] = b"AFTDCG07";
+/// A base file's trailer: the directory's offset and length, the blake3
+/// digest of every byte before the trailer, and [`TRAILER_MAGIC`].
+const TRAILER_LEN: usize = 16 + 32 + 8;
 pub(super) const BASE_EXTENSION: &str = "dead-code";
 pub(super) const OVERLAY_EXTENSION: &str = "dead-code-overlay";
 
@@ -293,6 +296,8 @@ pub(super) struct BaseWriter {
     skeletons: Vec<Span>,
     /// Each read entry's readers, by entry hash.
     readers: HashMap<u64, Vec<u32>>,
+    /// The digest of every byte written so far.
+    digest: blake3::Hasher,
 }
 
 impl BaseWriter {
@@ -316,6 +321,7 @@ impl BaseWriter {
                 skeleton_bytes: Vec::new(),
                 skeletons: Vec::new(),
                 readers: HashMap::new(),
+                digest: blake3::Hasher::new(),
             })
         })();
         match made {
@@ -343,6 +349,7 @@ impl BaseWriter {
                 self.failed = Some(error);
             }
         }
+        self.digest.update(bytes);
         self.position += bytes.len() as u64;
         span
     }
@@ -482,6 +489,7 @@ impl BaseWriter {
         };
         let directory = self.json(&directory);
         let mut trailer = u64_bytes(&[directory.offset, directory.len]);
+        trailer.extend(self.digest.finalize().as_bytes());
         trailer.extend(TRAILER_MAGIC);
         self.bytes(&trailer);
         if let Some(error) = self.failed.take() {
@@ -530,6 +538,46 @@ fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::i
     }
 }
 
+/// Whether the first `body` bytes of the base `file` (at `path`) hash to
+/// `digest`. A daemon opens the same base on every rollup, so a base
+/// verified once is remembered by its path, length and modification time
+/// and not read whole again.
+fn verified(path: &Path, file: &std::fs::File, body: u64, digest: &[u8]) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static VERIFIED: OnceLock<Mutex<HashSet<(PathBuf, u64, Option<std::time::SystemTime>)>>> =
+        OnceLock::new();
+    let key = (
+        path.to_path_buf(),
+        body,
+        file.metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+    );
+    let seen = VERIFIED.get_or_init(|| Mutex::new(HashSet::new()));
+    if seen.lock().is_ok_and(|seen| seen.contains(&key)) {
+        return true;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    while offset < body {
+        let len = (body - offset).min(buffer.len() as u64) as usize;
+        if read_exact_at(file, &mut buffer[..len], offset).is_err() {
+            return false;
+        }
+        hasher.update(&buffer[..len]);
+        offset += len as u64;
+    }
+    let good = hasher.finalize().as_bytes()[..] == *digest;
+    if good {
+        if let Ok(mut seen) = seen.lock() {
+            seen.insert(key);
+        }
+    }
+    good
+}
+
 /// The first two lines of a kept file: its header and its configuration
 /// digest.
 fn head(path: &Path) -> Option<(String, String)> {
@@ -566,9 +614,17 @@ impl Base {
         }
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
-        let mut trailer = [0u8; 24];
-        read_exact_at(&file, &mut trailer, len.checked_sub(24)?).ok()?;
-        if &trailer[16..] != TRAILER_MAGIC {
+        let mut trailer = [0u8; TRAILER_LEN];
+        let body = len.checked_sub(TRAILER_LEN as u64)?;
+        read_exact_at(&file, &mut trailer, body).ok()?;
+        if &trailer[48..] != TRAILER_MAGIC {
+            return None;
+        }
+        if !verified(path, &file, body, &trailer[16..48]) {
+            crate::slog_warn!(
+                "tier2 dead_code: the kept dead-code graph {} is damaged; working out every file again",
+                path.display()
+            );
             return None;
         }
         let numbers = u64s(&trailer[..16]);
@@ -767,9 +823,10 @@ pub(super) struct Overlay {
 }
 
 /// Reads the overlay at `path`: the base file name it is over, and the
-/// overlay; `None` when it is missing, of another format or cannot be read.
+/// overlay; `None` when it is missing, of another format, cannot be read,
+/// or does not hash to the digest written with it.
 pub(super) fn read_overlay(path: &Path) -> Option<(String, Overlay)> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
     let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut line = String::new();
     for expected in [Some(OVERLAY_HEADER), None] {
@@ -784,18 +841,36 @@ pub(super) fn read_overlay(path: &Path) -> Option<(String, Overlay)> {
     line.clear();
     reader.read_line(&mut line).ok()?;
     let base = line.trim_end().to_string();
-    let overlay = serde_json::from_reader(reader).ok()?;
+    line.clear();
+    reader.read_line(&mut line).ok()?;
+    let digest = line.trim_end().to_string();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).ok()?;
+    if blake3::hash(&body).to_hex().as_str() != digest {
+        crate::slog_warn!(
+            "tier2 dead_code: the kept dead-code overlay {} is damaged; not reading it",
+            path.display()
+        );
+        return None;
+    }
+    let overlay = serde_json::from_slice(&body).ok()?;
     Some((base, overlay))
 }
 
 /// Writes `overlay` over the base named `base` to `path`, through a
-/// temporary file; returns its size.
+/// temporary file, with the digest of its body; returns its size.
 pub(super) fn write_overlay(path: &Path, base: &str, overlay: &Overlay) -> std::io::Result<u64> {
     let temporary = path.with_extension(format!("tmp{}", std::process::id()));
     let written = (|| {
+        let body = serde_json::to_vec(overlay)?;
         let mut out = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
-        write!(out, "{OVERLAY_HEADER}\n{}\n{base}\n", overlay.state.config)?;
-        serde_json::to_writer(&mut out, overlay)?;
+        write!(
+            out,
+            "{OVERLAY_HEADER}\n{}\n{base}\n{}\n",
+            overlay.state.config,
+            blake3::hash(&body).to_hex()
+        )?;
+        out.write_all(&body)?;
         let file = out.into_inner().map_err(|error| error.into_error())?;
         let size = file.metadata()?.len();
         file.sync_all()?;
