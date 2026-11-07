@@ -257,6 +257,150 @@ impl Strings {
     }
 }
 
+/// How many strings of a [`ColdStrings`] table share one restart point.
+const COLD_BLOCK: usize = 16;
+
+/// Strings a slice holds only to copy into replies, never to compare or
+/// look up by: full names and signatures. They are sorted and front-coded:
+/// each is stored as how many leading bytes it shares with the string
+/// before it, then the rest. Calls in a chain have full names that extend
+/// one another (`a.b(x)`, `a.b(x).c`), and sorting puts such names side
+/// by side, so most of their text is stored once. Every [`COLD_BLOCK`]-th
+/// string is stored whole, so reading one decodes at most that many.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColdStrings {
+    len: u32,
+    /// Each string as a varint shared length, a varint rest length, and
+    /// the rest's bytes.
+    bytes: Box<[u8]>,
+    /// Where each block's first string starts in `bytes`.
+    blocks: Packed,
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value & 0x7F) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// The varint at `*at` in `bytes`, moving `*at` past it; `None` when it
+/// runs past the end or is longer than a `u64` needs.
+fn read_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+impl ColdStrings {
+    fn of(sorted: &[&str]) -> Self {
+        let mut bytes = Vec::new();
+        let mut blocks = Vec::new();
+        let mut previous: &[u8] = &[];
+        for (index, string) in sorted.iter().enumerate() {
+            let string = string.as_bytes();
+            let shared = if index % COLD_BLOCK == 0 {
+                blocks.push(bytes.len() as u64);
+                0
+            } else {
+                previous
+                    .iter()
+                    .zip(string)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
+            push_varint(&mut bytes, shared as u64);
+            push_varint(&mut bytes, (string.len() - shared) as u64);
+            bytes.extend_from_slice(&string[shared..]);
+            previous = string;
+        }
+        Self {
+            len: u32::try_from(sorted.len()).expect("fewer than 2^32 strings"),
+            bytes: bytes.into_boxed_slice(),
+            blocks: Packed::of(&blocks),
+        }
+    }
+
+    /// Every string of the block holding `index`, up to `index`, decoded
+    /// into `out` one after another; `None` when the bytes do not decode.
+    fn decode_to(&self, index: usize, out: &mut Vec<u8>) -> Option<()> {
+        let mut at = usize::try_from(self.blocks.get(index / COLD_BLOCK)).ok()?;
+        out.clear();
+        for _ in 0..=index % COLD_BLOCK {
+            let shared = usize::try_from(read_varint(&self.bytes, &mut at)?).ok()?;
+            let rest = usize::try_from(read_varint(&self.bytes, &mut at)?).ok()?;
+            let end = at
+                .checked_add(rest)
+                .filter(|end| *end <= self.bytes.len())?;
+            if shared > out.len() {
+                return None;
+            }
+            out.truncate(shared);
+            out.extend_from_slice(&self.bytes[at..end]);
+            at = end;
+        }
+        Some(())
+    }
+
+    /// The string at `index`, which decoding checked is in range and
+    /// decodes.
+    fn get(&self, index: u32) -> String {
+        let mut out = Vec::new();
+        self.decode_to(index as usize, &mut out)
+            .expect("a checked table decodes");
+        String::from_utf8(out).expect("a checked table holds UTF-8")
+    }
+
+    /// Checks that the table decodes as [`Self::of`] wrote it: each block
+    /// starts where `blocks` says, at a string stored whole, every string
+    /// is UTF-8, and the strings end where the bytes do.
+    fn validate(&self) -> Result<(), RecordError> {
+        let error = RecordError("the full-text string table");
+        let len = self.len as usize;
+        if self.blocks.len() != len.div_ceil(COLD_BLOCK) {
+            return Err(error);
+        }
+        let (mut at, mut out) = (0usize, Vec::new());
+        for index in 0..len {
+            if index % COLD_BLOCK == 0 {
+                if self.blocks.get(index / COLD_BLOCK) != at as u64 {
+                    return Err(error);
+                }
+                out.clear();
+            }
+            let shared = read_varint(&self.bytes, &mut at).ok_or(error.clone())?;
+            let rest = read_varint(&self.bytes, &mut at).ok_or(error.clone())?;
+            let end = usize::try_from(rest)
+                .ok()
+                .and_then(|rest| at.checked_add(rest))
+                .filter(|end| *end <= self.bytes.len())
+                .ok_or(error.clone())?;
+            if shared > out.len() as u64 {
+                return Err(error);
+            }
+            out.truncate(shared as usize);
+            out.extend_from_slice(&self.bytes[at..end]);
+            at = end;
+            if std::str::from_utf8(&out).is_err() {
+                return Err(RecordError("a string is not UTF-8"));
+            }
+        }
+        if at == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
 /// Reference kinds by their code in a slice.
 const REF_KINDS: [&str; 10] = [
     "call",
@@ -379,6 +523,8 @@ pub(crate) struct FileSlice {
     language: String,
     record_key: String,
     strings: Strings,
+    /// Full names and signatures, which rows index separately.
+    cold: ColdStrings,
     /// The id of every node handle: the surviving nodes', then the ids
     /// without a node.
     ids: Vec<u64>,
@@ -446,12 +592,13 @@ impl<'s> NodeView<'s> {
         self.string(&self.slice.nodes.kind)
     }
 
-    pub(crate) fn signature(&self) -> Option<&'s str> {
+    /// The signature, decoded from the slice's front-coded table.
+    pub(crate) fn signature(&self) -> Option<String> {
         self.slice
             .nodes
             .signature
             .get_option(self.index)
-            .map(|index| self.slice.strings.get(index))
+            .map(|index| self.slice.cold.get(index))
     }
 
     pub(crate) fn entry_attribute(&self) -> Option<&'s str> {
@@ -548,12 +695,13 @@ impl<'s> RefView<'s> {
 
     /// The full name, kept only where a lookup reads it: for an unresolved
     /// `call` or `construction` and for a `macro_body_call`. Every other
-    /// reference answers `None` whatever it was written with.
-    pub(crate) fn full_ref(&self) -> Option<&'s str> {
+    /// reference answers `None` whatever it was written with. Decoded from
+    /// the slice's front-coded table, so it comes back owned.
+    pub(crate) fn full_ref(&self) -> Option<String> {
         let refs = &self.slice.refs;
         refs.full_at
             .search(self.index as u64)
-            .map(|at| self.slice.strings.get(refs.full_name.get32(at)))
+            .map(|at| self.slice.cold.get(refs.full_name.get32(at)))
     }
 
     /// The name the reference binds locally; for a call written in a
@@ -795,13 +943,7 @@ impl FileSlice {
                 claim(index, "short names");
             }
         }
-        for at in 0..self.refs.full_at.len() {
-            claim(self.refs.full_name.get32(at), "full names");
-        }
         for node in self.nodes() {
-            if let Some(index) = self.nodes.signature.get_option(node.index) {
-                claim(index, "signatures");
-            }
             if let Some(index) = self.nodes.entry_attribute.get_option(node.index) {
                 claim(index, "entry attributes");
             }
@@ -819,6 +961,13 @@ impl FileSlice {
         }
         let mut parts = bytes.into_iter().collect::<Vec<_>>();
         parts.push(("string count", self.strings.len()));
+        parts.push(("front-coded table, stored", self.cold.bytes.len()));
+        parts.push((
+            "front-coded table, decoded",
+            (0..self.cold.len)
+                .map(|index| self.cold.get(index).len())
+                .sum(),
+        ));
         parts
     }
 
@@ -939,6 +1088,14 @@ const fn ref_kind_code(kind: BlobRefKind) -> u64 {
 
 /// The code of `macro_body_call` in [`REF_KINDS`].
 const MACRO_BODY_CALL_CODE: u64 = 9;
+
+/// Each string of `sorted` to its index.
+fn string_indexes<'a>(sorted: &[&'a str]) -> HashMap<&'a str, u64> {
+    (0u64..)
+        .zip(sorted)
+        .map(|(index, string)| (*string, index))
+        .collect()
+}
 /// The codes of `call` and `construction` in [`REF_KINDS`].
 const CALL_CODE: u64 = 0;
 const CONSTRUCTION_CODE: u64 = 2;
@@ -1127,18 +1284,19 @@ impl FileSlice {
         let handle = |id: &NodeId| handles[id];
 
         let mut strings = BTreeSet::<&str>::new();
+        let mut cold = BTreeSet::<&str>::new();
         for (symbol, _) in surviving {
             strings.extend([
                 symbol.name.as_str(),
                 symbol.scoped_name.as_str(),
                 symbol.kind.as_str(),
             ]);
-            strings.extend(symbol.signature.as_deref());
+            cold.extend(symbol.signature.as_deref());
             strings.extend(symbol.entry_attribute.as_deref());
         }
         for reference in refs.values() {
             strings.extend(reference.short_name);
-            strings.extend(reference.kept_full_ref());
+            cold.extend(reference.kept_full_ref());
             strings.extend(reference.local_name);
             if let Some((file, symbol)) = &reference.target {
                 strings.extend([file.as_str(), symbol.as_str()]);
@@ -1149,18 +1307,12 @@ impl FileSlice {
         }
         strings.extend(ordinary.iter().map(|(name, _)| *name));
         let sorted = strings.into_iter().collect::<Vec<_>>();
-        let index = sorted
-            .iter()
-            .enumerate()
-            .map(|(index, string)| {
-                (
-                    *string,
-                    u32::try_from(index).expect("fewer than 2^32 strings"),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let at = |string: &str| u64::from(index[string]);
+        let index = string_indexes(&sorted);
+        let at = |string: &str| index[string];
         let optional = |string: Option<&str>| string.map_or(0, |string| at(string) + 1);
+        let cold = cold.into_iter().collect::<Vec<_>>();
+        let cold_index = string_indexes(&cold);
+        let cold_at = |string: &str| cold_index[string];
 
         let column = |values: Vec<u64>| Packed::of(&values);
         let nodes = Nodes {
@@ -1170,7 +1322,7 @@ impl FileSlice {
             signature: column(
                 surviving
                     .iter()
-                    .map(|(s, _)| optional(s.signature.as_deref()))
+                    .map(|(s, _)| s.signature.as_deref().map_or(0, |s| cold_at(s) + 1))
                     .collect(),
             ),
             entry_attribute: column(
@@ -1243,7 +1395,7 @@ impl FileSlice {
         for (position, reference) in rows.iter().enumerate() {
             if let Some(name) = reference.kept_full_ref() {
                 full_at.push(position as u64);
-                full_name.push(at(name));
+                full_name.push(cold_at(name));
             }
             if let Some(name) = reference.local_name {
                 local_at.push(position as u64);
@@ -1315,6 +1467,7 @@ impl FileSlice {
             language: language.to_string(),
             record_key: record_key.to_string(),
             strings: Strings::of(&sorted),
+            cold: ColdStrings::of(&cold),
             ids,
             id_top: column(tops),
             nodes,
@@ -1377,6 +1530,16 @@ impl<'b> Reader<'b> {
         let len = self.u32()? as usize;
         String::from_utf8(self.take(len)?.to_vec())
             .map_err(|_| RecordError("a string is not UTF-8"))
+    }
+
+    fn cold(&mut self) -> Result<ColdStrings, RecordError> {
+        let len = self.u32()?;
+        let bytes = self.u32()? as usize;
+        Ok(ColdStrings {
+            len,
+            bytes: self.take(bytes)?.into(),
+            blocks: self.packed()?,
+        })
     }
 
     fn packed(&mut self) -> Result<Packed, RecordError> {
@@ -1474,6 +1637,10 @@ impl FileSlice {
         write_string(&mut body, &self.language);
         write_string(&mut body, &self.strings.text);
         write_packed(&mut body, &self.strings.ends);
+        write_u32(&mut body, self.cold.len as usize);
+        write_u32(&mut body, self.cold.bytes.len());
+        body.extend_from_slice(&self.cold.bytes);
+        write_packed(&mut body, &self.cold.blocks);
         write_u32(&mut body, self.ids.len());
         for id in &self.ids {
             body.extend_from_slice(&id.to_le_bytes());
@@ -1549,6 +1716,7 @@ impl FileSlice {
         let language = input.string()?;
         let text = input.string()?;
         let ends = input.packed()?;
+        let cold = input.cold()?;
         let id_count = input.u32()? as usize;
         if id_count > input.bytes.len() / 8 {
             return Err(RecordError("the id count runs past the end"));
@@ -1607,6 +1775,7 @@ impl FileSlice {
             language,
             record_key: record_key.to_string(),
             strings: Strings { text, ends },
+            cold,
             ids,
             id_top,
             nodes,
@@ -1641,6 +1810,8 @@ impl FileSlice {
         {
             return Err(RecordError("the string table is not sorted"));
         }
+        self.cold.validate()?;
+        let cold_count = u64::from(self.cold.len);
         let ids = self.ids.len();
         let ids_bound = ids as u64;
         check(&self.id_top, ids, 2, "id classes")?;
@@ -1653,9 +1824,13 @@ impl FileSlice {
         for column in [&n.name, &n.scoped_name, &n.kind] {
             check(column, nodes, string_count, "a node's string")?;
         }
-        for column in [&n.signature, &n.entry_attribute] {
-            check(column, nodes, string_count + 1, "a node's optional string")?;
-        }
+        check(&n.signature, nodes, cold_count + 1, "a node's signature")?;
+        check(
+            &n.entry_attribute,
+            nodes,
+            string_count + 1,
+            "a node's entry attribute",
+        )?;
         for column in [&n.start_line, &n.start_col, &n.end_line, &n.range_ordinal] {
             check(column, nodes, U32_BOUND, "a node's position")?;
         }
@@ -1685,7 +1860,7 @@ impl FileSlice {
             "a full name's reference",
         )?;
         check_ascending(&r.full_at, "full names out of order")?;
-        check(&r.full_name, r.full_at.len(), string_count, "a full name")?;
+        check(&r.full_name, r.full_at.len(), cold_count, "a full name")?;
         check(
             &r.local_at,
             r.local_at.len(),
@@ -1771,6 +1946,7 @@ impl FileSlice {
 aft_store::heap_bytes_none!(TargetLookup, NodeId, NodeHandle);
 aft_store::heap_bytes_of_fields!(Packed { len, width, words });
 aft_store::heap_bytes_of_fields!(Strings { text, ends });
+aft_store::heap_bytes_of_fields!(ColdStrings { len, bytes, blocks });
 aft_store::heap_bytes_of_fields!(Nodes {
     name,
     scoped_name,
@@ -1812,6 +1988,7 @@ aft_store::heap_bytes_of_fields!(FileSlice {
     language,
     record_key,
     strings,
+    cold,
     ids,
     id_top,
     nodes,
@@ -1944,6 +2121,44 @@ mod tests {
             FileSlice::decode(lib.path(), lib.record_key(), &unsorted.encode()),
             Err(RecordError("scoped names out of order"))
         );
+    }
+
+    #[test]
+    fn front_coded_strings_read_back_whole() {
+        // Chained full names extend one another; two strings can share a
+        // byte prefix that ends inside a character (`é` and `è` share their
+        // first byte); more strings than one block holds.
+        let mut strings = vec![
+            "",
+            "a.b(x)",
+            "a.b(x).c",
+            "a.b(x).c().d",
+            "aé",
+            "aè",
+            "pub fn run(&self)",
+        ];
+        let many = (0..40)
+            .map(|n| format!("self.items.get({n})"))
+            .collect::<Vec<_>>();
+        strings.extend(many.iter().map(String::as_str));
+        strings.sort_unstable();
+        let table = ColdStrings::of(&strings);
+        table.validate().unwrap();
+        for (index, string) in strings.iter().enumerate() {
+            assert_eq!(table.get(index as u32), *string);
+        }
+        let whole = strings.iter().map(|string| string.len()).sum::<usize>();
+        assert!(
+            table.bytes.len() < whole,
+            "{} >= {whole}",
+            table.bytes.len()
+        );
+        // A block start that is not where its block begins is refused.
+        let mut moved = table.clone();
+        let mut starts = moved.blocks.values().collect::<Vec<_>>();
+        starts[1] += 1;
+        moved.blocks = Packed::of(&starts);
+        assert!(moved.validate().is_err());
     }
 
     #[test]

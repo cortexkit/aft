@@ -310,7 +310,7 @@ fn store_node(slice: &FileSlice, node: NodeView<'_>) -> StoreNode {
         node.kind().to_string(),
         node.start_line().saturating_add(1),
         node.end_line().saturating_add(1),
-        node.signature().map(str::to_string),
+        node.signature(),
         node.exported(),
         node.entry_point(),
         lang_from_label(slice.language()).unwrap_or(LangId::TypeScript),
@@ -371,14 +371,15 @@ fn node_order(a: &NodeView<'_>, b: &NodeView<'_>) -> std::cmp::Ordering {
 /// A reference as an unresolved call of `caller`, named by its short name,
 /// else by its full name.
 fn unresolved_call(caller: &StoreNode, reference: RefView<'_>) -> StoreUnresolvedCall {
+    let full_ref = reference.full_ref();
     StoreUnresolvedCall {
         caller: caller.clone(),
         symbol: reference
             .short_name()
-            .or_else(|| reference.full_ref())
+            .or(full_ref.as_deref())
             .unwrap_or_default()
             .to_string(),
-        full_ref: reference.full_ref().map(str::to_string),
+        full_ref,
         line: reference.line(),
         byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
         byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
