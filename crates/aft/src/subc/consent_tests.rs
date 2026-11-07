@@ -6339,7 +6339,7 @@ async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
             grep_dispatch as DispatchFn,
         ),
         (
-            "aft_search",
+            "search",
             json!({"path":root,"query":"needle"}),
             aft_search_dispatch as DispatchFn,
         ),
@@ -6361,6 +6361,7 @@ async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
             .checkout_tool(&f.worker, tool, arguments, 70 + index as u64, dispatch)
             .await;
         assert!(code(&reply).is_empty(), "{tool}: {reply}");
+        assert!(reply.get("code").is_none(), "{tool}: {reply}");
         assert_eq!(
             reply["structuredContent"]["complete"], false,
             "{tool}: {reply}"
