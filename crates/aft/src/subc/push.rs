@@ -1473,6 +1473,10 @@ pub(super) fn process_lossy_push_envelope_batch(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "runner_head_background_tests.rs"]
+mod runner_head_background_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
