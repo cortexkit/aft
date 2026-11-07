@@ -5991,7 +5991,16 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
             && gap["files"] == 1));
     assert_eq!(ctx.status_bar_count_values().dead_code, None);
 
-    write_file(&root, "main.ts", "console.log('supported');\n");
+    // Inspect lists files from the root's index store, which learns of a file
+    // written outside AFT from the project watcher; this context runs none,
+    // so feed the event the watcher would report.
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    let main = write_file(&root, "main.ts", "console.log('supported');\n");
+    watcher_tx
+        .send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![main]))
+        .expect("send watcher event");
+    aft::runtime_drain::drain_watcher_events(&ctx);
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({"id":"python-mixed", "command":"inspect", "sections":["dead_code"]})),
         &ctx,
