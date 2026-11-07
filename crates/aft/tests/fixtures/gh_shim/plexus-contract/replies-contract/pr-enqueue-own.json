@@ -16,7 +16,7 @@
             "pullRequest": {
               "author": {
                 "__typename": "Bot",
-                "login": "app-fixture[bot]"
+                "login": "app-fixture"
               },
               "headRefOid": "0123456789abcdef0123456789abcdef01234567",
               "id": "PR_node_7",
@@ -48,7 +48,7 @@
               "pullRequest": {
                 "author": {
                   "__typename": "Bot",
-                  "login": "app-fixture[bot]"
+                  "login": "app-fixture"
                 },
                 "headRefOid": "0123456789abcdef0123456789abcdef01234567",
                 "id": "PR_node_7",

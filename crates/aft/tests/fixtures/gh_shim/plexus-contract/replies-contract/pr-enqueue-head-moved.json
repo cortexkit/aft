@@ -16,7 +16,7 @@
             "pullRequest": {
               "author": {
                 "__typename": "Bot",
-                "login": "app-fixture[bot]"
+                "login": "app-fixture"
               },
               "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "id": "PR_node_7",
