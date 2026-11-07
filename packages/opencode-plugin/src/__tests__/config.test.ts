@@ -417,7 +417,7 @@ describe("loadAftConfig", () => {
     expect(existsSync(fixture.projectConfigPath)).toBe(false);
   });
 
-  test("a project file naming retired experimental keys is refused and keeps its bytes", () => {
+  test("project retired experimental keys translate with active-harness precedence and keep their bytes", () => {
     const fixture = createConfigFixture();
     const text = `{
       // Committed project settings must not be rewritten by a plugin.
@@ -432,19 +432,21 @@ describe("loadAftConfig", () => {
     }\n`;
     writeFileSync(fixture.projectConfigPath, text);
 
-    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
+    const result = runConfigLoader(fixture.projectDirectory, {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(rejected.errors).toEqual(
-      [
-        "experimental_lsp_ty",
-        "experimental_bash_rewrite",
-        "experimental_bash_compress",
-        "experimental_bash_background",
-        "harnesses.opencode.experimental_bash_rewrite",
-        "harnesses.pi.experimental_lsp_ty",
-      ].map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`),
-    );
+    const config = JSON.parse(result.stdout);
+    expect(config.experimental).toEqual({ lsp_ty: true });
+    expect(config.bash).toEqual({ rewrite: false, compress: false, background: true });
+    for (const key of [
+      "experimental_lsp_ty",
+      "experimental_bash_rewrite",
+      "experimental_bash_compress",
+      "experimental_bash_background",
+      "harnesses",
+    ]) {
+      expect(config).not.toHaveProperty(key);
+    }
     expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(text);
   });
 
@@ -1284,8 +1286,7 @@ describe("loadAftConfig", () => {
   // in-memory config exposes them under `bash.*`. The user's on-disk file
   // is left untouched until Rust user auto-migration or explicit doctor --fix. We keep
   // these scenarios to lock in that the legacy nested input shape still
-  // produces the expected runtime state for the user file; a project file
-  // naming the block is refused.
+  // produces the expected runtime state in both files without rewriting them.
   test("user config can set bash.rewrite via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -1370,25 +1371,31 @@ describe("loadAftConfig", () => {
     });
   });
 
-  test("a project file setting experimental.bash is refused", () => {
+  test("project experimental.bash tuning translates and preserves user feature flags", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({ experimental: { bash: { rewrite: true } } }),
     );
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ experimental: { bash: { long_running_reminder_enabled: false } } }),
-    );
+    const projectText = JSON.stringify({
+      experimental: { bash: { long_running_reminder_enabled: false } },
+    });
+    writeFileSync(fixture.projectConfigPath, projectText);
 
-    const rejected = runRejectedConfigLoader(fixture.projectDirectory, {
+    const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(rejected.errors).toEqual([
-      "removed_config_key:experimental.bash; run npx @cortexkit/aft doctor --fix",
-    ]);
+    const config = JSON.parse(result.stdout);
+    expect(config.bash).toEqual({
+      rewrite: true,
+      compress: false,
+      background: false,
+      long_running_reminder_enabled: false,
+    });
+    expect(config).not.toHaveProperty("experimental.bash");
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
   });
 
   test("translates all experimental keys in memory without rewriting the user file", () => {
@@ -1504,15 +1511,21 @@ describe("loadAftConfig", () => {
     );
   });
 
-  test("translates the user file and refuses the project file, without writes", () => {
+  test("translates experimental keys in both files without writes", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ experimental_bash_compress: true }));
+    const projectText = JSON.stringify({ experimental_bash_compress: true });
+    writeFileSync(fixture.projectConfigPath, projectText);
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
 
-    expect(runRejectedConfigLoader(fixture.projectDirectory, env).errors).toEqual([
-      "removed_config_key:experimental_bash_compress; run npx @cortexkit/aft doctor --fix",
-    ]);
+    const translated = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
+    expect(translated).toMatchObject({
+      experimental: { lsp_ty: true },
+      bash: { compress: true },
+    });
+    expect(translated).not.toHaveProperty("experimental_bash_compress");
+    expect(translated).not.toHaveProperty("experimental_lsp_ty");
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ bash: { compress: true } }));
     expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
       experimental: { lsp_ty: true },

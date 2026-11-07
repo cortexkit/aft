@@ -221,7 +221,9 @@ describe("OpenCode feature-config registration", () => {
     // aft_grep name is ignored and only the user defaults remain disabled.
     expect(config.disabled_tools).toEqual(["aft_delete", "aft_move"]);
     expect(v1Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
-    expect(v2Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
+    expect(v2Names(config)).toEqual(
+      expected(["aft_delete", "aft_move"]).map(v2HostToolName).sort(),
+    );
     expect(
       getConfigLoadNotices().some(
         (notice) => notice.configPath === projectFile && notice.message.includes("retired keys"),

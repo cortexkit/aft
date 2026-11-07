@@ -146,7 +146,7 @@ describe("Pi/OMP feature-config registration", () => {
     ).toEqual([]);
   });
 
-  test("names retired in 0.62 or earlier refuse a project file and leave it unwritten", () => {
+  test("project retired names translate but cannot loosen LSP idle limits or rewrite the file", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     const text = JSON.stringify({
@@ -154,16 +154,15 @@ describe("Pi/OMP feature-config registration", () => {
       idle: { lsp_ttl_minutes: 120 },
     });
     writeFileSync(projectFile, text);
-    let rejected: unknown;
-    try {
-      loadWithUserConfig({ lsp: { idle_minutes: 30 } });
-    } catch (error) {
-      rejected = error;
-    }
-    expect((rejected as { errors?: string[] } | undefined)?.errors).toEqual([
-      "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
-      "removed_config_key:idle.lsp_ttl_minutes; run npx @cortexkit/aft doctor --fix",
-    ]);
+    const config = loadWithUserConfig({ lsp: { idle_minutes: 30 } });
+    expect(config.indexes).toEqual({ trigram: false, semantic: true, callgraph: true });
+    expect(config.lsp?.idle_minutes).toBe(30);
+    expect(config.disabled_tools).toEqual(["aft_delete", "aft_move"]);
+    expect(
+      getConfigLoadNotices().some(
+        (notice) => notice.configPath === projectFile && notice.message.includes("retired keys"),
+      ),
+    ).toBe(true);
     expect(readFileSync(projectFile, "utf8")).toBe(text);
   });
 
