@@ -80,6 +80,44 @@ fn inspect_category_is_off(
 type WaiterTx = Sender<JobOutcome>;
 type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 
+/// Dead code and unused exports read the whole call graph, and a run costs
+/// seconds and hundreds of MB on a large repository where the other Tier-2
+/// categories cost milliseconds. Automatic runs of them therefore follow their
+/// own schedule: once the root's call graph is current after it is bound, then
+/// at most once per this interval while edits keep arriving. An explicit
+/// `aft_inspect` is not held to it. Linked worktrees run no automatic Tier-2
+/// work at all (see `set_automatic_tier2_refresh_allowed`).
+pub(crate) const WHOLE_GRAPH_BACKGROUND_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+fn is_whole_graph_category(category: InspectCategory) -> bool {
+    matches!(
+        category,
+        InspectCategory::DeadCode | InspectCategory::UnusedExports
+    )
+}
+
+/// Set while one root's automatic dead-code or unused-exports run is in
+/// progress: the daemon serves many roots, and two such runs at once would
+/// double the peak memory for answers nobody is waiting on.
+static WHOLE_GRAPH_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The process-wide turn for an automatic whole-graph run; released on drop.
+struct WholeGraphBackgroundTurn(&'static AtomicBool);
+
+impl WholeGraphBackgroundTurn {
+    fn try_take(gate: &'static AtomicBool) -> Option<Self> {
+        gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(gate))
+    }
+}
+
+impl Drop for WholeGraphBackgroundTurn {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 struct Waiter {
     tx: WaiterTx,
@@ -221,6 +259,11 @@ pub struct Tier2RunSubmission {
     pub queued_categories: Vec<InspectCategory>,
     pub newly_queued_categories: Vec<InspectCategory>,
     pub deferred_categories: Vec<InspectCategory>,
+    /// Dead code or unused exports, due under their automatic schedule but
+    /// not started yet: this root's call graph has not been built, or another
+    /// root's run of them holds the process-wide turn. Retried like
+    /// `deferred_categories`, but these are not cold-build-limit deferrals.
+    pub whole_graph_waits: Vec<InspectCategory>,
     /// Categories not started because their last build failed and the
     /// automatic-retry pause has not elapsed.
     pub retry_paused: Vec<Tier2RetryPause>,
@@ -934,6 +977,13 @@ pub struct InspectManager {
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
+    /// When an automatic dead-code or unused-exports run last completed for
+    /// this root; `None` until the first one does. See
+    /// [`WHOLE_GRAPH_BACKGROUND_INTERVAL`].
+    whole_graph_background_done_at: Mutex<Option<Instant>>,
+    /// [`WHOLE_GRAPH_BACKGROUND_RUNNING`], or a test's own gate so tests
+    /// running in parallel do not take each other's turn.
+    whole_graph_gate: &'static AtomicBool,
     /// Monotonic count of Tier-2 completions delivered via the reuse path
     /// (watcher-driven scheduler runs). These bypass `result_rx`/
     /// `drain_completions`, so the `&AppContext`-side drain polls this counter
@@ -1127,6 +1177,8 @@ impl InspectManager {
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
+            whole_graph_background_done_at: Mutex::new(None),
+            whole_graph_gate: &WHOLE_GRAPH_BACKGROUND_RUNNING,
             reuse_completions: AtomicU64::new(0),
             successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
@@ -1187,6 +1239,14 @@ impl InspectManager {
         if token.cancel_requested_before_commit() {
             *token = token.fresh();
         }
+    }
+
+    /// This manager takes its whole-graph turn from `gate` instead of the
+    /// process-wide one.
+    #[cfg(test)]
+    pub(crate) fn with_whole_graph_gate(mut self, gate: &'static AtomicBool) -> Self {
+        self.whole_graph_gate = gate;
+        self
     }
 
     pub(crate) fn set_cold_build_limiter(
@@ -2106,6 +2166,12 @@ impl InspectManager {
             }
             None => true,
         });
+        let whole_graph_turn = self.admit_whole_graph_background(
+            &snapshot,
+            &mut requested,
+            &mut submission,
+            Instant::now(),
+        );
         if requested.is_empty() {
             return submission;
         }
@@ -2166,13 +2232,21 @@ impl InspectManager {
             submission
                 .queued_categories
                 .retain(|category| !deferred.contains(category));
-            submission.deferred_categories = deferred;
+            submission.deferred_categories.extend(deferred);
             submission.newly_queued_categories.clear();
             return submission;
         };
 
         let permit_slot = Arc::new(Mutex::new(Some(permit)));
         let categories_for_worker = submission.newly_queued_categories.clone();
+        // Held for the worker's whole serial run only when it runs a
+        // whole-graph category; otherwise that category was already in flight
+        // and this submission's turn is released here.
+        let whole_graph_turn = whole_graph_turn.filter(|_| {
+            categories_for_worker
+                .iter()
+                .any(|category| is_whole_graph_category(*category))
+        });
         for category in &categories_for_worker {
             self.view_refresh_dispatched(&snapshot.project_root, *category);
         }
@@ -2186,6 +2260,7 @@ impl InspectManager {
         let cancellation = cancellation.with_root(&snapshot.project_root);
         pool.spawn_fifo(move || {
             let _cancel = crate::executor::install_job_cancellation(cancellation);
+            let _whole_graph_turn = whole_graph_turn;
             for category in categories_for_worker {
                 let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
                 let _flight = manager.tier2_flight_exit_guard(job.key.clone());
@@ -2206,11 +2281,66 @@ impl InspectManager {
                         Duration::ZERO,
                     )
                 };
+                if is_whole_graph_category(category) && result.outcome.is_ok() {
+                    manager.note_whole_graph_background_done(Instant::now());
+                }
                 manager.route_tier2_reuse_completion(result);
             }
         });
 
         submission
+    }
+
+    /// Applies the automatic schedule for dead code and unused exports (see
+    /// [`WHOLE_GRAPH_BACKGROUND_INTERVAL`]) to `requested`. A category not
+    /// due yet is dropped. One that is due but must wait, because this root's
+    /// call graph is still building or another root holds the process-wide
+    /// turn, is reported in `whole_graph_waits`, so the scheduler tries
+    /// again shortly. Returns the turn when a due category stays in.
+    fn admit_whole_graph_background(
+        &self,
+        snapshot: &InspectSnapshot,
+        requested: &mut Vec<InspectCategory>,
+        submission: &mut Tier2RunSubmission,
+        now: Instant,
+    ) -> Option<WholeGraphBackgroundTurn> {
+        if !requested
+            .iter()
+            .any(|category| is_whole_graph_category(*category))
+        {
+            return None;
+        }
+        let due = self
+            .whole_graph_background_done_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none_or(|done| {
+                now.saturating_duration_since(done) >= WHOLE_GRAPH_BACKGROUND_INTERVAL
+            });
+        let graph_ready =
+            !snapshot.config.indexes.callgraph || self.callgraph_ready_for_snapshot(snapshot);
+        let turn = (due && graph_ready)
+            .then(|| WholeGraphBackgroundTurn::try_take(self.whole_graph_gate))
+            .flatten();
+        if turn.is_none() {
+            if due {
+                submission.whole_graph_waits.extend(
+                    requested
+                        .iter()
+                        .copied()
+                        .filter(|category| is_whole_graph_category(*category)),
+                );
+            }
+            requested.retain(|category| !is_whole_graph_category(*category));
+        }
+        turn
+    }
+
+    fn note_whole_graph_background_done(&self, now: Instant) {
+        *self
+            .whole_graph_background_done_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
     }
 
     pub fn tier2_any_in_flight(&self) -> bool {
@@ -6950,6 +7080,83 @@ mod guard_tests {
             }),
             Arc::new(RwLock::new(SymbolCache::new())),
         )
+    }
+
+    /// Automatic dead code and unused exports wait for the call graph, run on
+    /// one root at a time, and then only once per interval; other categories
+    /// are untouched.
+    #[test]
+    fn whole_graph_categories_follow_their_background_schedule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let gate: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let manager = InspectManager::new().with_whole_graph_gate(gate);
+        let other = InspectManager::new().with_whole_graph_gate(gate);
+        let with_callgraph = |callgraph: bool| {
+            let mut snapshot = tier1_snapshot(&root);
+            let mut config = (*snapshot.config).clone();
+            config.indexes.callgraph = callgraph;
+            snapshot.config = Arc::new(config);
+            snapshot
+        };
+        let admit = |manager: &InspectManager, snapshot: &InspectSnapshot, now: Instant| {
+            let mut requested = vec![
+                InspectCategory::DeadCode,
+                InspectCategory::UnusedExports,
+                InspectCategory::Complexity,
+            ];
+            let mut submission = Tier2RunSubmission::default();
+            let turn = manager.admit_whole_graph_background(
+                snapshot,
+                &mut requested,
+                &mut submission,
+                now,
+            );
+            (turn, requested, submission.whole_graph_waits)
+        };
+        let whole = vec![InspectCategory::DeadCode, InspectCategory::UnusedExports];
+        let start = Instant::now();
+
+        // No checkout of this root has published a call graph: wait.
+        let (turn, requested, waits) = admit(&manager, &with_callgraph(true), start);
+        assert!(turn.is_none());
+        assert_eq!(requested, vec![InspectCategory::Complexity]);
+        assert_eq!(waits, whole);
+
+        // Without a call graph to wait for, the first run is admitted.
+        let off = with_callgraph(false);
+        let (turn, requested, waits) = admit(&manager, &off, start);
+        assert!(turn.is_some());
+        assert_eq!(requested.len(), 3);
+        assert!(waits.is_empty());
+
+        // Another root waits while that turn is held, and gets it after.
+        let (other_turn, requested, waits) = admit(&other, &off, start);
+        assert!(other_turn.is_none());
+        assert_eq!(requested, vec![InspectCategory::Complexity]);
+        assert_eq!(waits, whole);
+        drop(turn);
+        let (other_turn, _, waits) = admit(&other, &off, start);
+        assert!(other_turn.is_some() && waits.is_empty());
+        drop(other_turn);
+
+        // After a completed run the categories are left out, without waiting,
+        // until the interval has passed.
+        manager.note_whole_graph_background_done(start);
+        let soon = start + WHOLE_GRAPH_BACKGROUND_INTERVAL - Duration::from_secs(1);
+        let (turn, requested, waits) = admit(&manager, &off, soon);
+        assert!(turn.is_none());
+        assert_eq!(requested, vec![InspectCategory::Complexity]);
+        assert!(waits.is_empty());
+        let later = start + WHOLE_GRAPH_BACKGROUND_INTERVAL;
+        let (turn, requested, _) = admit(&manager, &off, later);
+        assert!(turn.is_some());
+        assert_eq!(requested.len(), 3);
+        drop(turn);
+        assert!(
+            !gate.load(Ordering::Acquire),
+            "every turn is released on drop"
+        );
     }
 
     #[test]

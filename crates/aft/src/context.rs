@@ -10393,10 +10393,22 @@ impl AppContext {
         }
         let submission =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
-        if !submission.deferred_categories.is_empty() {
+        if !submission.deferred_categories.is_empty() || !submission.whole_graph_waits.is_empty() {
             self.tier2_refresh_scheduler
                 .lock()
                 .note_dispatch_deferred(Instant::now());
+        }
+        if !submission.whole_graph_waits.is_empty() {
+            crate::slog_info!(
+                "tier2 refresh holding whole-graph categories until the call graph is built and no other root runs them: categories={:?}",
+                submission
+                    .whole_graph_waits
+                    .iter()
+                    .map(|category| category.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        if !submission.deferred_categories.is_empty() {
             crate::slog_info!(
                 "tier2 refresh deferred by cold build limit: categories={:?}",
                 submission
