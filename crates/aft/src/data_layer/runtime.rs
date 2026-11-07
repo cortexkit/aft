@@ -143,13 +143,6 @@ const PUBLISH_AT: usize = 64;
 /// the changes are published.
 const PUBLISH_AT_REFRESHED: usize = 256;
 
-/// A checkout whose text and call graph read from more segments than this
-/// is built again whole, which writes everything it reads into one segment
-/// and retires what no other checkout reads; each publication of its
-/// changes adds one. Vector segments are not counted, since a build does
-/// not fold them.
-const COMPACT_AT: usize = 8;
-
 /// Whether a refresh publishes the changes it resolved.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Publish {
@@ -536,15 +529,17 @@ impl Work {
         match self.checkout.publish_changes() {
             Ok(Some(report)) => {
                 crate::slog_info!(
-                    "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments, {:.0} ms",
+                    "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments ({} read in all, {} retired), {:.0} ms",
                     self.checkout.root().display(),
                     report.paths,
                     report.fragments,
                     report.text_units,
                     report.segments,
+                    report.read_segments,
+                    report.retired_segments,
                     report.ms
                 );
-                if report.segments > COMPACT_AT {
+                if report.wants_build() {
                     self.start_build();
                 }
             }

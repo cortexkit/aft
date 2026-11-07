@@ -28,18 +28,21 @@ fn main() {
             .unwrap();
     eprintln!(
         "compared checkouts with cold builds {} times; {} differed; {} publications of changes, \
-         {} builds that folded A's segments (at most {} segments)",
+         {} builds that folded A's segments (at most {} segments only A read, {} in all, {} in \
+         the store)",
         summary.comparisons,
         summary.failed,
         summary.publications,
         summary.compactions,
-        summary.most_segments
+        summary.most_segments,
+        summary.most_read_segments,
+        summary.most_store_segments
     );
     assert!(summary.comparisons > 0, "nothing was compared");
     assert_eq!(summary.failed, 0, "a checkout differs from a cold build");
     assert!(
         summary.compactions > 0,
-        "checkout A never read from more than eight segments, so no build folded them: \
+        "checkout A never read from enough segments for a build to fold them: \
          replay more edits or lower CHECKOUT_GATE_PUBLISH_EDITS"
     );
 }

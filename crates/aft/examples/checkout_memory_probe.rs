@@ -10,7 +10,8 @@
 //! asks for the call graph after every edit would have it. The changes are
 //! published once more than 64 paths changed and at every commit end (the
 //! checkout going quiet), and the checkout is built again whole once it
-//! reads from more than eight segments, as the runtime does. At every
+//! reads from too many segments (`DeltaReport::wants_build`), as the runtime
+//! does. At every
 //! commit end the allocator's free pages are handed back to the system, as
 //! the daemon's allocator relief does.
 //!
@@ -52,8 +53,6 @@ const PUBLISH_AT: usize = 64;
 /// it, and each edit's line also says what the call graph held after the
 /// refresh and before that publication (`refreshed_callgraph_mib`).
 const PUBLISH_AT_REFRESHED: usize = 256;
-/// Segments past which the runtime builds a checkout again whole.
-const COMPACT_AT: usize = 8;
 
 /// Whether [`Counting`] counts: with PROBE_ALLOC=1, each edit's line says
 /// how many bytes recording it and refreshing the call graph allocated, and
@@ -287,10 +286,10 @@ fn sample(
 }
 
 /// Publishes the checkout's changes, and builds it again whole once it
-/// reads from more than [`COMPACT_AT`] segments. Returns what it did.
+/// reads from too many segments, as the runtime does. Returns what it did.
 fn publish(checkout: &Checkout) -> Option<String> {
     let report = checkout.publish_changes().unwrap()?;
-    if report.segments > COMPACT_AT {
+    if report.wants_build() {
         checkout.build().unwrap();
         return Some(format!(
             "published and built again ({} segments)",

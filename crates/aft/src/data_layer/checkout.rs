@@ -556,6 +556,12 @@ pub struct DeltaReport {
     /// afterwards. Vector segments and other checkouts' segments are not
     /// counted: a build of this checkout cannot fold them.
     pub segments: usize,
+    /// Every segment this checkout's text, content and call graph read from
+    /// afterwards, those other checkouts read too included.
+    pub read_segments: usize,
+    /// What the new segment left out because another checkout already reads
+    /// it.
+    pub shared: SharedUnits,
     /// Segments no checkout read any more, and other checkouts whose folder
     /// is gone, left out of the new generation as a build leaves them out.
     pub retired_segments: usize,
@@ -563,13 +569,49 @@ pub struct DeltaReport {
     pub ms: f64,
 }
 
+/// How many segments a build reads shared units from besides its own: the
+/// segments that serve it the most units other checkouts read too.
+/// Whatever other segments hold for it, it writes again.
+pub(crate) const SHARE_FROM: usize = 4;
+
+/// A checkout whose text and call graph read from more segments than this
+/// that no other checkout reads is built again whole, which writes
+/// everything it reads into one segment and retires what no other checkout
+/// reads; each publication of its changes adds one. Vector segments are
+/// not counted, since a build does not fold them.
+pub(crate) const COMPACT_AT: usize = 8;
+
+/// A checkout that reads from more segments than this in all, those other
+/// checkouts read too included, is built again whole as well: a build
+/// reads from at most [`SHARE_FROM`] of them besides its own, so the units
+/// it reads from any others move into its new segment. Without it, a
+/// checkout that takes in other checkouts' changes (a merge, a pull) read
+/// from each of their change segments, and kept every one of them in the
+/// store for as long as it held the same contents.
+pub(crate) const READ_AT: usize = 16;
+
+const _: () = assert!(
+    READ_AT > SHARE_FROM + 1,
+    "a build must leave a checkout reading fewer segments than call for one"
+);
+
+impl DeltaReport {
+    /// Whether the checkout reads from so many segments that it is to be
+    /// built again whole: past [`COMPACT_AT`] only it reads, or past
+    /// [`READ_AT`] in all.
+    #[must_use]
+    pub fn wants_build(&self) -> bool {
+        self.segments > COMPACT_AT || self.read_segments > READ_AT
+    }
+}
+
 /// What a build did.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct BuildReport {
     pub files: usize,
     pub text_units: usize,
-    /// What the new segment left out because a segment another checkout
-    /// reads already holds it.
+    /// What the new segment left out because another checkout already
+    /// reads it from a segment this build shares.
     pub shared: SharedUnits,
     pub parsed_files: usize,
     pub extract_failures: usize,
@@ -1675,6 +1717,18 @@ impl Checkout {
         snapshot: &Snapshot,
         states: &[&CheckoutState],
     ) -> Result<SegmentsRead, DataError> {
+        self.segments_read_noting(snapshot, states, |_, _| {})
+    }
+
+    /// [`Self::segments_read_by`], also calling `note` with each unit a
+    /// member of `states` reads and the place in the manifest of the
+    /// segment it reads it from.
+    fn segments_read_noting(
+        &self,
+        snapshot: &Snapshot,
+        states: &[&CheckoutState],
+        mut note: impl FnMut(ReadUnit, usize),
+    ) -> Result<SegmentsRead, DataError> {
         let known = known_sections();
         let entries = snapshot.manifest().segments().to_vec();
         // Each segment this build can use, by its place in the manifest;
@@ -1717,7 +1771,9 @@ impl Checkout {
                 for (position, record) in state.paths().iter().enumerate() {
                     match locator.get(record.content) {
                         Some(Located::Indexed { segment, .. }) => {
-                            needed[text_index[segment as usize]] = true;
+                            let holder = text_index[segment as usize];
+                            needed[holder] = true;
+                            note(ReadUnit::Text(record.content), holder);
                         }
                         Some(_) => {}
                         None if record.kind == PathKind::Text
@@ -1731,14 +1787,20 @@ impl Checkout {
                         let key =
                             RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
                         match newest_holder(&contents, |content| content.find(key))? {
-                            Some(holder) => needed[usable[holder]] = true,
+                            Some(holder) => {
+                                needed[usable[holder]] = true;
+                                note(ReadUnit::Record(key), usable[holder]);
+                            }
                             None => needs_unusable = true,
                         }
                     }
                     if let Some(fragment) = state.fragment(position) {
                         let key = FragmentKey::from_digest(fragment);
                         match newest_holder(&graphs, |graph| graph.find(key))? {
-                            Some(holder) => needed[usable[holder]] = true,
+                            Some(holder) => {
+                                needed[usable[holder]] = true;
+                                note(ReadUnit::Fragment(key), usable[holder]);
+                            }
                             None => needs_unusable = true,
                         }
                     }
@@ -1788,78 +1850,90 @@ impl Checkout {
         Ok(OtherStates::Read { states, gone })
     }
 
+    /// The units the family's other checkouts read, each with the segment
+    /// they read it from; `None` when another checkout's state cannot be
+    /// read, since that state could read anything.
+    fn read_by_others(&self, snapshot: &Snapshot) -> Result<Option<ReadByOthers>, DataError> {
+        let OtherStates::Read { states, .. } = self.other_states(snapshot)? else {
+            return Ok(None);
+        };
+        let mut read = ReadByOthers::default();
+        if states.is_empty() {
+            return Ok(Some(read));
+        }
+        let others = states.iter().collect::<Vec<_>>();
+        self.segments_read_noting(snapshot, &others, |unit, holder| match unit {
+            ReadUnit::Text(key) => {
+                read.text.insert(key, holder);
+            }
+            ReadUnit::Record(key) => {
+                read.records.insert(key, holder);
+            }
+            ReadUnit::Fragment(key) => {
+                read.fragments.insert(key, holder);
+            }
+        })?;
+        Ok(Some(read))
+    }
+
     /// Leaves out of a build's new segment the text units, content records
-    /// and fragments that a segment another checkout reads already holds.
+    /// and fragments another checkout already reads, when it reads them
+    /// from one of the [`SHARE_FROM`] segments that serve the most of them.
     /// Worktrees of one repository hold mostly the same contents, which
     /// each first build used to store again (about 155 MB for each
-    /// prefrontal worktree). Such a segment stays while that checkout reads
-    /// from it, and this checkout's state then reads from it too, so
-    /// retirement keeps it for either. Leaves nothing out when another
-    /// checkout's state cannot be read.
+    /// prefrontal worktree); nearly all of them sit in a sibling's build
+    /// segment, which is among those kept.
+    ///
+    /// Everything else is written again. Other checkouts' small change
+    /// segments are folded in that way: those checkouts then read the
+    /// units from this build's segment, the newest that holds them, and a
+    /// change segment nobody reads any more leaves the store. Sharing from
+    /// every segment instead left two checkouts reading one change segment
+    /// each waiting on the other to fold it, which neither ever did. A unit
+    /// a sibling's segment holds but no other checkout reads is written
+    /// again too, so a build never keeps a segment alive that only it reads.
+    /// Leaves nothing out when another checkout's state cannot be read.
     fn leave_out_shared(
         &self,
         snapshot: &Snapshot,
         text: &mut TextSectionsBuilder,
-        sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
+        mut sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
     ) -> Result<SharedUnits, DataError> {
-        let OtherStates::Read { states, .. } = self.other_states(snapshot)? else {
+        let Some(read) = self.read_by_others(snapshot)? else {
             return Ok(SharedUnits::default());
         };
-        if states.is_empty() {
-            return Ok(SharedUnits::default());
-        }
-        let others = states.iter().collect::<Vec<_>>();
-        let read = self.segments_read_by(snapshot, &others)?;
-        let shared = read
-            .usable
-            .iter()
-            .filter(|&&index| read.needed[index])
-            .map(|&index| {
-                read.opened[index]
-                    .as_deref()
-                    .expect("usable segments are open")
-            })
-            .collect::<Vec<_>>();
-        let mut texts = Vec::new();
-        for segment in &shared {
-            if let Some(found) = TextSegment::open(segment).map_err(DataError::store)? {
-                texts.push(found);
+        // How many of this build's units each segment serves the others.
+        let serves = std::cell::RefCell::new(HashMap::<usize, usize>::new());
+        let count = |unit| {
+            if let Some(holder) = read.holder(unit) {
+                *serves.borrow_mut().entry(holder).or_default() += 1;
             }
-        }
-        let locator = TextLocator::build(&texts).map_err(DataError::store)?;
-        let contents = shared
-            .iter()
-            .map(|segment| ContentSegment::open(segment).map_err(DataError::store))
-            .collect::<Result<Vec<_>, _>>()?;
-        let graphs = shared
-            .iter()
-            .map(|segment| GraphSegment::open(segment).map_err(DataError::store))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut left = SharedUnits::default();
-        let before = text.len();
-        text.retain(|key| locator.get(key).is_none());
-        left.text_units = before - text.len();
-        if let Some(sections) = sections {
-            // A lookup that fails counts as not held: the unit is written
-            // again rather than named where it cannot be read.
-            let (records, fragments) = sections.leave_out(
+        };
+        text.retain(|key| {
+            count(ReadUnit::Text(key));
+            true
+        });
+        if let Some(sections) = sections.as_deref_mut() {
+            sections.leave_out(
                 |key| {
-                    contents
-                        .iter()
-                        .flatten()
-                        .any(|content| matches!(content.find(key), Ok(Some(_))))
+                    count(ReadUnit::Record(key));
+                    false
                 },
                 |key| {
-                    graphs
-                        .iter()
-                        .flatten()
-                        .any(|graph| matches!(graph.find(key), Ok(Some(_))))
+                    count(ReadUnit::Fragment(key));
+                    false
                 },
             );
-            left.records = records;
-            left.fragments = fragments;
         }
-        Ok(left)
+        let mut ranked = serves.into_inner().into_iter().collect::<Vec<_>>();
+        // The most units first; between equals, the newer segment.
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        let kept = ranked
+            .into_iter()
+            .take(SHARE_FROM)
+            .map(|(holder, _)| holder)
+            .collect::<HashSet<_>>();
+        Ok(read.leave_out(Some(text), sections, |holder| kept.contains(&holder)))
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -2280,6 +2354,18 @@ impl Checkout {
             self.adopt_newest()?;
             return Ok(None);
         }
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        // What another checkout already reads stays where it reads it from,
+        // as a build leaves it. Written again here, it would be newest in
+        // this segment, and that checkout would read it from here; once
+        // this checkout edited it away, the other one would keep this
+        // segment in the store alone, without ever counting it as its own.
+        let read_by_others = self.read_by_others(&snapshot)?;
+        let mut shared = read_by_others
+            .as_ref()
+            .map_or_else(SharedUnits::default, |read| {
+                read.leave_out(Some(&mut text_units), None, |_| true)
+            });
         let mut pending = session.create_segment().map_err(DataError::store)?;
         text_units
             .write(pending.writer())
@@ -2297,6 +2383,11 @@ impl Checkout {
                 sections
                     .add(&inputs, file, &resolution.decode(file))
                     .map_err(DataError::Store)?;
+            }
+            if let Some(read) = &read_by_others {
+                let left = read.leave_out(None, Some(&mut sections), |_| true);
+                shared.records = left.records;
+                shared.fragments = left.fragments;
             }
             sections
                 .finish(pending.writer(), None)
@@ -2374,6 +2465,8 @@ impl Checkout {
                 .zip(&others_read)
                 .filter(|(own, other)| **own && !**other)
                 .count(),
+            read_segments: read.needed.iter().filter(|own| **own).count(),
+            shared,
             retired_segments,
             retired_checkouts,
             ms: 0.0,
@@ -2395,6 +2488,23 @@ impl Checkout {
             ms: elapsed_ms(started),
             ..report
         }))
+    }
+
+    /// How many segments the newest generation of the family store names,
+    /// for every checkout of the family. For gates and tests.
+    ///
+    /// # Errors
+    ///
+    /// When the store's newest generation cannot be read.
+    #[doc(hidden)]
+    pub fn store_segments(&self) -> Result<usize, DataError> {
+        Ok(self
+            .family
+            .snapshot()
+            .map_err(DataError::store)?
+            .manifest()
+            .segments()
+            .len())
     }
 
     /// How many paths changed since the publication.
@@ -3607,6 +3717,61 @@ struct SegmentsRead {
     needed: Vec<bool>,
 }
 
+/// A unit a checkout's state reads from a segment.
+#[derive(Clone, Copy)]
+enum ReadUnit {
+    Text(ContentKey),
+    Record(RecordKey),
+    Fragment(FragmentKey),
+}
+
+/// The units the family's other checkouts read, each with the place in the
+/// manifest of the segment they read it from: the newest that holds it.
+#[derive(Default)]
+struct ReadByOthers {
+    text: HashMap<ContentKey, usize>,
+    records: HashMap<RecordKey, usize>,
+    fragments: HashMap<FragmentKey, usize>,
+}
+
+impl ReadByOthers {
+    /// Where the other checkouts read `unit` from, if they read it.
+    fn holder(&self, unit: ReadUnit) -> Option<usize> {
+        match unit {
+            ReadUnit::Text(key) => self.text.get(&key),
+            ReadUnit::Record(key) => self.records.get(&key),
+            ReadUnit::Fragment(key) => self.fragments.get(&key),
+        }
+        .copied()
+    }
+
+    /// Leaves out of a new segment the units the other checkouts read from
+    /// a segment `keep` accepts, and returns how many of each it left out.
+    /// The checkout writing the segment then reads them from where the
+    /// others do.
+    fn leave_out(
+        &self,
+        text: Option<&mut TextSectionsBuilder>,
+        sections: Option<&mut super::graph_store::SectionsWriter<'_>>,
+        keep: impl Fn(usize) -> bool,
+    ) -> SharedUnits {
+        let shared = |unit| self.holder(unit).is_some_and(&keep);
+        let mut left = SharedUnits::default();
+        if let Some(text) = text {
+            let before = text.len();
+            text.retain(|key| !shared(ReadUnit::Text(key)));
+            left.text_units = before - text.len();
+        }
+        if let Some(sections) = sections {
+            (left.records, left.fragments) = sections.leave_out(
+                |key| shared(ReadUnit::Record(key)),
+                |key| shared(ReadUnit::Fragment(key)),
+            );
+        }
+        left
+    }
+}
+
 fn newest_holder<T>(
     segments: &[Option<T>],
     find: impl Fn(&T) -> Result<Option<u32>, aft_store::segment::SegmentError>,
@@ -3657,8 +3822,8 @@ enum OtherStates {
     Unreadable { gone: Vec<CheckoutId> },
 }
 
-/// What a build left out of its new segment because a segment another
-/// checkout reads already holds it.
+/// What a build left out of its new segment, or a publication of changes
+/// out of its own, because another checkout already reads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SharedUnits {
     pub text_units: usize,
@@ -5183,13 +5348,7 @@ pub fn other() { callee(); }
 
     /// The live segments of the family store at `checkout`'s.
     fn live_segments(checkout: &Checkout) -> usize {
-        checkout
-            .family
-            .snapshot()
-            .unwrap()
-            .manifest()
-            .segments()
-            .len()
+        checkout.store_segments().unwrap()
     }
 
     /// A checkout that keeps editing the same file publishes each round of
@@ -5247,6 +5406,189 @@ pub fn other() { callee(); }
         assert_eq!(
             ours,
             callers_of(&restarted.view().unwrap(), "src/util.rs", "callee")
+        );
+    }
+
+    /// One checkout of the repository the store-growth test replays: its
+    /// folder, its files as written there, and the checkout.
+    struct Worktree {
+        dir: tempfile::TempDir,
+        files: BTreeMap<String, String>,
+        checkout: Checkout,
+    }
+
+    impl Worktree {
+        fn new(layer: &Arc<DataLayer>, store: &Path, files: BTreeMap<String, String>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            for (path, text) in &files {
+                write(dir.path(), path, text);
+            }
+            let checkout = Checkout::bind(Arc::clone(layer), store, family(), dir.path()).unwrap();
+            checkout.build().unwrap();
+            Self {
+                dir,
+                files,
+                checkout,
+            }
+        }
+
+        /// Writes each `(path, text)` of `edits`, resolves them and publishes
+        /// them, and builds the checkout again whole when the publication
+        /// asks for it, as the runtime does. Returns whether it was built.
+        fn edit(&mut self, edits: &[(String, String)]) -> bool {
+            for (path, text) in edits {
+                write(self.dir.path(), path, text);
+                self.files.insert(path.clone(), text.clone());
+            }
+            let paths = edits
+                .iter()
+                .map(|(path, _)| path.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            self.checkout.record_paths(&paths).unwrap();
+            self.checkout.refresh_callgraph().unwrap();
+            let report = self.checkout.publish_changes().unwrap().expect("published");
+            if report.wants_build() {
+                self.checkout.build().unwrap();
+                return true;
+            }
+            false
+        }
+    }
+
+    /// A module of the repository the store-growth test replays: each
+    /// calls the next, and an edit adds a function calling it.
+    fn chain_module(index: usize, added: Option<&str>) -> String {
+        let mut text = if index + 1 < CHAIN {
+            let next = index + 1;
+            format!("import {{ f{next} }} from './m{next}';\nexport function f{index}() {{ f{next}(); }}\n")
+        } else {
+            format!("export function f{index}() {{}}\n")
+        };
+        if let Some(added) = added {
+            text.push_str(&format!("export function {added}() {{ f{index}(); }}\n"));
+        }
+        text
+    }
+
+    const CHAIN: usize = 8;
+
+    /// Worktrees of one repository keep editing while a main checkout takes
+    /// in their changes, as one merging its workers' branches does, and a
+    /// new worktree is made from main every few rounds; older worktrees go
+    /// idle. Each round's edits change a module, which a later round
+    /// changes again, and add a file nobody changes again. Every checkout
+    /// publishes its changes and is built again when the publication asks
+    /// for it, as the runtime does. The family store stays within
+    /// [`READ_AT`] + 2 segments per checkout throughout. It used to grow by
+    /// a segment every round: the change segment holding a round's new file
+    /// was read by both the worker and main, so neither ever counted it as
+    /// its own or folded it. Every checkout then answers as a cold build of
+    /// its files does.
+    #[test]
+    fn worktrees_editing_in_turn_keep_the_store_bounded() {
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package.json".to_string(),
+            "{ \"name\": \"demo\" }\n".to_string(),
+        );
+        for index in 0..CHAIN {
+            files.insert(format!("src/m{index}.ts"), chain_module(index, None));
+        }
+        files.insert("notes.txt".to_string(), "nothing to see\n".to_string());
+        let mut main = Worktree::new(&layer, store.path(), files);
+        let mut workers: Vec<Worktree> = Vec::new();
+        let mut builds = 0;
+        let mut most = (0, 0);
+        let mut new_worktree_bytes = Vec::new();
+        let mut series = Vec::new();
+        for round in 0..60 {
+            if round % 15 == 0 {
+                let worktree = Worktree::new(&layer, store.path(), main.files.clone());
+                // The build's segment is the newest the store names.
+                let snapshot = worktree.checkout.family.snapshot().unwrap();
+                new_worktree_bytes.push(snapshot.manifest().segments().last().unwrap().len);
+                workers.push(worktree);
+            }
+            // The two newest worktrees edit; the rest are idle.
+            let active = workers.len().saturating_sub(2);
+            for (offset, worker) in workers[active..].iter_mut().enumerate() {
+                let index = (round + offset) % CHAIN;
+                let edits = [
+                    (
+                        format!("src/m{index}.ts"),
+                        chain_module(index, Some(&format!("r{round}w{offset}"))),
+                    ),
+                    (
+                        format!("src/r{round}w{offset}.ts"),
+                        format!(
+                            "import {{ f{index} }} from './m{index}';\nexport function g{round}w{offset}() {{ f{index}(); }}\n"
+                        ),
+                    ),
+                ];
+                builds += usize::from(worker.edit(&edits));
+                // Main takes the change in.
+                builds += usize::from(main.edit(&edits));
+            }
+            let checkouts = workers.len() + 1;
+            let segments = main.checkout.store_segments().unwrap();
+            series.push(segments);
+            most = most.max((segments, checkouts));
+            assert!(
+                segments <= checkouts * (READ_AT + 2),
+                "round {round}: {segments} segments for {checkouts} checkouts: {series:?}"
+            );
+        }
+        eprintln!(
+            "store growth: at most {} segments for {} checkouts; {builds} builds; new \
+             worktrees wrote {new_worktree_bytes:?} bytes; {series:?}",
+            most.0, most.1
+        );
+        assert!(builds > 0, "no checkout was ever built again");
+        for (name, worktree) in
+            std::iter::once(("main", &main)).chain(workers.iter().map(|worker| ("worker", worker)))
+        {
+            let cold_store = tempfile::tempdir().unwrap();
+            let cold = Checkout::bind(
+                Arc::clone(&layer),
+                cold_store.path(),
+                family(),
+                worktree.dir.path(),
+            )
+            .unwrap();
+            let cold_bytes = cold.build().unwrap().segment_bytes;
+            eprintln!("{name}: a cold build of its files writes {cold_bytes} bytes");
+            let ours = worktree.checkout.view().unwrap();
+            let theirs = cold.view().unwrap();
+            for index in 0..CHAIN {
+                let file = format!("src/m{index}.ts");
+                let symbol = format!("f{index}");
+                let callers = callers_of(&ours, &file, &symbol);
+                assert!(
+                    index == 0 || callers.contains(&format!("f{}", index - 1)),
+                    "{name} {file}: {callers}"
+                );
+                assert_eq!(
+                    callers,
+                    callers_of(&theirs, &file, &symbol),
+                    "{name} {file}"
+                );
+            }
+            for pattern in ["export function g", "nothing to see", "r59"] {
+                assert_eq!(
+                    candidates_for(&ours, pattern),
+                    candidates_for(&theirs, pattern),
+                    "{name} {pattern}"
+                );
+            }
+        }
+        // Main took in every round's files, so its callers of each module
+        // include the files added for it.
+        let callers = callers_of(&main.checkout.view().unwrap(), "src/m3.ts", "f3");
+        assert!(
+            callers.contains("g59w0") || callers.contains("g58w1"),
+            "{callers}"
         );
     }
 

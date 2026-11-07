@@ -11,8 +11,9 @@
 //!   and resolved with [`Checkout::refresh_callgraph`]. Every few edits,
 //!   and at every third commit end, its changes are published on their own
 //!   with [`Checkout::publish_changes`], as the runtime does when a checkout
-//!   goes quiet; once A's text and call graph read from more than eight
-//!   segments, A is built again whole, as the runtime does to fold them. A
+//!   goes quiet; once A's text and call graph read from too many segments
+//!   (`DeltaReport::wants_build`), A is built again whole, as the runtime
+//!   does to fold them. A
 //!   third of the way through, A is built again while a file it was never
 //!   told about has changed and a watcher keeps reporting paths during the
 //!   build. Two thirds through, A is dropped and bound again from the
@@ -840,11 +841,6 @@ fn family_of(root: &Path) -> Result<FamilyId, String> {
     Ok(FamilyId::from_digest(Digest128::of(identity.as_bytes())))
 }
 
-/// How many segments a checkout's text and call graph may read from
-/// ([`super::checkout::DeltaReport::segments`]) before the runtime builds it
-/// again whole: the runtime's own threshold.
-const COMPACT_AT: usize = 8;
-
 /// How long the gate waits for the runtime's checkout to have a call graph
 /// that covers every recorded change.
 const RUNTIME_WAIT: Duration = Duration::from_secs(600);
@@ -1177,10 +1173,15 @@ pub struct Summary {
     pub failed: usize,
     /// Times A's changes were published on their own.
     pub publications: usize,
-    /// Builds that folded A's segments once it read from more than eight.
+    /// Builds that folded A's segments once it read from too many.
     pub compactions: usize,
-    /// The most segments A read from after a publication of its changes.
+    /// The most segments only A read from after a publication of its
+    /// changes, and the most it read from in all.
     pub most_segments: usize,
+    pub most_read_segments: usize,
+    /// The most segments the family store held after a publication of A's
+    /// changes.
+    pub most_store_segments: usize,
 }
 
 impl Summary {
@@ -1199,8 +1200,9 @@ impl Summary {
 
     /// Publishes `checkout`'s changes on their own, as the runtime does when
     /// a checkout goes quiet, and builds it again whole once it reads from
-    /// more than [`COMPACT_AT`] segments, as the runtime then does. A
-    /// watcher keeps recording `noise` during that build.
+    /// too many segments ([`super::checkout::DeltaReport::wants_build`]), as
+    /// the runtime then does. A watcher keeps recording `noise` during that
+    /// build.
     fn publish(
         &mut self,
         checkout: &Checkout,
@@ -1215,15 +1217,27 @@ impl Summary {
         };
         self.publications += 1;
         self.most_segments = self.most_segments.max(report.segments);
+        self.most_read_segments = self.most_read_segments.max(report.read_segments);
+        self.most_store_segments = self.most_store_segments.max(
+            checkout
+                .store_segments()
+                .map_err(|error| error.to_string())?,
+        );
         events.push(format!(
-            "published {} changed paths ({} fragments, {} records, {} text units); {} segments",
-            report.paths, report.fragments, report.records, report.text_units, report.segments
+            "published {} changed paths ({} fragments, {} records, {} text units); {} segments, {} read in all, {} retired",
+            report.paths,
+            report.fragments,
+            report.records,
+            report.text_units,
+            report.segments,
+            report.read_segments,
+            report.retired_segments
         ));
-        if report.segments > COMPACT_AT {
+        if report.wants_build() {
             let recorded = build_under_watcher(checkout, noise)?;
             self.compactions += 1;
             events.push(format!(
-                "built again whole past {COMPACT_AT} segments, while a watcher recorded {recorded} times"
+                "built again whole past its segment limits, while a watcher recorded {recorded} times"
             ));
         }
         Ok(true)
