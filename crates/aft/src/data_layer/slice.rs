@@ -886,7 +886,7 @@ impl FileSlice {
         self.node(handle).map(|node| node.kind())
     }
 
-    /// Bytes by part, for a measurement probe: the string table, nodes (with
+    /// Bytes by part, for a measurement probe: the string tables, nodes (with
     /// every id), references, edges, the lookup arrays, the slice itself
     /// (its fixed-size part and its path, language and record key), and
     /// counts of nodes, references, resolved references and edges.
@@ -895,7 +895,7 @@ impl FileSlice {
         use aft_store::heap::HeapBytes as _;
         let mut seen = aft_store::heap::Seen::new();
         [
-            self.strings.heap_bytes(&mut seen),
+            self.strings.heap_bytes(&mut seen) + self.cold.heap_bytes(&mut seen),
             self.nodes.heap_bytes(&mut seen)
                 + self.ids.heap_bytes(&mut seen)
                 + self.id_top.heap_bytes(&mut seen),
