@@ -37,13 +37,10 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
-const LEGACY_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/tool_provider_legacy_replies.json"
-);
-
 fn legacy_fixtures() -> Value {
-    serde_json::from_slice(&std::fs::read(LEGACY_FIXTURES).unwrap()).unwrap()
+    let path = crate::test_helpers::manifest_dir()
+        .join("tests/fixtures/tool_provider_legacy_replies.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 /// PowerShell is optional; every other row remains mandatory for its preset.

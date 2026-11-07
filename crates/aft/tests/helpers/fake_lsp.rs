@@ -31,13 +31,9 @@ pub fn fake_server_binary() -> PathBuf {
 
 /// The checkout the tests run against. Cargo and nextest set
 /// `CARGO_MANIFEST_DIR` when a test runs, and nextest points it at the
-/// remapped checkout when an archive is extracted elsewhere, so the runtime
-/// value is preferred over the path baked in at compile time.
+/// remapped checkout when an archive is extracted elsewhere.
 fn workspace_root() -> PathBuf {
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    manifest_dir.join("../..")
+    crate::test_helpers::manifest_dir().join("../..")
 }
 
 #[allow(dead_code)]

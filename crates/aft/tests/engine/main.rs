@@ -2,6 +2,9 @@
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 
+#[path = "../helpers/manifest_dir.rs"]
+mod test_helpers;
+
 // Keep these source paths stable because search-quality descriptors and inline
 // fixture includes refer to them.
 #[path = "../engine_anchored_test.rs"]

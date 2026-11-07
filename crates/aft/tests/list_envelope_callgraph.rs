@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::Path;
 
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::callgraph_store_adapter::callgraph_surface::{
@@ -19,7 +18,7 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn load_golden(name: &str) -> String {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = crate::test_helpers::manifest_dir();
     let path = manifest_dir
         .join("tests")
         .join("fixtures")

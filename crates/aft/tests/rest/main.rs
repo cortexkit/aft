@@ -6,6 +6,9 @@ mod context_storage;
 // second copy of the helper tests in this target.
 use callgraph_store_test::test_helpers;
 
+#[path = "../build_path_independence.rs"]
+mod build_path_independence;
+
 #[path = "../fake_helper_cache_test.rs"]
 mod fake_helper_cache_test;
 #[path = "../helpers/fake_lsp.rs"]

@@ -184,7 +184,9 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
                 .expect("HELLO build Git SHA must be a string when present");
             assert_eq!(build_git_sha.len(), 40, "HELLO build Git SHA must be full");
             let git = std::process::Command::new("git")
-                .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+                .arg("-C")
+                .arg(crate::test_helpers::manifest_dir())
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .expect("checkout build revision");
             assert!(git.status.success(), "checkout revision must be available");

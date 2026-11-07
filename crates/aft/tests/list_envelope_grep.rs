@@ -1,7 +1,7 @@
 //! Integration tests for grep list surface truncation contract.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use aft::list_envelope::{derive_wire_key, render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::grep::{
@@ -14,7 +14,7 @@ use aft::subc_format::{format_response_with_context, rendered_grep_match_count, 
 use serde_json::Value;
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("grep")

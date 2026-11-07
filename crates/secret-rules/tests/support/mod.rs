@@ -331,13 +331,17 @@ pub fn base64_decodes(text: &str) -> Vec<Vec<u8>> {
 
 /// Load a committed vector file.
 pub fn load(name: &str) -> Value {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("vectors")
-        .join(name);
+    let path = manifest_dir().join("vectors").join(name);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("{} is not valid JSON: {err}", path.display()))
+}
+
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR must be set at runtime by Cargo or nextest")
 }
 
 /// The case's `name` field.

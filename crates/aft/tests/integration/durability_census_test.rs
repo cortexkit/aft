@@ -900,7 +900,7 @@ fn durability_census_in_process_child() {
     assert!(search.write_to_disk(&storage.join("index").join("census"), None));
     // The same write for a real-sized tree (this crate's sources), where the
     // synced file is megabytes rather than kilobytes.
-    let crate_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let crate_src = crate::test_helpers::manifest_dir().join("src");
     census_mark("search index: build crates/aft/src in memory");
     let mut large = SearchIndex::build(&crate_src);
     census_mark("search index: cache write for crates/aft/src");

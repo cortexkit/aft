@@ -508,8 +508,7 @@ fn rewrites_cat_append_and_echo_append() {
 
 #[test]
 fn rewrite_append_uses_original_session_for_backups() {
-    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/aft-bash-rewrite-tests");
+    let parent = crate::test_helpers::manifest_dir().join("../../target/aft-bash-rewrite-tests");
     fs::create_dir_all(&parent).unwrap();
     let dir = tempfile::Builder::new()
         .prefix("case-")

@@ -34,6 +34,10 @@ mod executable_cache;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
+#[cfg(target_os = "macos")]
+#[path = "helpers/manifest_dir.rs"]
+mod manifest_dir;
+
 fn flags() -> Flags {
     Flags::new(false, Priority::Interactive, false)
 }

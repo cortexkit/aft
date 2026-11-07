@@ -70,7 +70,7 @@ const UNBOUND_REPOSITORY: &str = "someone/unbound";
 const ROUTE_CHANNEL: u16 = 42;
 
 fn goldens_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/investigations/gh-shim-wire-goldens")
+    crate::test_helpers::manifest_dir().join("../../docs/investigations/gh-shim-wire-goldens")
 }
 
 fn regenerating() -> bool {
