@@ -9753,7 +9753,9 @@ mod tests {
         let ctx = test_context();
         let configure = |semantic: bool| {
             let req = configure_request_with_params(json!({
-                "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+                // An OpenCode session opens the root, which admits it for
+                // semantic search; a runner session would not.
+                "project_root": project.path(), "harness": "opencode", "storage_dir": ctx._storage.path(),
                 "config": [user_tier(json!({
                     "indexes": {"trigram": false, "semantic": semantic, "callgraph": false},
                     "semantic": {"backend": "openai_compatible", "base_url": "http://127.0.0.1:1"},
