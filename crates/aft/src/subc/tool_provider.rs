@@ -174,6 +174,16 @@ pub(super) fn check_program_scope(
     }
 }
 
+/// The tool-provider contract's session-notices capability (contract 2.2),
+/// spelled out because the pinned role crate predates its constant. AFT
+/// declares it in `role.describe` and in its manifest so a session runner may
+/// let AFT's notices start a run on an idle session. The promise is that only
+/// a completion may start one: a finished background task is a completion,
+/// while long-running reminders and drain nudges are not and never start a
+/// run. Pattern-watch matches are not completions either, and AFT offers no
+/// asynchronous pattern watches on runner-hosted sessions.
+pub(crate) const SESSION_NOTICES: &str = "session-notices/v1";
+
 pub(super) fn describe() -> Value {
     serde_json::to_value(
         RoleDescribe::new(
@@ -196,6 +206,7 @@ pub(super) fn describe() -> Value {
             "tool-catalog-confine/v1".into(),
             cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
+            SESSION_NOTICES.into(),
         ]),
     )
     .expect("the commons role declaration is JSON")

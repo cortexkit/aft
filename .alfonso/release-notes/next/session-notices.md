@@ -1,0 +1,1 @@
+- A finished background shell command can now start the next turn of an idle session hosted by a session runner, as it already does for OpenCode and Pi plugin sessions.
