@@ -209,9 +209,11 @@ function refusedFromVersion(): string {
  * `release` (this package's own release unless a test names one). The names
  * retired in 0.62 or earlier (`REFUSED_RETIRED_PATHS` and the prefixed tool
  * names) fail only when `refuseRetired` is true. The plugins pass false for
- * the user file because the AFT binary rewrites that file to current keys
- * when it loads it. Mirrors `removed_config_key_errors` in
- * `crates/aft/src/feature_config.rs`, which always refuses them.
+ * both files: the AFT binary rewrites the user file to current keys when it
+ * loads it, and a project file loads with a notice rather than leaving a
+ * repository without AFT. Mirrors `removed_config_key_errors` in
+ * `crates/aft/src/feature_config.rs`, which always refuses them; the binary
+ * applies it to the user file only.
  */
 export function removedConfigKeyErrors(
   value: unknown,

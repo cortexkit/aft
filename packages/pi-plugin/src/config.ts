@@ -1570,12 +1570,13 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod. Names retired in 0.62 or earlier
-  // are refused in a project file. The user file is the exception: the AFT
-  // binary rewrites it to current keys when it loads the file (with a backup
-  // and a notice), so the plugin translates it in memory for this one start
-  // instead of refusing a file that is about to be fixed.
-  const removed = removedConfigKeyErrors(cleanConfig, undefined, tier === "project");
+  // validation, so they never reach Zod. Names retired in 0.62 or earlier are
+  // translated here in both files, never refused. The AFT binary rewrites the
+  // user file to current keys when it loads it (with a backup and a notice).
+  // A project file belongs to its repository, and refusing it would leave
+  // everyone who opens the repository without AFT until a tracked file is
+  // edited, so it loads with a notice instead.
+  const removed = removedConfigKeyErrors(cleanConfig, undefined, false);
   if (removed.length) {
     throw new ConfigRejectedError(removed);
   }
