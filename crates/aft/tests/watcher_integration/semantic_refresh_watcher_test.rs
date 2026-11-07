@@ -935,7 +935,10 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     // vectors are missing until the refresh finishes. The index store names
     // that file, where today's index answered "ready" with a count warning.
     assert_eq!(mid_refresh["status"], "partial", "{mid_refresh:?}");
-    assert_eq!(mid_refresh["semantic_status"], "ready", "{mid_refresh:?}");
+    assert_eq!(
+        mid_refresh["semantic_status"], "refreshing",
+        "{mid_refresh:?}"
+    );
     assert_eq!(mid_refresh["interpreted_as"], "semantic");
     let mid_text = mid_refresh["text"].as_str().unwrap_or_default();
     assert!(
