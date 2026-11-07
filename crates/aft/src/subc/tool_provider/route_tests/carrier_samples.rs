@@ -105,23 +105,8 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     let response = crate::commands::configure::handle_configure(&request, &ctx);
     assert!(response.success, "configure: {response:?}");
     crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        crate::runtime_drain::drain_callgraph_store_events(&ctx);
-        let search_ready = crate::data_layer::surfaces::text_plane_ready(&ctx) == Some(true);
-        let graph_ready = matches!(
-            ctx.callgraph_store_for_ops(),
-            crate::context::CallgraphStoreAccess::Ready(_)
-        );
-        if search_ready && graph_ready {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "fixture indexes did not become ready"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // The index store serves search and the call graph once its build ends.
+    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
 
     // A completed task avoids a live process and makes its duration reproducible.
     let storage = crate::bash_background::task_storage_dir(&ctx);

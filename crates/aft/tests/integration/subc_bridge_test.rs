@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 use aft::bash_background::BgTaskStatus;
 use aft::config::Config;
 use aft::context::{
-    App, AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
-    SemanticRefreshWorkerSlot,
+    App, AppContext,
 };
 use aft::executor::{Executor, ExecutorConfig, Lane};
 use aft::harness::Harness;
@@ -292,7 +291,6 @@ struct BridgeInner {
     deferred_push_release: bool,
     configure_events: Vec<ConfigureEvent>,
     watcher_senders: Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>,
-    semantic_refresh_event_senders: Vec<crossbeam_channel::Sender<SemanticRefreshEvent>>,
 }
 
 fn bridge_state_slot() -> &'static Mutex<Option<Arc<BridgeState>>> {
@@ -553,14 +551,6 @@ impl BridgeState {
     fn retain_watcher_sender(&self, sender: crossbeam_channel::Sender<WatcherDispatchEvent>) {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.watcher_senders.push(sender);
-    }
-
-    fn retain_semantic_refresh_event_sender(
-        &self,
-        sender: crossbeam_channel::Sender<SemanticRefreshEvent>,
-    ) {
-        let mut guard = self.inner.lock().expect("bridge state lock");
-        guard.semantic_refresh_event_senders.push(sender);
     }
 
     fn assert_overlap(&self) {
@@ -1056,56 +1046,6 @@ fn enqueue_watcher_event_for_test(
     )
 }
 
-fn enqueue_semantic_refresh_event_for_test(
-    req: &RawRequest,
-    ctx: &AppContext,
-    state: &BridgeState,
-) -> Response {
-    let Some(root) = ctx.config().project_root.clone() else {
-        return Response::error(
-            &req.id,
-            "missing_project_root",
-            "subc semantic refresh test requires a configured project root",
-        );
-    };
-    let path = root.join("subc_semantic_refresh_tick.rs");
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            return Response::error(
-                &req.id,
-                "semantic_refresh_test_setup_failed",
-                format!("failed to create semantic refresh test dir: {error}"),
-            );
-        }
-    }
-    if let Err(error) = std::fs::write(&path, "pub fn subc_semantic_refresh_tick() {}\n") {
-        return Response::error(
-            &req.id,
-            "semantic_refresh_test_setup_failed",
-            format!("failed to write semantic refresh test file: {error}"),
-        );
-    }
-
-    let (request_tx, _request_rx) = crossbeam_channel::unbounded::<SemanticRefreshRequest>();
-    let (event_tx, event_rx) = crossbeam_channel::unbounded::<SemanticRefreshEvent>();
-    let worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
-    ctx.install_semantic_refresh_worker(request_tx, event_rx, worker_slot);
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-    event_tx
-        .send(SemanticRefreshEvent::Started {
-            paths: vec![path.clone()],
-        })
-        .expect("queue semantic refresh event");
-    state.retain_semantic_refresh_event_sender(event_tx);
-
-    Response::success(
-        &req.id,
-        json!({ "queued": true, "path": path.to_string_lossy() }),
-    )
-}
-
 fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -1446,9 +1386,6 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             )
         }
         "subc_test_enqueue_watcher_event" => enqueue_watcher_event_for_test(&req, ctx, &state),
-        "subc_test_enqueue_semantic_refresh_event" => {
-            enqueue_semantic_refresh_event_for_test(&req, ctx, &state)
-        }
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.indexes.callgraph = true);
             Response::success(req.id, json!({ "callgraph_store": true }))
@@ -2429,16 +2366,6 @@ fn subc_bridge_configure_warning_pushes_are_session_scoped() {
         "subc_bridge_configure_warning_pushes_are_session_scoped",
         Duration::from_secs(30),
         drive_configure_warning_daemon,
-        |_, _, _| {},
-    );
-}
-
-#[test]
-fn subc_bridge_semantic_refresh_maintenance_push() {
-    run_subc_bridge_test(
-        "subc_bridge_semantic_refresh_maintenance_push",
-        Duration::from_secs(30),
-        drive_semantic_refresh_daemon,
         |_, _, _| {},
     );
 }
@@ -6795,31 +6722,6 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
         "session-1-reconfigure-warning",
     )
     .await;
-
-    send_connection_goodbye(&mut stream).await;
-}
-
-async fn drive_semantic_refresh_daemon(input: FakeDaemonInput) {
-    let FakeDaemonSession {
-        mut stream, root1, ..
-    } = open_fake_daemon_session(input).await;
-    bind_route1(&mut stream, &root1).await;
-
-    // Semantic-refresh maintenance injects a SemanticRefreshEvent through the
-    // same event_rx seam used by standalone tests. The full subc maintenance
-    // tick must run the semantic refresh drain and emit the refreshing status.
-    send_tool_call(
-        &mut stream,
-        1,
-        66,
-        "subc_test_enqueue_semantic_refresh_event",
-        json!({}),
-    )
-    .await;
-    let semantic_refresh_pushes =
-        expect_semantic_refresh_status_pushes_for_tool(&mut stream, 66, HashSet::from([1]), &root1)
-            .await;
-    assert_eq!(semantic_refresh_pushes.len(), 1);
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -16150,68 +16052,6 @@ async fn expect_watcher_stale_status_pushes_for_tool(
                 response_seen = true;
             }
             other => panic!("unexpected frame while waiting for watcher stale push: {other:?}"),
-        }
-    }
-
-    assert_eq!(channels, expected_channels);
-    pushes
-}
-
-async fn expect_semantic_refresh_status_pushes_for_tool(
-    stream: &mut tokio::net::TcpStream,
-    corr: u64,
-    expected_channels: HashSet<u16>,
-    expected_root: &std::path::Path,
-) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let expected_root = expected_root.to_string_lossy().into_owned();
-    let mut response_seen = false;
-    let mut pushes = Vec::new();
-    let mut channels = HashSet::new();
-
-    while !response_seen || channels != expected_channels {
-        let now = Instant::now();
-        assert!(
-            now < deadline,
-            "timed out waiting for semantic refresh status push"
-        );
-        let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_subc_frame(stream))
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for semantic refresh status push"))
-            .expect("read frame")
-            .unwrap_or_else(|| panic!("EOF waiting for semantic refresh status push"));
-        match frame.header.ty {
-            FrameType::Push => {
-                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
-                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                let snapshot = body.get("snapshot").unwrap_or(&Value::Null);
-                let refreshing = snapshot
-                    .get("semantic_index")
-                    .and_then(|semantic| semantic.get("refreshing_count"))
-                    .and_then(Value::as_u64)
-                    == Some(1);
-                let root_matches = snapshot.get("project_root").and_then(Value::as_str)
-                    == Some(expected_root.as_str());
-                if push_type(&body) == Some("status_changed") && refreshing && root_matches {
-                    assert!(
-                        expected_channels.contains(&frame.header.channel),
-                        "semantic refresh push leaked to unexpected channel {}",
-                        frame.header.channel
-                    );
-                    channels.insert(frame.header.channel);
-                    pushes.push(body);
-                }
-            }
-            FrameType::Response if frame.header.corr == corr => {
-                let response = tool_response_json(&frame);
-                assert!(
-                    response["success"].as_bool().unwrap_or(false),
-                    "semantic refresh injection response should succeed: {response:?}"
-                );
-                response_seen = true;
-            }
-            other => panic!("unexpected frame while waiting for semantic refresh push: {other:?}"),
         }
     }
 

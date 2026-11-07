@@ -1,5 +1,6 @@
-//! End-to-end sequences for the shared search artifact that a repository's
-//! home checkout publishes and its linked worktrees borrow.
+//! End-to-end sequences over a repository's home checkout, its linked
+//! worktree and its subfolders: each session's search answers cover exactly
+//! the folder it was opened in, whatever the other sessions indexed before.
 //!
 //! Each "session" is a fresh `aft` process pointed at one directory, all
 //! sharing one isolated storage directory and a throwaway HOME, which is how
@@ -30,10 +31,6 @@ struct SessionOutcome {
     /// Match counts for `TOKEN_TOP`, `TOKEN_ONE`, `TOKEN_TWO`, in that order.
     counts: [u64; 3],
     index_status: String,
-    /// `outcome=` values of every borrowed search `artifact_loaded` event.
-    borrowed_outcomes: Vec<String>,
-    /// Number of search `build_ready` events, i.e. owner rebuilds.
-    builds: usize,
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -123,8 +120,8 @@ fn run_session(fixture: &Fixture, root: &Path) -> SessionOutcome {
         "configure failed: {configured:?}"
     );
 
-    // A borrowed load that is refused never becomes ready, so this wait is
-    // bounded and the grep below reports whatever state the session reached.
+    // The wait is bounded, so the grep below reports whatever state the
+    // session reached.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let status = send(
@@ -159,35 +156,15 @@ fn run_session(fixture: &Fixture, root: &Path) -> SessionOutcome {
 
     let (status, stderr) = aft.stderr_output();
     assert!(status.success(), "aft exited badly: {stderr}");
-    let search_events = stderr
-        .lines()
-        .filter(|line| line.contains("index_event ") && line.contains("plane=search"));
-    let mut borrowed_outcomes = Vec::new();
-    let mut builds = 0;
-    for line in search_events {
-        if line.contains("kind=artifact_loaded") && line.contains("borrowed=true") {
-            if let Some(outcome) = line
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix("outcome="))
-            {
-                borrowed_outcomes.push(outcome.to_string());
-            }
-        }
-        if line.contains("kind=build_ready") {
-            builds += 1;
-        }
-    }
     SessionOutcome {
         counts,
         index_status,
-        borrowed_outcomes,
-        builds,
     }
 }
 
-/// A worktree whose ignore files match the home checkout's must borrow the
-/// home checkout's artifact as fully current. `.git/info/exclude` lives in the
-/// shared git directory: inside the home checkout, outside every worktree.
+/// A worktree opened after its home checkout must answer from a current index
+/// covering every file. `.git/info/exclude` lives in the shared git
+/// directory: inside the home checkout, outside every worktree.
 #[test]
 fn worktree_borrow_of_home_artifact_is_ready_when_ignore_rules_match() {
     let fixture = fixture();
@@ -199,12 +176,11 @@ fn worktree_borrow_of_home_artifact_is_ready_when_ignore_rules_match() {
     eprintln!("worktree: {worktree:?}");
     assert_eq!(worktree.counts, [1, 1, 1]);
     assert_eq!(worktree.index_status, "Ready");
-    assert_eq!(worktree.borrowed_outcomes, vec!["ready".to_string()]);
 }
 
 /// The sequence from the subfolder report: a session opened in a subfolder
-/// must neither narrow the artifact that the top level and worktrees borrow,
-/// nor keep overwriting a sibling subfolder's artifact.
+/// must not narrow what the top level and the worktree find afterwards, and
+/// sibling subfolders must keep finding only their own files.
 #[test]
 fn subfolder_session_never_narrows_the_repository_artifact() {
     let fixture = fixture();
@@ -228,24 +204,20 @@ fn subfolder_session_never_narrows_the_repository_artifact() {
     assert_eq!(
         step4.counts,
         [1, 1, 1],
-        "a subfolder session narrowed the artifact the worktree borrows"
+        "a subfolder session narrowed what the worktree finds"
     );
     assert_eq!(step4.index_status, "Ready");
-    assert_eq!(step4.borrowed_outcomes, vec!["ready".to_string()]);
 
     let step5 = run_session(&fixture, &sub2);
     eprintln!("5 home/sub2: {step5:?}");
     assert_eq!(step5.counts, [0, 0, 1]);
 
-    // Each subfolder owns its own artifact, so returning to sub1 reuses the
-    // artifact it wrote in step 3 instead of rebuilding over sub2's.
+    // Returning to sub1 after sub2 still answers for sub1 alone.
     let step6 = run_session(&fixture, &sub1);
     eprintln!("6 home/sub1 again: {step6:?}");
-    assert_eq!(step6.counts, [0, 1, 0]);
-    assert_eq!(step6.builds, 0, "sibling subfolders overwrote each other");
+    assert_eq!(step6.counts, [0, 1, 0], "sibling subfolders overwrote each other");
 
     let step7 = run_session(&fixture, &fixture.home);
     eprintln!("7 home again: {step7:?}");
-    assert_eq!(step7.counts, [1, 1, 1]);
-    assert_eq!(step7.builds, 0, "the repository artifact was disturbed");
+    assert_eq!(step7.counts, [1, 1, 1], "a subfolder session narrowed the repository");
 }

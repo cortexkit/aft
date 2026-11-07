@@ -7162,16 +7162,6 @@ mod tests {
         }))
     }
 
-    fn configure_callgraph_views(root: &Path, storage: &Path, views: bool) -> RawRequest {
-        configure_request_with_params(json!({
-            "project_root": root, "harness": "opencode", "storage_dir": storage,
-            "config": [user_tier(json!({
-                "views": { "enabled": views },
-                "indexes": { "trigram": true, "semantic": false, "callgraph": true }
-            }))]
-        }))
-    }
-
     /// The navigation answers whose output the views route must reproduce.
     fn callgraph_views_answers(ctx: &AppContext, root: &Path) -> Vec<(String, Response)> {
         let requests = [
@@ -7200,69 +7190,6 @@ mod tests {
                 (format!("{command} {file} {symbol}"), response)
             })
             .collect()
-    }
-
-    /// What a root's storage holds outside the v3 namespace: content-addressed
-    /// v1 views and v1/v2 blob stores, plus the legacy symbol cache file.
-    fn legacy_views_on_writes(storage: &Path) -> Vec<String> {
-        let mut found = Vec::new();
-        for (dir, keep) in [("blobs", Some("v3")), ("views", None), ("symbols", None)] {
-            if let Ok(entries) = std::fs::read_dir(storage.join(dir)) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if keep != Some(name.as_str()) {
-                        found.push(format!("{dir}/{name}"));
-                    }
-                }
-            }
-        }
-        found.sort();
-        found
-    }
-
-    /// The standalone transport, the plugins' default, drains configure
-    /// maintenance through `drain_standalone_configure_unit` instead of the
-    /// attached path. A routed root opens no v1 view there either: no v1 blob
-    /// stores, no v1 view directory and no pending status rows.
-    #[test]
-    fn views_routed_root_on_the_standalone_drain_opens_no_v1_view() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
-        init_git_fixture(&root);
-        std::fs::write(
-            root.join("a.ts"),
-            "export function target() { return 1; }\n",
-        )
-        .unwrap();
-        git_commit_all(&root, "graph");
-        let root = std::fs::canonicalize(root).unwrap();
-        let storage = temp.path().join("storage");
-        // The standalone drain takes the shared context the standalone loop owns.
-        let TestContext { context, _storage } = test_context();
-        let ctx = Arc::new(context);
-        assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
-        );
-        assert!(false);
-
-        let mut state = super::ConfigureMaintenanceState::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            super::drain_standalone_configure_prefix(&ctx, &mut state);
-            let worked = super::drain_standalone_configure_unit(&ctx, &mut state);
-            if !worked && !super::standalone_configure_maintenance_pending(&ctx, &mut state) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "standalone configure maintenance never finished"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
-        assert!(true);
     }
 
     fn configure_search_with_max_file_size(
@@ -8954,28 +8881,6 @@ mod tests {
         (ctx, server, temp, project, storage)
     }
 
-    fn git_commit_all(root: &Path, message: &str) {
-        assert!(git_command(root)
-            .args(["add", "."])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(root)
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                message,
-            ])
-            .status()
-            .unwrap()
-            .success());
-    }
-
     fn configure_ram_overlay_worktree(root: &Path, storage: &Path) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
@@ -9607,9 +9512,12 @@ mod tests {
         super::drain_deferred_configure_maintenance(&ctx);
         super::ensure_project_watcher(&ctx);
         assert_no_workers();
+        // The index store answers the search lane of a root it never binds as
+        // off; the meaning lane keeps reporting itself disabled. Both name
+        // the broad root as the reason.
         let status = ctx.build_status_snapshot();
-        for lane in ["search_index", "semantic_index"] {
-            assert_eq!(status[lane]["status"], "disabled");
+        for (lane, word) in [("search_index", "off"), ("semantic_index", "disabled")] {
+            assert_eq!(status[lane]["status"], word, "{lane}");
             assert_eq!(status[lane]["reason"], "root_too_broad");
         }
         for plane in crate::feature_status::IndexPlane::ALL {
@@ -9743,7 +9651,6 @@ mod tests {
         assert!(ctx.config().indexes.trigram);
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
-        assert!(false);
         super::drain_deferred_configure_maintenance(&ctx);
         ctx.stop_watcher_runtime();
     }
@@ -9824,17 +9731,10 @@ mod tests {
         assert!(ctx.config().indexes.trigram);
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
-        assert!(false);
-        // With views on, the checkout's lexical view replaces the legacy
-        // search loader, so trigram work for this root is the lexical view.
-        assert!(false);
-        assert!(ctx.semantic_index_rx().lock().is_some());
+        // The index store binds this root.
+        assert!(ctx.data_layer_withheld().is_none());
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.watcher_runtime_active());
-        // The root's reads go through its v3 checkout views, so no v1 view
-        // runtime is opened for it.
-        assert!(false);
-        assert!(true);
         assert!(ctx.callgraph_writer());
         ctx.stop_watcher_runtime();
     }

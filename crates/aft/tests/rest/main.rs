@@ -13,8 +13,6 @@ mod fake_lsp;
 
 // Include ignored benchmarks and reproductions so they can still run by name
 // without linking a separate test executable for each source file.
-#[path = "../callgraph_borrowed_disclosure_test.rs"]
-mod callgraph_borrowed_disclosure_test;
 #[path = "../callgraph_query_bench.rs"]
 mod callgraph_query_bench;
 #[path = "../callgraph_refresh_bench.rs"]

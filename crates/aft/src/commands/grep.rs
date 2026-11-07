@@ -1797,6 +1797,45 @@ mod tests {
         assert_eq!(response.data["walk_stopped_by"], "file_limit");
     }
 
+    /// While the index is still building, grep answers from a walk. The reply
+    /// must say the walk read every file, so a zero is trustworthy; a bare
+    /// "[index: building]" next to the count would leave that unknown.
+    #[test]
+    fn grep_while_index_builds_says_the_walk_searched_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for (name, body) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n"), ("c.rs", "fn c() {}\n")] {
+            std::fs::write(root.join("src").join(name), body).unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        // The index store binds the root and its first build waits here.
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "grep-while-building", "command": "grep",
+            "pattern": "definitely_absent_token",
+        }))
+        .unwrap();
+        let response = handle_grep(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["index_status"], "Building", "{:?}", response.data);
+        assert_eq!(
+            response.data["text"],
+            "Found 0 matches in 0 files [index: building; searched all 3 files directly]",
+            "{:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert_eq!(response.data["files_read_directly"], 3, "{:?}", response.data);
+    }
+
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {
         GrepMatch {
             file: PathBuf::from(file),

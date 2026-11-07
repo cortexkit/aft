@@ -41,10 +41,8 @@ fn wait_for_capture_ready(ctx: &AppContext, timeout: Duration) {
         crate::runtime_drain::drain_watcher_events(ctx);
         crate::runtime_drain::drain_build_completions(ctx);
         let search_ready = crate::data_layer::surfaces::text_plane_ready(ctx) == Some(true);
-        let callgraph_ready = matches!(
-            ctx.callgraph_store_for_ops(),
-            crate::context::CallgraphStoreAccess::Ready(_)
-        );
+        let callgraph_ready = crate::data_layer::surfaces::warm(ctx).1
+            == crate::data_layer::surfaces::WarmState::Ready;
         // These are the same pending signals captured before indexed tool calls
         // and rendered as watcher/callgraph lag disclosures in their replies.
         let pending = ctx.pending_changes_for_query(true);

@@ -5,7 +5,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::cache_freshness;
-use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
     handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call,
@@ -606,84 +605,6 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
 }
 
 #[test]
-fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "import { used } from './lib';\nused();\n",
-    );
-    write_file(
-        &root,
-        "src/lib.ts",
-        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    // A borrow-only root (a worktree) keeps its own inspect store but may only
-    // read, never build, the shared call graph; no main-checkout store exists.
-    ctx.set_cache_writer_capabilities(false, true);
-    // An earlier count (from before the root became borrow-only) must not
-    // survive as if it were current.
-    ctx.update_status_bar_tier2(Some(7), None, None, None, false);
-    assert_eq!(ctx.status_bar_count_values().dead_code, Some(7));
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-borrow-only",
-            "command": "inspect",
-            "sections": ["dead_code", "unused_exports", "duplicates"],
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let dead_code = &response["summary"]["dead_code"];
-    assert_eq!(dead_code["unavailable"], true, "{response:#}");
-    assert_eq!(dead_code["complete"], false, "{response:#}");
-    assert!(
-        dead_code.get("count").is_none() && dead_code.get("by_language").is_none(),
-        "an unavailable analysis must carry no count: {response:#}"
-    );
-    assert_eq!(
-        dead_code["gaps"][0]["reason"],
-        "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout",
-        "{response:#}"
-    );
-    let text = response["text"].as_str().unwrap_or_default();
-    assert!(
-        text.contains("dead code: unavailable in this worktree (call graph is borrow-only)"),
-        "the named gap must be rendered: {text}"
-    );
-    assert!(
-        !text.lines().any(|line| line.starts_with("Dead code: ")),
-        "no dead-code count may be rendered: {text}"
-    );
-    assert_eq!(
-        ctx.status_bar_count_values().dead_code,
-        None,
-        "the status bar must show dead code as unknown, not the earlier count"
-    );
-    // The background refresh path reads counts from the inspect store; it must
-    // not bring the old number back either.
-    aft::runtime_drain::drain_inspect_events(&ctx);
-    ctx.update_status_bar_tier2(None, None, None, None, false);
-    // A `None` count renders as `D?` in the agent bar (see
-    // response_finalize::agent_bar_marks_missing_categories_instead_of_zeroing_them).
-    assert_eq!(ctx.status_bar_count_values().dead_code, None);
-
-    // These analyses need no call graph and are computed locally even in a
-    // borrow-only root, so they do report real numbers.
-    assert_eq!(
-        response["summary"]["unused_exports"]["count"], 1,
-        "{response:#}"
-    );
-    assert!(
-        response["summary"]["duplicates"]["count"].is_u64(),
-        "{response:#}"
-    );
-}
-
-#[test]
 fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     let (_temp_dir, root) = fixture_project();
     write_file(
@@ -756,11 +677,6 @@ fn dead_code_tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectS
     )
 }
 
-fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
-    let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    aft::search_index::artifact_cache_key(project_root)
-}
-
 #[test]
 fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     let (_temp_dir, root) = fixture_project();
@@ -770,16 +686,9 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
         "export function unused() { return 1; }\n",
     );
     let inspect_dir = root.join(".aft-cache").join("inspect");
-    let project_key = artifact_cache_key_for_test(&root);
-    let callgraph_dir = inspect_dir
-        .parent()
-        .expect("storage dir")
-        .join("callgraph")
-        .join(&project_key);
-    aft::root_cache::configure_artifact_access(&root, &project_key, false);
-    let _not_ready_store =
-        CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
 
+    // This manager was never handed an index-store checkout for the root, so
+    // the call graph dead code reads is not ready: it reports it as building.
     let manager = InspectManager::new();
     let success = manager
         .tier2_run_with_reuse_result(
@@ -788,17 +697,18 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
             None,
         )
         .outcome
-        .expect("dead_code unavailable aggregate succeeds");
+        .expect("dead_code pending aggregate succeeds");
 
     assert!(
         success.contributions.is_empty(),
-        "unavailable callgraph must not fabricate per-file dead_code contributions"
+        "a call graph that is not ready must not fabricate per-file dead_code contributions"
     );
-    assert_eq!(success.aggregate["callgraph_available"], false);
-    assert_eq!(success.aggregate["notes"], json!(["callgraph_unavailable"]));
+    assert_eq!(success.aggregate["status"], "pending");
+    assert_eq!(success.aggregate["reason"], "callgraph_building");
+    assert_eq!(success.aggregate["complete"], false);
     assert!(
         success.aggregate.get("count").is_none(),
-        "unavailable callgraph must not be represented as zero dead code"
+        "a call graph that is not ready must not be represented as zero dead code"
     );
 }
 

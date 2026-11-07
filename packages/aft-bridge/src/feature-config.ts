@@ -128,6 +128,20 @@ export const DATA_LAYER_RETIRED_PATHS = [
   "worktree.ram_overlay",
 ] as const;
 
+/**
+ * The `views` block a plugin sends to configure: the resolved block without
+ * `enabled`, or `undefined` when nothing else is left. `views.enabled` does
+ * nothing from 0.64; the file that sets it still gets the removed-key notice,
+ * but the key never reaches the resolved config, as in the Rust resolver.
+ */
+export function viewsForConfigure<T extends { enabled?: unknown }>(
+  views: T | undefined,
+): Omit<T, "enabled"> | undefined {
+  if (views === undefined) return undefined;
+  const { enabled: _enabled, ...rest } = views;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
 /** `idle.checkout_hours` default and range; mirrors `crates/aft/src/config.rs`. */
 export const IDLE_CHECKOUT_HOURS_DEFAULT = 168;
 export const IDLE_CHECKOUT_HOURS_MIN = 1;

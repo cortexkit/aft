@@ -39,6 +39,7 @@ import {
   translateConfigDocument,
   unionDisabledTools,
   validateResolvedConfig,
+  viewsForConfigure,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 import { z } from "zod";
@@ -987,7 +988,10 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // Background index switches, always resolved (default on).
   overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  if (config.views !== undefined) overrides.views = config.views;
+  // views.enabled does nothing any more; only the views keys the engine
+  // still reads are sent.
+  const views = viewsForConfigure(config.views);
+  if (views !== undefined) overrides.views = views;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 

@@ -5417,7 +5417,6 @@ mod tests {
             ),
         ]);
         assert_eq!(project.config.idle.checkout_hours, 72);
-        assert!(project.config.views.enabled);
 
         let clamped = resolve_config(&[tier("user", r#"{"views":{"idle_checkout_hours":0}}"#)]);
         assert_eq!(clamped.config.idle.checkout_hours, 1);

@@ -9287,6 +9287,10 @@ mod deferred_terminal_tests {
         )
         .unwrap();
         let ctx = deferred_test_context(&root);
+        ctx.update_config(|config| config.indexes.callgraph = true);
+        // Dead code reads its call graph from the root's index-store
+        // checkout, so the run can only complete once that graph is built.
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         let mut config = ctx.config().as_ref().clone();
         config.indexes.callgraph = true;
         let snapshot = InspectSnapshot::new(
@@ -9298,6 +9302,10 @@ mod deferred_terminal_tests {
         let project_key = crate::search_index::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let manager = ctx.inspect_manager();
+        manager.read_dead_code_from_data_layer(
+            &root,
+            &ctx.data_checkout().expect("the index store binds the root"),
+        );
         let limiter = crate::cold_build_limiter::test_limiter(1);
         manager.set_cold_build_limiter(limiter.clone());
         let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::new(

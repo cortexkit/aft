@@ -14,8 +14,7 @@
   },
   "restrict_to_project_root": false,
   "views": {
-    "callgraph_copies": 2,
-    "enabled": true
+    "callgraph_copies": 2
   },
   "worktree": {
     "ram_overlay": false

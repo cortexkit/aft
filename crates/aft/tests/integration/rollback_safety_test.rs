@@ -7,8 +7,6 @@
 //! owning component reports itself unavailable with that refusal as the reason.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -16,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use aft::config::Config;
 use aft::context::AppContext;
-use aft::feature_status::{observed_index_status, IndexEffective, IndexPlane};
+use aft::feature_status::{observed_index_status, IndexPlane};
 use aft::parser::TreeSitterProvider;
 use aft::persisted_format::{PersistedStore, CODE};
 use aft::protocol::RawRequest;
@@ -114,63 +112,6 @@ fn search_settled(ctx: &AppContext) -> bool {
     aft::data_layer::surfaces::text_plane_ready(ctx) != Some(false)
 }
 
-/// A minimal OpenAI-compatible embedding endpoint, so a semantic cold build
-/// could actually run (and persist) if the refusal did not stop it first.
-fn start_embedding_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            thread::spawn(move || {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut bytes = Vec::new();
-                let mut chunk = [0u8; 8192];
-                let body = loop {
-                    let Ok(read) = stream.read(&mut chunk) else {
-                        return;
-                    };
-                    if read == 0 {
-                        return;
-                    }
-                    bytes.extend_from_slice(&chunk[..read]);
-                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let length = String::from_utf8_lossy(&bytes[..end])
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= end + 4 + length {
-                        break bytes[end + 4..end + 4 + length].to_vec();
-                    }
-                };
-                let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-                let inputs = match &request["input"] {
-                    Value::Array(values) => values.len(),
-                    Value::String(_) => 1,
-                    _ => 0,
-                };
-                let data = (0..inputs)
-                    .map(|index| json!({ "embedding": [0.1, 0.2, 0.3], "index": index }))
-                    .collect::<Vec<_>>();
-                let body = json!({ "data": data }).to_string();
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-            });
-        }
-    });
-    url
-}
-
 fn drain(ctx: &AppContext) {
     aft::runtime_drain::drain_callgraph_store_events(ctx);
 }
@@ -211,23 +152,6 @@ fn assert_named(reason: &str, store: PersistedStore, path: &Path) {
     assert!(
         reason.contains(&FUTURE.to_string()),
         "reason must carry the version: {reason}"
-    );
-}
-
-fn assert_plane_refused(ctx: &AppContext, plane: IndexPlane, store: PersistedStore, path: &Path) {
-    let observation = observed_index_status(ctx, plane);
-    assert_eq!(
-        observation.effective,
-        IndexEffective::Unavailable,
-        "{observation:?}"
-    );
-    assert_named(
-        observation
-            .unavailable_reason
-            .as_deref()
-            .unwrap_or_default(),
-        store,
-        path,
     );
 }
 
@@ -513,188 +437,6 @@ fn assert_named_index_store(reason: &str, path: &Path) {
             "{CODE}: index_store at {} has format version {FUTURE}; this build reads up to 1",
             path.display()
         )
-    );
-}
-
-#[test]
-fn future_semantic_index_is_refused_by_name_and_left_byte_identical() {
-    let fixture = Fixture::new();
-    let snapshot = fixture.artifact("semantic", "semantic.bin");
-    let mut bytes = vec![FUTURE as u8];
-    bytes.extend_from_slice(&[0x5A; 256]);
-    fs::write(&snapshot, &bytes).unwrap();
-
-    // A working embedding backend: without the refusal, the lane would cold
-    // build and persist a fresh snapshot over the newer one.
-    let embeddings = start_embedding_server();
-    let ctx = fixture.configure_with_embeddings(
-        json!({ "trigram": false, "semantic": true, "callgraph": false }),
-        &embeddings,
-    );
-    settle(&ctx, "semantic index", |ctx| {
-        matches!(
-            *ctx.semantic_index_status().read().unwrap(),
-            aft::context::SemanticIndexStatus::Failed(_)
-                | aft::context::SemanticIndexStatus::Ready { .. }
-        )
-    });
-    // Let a persist that follows a (wrongly) finished build reach the disk.
-    thread::sleep(Duration::from_millis(500));
-
-    assert_eq!(
-        fs::read(&snapshot).unwrap(),
-        bytes,
-        "newer semantic snapshot was changed"
-    );
-    assert_plane_refused(
-        &ctx,
-        IndexPlane::Semantic,
-        PersistedStore::SemanticIndex,
-        &snapshot,
-    );
-    let status = assert_status_lists(&ctx, PersistedStore::SemanticIndex);
-    assert_eq!(status["semantic_index"]["status"], "unavailable");
-    assert_named(
-        status["semantic_index"]["reason"]
-            .as_str()
-            .unwrap_or_default(),
-        PersistedStore::SemanticIndex,
-        &snapshot,
-    );
-}
-
-#[test]
-fn future_callgraph_generation_is_refused_by_name_and_left_byte_identical() {
-    let fixture = Fixture::new();
-    let generation = format!("{}.g1.1.sqlite", fixture.key);
-    let generation_path = fixture.artifact("callgraph", &generation);
-    {
-        let conn = rusqlite::Connection::open(&generation_path).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-             INSERT INTO meta(k, v) VALUES ('schema_version', '{FUTURE}');
-             INSERT INTO meta(k, v) VALUES ('fingerprint', 'written-by-a-newer-build');
-             INSERT INTO meta(k, v) VALUES ('ready', '1');"
-        ))
-        .unwrap();
-    }
-    let pointer = fixture.artifact("callgraph", &format!("{}.current", fixture.key));
-    fs::write(&pointer, &generation).unwrap();
-    let generation_bytes = fs::read(&generation_path).unwrap();
-    let callgraph_dir = generation_path.parent().unwrap().to_path_buf();
-    let listing = |dir: &Path| {
-        let mut names = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".sqlite") || name.ends_with(".current"))
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
-    let files_before = listing(&callgraph_dir);
-
-    let ctx = fixture.configure(json!({ "trigram": false, "semantic": false, "callgraph": true }));
-    // Asking for the store is what would cold-build and republish the
-    // pointer; it must answer with the refusal instead.
-    let access = ctx.callgraph_store_for_ops();
-    let error = match access {
-        aft::context::CallgraphStoreAccess::Error(error) => error.to_string(),
-        aft::context::CallgraphStoreAccess::Ready(_) => panic!("the newer store was opened"),
-        aft::context::CallgraphStoreAccess::Building => panic!("a build was started over it"),
-        _ => panic!("expected the named refusal"),
-    };
-    assert_named(&error, PersistedStore::CallgraphStore, &generation_path);
-    settle(&ctx, "callgraph", |ctx| {
-        ctx.callgraph_store_rx()
-            .try_lock()
-            .is_some_and(|rx| rx.is_none())
-    });
-
-    assert_eq!(fs::read(&generation_path).unwrap(), generation_bytes);
-    assert_eq!(
-        fs::read_to_string(&pointer).unwrap(),
-        generation,
-        "pointer was republished"
-    );
-    assert_eq!(
-        listing(&callgraph_dir),
-        files_before,
-        "a new generation was published"
-    );
-    assert_plane_refused(
-        &ctx,
-        IndexPlane::Callgraph,
-        PersistedStore::CallgraphStore,
-        &generation_path,
-    );
-    assert_status_lists(&ctx, PersistedStore::CallgraphStore);
-}
-
-#[test]
-fn future_symbol_cache_is_refused_by_name_and_left_byte_identical() {
-    let fixture = Fixture::new();
-    let cache = fixture.artifact("symbols", "symbols.bin");
-    let mut bytes = b"AFTSYM1\0".to_vec();
-    bytes.extend_from_slice(&FUTURE.to_le_bytes());
-    bytes.extend_from_slice(&4_u32.to_le_bytes());
-    bytes.extend_from_slice(&[0x3C; 64]);
-    fs::write(&cache, &bytes).unwrap();
-
-    // The search index load prewarms (and persists) the symbol cache.
-    let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
-    settle(&ctx, "search index", search_settled);
-    // Give the prewarm, which runs after the index is published, time to
-    // reach its persist step.
-    thread::sleep(Duration::from_millis(500));
-
-    assert_eq!(
-        fs::read(&cache).unwrap(),
-        bytes,
-        "newer symbol cache was changed"
-    );
-    let status = assert_status_lists(&ctx, PersistedStore::SymbolCache);
-    let refusal = status["storage_refusals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|refusal| refusal["store"] == "symbols")
-        .unwrap();
-    assert_named(
-        refusal["message"].as_str().unwrap(),
-        PersistedStore::SymbolCache,
-        &cache,
-    );
-}
-
-#[test]
-fn future_owner_manifest_is_refused_by_name_and_left_byte_identical() {
-    let fixture = Fixture::new();
-    let manifest = fixture.artifact("artifact-owners", "owner.json");
-    let bytes = serde_json::to_vec_pretty(&json!({
-        "schema_version": FUTURE,
-        "project_scope_key": "written-by-a-newer-build",
-        "checkout_path": "/nonexistent/newer",
-        "owner": { "shape": "changed" },
-    }))
-    .unwrap();
-    fs::write(&manifest, &bytes).unwrap();
-
-    let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
-    drain(&ctx);
-
-    assert_eq!(
-        fs::read(&manifest).unwrap(),
-        bytes,
-        "newer owner manifest was changed"
-    );
-    let status = assert_status_lists(&ctx, PersistedStore::ArtifactOwner);
-    assert_eq!(status["artifact_owner"]["mode"], "read_only");
-    assert_named(
-        status["artifact_owner"]["note"]
-            .as_str()
-            .unwrap_or_default(),
-        PersistedStore::ArtifactOwner,
-        &manifest,
     );
 }
 

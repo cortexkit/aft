@@ -4165,13 +4165,13 @@ def local():
 
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true, "zoom should succeed: {:?}", json);
-        // No callgraph index is observed here: the file-local call lists
+        // No index-store checkout is bound here: the file-local call lists
         // below are still returned, alongside an explicit callgraph status.
         assert_eq!(json["callgraph"]["status"], "unavailable");
         assert_eq!(json["callgraph"]["code"], "callgraph_unavailable");
         assert_eq!(
             json["callgraph"]["index"],
-            serde_json::json!({"status": "unavailable", "reason": "runtime_not_observed"})
+            serde_json::json!({"status": "off", "reason": "not_bound"})
         );
 
         let calls_out = json["annotations"]["calls_out"]
