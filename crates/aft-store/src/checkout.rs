@@ -6,6 +6,7 @@
 //! a lookup is a binary search.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::content::DecodeError;
 use crate::content::codec::{Decoder, Encoder};
@@ -121,10 +122,12 @@ pub struct CheckoutState {
     /// family can tell when this one's folder is gone; empty when the root
     /// is not UTF-8 or was not recorded.
     root: Vec<u8>,
-    paths: Vec<PathRecord>,
+    /// Shared by every copy of the state, so copying a state (a view, the
+    /// call graph's inputs) copies no record.
+    paths: Arc<Vec<PathRecord>>,
     /// For each path, the call-graph fragment that holds its resolution in
     /// this checkout, when it has one. Empty, or one entry per path.
-    fragments: Vec<Option<Digest128>>,
+    fragments: Arc<Vec<Option<Digest128>>>,
 }
 
 /// Why a state could not be built.
@@ -167,8 +170,8 @@ impl CheckoutState {
             git,
             conversion,
             root: Vec::new(),
-            paths,
-            fragments: Vec::new(),
+            paths: Arc::new(paths),
+            fragments: Arc::default(),
         })
     }
 
@@ -208,7 +211,7 @@ impl CheckoutState {
         if fragments.len() != self.paths.len() {
             return Err(StateError::PlaneMismatch);
         }
-        self.fragments = fragments;
+        self.fragments = Arc::new(fragments);
         Ok(self)
     }
 
@@ -229,6 +232,25 @@ impl CheckoutState {
     #[must_use]
     pub fn paths(&self) -> &[PathRecord] {
         &self.paths
+    }
+
+    /// Sets the language of the path at `index` in [`paths`](Self::paths),
+    /// the one field of a record that changes without moving it. Copies the
+    /// records first only when another copy of this state shares them.
+    ///
+    /// # Errors
+    ///
+    /// When `language` is too long to store.
+    ///
+    /// # Panics
+    ///
+    /// When `index` is not a path's index.
+    pub fn set_language(&mut self, index: usize, language: String) -> Result<(), StateError> {
+        if language.len() > usize::from(u8::MAX) {
+            return Err(StateError::TooLong);
+        }
+        Arc::make_mut(&mut self.paths)[index].language = language;
+        Ok(())
     }
 
     /// The record of `path`.
@@ -290,7 +312,7 @@ impl CheckoutState {
         out.blob(&self.root);
         out.usize(self.paths.len());
         let mut previous: Option<&PathRecord> = None;
-        for record in &self.paths {
+        for record in self.paths.iter() {
             let shared = previous.map_or(0, |previous| {
                 previous
                     .path
@@ -333,7 +355,7 @@ impl CheckoutState {
         // Fragments follow the paths: a flag, then one optional digest per
         // path.
         out.byte(u8::from(!self.fragments.is_empty()));
-        for fragment in &self.fragments {
+        for fragment in self.fragments.iter() {
             match fragment {
                 Some(digest) => {
                     out.byte(1);
@@ -477,8 +499,8 @@ impl CheckoutState {
             git,
             conversion,
             root,
-            paths,
-            fragments,
+            paths: Arc::new(paths),
+            fragments: Arc::new(fragments),
         })
     }
 }

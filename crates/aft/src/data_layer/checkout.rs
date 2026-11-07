@@ -909,7 +909,7 @@ impl Checkout {
         &self,
         base: &CheckoutState,
         generation: u64,
-        state: CheckoutState,
+        mut state: CheckoutState,
         changed: &[Vec<u8>],
         read: HashMap<Vec<u8>, Vec<u8>>,
     ) -> bool {
@@ -917,35 +917,45 @@ impl Checkout {
         // did not change; a changed text file gets the language its path and
         // bytes choose. Only changed paths are extracted: a file read again
         // only because its stat moved (a touch, a copied checkout) has the
-        // content it had.
-        let changed_set = changed.iter().collect::<HashSet<_>>();
+        // content it had. The scanned state is this scan's own, so its
+        // records take their languages in place rather than being copied.
         let mut extracted = HashMap::new();
-        let records = state
-            .paths()
+        let mut languages = Vec::new();
+        for path in changed {
+            let (Some(bytes), Some(index)) = (read.get(path), state.position(path)) else {
+                continue;
+            };
+            let (language, content) = extract_changed(&state.paths()[index], bytes);
+            languages.push((index, language));
+            extracted.insert(path.clone(), content);
+        }
+        // Every other record without a language takes the base's when its
+        // content is the same. Both states are in path order, so one pass
+        // walks the two together.
+        let mut extracted_at = languages
             .iter()
-            .map(|record| {
-                let mut record = record.clone();
-                if let Some(bytes) = read
-                    .get(&record.path)
-                    .filter(|_| changed_set.contains(&record.path))
-                {
-                    let (language, content) = extract_changed(&record, bytes);
-                    record.language = language;
-                    extracted.insert(record.path.clone(), content);
-                } else if record.language.is_empty() {
-                    if let Some(before) = base
-                        .get(&record.path)
-                        .filter(|before| before.content == record.content)
-                    {
-                        record.language.clone_from(&before.language);
-                    }
-                }
-                record
-            })
+            .map(|(index, _)| *index)
             .collect::<Vec<_>>();
-        let state = CheckoutState::new(state.git.clone(), state.conversion, records)
-            .expect("the scanned state's paths, unchanged")
-            .with_root_of(&state);
+        extracted_at.sort_unstable();
+        let mut before = base.paths().iter().peekable();
+        for (index, record) in state.paths().iter().enumerate() {
+            if !record.language.is_empty() || extracted_at.binary_search(&index).is_ok() {
+                continue;
+            }
+            while before.next_if(|before| before.path < record.path).is_some() {}
+            if let Some(before) = before.peek().filter(|before| {
+                before.path == record.path
+                    && before.content == record.content
+                    && !before.language.is_empty()
+            }) {
+                languages.push((index, before.language.clone()));
+            }
+        }
+        for (index, language) in languages {
+            state
+                .set_language(index, language)
+                .expect("a language a state stores");
+        }
         if changed.is_empty() {
             let mut live = self.write_live();
             if live.generation != generation {
@@ -967,16 +977,19 @@ impl Checkout {
             let content = extracted.remove(path).unwrap_or(Extracted::Nothing);
             entries.push((path.clone(), entry, record, content));
         }
-        let mut live = self.write_live();
+        let mut guard = self.write_live();
+        let live = &mut *guard;
         if live.generation != generation {
             return false;
         }
         live.sequence += 1;
         self.touch_memory();
         let sequence = live.sequence;
-        let mut text = (*live.text).clone();
-        let mut pending = (*live.callgraph_pending).clone();
-        let mut unparsed = (*live.unparsed).clone();
+        // Each set is copied only when a view still holds it; otherwise the
+        // changed paths are set in place.
+        let text = Arc::make_mut(&mut live.text);
+        let pending = Arc::make_mut(&mut live.callgraph_pending);
+        let unparsed = Arc::make_mut(&mut live.unparsed);
         for (path, entry, record, content) in entries {
             pending.insert(path.clone());
             let failed =
@@ -996,10 +1009,7 @@ impl Checkout {
                 },
             );
         }
-        live.text = Arc::new(text);
         live.text_members = Arc::default();
-        live.callgraph_pending = Arc::new(pending);
-        live.unparsed = Arc::new(unparsed);
         live.state = Some(Arc::new(state));
         true
     }
@@ -4435,12 +4445,15 @@ mod tests {
     /// The census measures what a checkout holds rather than guessing it:
     /// walking a copy of its state, a decoded call-graph slice and a decoded
     /// parse adds up what the allocator handed out to make that copy. A
-    /// state and a parse are vectors and strings, so the two agree to the
-    /// byte; a slice's B-tree maps are counted as full nodes, a lower bound
-    /// on what a copy allocates.
+    /// copy of a state shares the original's records, and the census counts
+    /// an allocation reached twice once, so walked after the original the
+    /// copy counts exactly what copying it allocated. A state and a parse
+    /// are vectors and strings, so the two agree to the byte; a slice's
+    /// B-tree maps are counted as full nodes, a lower bound on what a copy
+    /// allocates.
     #[test]
     fn the_census_walk_adds_up_what_the_allocator_gave_a_copy() {
-        use aft_store::heap::heap_bytes_of;
+        use aft_store::heap::{heap_bytes_of, HeapBytes as _};
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
@@ -4452,7 +4465,13 @@ mod tests {
         let state = view.state().clone();
         let (copy, allocated) = crate::test_allocations::count_bytes(|| state.clone());
         assert!(allocated > 0);
-        assert_eq!(heap_bytes_of(&copy), allocated);
+        let mut seen = aft_store::heap::Seen::new();
+        let whole = state.heap_bytes(&mut seen);
+        assert_eq!(copy.heap_bytes(&mut seen), allocated);
+        assert!(
+            allocated < whole,
+            "a copy of {whole} bytes allocated {allocated}"
+        );
 
         let graph = Arc::clone(&view.published.graph);
         let slice = graph.slice("src/lib.rs").expect("a stored slice");
