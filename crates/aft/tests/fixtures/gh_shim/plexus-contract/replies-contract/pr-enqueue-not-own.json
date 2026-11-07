@@ -37,7 +37,7 @@
     "result": {
       "code": "pr_edit_not_own",
       "detail": {
-        "message": "'pr edit' changes only pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by human. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."
+        "message": "'pr enqueue' changes only pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by human. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."
       },
       "refusal_code": "pr_edit_not_own",
       "retry_same_nonce": false,

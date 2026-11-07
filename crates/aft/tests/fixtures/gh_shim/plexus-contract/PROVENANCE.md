@@ -4,8 +4,8 @@ Copied byte-for-byte from the Plexus repository (`cortexkit/plexus`),
 `crates/plexus-core/tests/fixtures/gh_shim_wire/`:
 
 - `README.md` and `replies-contract/` (27 vectors): commit
-  `fec01fefcd8aee8a5e25ced70585ecb12a7d8685` (2026-10-30,
-  "mason: isolate paused relay timing tests from real TCP").
+  `4afa4f9e8488b29ac0fa4663aa3831eb6c349f5e` (2026-11-07,
+  "github facade: match GraphQL bot slugs in merge-queue ownership").
 - `requests-contract/` (159 vectors): commit
   `3a702b4dc39eca2013407c8bed82b2adc5bc968b` (2026-10-29,
   "mason: add owned bot pull request merge queue operations").
@@ -34,18 +34,18 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | --- | --- |
 | `README.md` | `cda24bab7c08fb2caf7b5b7542ece62629a22d2f6645f47ff69731ff61cc03c4` |
 | `replies-contract/comment-edit-pre-read-unknown.json` | `f46647cf863fdeb0919f38df2e530df1ac1860a5b88462defbc19aad038a8331` |
-| `replies-contract/pr-dequeue-closed.json` | `a325282140b12603035d0925c3068c42872e54f0ca5a86a3760aeb0f884eba02` |
-| `replies-contract/pr-dequeue-graphql-errors.json` | `69a7cc46a10cef3b8a9d3934896add2915d17ef55975678e3b78a5d1c6710282` |
-| `replies-contract/pr-dequeue-not-own.json` | `32c72e5195ec93a61fda09b95ab093e6de27c615ffbbe0dbb975fd1cab16034f` |
-| `replies-contract/pr-dequeue-own.json` | `53268db11e0077d539863791b1ac0c3011f495250d9790498fd0800c8cf36431` |
+| `replies-contract/pr-dequeue-closed.json` | `c4e5799d628eb35cc662c5952158df984b78bd10aa4407d802f60039352136e8` |
+| `replies-contract/pr-dequeue-graphql-errors.json` | `21d2d0a4b0692ed6a648a6d80ebf5c8cb71ee69adb62a4b55b437616250880b4` |
+| `replies-contract/pr-dequeue-not-own.json` | `3a44f8aef93ec5ffd4e9867fdf7f4a92a12305dc90ebec5990f9781ddb33e036` |
+| `replies-contract/pr-dequeue-own.json` | `28fa66c1339ed652b05108c63c106878d7fb46b69b529224df717b57356a04b9` |
 | `replies-contract/pr-draft-not-own.json` | `2291c88046bf5f97179f06a26091861beda31b3fc66cab8c1d88439ca8c9a3e5` |
 | `replies-contract/pr-edit-not-own.json` | `fdb61597f7b15e9e1da6ca5648250e1fcae09a98ae42d9ea3552111695c71621` |
 | `replies-contract/pr-edit-pull-request-not-found.json` | `1a19a35d2929e989bbe6f5213a123efce5e4101ff00e4ca774893456b30f8982` |
-| `replies-contract/pr-enqueue-closed.json` | `d6de551937145eb949a69717c1e0cf824e4c9987b4f08da1c58c5e9959f13cec` |
-| `replies-contract/pr-enqueue-graphql-errors.json` | `cd08865baf532049d3685452260dd77be657a82eedb47a0abdaa92d5847d0553` |
-| `replies-contract/pr-enqueue-head-moved.json` | `2b655f033baa4109e0f3d373d7dac5b3b0b1a3b63d386783351417761188bcc1` |
-| `replies-contract/pr-enqueue-not-own.json` | `ddf9e52cebbcef7f885d6ff995457e799426714b37b432988cbcebd65af3c7a8` |
-| `replies-contract/pr-enqueue-own.json` | `f27d754fb60d1fc7fce566f62c55c949c095fde0c0d71840b4299ebcb0dfb55c` |
+| `replies-contract/pr-enqueue-closed.json` | `5fa837ea4363040c207aea9f8ef7218bbfc1cb8f69e4ef051b2e08c1384aa8bf` |
+| `replies-contract/pr-enqueue-graphql-errors.json` | `8b3e85f06335766749d022bf6ef0c37f1e67e50117eec0a36af05c33a69a8ada` |
+| `replies-contract/pr-enqueue-head-moved.json` | `c340949bb621f9b6c330bb33a3c251028c352580728288f1653ba0e918fa3d1c` |
+| `replies-contract/pr-enqueue-not-own.json` | `0ea32f92c79e4777ac559baafcbbe7f3c10c9bddac8a397467ac9d6ea91a9449` |
+| `replies-contract/pr-enqueue-own.json` | `d47156d99d631af891ede31306b6724c6cb8e3c09ffd1936bff2056c5adbbc1d` |
 | `replies-contract/pr-ready-not-own.json` | `1cc3bcdc280efb26f96ee91275c99df7085e3b25a180b0f3c6789cdf8718b34c` |
 | `replies-contract/pr-ready-pull-request-read-incomplete.json` | `c49a9d14cf1776ab95dd2c7bb7b9df2ebb7eef9fa248e59ec0fc6e5b36201929` |
 | `replies-contract/resolve-thread-graphql-errors.json` | `6afcd80ea593f360ec394fc0ef0e921275f120dd17486fa5344ceb86af13801b` |
