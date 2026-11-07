@@ -931,11 +931,12 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
         mid_refresh["success"], true,
         "mid-refresh semantic search should succeed: {mid_refresh:?}"
     );
-    assert_eq!(mid_refresh["status"], "ready", "{mid_refresh:?}");
+    // The reply is partial: the index serves, but the refreshing file's
+    // vectors are missing until the refresh finishes. The index store names
+    // that file, where today's index answered "ready" with a count warning.
+    assert_eq!(mid_refresh["status"], "partial", "{mid_refresh:?}");
     assert_eq!(mid_refresh["semantic_status"], "ready", "{mid_refresh:?}");
     assert_eq!(mid_refresh["interpreted_as"], "semantic");
-    // The index store names the files still waiting for vectors, and the
-    // reply says it is incomplete, where today's index printed a count.
     let mid_text = mid_refresh["text"].as_str().unwrap_or_default();
     assert!(
         mid_text.contains("semantic: 1 file(s) not yet embedded: src/b.rs"),
