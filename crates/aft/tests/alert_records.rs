@@ -70,7 +70,7 @@ struct PersistedRenderedRow {
 
 fn fixture(name: &str) -> String {
     fs::read_to_string(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        crate::test_helpers::manifest_dir()
             .join("tests")
             .join("fixtures")
             .join("alert_records")

@@ -24,7 +24,7 @@ impl Drop for Keychain {
 
 impl Keychain {
     fn create() -> Self {
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/keychain-fixtures");
+        let scratch = crate::manifest_dir::manifest_dir().join("../../target/keychain-fixtures");
         std::fs::create_dir_all(&scratch).unwrap();
         let dir = tempfile::tempdir_in(scratch).unwrap();
         let fixture = Self {

@@ -46,7 +46,7 @@ fn attach_fixture_search_envelope(
 fn load_fixture(name: &str) -> Value {
     let path = format!(
         "{}/tests/fixtures/search/{name}.json",
-        env!("CARGO_MANIFEST_DIR")
+        crate::test_helpers::manifest_dir().display()
     );
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read fixture at {path}: {err}"));

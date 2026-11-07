@@ -9,7 +9,7 @@ pub(crate) fn manifest_dir() -> &'static Path {
         .get_or_init(|| {
             std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+                .expect("CARGO_MANIFEST_DIR must be set at runtime by Cargo or nextest")
         })
         .as_path()
 }

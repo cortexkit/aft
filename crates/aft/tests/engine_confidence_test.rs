@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -66,7 +66,7 @@ struct HeadPairFixture {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join("../..")
         .canonicalize()
         .expect("workspace root")

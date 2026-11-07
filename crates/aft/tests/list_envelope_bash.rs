@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 #[path = "helpers/mod.rs"]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 use aft::compress::builtin_filters;
 use aft::compress::caps::DropClass;
@@ -26,7 +28,7 @@ use serde_json::Value;
 use test_helpers::{user_config, AftProcess};
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("bash")

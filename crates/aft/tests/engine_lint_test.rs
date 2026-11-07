@@ -192,7 +192,7 @@ pub fn lint_cross_depth_harness(file: &str, content: &str) -> Result<(), Vec<Lin
 }
 
 fn get_workspace_root() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = crate::test_helpers::manifest_dir();
     if manifest_dir.join("../../benchmarks").exists() {
         manifest_dir.join("../..").canonicalize().unwrap()
     } else {

@@ -1531,49 +1531,11 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-/// Resolve the crate manifest directory.
+mod manifest_dir;
+pub use manifest_dir::manifest_dir;
+
 pub fn cargo_manifest_dir() -> PathBuf {
-    normalize_embedded_manifest_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-#[cfg(not(windows))]
-fn normalize_embedded_manifest_dir(path: PathBuf) -> PathBuf {
-    path
-}
-
-#[cfg(windows)]
-fn normalize_embedded_manifest_dir(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        return path;
-    }
-
-    // The Windows VM verification path cross-compiles the test binary on macOS.
-    // Cargo embeds a Unix-shaped manifest dir such as `/Users/.../crates/aft`;
-    // on Windows that is drive-relative, not absolute, so AFT correctly rejects
-    // it as a project root. Map that shape onto the current drive for the VM.
-    let raw = path.to_string_lossy();
-    let Some(stripped) = raw.strip_prefix('/').or_else(|| raw.strip_prefix('\\')) else {
-        return path;
-    };
-    let Some(drive) = current_windows_drive() else {
-        return path;
-    };
-    PathBuf::from(format!("{drive}:/{stripped}"))
-}
-
-#[cfg(windows)]
-fn current_windows_drive() -> Option<char> {
-    use std::path::{Component, Prefix};
-
-    match std::env::current_dir().ok()?.components().next()? {
-        Component::Prefix(prefix) => match prefix.kind() {
-            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
-                Some((drive as char).to_ascii_uppercase())
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+    manifest_dir().to_path_buf()
 }
 
 /// Resolve a fixture file path relative to the project root.

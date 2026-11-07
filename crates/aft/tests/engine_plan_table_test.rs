@@ -8,7 +8,7 @@ use aft::commands::semantic_search::plan_table::{
 fn test_running_table_matches_pinned_json() {
     verify_pinned_plan_table_at_startup().expect("running table must match pinned plan-table.json");
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = crate::test_helpers::manifest_dir();
     let fixture_path = if manifest_dir
         .join("../../benchmarks/aft-search/engine-fixtures/plan-table.json")
         .exists()

@@ -6,6 +6,9 @@ mod context_storage;
 // second copy of the helper tests in this target.
 use callgraph_store_test::test_helpers;
 
+#[path = "../build_path_independence.rs"]
+mod build_path_independence;
+
 #[path = "../fake_helper_cache_test.rs"]
 mod fake_helper_cache_test;
 #[path = "../helpers/fake_lsp.rs"]
@@ -64,8 +67,7 @@ mod status_counts_inspect_seams;
 #[path = "../synapse_live_test.rs"]
 mod synapse_live_test;
 #[cfg(unix)]
-#[path = "../../src/test_support.rs"]
-mod test_support;
+use test_helpers as test_support;
 #[path = "../tool_provider_conformance.rs"]
 mod tool_provider_conformance;
 #[path = "../tool_provider_subc_e2e.rs"]

@@ -156,7 +156,7 @@ fn injected_value_coverage_refuses_row_quota_and_requests_sweep() {
 
 #[test]
 fn only_the_bound_facade_opens_or_puts_blob_stores() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/subc");
+    let root = crate::test_helpers::manifest_dir().join("src/subc");
     let mut sources = Vec::new();
     collect_rust_sources(&root, &mut sources);
     let facade = root.join("blob_store.rs");

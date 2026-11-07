@@ -13,7 +13,7 @@ fn toml_extension_and_workspace_manifest_symbols_are_supported() {
         Some(LangId::Toml)
     );
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = crate::test_helpers::manifest_dir().join("Cargo.toml");
     let provider = TreeSitterProvider::new();
     let symbols = provider
         .list_symbols(&manifest)
@@ -35,7 +35,7 @@ fn toml_extension_and_workspace_manifest_symbols_are_supported() {
 
 #[test]
 fn toml_outline_and_zoom_render_sections_and_child_keys() {
-    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let project_root = crate::test_helpers::manifest_dir();
     let file = project_root.join("tests/fixtures/pyproject.toml");
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(project_root)["success"], true);

@@ -6,7 +6,7 @@
 
 use std::fs;
 #[cfg(not(test))]
-use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRole {
@@ -303,6 +303,13 @@ pub fn semantic_dimension_exists(id: &str) -> bool {
     SEMANTIC_DIMENSIONS.contains(&id)
 }
 
+#[cfg(not(test))]
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR must be set at runtime by Cargo or nextest")
+}
+
 pub fn baseline_source_resolves(source: &str) -> bool {
     let Some((file, symbol)) = source.split_once("::") else {
         return false;
@@ -316,7 +323,7 @@ pub fn baseline_source_resolves(source: &str) -> bool {
     #[cfg(test)]
     let manifest_dir = crate::test_support::manifest_dir();
     #[cfg(not(test))]
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = manifest_dir();
     let path = manifest_dir.join(file);
     path.is_file()
         && fs::read_to_string(path)

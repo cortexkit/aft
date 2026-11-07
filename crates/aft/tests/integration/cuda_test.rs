@@ -16,7 +16,7 @@ fn cuda_extensions_outline_and_zoom_use_the_cuda_grammar() {
     assert_eq!(detect_language(Path::new("kernel.cu")), Some(LangId::Cuda));
     assert_eq!(detect_language(Path::new("kernel.cuh")), Some(LangId::Cuda));
 
-    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let project_root = crate::test_helpers::manifest_dir();
     let file = project_root.join("tests/fixtures/sample.cu");
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(project_root)["success"], true);

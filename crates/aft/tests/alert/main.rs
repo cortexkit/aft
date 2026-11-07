@@ -1,6 +1,9 @@
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 
+#[path = "../helpers/manifest_dir.rs"]
+mod test_helpers;
+
 #[path = "../alert_block_finalization.rs"]
 mod alert_block_finalization;
 #[path = "../alert_fleet_compose.rs"]

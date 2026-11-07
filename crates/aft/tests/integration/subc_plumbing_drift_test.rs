@@ -22,7 +22,7 @@ const PLUGIN_NAMES: &[&str] = &["opencode-plugin", "pi-plugin"];
 const MANAGEMENT_OPERATIONS: &[&str] = &["health.digest", "memory.census"];
 
 fn plugin_bridge_calls(plugin: &str) -> BTreeSet<String> {
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let source_root = crate::test_helpers::manifest_dir()
         .join("../../packages")
         .join(plugin)
         .join("src");

@@ -12,6 +12,9 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[path = "../tests/helpers/manifest_dir.rs"]
+mod manifest_dir;
+
 const OLD_TOKEN: &str = "TOKEN_OLD";
 const NEW_TOKEN: &str = "TOKEN_NEW";
 
@@ -30,7 +33,7 @@ fn main() {
     assert!(args.iterations > 0, "--iterations must be positive");
 
     let source = fixture_source(args.bytes, args.matches);
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = manifest_dir::manifest_dir()
         .join("target")
         .join("edit-match-perf-probe.ts");
     std::fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("create fixture dir");

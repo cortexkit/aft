@@ -168,15 +168,13 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
             manifest["provenance"]["wire_crate_version"],
             json!("0.34.3")
         );
-        // `build.rs` embeds Git's HEAD only when it recognizes the tracked AFT
-        // workspace. Snapshot builds without that metadata can omit the SHA; the
-        // pipe nonce and child checks below do not depend on build provenance.
+        // Binary builders may provide a revision explicitly. Ordinary Cargo
+        // builds omit it; the nonce and child checks do not depend on provenance.
         let build_git_sha = &manifest["provenance"]["build_git_sha"];
-        // CI always builds from a full Git checkout, so a missing SHA there is a
-        // provenance regression rather than a snapshot build.
+        // A builder that supplies a revision must preserve it through HELLO.
         assert!(
-            !build_git_sha.is_null() || std::env::var_os("CI").is_none(),
-            "CI builds must embed the HELLO build Git SHA"
+            !build_git_sha.is_null() || std::env::var_os("AFT_BUILD_GIT_SHA").is_none(),
+            "builds with AFT_BUILD_GIT_SHA must embed the HELLO build Git SHA"
         );
         if !build_git_sha.is_null() {
             let build_git_sha = build_git_sha
@@ -184,7 +182,9 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
                 .expect("HELLO build Git SHA must be a string when present");
             assert_eq!(build_git_sha.len(), 40, "HELLO build Git SHA must be full");
             let git = std::process::Command::new("git")
-                .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+                .arg("-C")
+                .arg(crate::test_helpers::manifest_dir())
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .expect("checkout build revision");
             assert!(git.status.success(), "checkout revision must be available");

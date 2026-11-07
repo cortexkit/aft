@@ -107,7 +107,7 @@ fn full_validation_case(
     let stub = root.join("node_modules/.bin/tsc");
     match checker {
         ValidationChecker::Real => {
-            let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let tsc = crate::test_helpers::manifest_dir()
                 .join("../../node_modules/typescript/bin/tsc")
                 .canonicalize()
                 .expect("bun install before the real-compiler checks");

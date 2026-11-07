@@ -1,4 +1,4 @@
-// Compile the build script's private regression tests as a normal Cargo target.
+// Compile the regenerator's private regression tests as a normal Cargo target.
 #[allow(dead_code)]
-#[path = "../build.rs"]
-mod build_script;
+#[path = "../examples/regenerate_claude.rs"]
+mod regeneration;

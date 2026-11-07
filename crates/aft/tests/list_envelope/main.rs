@@ -1,6 +1,12 @@
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 
+#[cfg(unix)]
+use list_envelope_bash::test_helpers;
+#[cfg(not(unix))]
+#[path = "../helpers/manifest_dir.rs"]
+mod test_helpers;
+
 #[path = "../helpers/list_cut_item.rs"]
 mod list_cut_item;
 

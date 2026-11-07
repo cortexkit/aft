@@ -60,7 +60,7 @@ fn writer_epoch_fence_rejects_usurped_callgraph_write() {
 
 #[test]
 fn store_trace_data_covers_callgraph_fixtures() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph");
+    let root = crate::test_helpers::manifest_dir().join("tests/fixtures/callgraph");
     let root = std::fs::canonicalize(root).unwrap();
     let dir = tempdir().unwrap();
     let store =
@@ -2008,7 +2008,7 @@ fn live_poisoned_callgraph_db_copy_recovers_projection_if_available() {
         return;
     }
 
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = crate::test_helpers::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -2036,7 +2036,7 @@ fn live_poisoned_callgraph_db_copy_recovers_projection_if_available() {
 #[test]
 #[ignore]
 fn measure_current_worktree_cold_build() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = crate::test_helpers::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .unwrap()

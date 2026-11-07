@@ -9,7 +9,7 @@ use crate::list_cut_item::extract_item_name;
 
 /// Returns the path to `crates/aft/src`.
 fn aft_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    crate::test_helpers::manifest_dir().join("src")
 }
 
 /// Recursively collect all `.rs` files under a directory.

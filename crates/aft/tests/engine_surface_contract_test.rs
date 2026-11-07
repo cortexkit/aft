@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -127,7 +127,7 @@ fn continuity_key(root: &str, query: &str) -> SurfaceContinuityKey {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join("../..")
         .canonicalize()
         .expect("workspace root")

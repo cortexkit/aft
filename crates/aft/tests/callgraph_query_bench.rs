@@ -31,7 +31,7 @@ struct Timing {
 #[test]
 #[ignore]
 fn callgraph_query_plane_benchmark() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = crate::test_helpers::manifest_dir()
         .parent()
         .and_then(Path::parent)
         .expect("workspace root")

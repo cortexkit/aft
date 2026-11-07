@@ -736,7 +736,7 @@ fn bench_repository_cold_materialization() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     // The whole repository, not only this crate.
-    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repository = crate::test_support::manifest_dir().join("../..");
     let archive = Command::new("git")
         .args(["archive", "HEAD"])
         .current_dir(&repository)

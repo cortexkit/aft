@@ -19,7 +19,7 @@ use serde_json::Value;
 fn load_fixture(name: &str) -> Value {
     let path = format!(
         "{}/tests/fixtures/trace/{}",
-        env!("CARGO_MANIFEST_DIR"),
+        crate::test_helpers::manifest_dir().display(),
         name
     );
     let content = std::fs::read_to_string(&path)
@@ -569,7 +569,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 
 fn setup_real_callgraph_context() -> (tempfile::TempDir, aft::context::AppContext) {
     let temp = tempdir().expect("tempdir");
-    let fixture_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph");
+    let fixture_src = crate::test_helpers::manifest_dir().join("tests/fixtures/callgraph");
     copy_dir_all(&fixture_src, temp.path());
     let root = std::fs::canonicalize(temp.path()).expect("canonical root");
 

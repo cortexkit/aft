@@ -16,7 +16,7 @@ const SESSION: &str = "backup-dual-write-session";
 const PROJECT_KEY: &str = "backup-project-key";
 
 fn non_temp_dir() -> std::io::Result<tempfile::TempDir> {
-    let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/aft-backup-tests");
+    let parent = crate::test_helpers::manifest_dir().join("../../target/aft-backup-tests");
     fs::create_dir_all(&parent)?;
     tempfile::Builder::new().prefix("case-").tempdir_in(parent)
 }

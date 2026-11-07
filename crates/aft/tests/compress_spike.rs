@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::fs;
 
 use aft::compress::{builtin_filters, compress_with_registry, toml_filter};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ struct SpikeOutputEntry {
 
 #[test]
 fn compression_token_spike_emits_fixture_outputs() {
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = crate::test_helpers::manifest_dir();
     let repo_root = crate_dir
         .parent()
         .and_then(|p| p.parent())

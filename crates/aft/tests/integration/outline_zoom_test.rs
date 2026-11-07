@@ -706,7 +706,7 @@ export function plain(n: number) { return n; }
 
 #[test]
 fn outline_existing_large_interface_is_a_nested_member_menu() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let file = crate::test_helpers::manifest_dir()
         .join("../..")
         .join("packages/aft-bridge/src/subc-transport.ts");
     let mut aft = AftProcess::spawn();

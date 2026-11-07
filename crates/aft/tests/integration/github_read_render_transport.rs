@@ -75,7 +75,7 @@ impl TransportHarness {
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    crate::test_helpers::manifest_dir()
         .join(FIXTURE_DIRECTORY)
         .join(name)
 }
