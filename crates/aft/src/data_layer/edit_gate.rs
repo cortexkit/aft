@@ -465,11 +465,16 @@ pub fn run(
             (path.clone(), (key.clone(), bytes))
         })
         .collect::<BTreeMap<_, _>>();
+    let base_digest = resolutions_digest(
+        base.iter()
+            .map(|(path, (key, bytes))| (path.as_str(), key.as_str(), bytes.clone())),
+    );
     writeln!(
         out,
         "{}",
         serde_json::json!({"base": true, "files": files.entries.len(), "extract_ms": extract_ms,
             "cold_ms": cold_ms,
+            "resolutions_digest": base_digest,
             "segment_bytes": std::fs::metadata(&segment_path).map(|m| m.len()).unwrap_or(0)})
     )
     .map_err(|error| error.to_string())?;
@@ -597,9 +602,40 @@ pub fn run(
             break;
         }
     }
+    // Every file's resolution after the last edit, digested like the base's,
+    // so two builds of the engine can be compared byte for byte.
+    let final_digest =
+        resolutions_digest(live.inputs.parses.iter().filter_map(|(path, (key, _))| {
+            let resolution = live.resolved.get(path)?;
+            Some((
+                path.as_str(),
+                key.as_str(),
+                super::fragment::encode(resolution),
+            ))
+        }));
+    writeln!(
+        out,
+        "{}",
+        serde_json::json!({"final": true, "edits": edits.len(), "resolutions_digest": final_digest})
+    )
+    .map_err(|error| error.to_string())?;
     drop(segment);
     let _ = std::fs::remove_dir_all(&directory);
     Ok((checked, failures))
+}
+
+/// A digest of every file's resolution, given as (path, record key,
+/// fragment encoding) in path order: equal digests mean byte-identical
+/// resolutions.
+fn resolutions_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, Vec<u8>)>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (path, key, bytes) in files {
+        for part in [path.as_bytes(), key.as_bytes(), &bytes] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Lays every file whose parse or resolution changed since the base over

@@ -997,7 +997,7 @@ pub(crate) fn resolve_checkout_into(
                 &refs(batch),
                 &|path, resolution| {
                     let (_, parse) = &parses[path];
-                    let site = Arc::new(SiteFile::new(path, parse, &resolution));
+                    let site = Arc::new(SiteFile::new(parse, &resolution));
                     (site, super::fragment::encode(&resolution))
                 },
             )?);
@@ -1298,16 +1298,21 @@ pub(crate) fn dispatch_targets(
 /// What pass 4 reads about one file beyond its own facts: which of its
 /// references Rust spells as an associated or `self.` call, and which of
 /// its references already have an ordinary edge from pass 2.
+///
+/// References are kept by their key (`BlobRef::ordinal`) within the file,
+/// not as the `view:<path>:<key>` text that names them in answers: every
+/// lookup is for the same file, and a formatted string per reference was
+/// one small allocation per call site of every file pass 4 read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrdinaryCalls {
-    /// `view:<path>:<key>` of call and construction references spelled as an
-    /// associated function or a `self.` call.
-    syntax: HashSet<String>,
+    /// Keys of call and construction references spelled as an associated
+    /// function or a `self.` call.
+    syntax: HashSet<u32>,
     /// Reference keys of associated-function calls.
     associated: Vec<u32>,
-    /// `view:<path>:<key>` of references pass 2 linked from a caller symbol
-    /// to a target symbol.
-    edges: HashSet<String>,
+    /// Keys of references pass 2 linked from a caller symbol to a target
+    /// symbol.
+    edges: HashSet<u32>,
 }
 
 /// One file's pass-4 inputs: its method-call facts, the parse the resolver
@@ -1321,14 +1326,14 @@ pub(crate) struct SiteFile {
 }
 
 impl SiteFile {
-    fn new(path: &str, parse: &ParseBlob, resolution: &FileResolution) -> Self {
+    fn new(parse: &ParseBlob, resolution: &FileResolution) -> Self {
         let references = references_by_key(parse);
         let mut facts = FileFacts::new(parse);
         facts.import_targets = import_targets(&resolution.rows, &references);
         if let Some(dispatch) = &resolution.dispatch {
             facts.type_targets = dispatch.targets.clone();
         }
-        let ordinary = ordinary_calls(path, parse, &resolution.rows, &references);
+        let ordinary = ordinary_calls(parse, &resolution.rows, &references);
         let parse = facts.resolver_parse();
         Self {
             facts,
@@ -1401,10 +1406,7 @@ impl MethodCallInputs {
             .par_iter()
             .filter_map(|(path, (_, parse))| {
                 let resolution = resolved.resolution(path)?;
-                Some((
-                    path.clone(),
-                    Arc::new(SiteFile::new(path, parse, resolution)),
-                ))
+                Some((path.clone(), Arc::new(SiteFile::new(parse, resolution))))
             })
             .collect::<Vec<_>>();
         Self::from_site_files(built)
@@ -1471,10 +1473,8 @@ impl MethodCallInputs {
             return;
         }
         if let (Some(parse), Some(resolution)) = (parse, resolution) {
-            self.files.insert(
-                path.to_string(),
-                Arc::new(SiteFile::new(path, parse, resolution)),
-            );
+            self.files
+                .insert(path.to_string(), Arc::new(SiteFile::new(parse, resolution)));
         }
     }
 
@@ -1490,7 +1490,7 @@ impl MethodCallInputs {
     ) -> (BTreeSet<String>, bool) {
         let new = resolution
             .zip(inputs.parses.get(path))
-            .map(|(file, (_, parse))| Arc::new(SiteFile::new(path, parse, file)));
+            .map(|(file, (_, parse))| Arc::new(SiteFile::new(parse, file)));
         let old = self.files.remove(path);
         let mut keys = BTreeSet::new();
         FileFacts::changed_keys_by_method(
@@ -1595,7 +1595,7 @@ impl<'s> SiteSource<'s> {
             .get_or_init(|| {
                 let (_, parse) = self.inputs.parses.get(path)?;
                 let resolution = self.resolved.resolution(path)?;
-                Some(Arc::new(SiteFile::new(path, parse, resolution)))
+                Some(Arc::new(SiteFile::new(parse, resolution)))
             })
             .as_deref()
     }
@@ -1691,15 +1691,14 @@ fn resolve_chunk(
                 .ordinary;
             let mut sites = Vec::new();
             for site in parse.bound_dispatch_sites() {
-                let ref_id = format!("view:{path}:{}", site.ordinal);
                 let resolution = memoized.resolve(path, &site);
                 // Keep proven self-call and scoped module-function bindings
                 // when dispatch facts do not identify a project receiver type.
                 if parse.language == "rust"
                     && resolution.external > 0
                     && resolution.targets.is_empty()
-                    && calls.edges.contains(&ref_id)
-                    && calls.syntax.contains(&ref_id)
+                    && calls.edges.contains(&site.ordinal)
+                    && calls.syntax.contains(&site.ordinal)
                 {
                     continue;
                 }
@@ -1738,7 +1737,6 @@ fn import_targets(
 }
 
 fn ordinary_calls(
-    path: &str,
     parse: &ParseBlob,
     rows: &[DerivedRow],
     references: &HashMap<u32, &BlobRef>,
@@ -1753,7 +1751,6 @@ fn ordinary_calls(
         let Some(reference) = references.get(&row.ref_ordinal) else {
             continue;
         };
-        let ref_id = format!("view:{path}:{}", row.ref_ordinal);
         let full = reference.full_ref.as_deref().filter(|_| {
             parse.language == "rust"
                 && matches!(row.kind, BlobRefKind::Call | BlobRefKind::Construction)
@@ -1764,7 +1761,7 @@ fn ordinary_calls(
                 calls.associated.push(row.ref_ordinal);
             }
             if associated || full.starts_with("self.") {
-                calls.syntax.insert(ref_id.clone());
+                calls.syntax.insert(row.ref_ordinal);
             }
         }
         if matches!(
@@ -1777,7 +1774,7 @@ fn ordinary_calls(
             && row.target_path.is_some()
             && row.target_symbol.is_some()
         {
-            calls.edges.insert(ref_id);
+            calls.edges.insert(row.ref_ordinal);
         }
     }
     calls

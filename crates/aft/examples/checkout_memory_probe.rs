@@ -22,7 +22,7 @@
 //! (`record_ms`). With PROBE_PARTS=1 a line breaks the call graph's memory
 //! down part by part, the engine's and the rest's; with PROBE_ALLOC=1 it
 //! says how many bytes recording the edit and refreshing the call graph
-//! allocated.
+//! allocated, and in how many allocations, and the summary adds them up.
 //!
 //! With PROBE_ENGINES=N, N more checkouts of two small files each are
 //! bound, built, edited and refreshed before the pack is replayed, so N + 1
@@ -56,10 +56,14 @@ const PUBLISH_AT_REFRESHED: usize = 256;
 const COMPACT_AT: usize = 8;
 
 /// Whether [`Counting`] counts: with PROBE_ALLOC=1, each edit's line says
-/// how many bytes recording it and refreshing the call graph allocated.
+/// how many bytes recording it and refreshing the call graph allocated, and
+/// in how many allocations.
 static COUNTING: AtomicBool = AtomicBool::new(false);
 /// Bytes allocated since the process started, while counting.
 static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+/// Allocations made since the process started, while counting; a
+/// reallocation is not counted as one.
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// The system allocator, counting the bytes each allocation asks for.
 struct Counting;
@@ -70,18 +74,25 @@ impl Counting {
             ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
         }
     }
+
+    fn count_new(size: usize) {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: every call is passed to the system allocator unchanged.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        Self::count(layout.size());
+        Self::count_new(layout.size());
         // SAFETY: the caller's contract is the system allocator's.
         unsafe { std::alloc::System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        Self::count(layout.size());
+        Self::count_new(layout.size());
         // SAFETY: as above.
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
@@ -402,6 +413,12 @@ fn main() {
     // Each edit's record-and-refresh time, without its publication, for
     // comparing builds of the read path.
     let mut refresh_times = Vec::new();
+    // Each edit's recording time alone (`record_ms`).
+    let mut record_times = Vec::new();
+    // With PROBE_ALLOC=1, what recording and refreshing allocated over the
+    // whole run: (bytes, allocations) each.
+    let mut record_total = (0u64, 0u64);
+    let mut refresh_total = (0u64, 0u64);
     for (index, edit) in edits.iter().enumerate() {
         let path = edit["path"].as_str().unwrap_or_default();
         if !safe(path) {
@@ -415,13 +432,22 @@ fn main() {
         }
         let edit_started = std::time::Instant::now();
         let allocated = ALLOCATED.load(Ordering::Relaxed);
+        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
         checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
         let record_ms = edit_started.elapsed().as_secs_f64() * 1000.0;
         let record_allocated = ALLOCATED.load(Ordering::Relaxed) - allocated;
+        let record_allocations = ALLOCATIONS.load(Ordering::Relaxed) - allocations;
         checkout.refresh_callgraph().unwrap();
         let refresh_ms = edit_started.elapsed().as_secs_f64() * 1000.0;
         let refresh_allocated = ALLOCATED.load(Ordering::Relaxed) - allocated - record_allocated;
+        let refresh_allocations =
+            ALLOCATIONS.load(Ordering::Relaxed) - allocations - record_allocations;
         refresh_times.push(refresh_ms);
+        record_times.push(record_ms);
+        record_total.0 += record_allocated;
+        record_total.1 += record_allocations;
+        refresh_total.0 += refresh_allocated;
+        refresh_total.1 += refresh_allocations;
         let mut label = "edit".to_string();
         // With the runtime's second rule, what the refresh held before the
         // publication it triggers, as the line after it no longer shows it.
@@ -451,6 +477,8 @@ fn main() {
         if COUNTING.load(Ordering::Relaxed) {
             line["record_alloc_kib"] = serde_json::json!(record_allocated >> 10);
             line["refresh_alloc_kib"] = serde_json::json!(refresh_allocated >> 10);
+            line["record_allocs"] = serde_json::json!(record_allocations);
+            line["refresh_allocs"] = serde_json::json!(refresh_allocations);
         }
         let peak = line["peak_rss_mib"].as_u64().unwrap_or_default();
         if peak > worst_edit.0 {
@@ -490,6 +518,30 @@ fn main() {
         }
     }
     peaks.stop.store(true, Ordering::Release);
+    record_times.sort_by(f64::total_cmp);
+    let record_at = |fraction: f64| {
+        record_times
+            .get(((record_times.len().saturating_sub(1)) as f64 * fraction).round() as usize)
+            .copied()
+            .unwrap_or_default()
+    };
+    eprintln!(
+        "record: {} edits, total {:.0} ms, p50 {:.2} ms, p90 {:.2} ms, max {:.2} ms",
+        record_times.len(),
+        record_times.iter().sum::<f64>(),
+        record_at(0.5),
+        record_at(0.9),
+        record_at(1.0)
+    );
+    if COUNTING.load(Ordering::Relaxed) {
+        eprintln!(
+            "allocated: recording {} KiB in {} allocations, refreshing {} KiB in {} allocations",
+            record_total.0 >> 10,
+            record_total.1,
+            refresh_total.0 >> 10,
+            refresh_total.1
+        );
+    }
     refresh_times.sort_by(f64::total_cmp);
     let at = |fraction: f64| {
         refresh_times
