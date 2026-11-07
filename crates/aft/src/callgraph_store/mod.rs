@@ -6274,7 +6274,6 @@ fn project_key_for_store(callgraph_dir: &Path, project_root: &Path) -> Result<St
 }
 
 impl CallGraphStore {
-
     pub fn open_if_enabled(
         options: CallGraphStoreOptions,
         callgraph_dir: PathBuf,

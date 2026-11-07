@@ -101,7 +101,6 @@ fn root_keyed_adversarial_child() {
     }
 }
 
-
 struct MigrationFailReset;
 
 impl Drop for MigrationFailReset {
@@ -109,7 +108,6 @@ impl Drop for MigrationFailReset {
         aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(false);
     }
 }
-
 
 fn canonical_temp_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
