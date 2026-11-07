@@ -266,11 +266,12 @@ bun run lint           # biome check
 bun run format         # biome format + cargo fmt
 ```
 
-**Build cache (recommended):** the workspace sets `incremental = false`
-(`.cargo/config.toml`) to avoid a large, fast-growing `target/debug/incremental`
-directory. Pair it with [sccache](https://github.com/mozilla/sccache) for a
-shared compiled-artifact cache — especially valuable if you build in multiple
-checkouts or git worktrees, since the cache is shared across all of them:
+**Build cache (recommended):** debug and test builds compile the workspace
+crates incrementally (Cargo's default), so an edit recompiles only what
+changed. The state grows in `target/<profile>/incremental`; `cargo clean -p
+agent-file-tools` reclaims it. Dependencies never build incrementally, so
+[sccache](https://github.com/mozilla/sccache) can share them across checkouts
+and git worktrees:
 
 ```sh
 brew install sccache            # or: cargo install sccache

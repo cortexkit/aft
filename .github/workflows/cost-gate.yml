@@ -31,6 +31,9 @@ permissions:
   contents: read
 
 env:
+  # Every CI run builds from scratch, where incremental state only costs time
+  # and cache space; the repository leaves it on for local edit-compile loops.
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   # Two runs over five repositories can use the full budget without making a
   # single slow repository consume an unbounded scheduled-run allocation.

@@ -27,6 +27,9 @@ on:
         default: false
 
 env:
+  # Every CI run builds from scratch, where incremental state only costs time
+  # and cache space; the repository leaves it on for local edit-compile loops.
+  CARGO_INCREMENTAL: "0"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Preserve the compiler cache daemon and its statistics between build steps.
   SCCACHE_IDLE_TIMEOUT: "0"

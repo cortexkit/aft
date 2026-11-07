@@ -11,23 +11,20 @@
 # If you need full variable inspection in lldb for a tricky issue, run with
 # RUSTFLAGS="-C debuginfo=2" cargo test ... for that session.
 
-# Incremental compilation OFF (repo-wide).
+# Incremental compilation is left at Cargo's default: on for the dev and test
+# profiles, off for release. Only workspace crates build incrementally;
+# dependencies never do, so sccache (opt-in via `RUSTC_WRAPPER=sccache`, see
+# README) still caches them. An edit to agent-file-tools then recompiles only
+# what changed instead of the whole crate.
 #
-# Why: a long-lived dev session accumulated 84G of stale `target/debug/
-# incremental` fingerprints, and each parallel git-worktree worker cloned the
-# whole `target/` (~255G each). Turning incremental off eliminates that dir
-# everywhere — main checkout, every worktree, contributors, and CI — with no
-# tooling requirement. It also pairs with sccache (below): the two are mutually
-# exclusive, and incremental-off is what lets sccache cache effectively.
+# Incremental state lives in target/<profile>/incremental and grows over a long
+# session; `cargo clean -p agent-file-tools` or deleting that folder reclaims
+# it. CI builds from scratch every run, so its workflows set
+# CARGO_INCREMENTAL=0 themselves.
 #
-# sccache (shared compiled-artifact cache across the main checkout AND every
-# worktree) is opt-in via the `RUSTC_WRAPPER=sccache` env var rather than a
-# committed `[build] rustc-wrapper`, because a committed wrapper propagates into
-# the Docker-based `cross` release builds (where sccache isn't installed) and
-# would break CI. Install + enable it for local dev — see README (Development).
-[build]
-incremental = false
-
+# sccache is not a committed `[build] rustc-wrapper` because a committed
+# wrapper propagates into the Docker-based `cross` release builds, where
+# sccache isn't installed.
 [profile.dev]
 debug = "line-tables-only"
 

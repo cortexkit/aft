@@ -21,6 +21,9 @@ permissions:
   id-token: write
 
 env:
+  # Every CI run builds from scratch, where incremental state only costs time
+  # and cache space; the repository leaves it on for local edit-compile loops.
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   # The aft binary reports the commit it was built from when it registers
   # with the daemon. The crate has no build script, so the release sets it here;

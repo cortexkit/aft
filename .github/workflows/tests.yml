@@ -54,6 +54,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 env:
+  # Every CI run builds from scratch, where incremental state only costs time
+  # and cache space; the repository leaves it on for local edit-compile loops.
+  CARGO_INCREMENTAL: "0"
   # Keep the compiler cache server alive between build steps so its final
   # statistics cover the whole job instead of a newly started daemon.
   SCCACHE_IDLE_TIMEOUT: "0"

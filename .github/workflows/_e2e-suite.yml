@@ -25,6 +25,9 @@ on:
         default: stage
 
 env:
+  # Every CI run builds from scratch, where incremental state only costs time
+  # and cache space; the repository leaves it on for local edit-compile loops.
+  CARGO_INCREMENTAL: "0"
   # Preserve the compiler cache daemon and its statistics between build steps.
   SCCACHE_IDLE_TIMEOUT: "0"
   # Branch-private writes compete with the shared main cache quota.
