@@ -857,7 +857,12 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     ]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let server = MockEmbeddingServer::start();
-    let mut aft = AftProcess::spawn_with_real_watcher();
+    // The index store embeds an edit once the checkout has gone quiet, two
+    // minutes after the last change; this test shortens that to a second.
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "AFT_TEST_DATA_QUIET_MS",
+        std::ffi::OsStr::new("1000"),
+    )]);
 
     let configure =
         configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
