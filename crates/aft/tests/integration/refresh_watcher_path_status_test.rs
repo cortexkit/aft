@@ -43,7 +43,7 @@ fn dirty_read_stays_pending_without_running_plane_work_and_requeues_on_next_even
         })
     ));
 
-    let view = tempfile::tempdir().expect("create view directory");
+    let view = crate::test_helpers::tempdir();
     let mut statuses = PathStatusStore::open(view.path()).expect("open path-status store");
     preserve_pending_after_unstable_read(&mut statuses, b"src/dirty.rs", 41)
         .expect("record pending path");
@@ -122,7 +122,7 @@ fn a_full_key_is_processed_once_and_fanned_out_to_every_path() {
 
 #[test]
 fn retry_and_quarantine_results_drive_per_view_status_counts_and_path_cap() {
-    let view = tempfile::tempdir().expect("create view directory");
+    let view = crate::test_helpers::tempdir();
     let mut statuses = PathStatusStore::open(view.path()).expect("open path-status store");
     let key = CallgraphKey::for_current(b"transient", "rust").full_key();
     let mut tracker = FailureTracker::default();

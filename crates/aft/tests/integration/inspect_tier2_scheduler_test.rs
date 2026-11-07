@@ -20,7 +20,7 @@ use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
@@ -48,6 +48,7 @@ fn configured_context_with_storage(
     storage_dir: &Path,
     callgraph_store: bool,
 ) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -63,7 +64,7 @@ fn configured_context_with_storage(
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": callgraph_store }
         })),
     }));
@@ -79,6 +80,7 @@ fn configured_context_with_storage(
     // this file's scheduling decisions, not the suite's load (issue #1190's
     // isolation seam).
     ctx.isolate_cold_build_limiter_for_test(2);
+    crate::test_helpers::admission::settle(&ctx);
     // These fixtures exercise scheduler behavior rather than LSP startup. Seed a
     // checked-clean report tied to real file content so the warm inspect path
     // can finish diagnostics without starting a language server.
@@ -113,7 +115,7 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     let worktree_root = temp_dir.path().join("linked-worktree");
     let storage_dir = temp_dir.path().join("storage");
@@ -400,7 +402,7 @@ fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
             "storage_dir": storage_dir.to_string_lossy(),
-            "config": crate::helpers::user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             })),
         })),

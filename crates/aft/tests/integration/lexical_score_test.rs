@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aft::search_index::{extract_trigrams, lexical_score, SearchIndex};
 
 fn indexed_file(content: &str) -> (tempfile::TempDir, SearchIndex, u32) {
-    let project = tempfile::tempdir().expect("create project");
+    let project = crate::test_helpers::tempdir();
     let path = project.path().join("src/lib.rs");
     fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
     fs::write(&path, content).expect("write file");

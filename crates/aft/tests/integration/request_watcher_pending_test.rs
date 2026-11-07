@@ -70,9 +70,9 @@ fn call_with_drain(
 
 #[test]
 fn request_watcher_burst_discloses_unapplied_index_changes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = std::fs::canonicalize(temp.path()).unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     std::fs::write(root.join("old.rs"), "pub fn old() {}\n").unwrap();
     let ctx = AppContext::new(
         default_language_provider_factory(),

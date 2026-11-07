@@ -150,7 +150,7 @@ struct RepoFixture {
 impl RepoFixture {
     fn new(file_count: usize, changed_count: usize) -> Self {
         assert!(file_count >= changed_count.max(3));
-        let temp = tempfile::tempdir().expect("create repository tempdir");
+        let temp = crate::test_helpers::tempdir();
         let root = std::fs::canonicalize(temp.path()).expect("canonical repository root");
         git(&root, &["init", "-q"]);
         git(
@@ -334,7 +334,7 @@ fn configure_context_with_views(
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": true, "semantic": true, "callgraph": true },
             "views": { "enabled": views_enabled },
             "worktree": { "ram_overlay": ram_overlay },
@@ -350,7 +350,7 @@ fn configure_context_with_views(
     }));
     let configured = aft::commands::configure::handle_configure(&configure, &ctx);
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_helpers::admission::settle(&ctx);
     wait_until_ready(&ctx);
     ctx
 }
@@ -698,7 +698,7 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
     let result = std::panic::catch_unwind(|| {
         let server = MockEmbeddingServer::start();
         let repo = RepoFixture::new(40, 20);
-        let storage = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
         let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
 
         wait_for_views_branch(&ctx, &repo.root, 'A');
@@ -820,7 +820,7 @@ fn branch_switch_e2e_matrix() {
 
         run_row("small diff", || {
             let repo = RepoFixture::new(40, 20);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let ctx = configure_context(&repo.root, storage.path(), &server, false);
             let resident = wait_until_ready(&ctx);
             git(&repo.root, &["checkout", "-q", "B"]);
@@ -832,7 +832,7 @@ fn branch_switch_e2e_matrix() {
 
         run_row("large diff cliff", || {
             let repo = RepoFixture::new(400, 300);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let ctx = configure_context(&repo.root, storage.path(), &server, false);
             let resident = wait_until_ready(&ctx);
             git(&repo.root, &["checkout", "-q", "B"]);
@@ -848,7 +848,7 @@ fn branch_switch_e2e_matrix() {
 
         run_row("round trip", || {
             let repo = RepoFixture::new(40, 20);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let ctx = configure_context(&repo.root, storage.path(), &server, false);
             let original = assert_branch_state(&ctx, &repo.root, 'A');
             git(&repo.root, &["checkout", "-q", "B"]);
@@ -871,7 +871,7 @@ fn branch_switch_e2e_matrix() {
         run_row("rebase", || {
             let repo = RepoFixture::new(40, 20);
             git(&repo.root, &["checkout", "-q", "B"]);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let ctx = configure_context(&repo.root, storage.path(), &server, false);
             let resident = wait_until_ready(&ctx);
             git(&repo.root, &["checkout", "-q", "A"]);
@@ -892,7 +892,7 @@ fn branch_switch_e2e_matrix() {
 
         run_row("stash pop", || {
             let repo = RepoFixture::new(80, 20);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let ctx = configure_context(&repo.root, storage.path(), &server, false);
             for index in 20..70 {
                 std::fs::write(
@@ -923,10 +923,10 @@ fn branch_switch_e2e_matrix() {
 
         run_row("linked worktree overlay", || {
             let repo = RepoFixture::new(40, 20);
-            let storage = tempfile::tempdir().unwrap();
+            let storage = crate::test_helpers::tempdir();
             let parent = configure_context(&repo.root, storage.path(), &server, false);
             let parent_store = wait_until_ready(&parent);
-            let worktree_parent = tempfile::tempdir().unwrap();
+            let worktree_parent = crate::test_helpers::tempdir();
             let worktree = worktree_parent.path().join("branch-b");
             git(
                 &repo.root,

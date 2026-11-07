@@ -173,6 +173,7 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         })
         .collect::<Vec<_>>();
     for child in &children {
+        super::worker::admit_child(session, child);
         let cache = read(&child.inspect).clone();
         for category in &categories {
             if !config.inspect.category_enabled(*category) {

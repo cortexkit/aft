@@ -2,7 +2,6 @@ use super::helpers::AftProcess;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 const VUE_FIXTURE: &str = r#"<template>
   <div class="greeting">
@@ -44,7 +43,7 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
 
 #[test]
 fn vue_outline_returns_top_level_sfc_sections() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "src/App.vue", VUE_FIXTURE);
 
     let mut aft = AftProcess::spawn();
@@ -77,7 +76,7 @@ fn vue_outline_returns_top_level_sfc_sections() {
 
 #[test]
 fn vue_zoom_targets_template_script_and_style_sections() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "src/App.vue", VUE_FIXTURE);
 
     let mut aft = AftProcess::spawn();
@@ -111,7 +110,7 @@ fn vue_zoom_targets_template_script_and_style_sections() {
 
 #[test]
 fn vue_ast_search_supports_sfc_and_dollar_meta_variables() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "src/App.vue", VUE_FIXTURE);
 
     let mut aft = AftProcess::spawn();
@@ -159,7 +158,7 @@ fn vue_ast_search_supports_sfc_and_dollar_meta_variables() {
 
 #[test]
 fn vue_ast_search_documents_opaque_script_contents() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "src/App.vue", VUE_FIXTURE);
 
     let mut aft = AftProcess::spawn();
@@ -191,7 +190,7 @@ fn vue_ast_search_documents_opaque_script_contents() {
 
 #[test]
 fn vue_unsupported_formatter_but_import_organize_succeeds() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("src/App.vue");
 
     let mut aft = AftProcess::spawn();
@@ -240,7 +239,7 @@ fn vue_unsupported_formatter_but_import_organize_succeeds() {
 }
 #[test]
 fn vue_add_import_errors_without_script_block() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let content = "<template>\n  <div />\n</template>\n";
     let file = write_file(dir.path(), "src/NoScript.vue", content);
 
@@ -268,7 +267,7 @@ fn vue_add_import_errors_without_script_block() {
 
 #[test]
 fn vue_add_import_errors_with_multiple_script_blocks() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let content = "<template>\n  <div />\n</template>\n\n<script>\nconst a = 1\n</script>\n\n<script setup lang=\"ts\">\nconst b = 2\n</script>\n";
     let file = write_file(dir.path(), "src/MultiScript.vue", content);
 

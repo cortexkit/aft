@@ -4,7 +4,7 @@ use aft::harness::Harness;
 
 #[test]
 fn cleanup_staging_dirs_removes_orphans() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     fs::create_dir_all(root.join("opencode/staging-bash-tasks-aaa/nested")).unwrap();
     fs::create_dir_all(root.join("opencode/staging-backups-bbb")).unwrap();
@@ -18,7 +18,7 @@ fn cleanup_staging_dirs_removes_orphans() {
 
 #[test]
 fn cleanup_staging_dirs_leaves_non_staging_dirs() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     fs::create_dir_all(root.join("opencode/staging-x")).unwrap();
     fs::create_dir_all(root.join("opencode/regular-dir")).unwrap();
@@ -32,7 +32,7 @@ fn cleanup_staging_dirs_leaves_non_staging_dirs() {
 
 #[test]
 fn cleanup_staging_dirs_idempotent() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     fs::create_dir_all(root.join("opencode/staging-x")).unwrap();
 
@@ -45,7 +45,7 @@ fn cleanup_staging_dirs_idempotent() {
 
 #[test]
 fn cleanup_staging_dirs_removes_root_target_and_child_union_orphans() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     fs::create_dir_all(root.join("index/staging-index-project-a/nested")).unwrap();
     fs::create_dir_all(root.join("semantic/staging-semantic-project-a")).unwrap();
@@ -63,7 +63,7 @@ fn cleanup_staging_dirs_removes_root_target_and_child_union_orphans() {
 
 #[test]
 fn cleanup_staging_dirs_removes_file_target_staging_files() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     fs::create_dir_all(root.join("opencode")).unwrap();
     fs::write(
@@ -90,7 +90,7 @@ fn cleanup_staging_dirs_removes_file_target_staging_files() {
 
 #[test]
 fn cleanup_staging_dirs_handles_missing_harness_dir() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("missing-root");
 
     let removed = aft::migrate_storage::cleanup_staging_dirs(&root, Harness::Opencode).unwrap();

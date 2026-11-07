@@ -12,6 +12,9 @@ use crate::{slog_info, slog_warn};
 
 /// Handle a `callers` request.
 pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = answer_callers(req, ctx);
     disclose_borrowed_answer(
         ctx,

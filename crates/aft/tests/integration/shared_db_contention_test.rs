@@ -36,8 +36,8 @@ impl Contended {
     }
 
     fn start_with_retry_gate(gate: Option<&std::path::Path>) -> Self {
-        let project = tempfile::tempdir().expect("project dir");
-        let storage = tempfile::tempdir().expect("storage dir");
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
         let mut env = vec![
             ("AFT_CACHE_DIR", storage.path().as_os_str()),
             // Run maintenance every few hundred milliseconds instead of
@@ -203,7 +203,7 @@ struct MaintenanceRetryGate(tempfile::TempDir);
 
 impl MaintenanceRetryGate {
     fn new() -> Self {
-        Self(tempfile::tempdir().expect("maintenance retry gate"))
+        Self(crate::test_helpers::tempdir())
     }
 
     fn is_paused(&self) -> bool {

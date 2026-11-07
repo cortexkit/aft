@@ -10,7 +10,7 @@ use aft::search_index::SearchIndex;
 use super::helpers::AftProcess;
 
 fn setup_project(files: &[(&str, &str)]) -> TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
 
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);

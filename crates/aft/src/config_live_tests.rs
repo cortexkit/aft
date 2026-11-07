@@ -23,6 +23,7 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().join("project");
         std::fs::create_dir_all(&root).expect("project root");
+        crate::test_project::mark_project(&root).unwrap();
         let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
         let project_path = project_config_path(&root);
         write(&user_path, user);
@@ -57,8 +58,17 @@ impl Fixture {
         }))
         .expect("configure request");
         let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = crate::test_env::without_project_watcher();
+        if crate::folder_admission_runtime::snapshot(&self.ctx).is_none() {
+            crate::test_admission::prepare_project(&self.ctx, &self.root);
+        }
         let response = crate::commands::configure::handle_configure(&req, &self.ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
+        crate::test_admission::settle(&self.ctx);
+        drop(_watcher);
+        // Config-file watches share the test switch, but no project watcher is started here.
+        let _config_watches = crate::test_env::with_project_watcher();
+        sync_config_watches(&self.ctx);
     }
 
     /// Run the reload the file watcher would have asked for.
@@ -328,6 +338,17 @@ fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {
     assert_eq!(result.deferred, vec!["storage.cache_dir"]);
     assert_eq!(result.next.bash.env["TZ"], "UTC");
     assert_eq!(result.next.cache_dir, published.cache_dir);
+}
+
+#[test]
+fn project_detection_changes_apply_live_for_admission_recheck() {
+    let published = Config::default();
+    let mut candidate = published.clone();
+    candidate.project_detection.mode = crate::folder_admission::DetectionMode::Off;
+    let result = super::apply_live_config(&published, &candidate, &published);
+    assert!(result.deferred.is_empty());
+    assert_eq!(result.applied, ["project_detection"]);
+    assert_eq!(result.next.project_detection, candidate.project_detection);
 }
 
 #[test]

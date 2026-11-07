@@ -255,8 +255,8 @@ fn assert_row_matches_task(row: &DbTaskRow, task: &PersistedTask, project: &Path
 
 #[test]
 fn bash_tasks_dual_write_spawn_writes_both_json_and_db_row() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(&registry, storage.path(), project.path(), "echo dual-write");
@@ -299,8 +299,8 @@ fn bash_tasks_dual_write_spawn_writes_both_json_and_db_row() {
 
 #[test]
 fn bash_tasks_dual_write_status_transitions_update_db_row() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let marker = project.path().join("dual-write-running.alive");
@@ -325,8 +325,8 @@ fn bash_tasks_dual_write_status_transitions_update_db_row() {
 
 #[test]
 fn bash_tasks_dual_write_background_task_updates_under_watchdog() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -344,8 +344,8 @@ fn bash_tasks_dual_write_background_task_updates_under_watchdog() {
 
 #[test]
 fn bash_tasks_dual_write_db_failure_does_not_break_json_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
     conn.lock()
         .unwrap()
@@ -368,8 +368,8 @@ fn bash_tasks_dual_write_db_failure_does_not_break_json_write() {
 
 #[test]
 fn bash_tasks_dual_write_output_bytes_propagate_into_db_row() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -386,7 +386,7 @@ fn bash_tasks_dual_write_output_bytes_propagate_into_db_row() {
 
 #[test]
 fn bash_tasks_dual_write_upsert_replaces_not_duplicates() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
     let mut row = direct_row("opencode", "session", "bash-dupe", "running");
     upsert_bash_task(&conn, &row).unwrap();
@@ -407,7 +407,7 @@ fn bash_tasks_dual_write_upsert_replaces_not_duplicates() {
 
 #[test]
 fn bash_tasks_dual_write_harness_isolation_in_db() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
 
     upsert_bash_task(
@@ -433,8 +433,8 @@ fn bash_tasks_dual_write_harness_isolation_in_db() {
 
 #[test]
 fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
     let deletable = write_gc_task(
         &conn,
@@ -474,8 +474,8 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
 #[test]
 fn persisted_gc_logs_each_deleted_row_with_task_and_reason() {
     super::test_helpers::init_test_logger_with_level(log::LevelFilter::Debug);
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
     write_gc_task(
         &conn,
@@ -500,8 +500,8 @@ fn persisted_gc_logs_each_deleted_row_with_task_and_reason() {
 
 #[test]
 fn bash_tasks_dual_write_disabled_db_pool_skips_dual_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     registry.set_harness(Harness::Opencode);
 

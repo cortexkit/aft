@@ -188,6 +188,7 @@ fn commit_all(root: &Path, message: &str) {
 
 fn init_repo(root: &Path, files: &[(&str, String)]) {
     std::fs::create_dir_all(root).unwrap();
+    crate::test_helpers::project::mark_project(root).unwrap();
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "parent@example.test"]);
     git(root, &["config", "user.name", "Parent Test"]);
@@ -368,12 +369,12 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(root, doc)),
         })),
         &ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -410,12 +411,13 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}; cache_unavailable={:?}",
+            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}; cache_unavailable={:?}; folder={}",
             root.display(),
             ctx.config().indexes.trigram,
             ctx.cached_artifact_cache_key(root),
             ctx.degraded_reasons(),
             ctx.cache_unavailable_reason(),
+            ctx.build_status_snapshot()["folder"],
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -662,6 +664,7 @@ fn parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
 /// for a missing session fails at once, and so does a retry that never lands
 /// within the deadline.
 fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
+    crate::test_helpers::admission::settle(ctx);
     let started = Instant::now();
     let mut retried = false;
     let session = loop {
@@ -975,13 +978,14 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     init_repo(&child, &child_files(0));
     init_repo(&other, &child_files(1));
     let configure_request = |root: &Path, views: bool| {
+        let doc = config_doc(views, TRIGRAM_ONLY, None);
         json!({
             "id": "cfg",
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(views, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(root, doc)),
         })
         .to_string()
     };
@@ -991,6 +995,8 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     for repo in [&child, &other] {
         let configured = aft.send(&configure_request(repo, false));
         assert_eq!(configured["success"], true, "{configured:#}");
+        let folder = aft.wait_for_folder_admission();
+        assert_eq!(folder["classification"], "project", "{folder}");
         let deadline = Instant::now() + DEADLINE;
         while !trigram_artifact(repo, &storage).is_file() {
             assert!(Instant::now() < deadline, "child index never persisted");
@@ -1040,6 +1046,17 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
         "parent folder watcher: edit visible to parent grep after {} ms",
         started.elapsed().as_millis()
     );
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["recursive_watcher"], "on", "{folder}");
+    assert_eq!(folder["indexes"]["text"], "off", "{folder}");
+    assert_eq!(folder["indexes"]["call_graph"], "off", "{folder}");
+
+    let configured = aft.send(&configure_request(&root, false));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["classification"], "workspace", "{folder}");
+    assert_eq!(folder["recursive_watcher"], "off", "{folder}");
+    assert_eq!(folder["indexes"]["text"], "off", "{folder}");
     assert!(aft.shutdown().success());
 }
 
@@ -1567,9 +1584,8 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
     let root = base.join("projects");
     let storage = base.join("storage");
     for index in 0..66 {
-        // Discovery needs only the `.git` marker; these children never built
-        // an index.
-        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+        let child = root.join(format!("repo-{index:02}"));
+        init_repo(&child, &[]);
     }
     let parent = configure(&root, &storage, config_doc(true, TRIGRAM_ONLY, None));
     let session = parent_session(&parent);
@@ -1619,7 +1635,8 @@ fn slow_discovery_never_delays_the_bind() {
     let root = base.join("projects");
     let storage = base.join("storage");
     for index in 0..20 {
-        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+        let child = root.join(format!("repo-{index:02}"));
+        init_repo(&child, &[]);
     }
     let discovery = aft::views::parent::hold_discovery_for_test(&root);
     let ctx = Arc::new(
@@ -1635,7 +1652,7 @@ fn slow_discovery_never_delays_the_bind() {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, TRIGRAM_ONLY, None))),
     }));
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
@@ -1716,7 +1733,7 @@ fn standalone_view_open_never_blocks_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None))),
     }).to_string())["success"], true);
     let deadline = Instant::now() + Duration::from_secs(15);
     while !started_file.exists() {
@@ -1804,7 +1821,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder)))),
     }).to_string())["success"], true);
     let mut grace_max = 0;
     let mut load_max = 0;
@@ -1911,7 +1928,7 @@ fn parent_folder_survives_a_real_process_restart() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, TRIGRAM_ONLY, None))),
         })
         .to_string()
     };

@@ -41,7 +41,7 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 /// Hard timeout Broca assumes when a `bash` call omits `timeout`.
 const CONSUMER_DEFAULT_HARD_TIMEOUT_MS: u64 = 1_800_000;
@@ -69,7 +69,7 @@ const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
 fn omitted_bash_timeout_resolves_to_thirty_minute_hard_cap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, dir.path(), &storage);
@@ -146,7 +146,7 @@ fn subc_block_to_completion_answers_timed_out_within_timeout_plus_margin() {
 }
 
 fn assert_standalone_held_call_times_out(flag: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let pidfile = dir.path().join("grandchild.pid");
     let mut aft = AftProcess::spawn();
@@ -265,7 +265,7 @@ const MARKER_SLACK: Duration = Duration::from_millis(750);
 
 #[test]
 fn foreground_without_wait_is_killed_at_its_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn();
@@ -295,7 +295,7 @@ fn foreground_without_wait_is_killed_at_its_timeout() {
 
 #[test]
 fn promoted_foreground_is_killed_at_its_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn_with_env(&[(
@@ -423,7 +423,7 @@ fn subc_pty_is_killed_at_its_timeout() {
 /// Launches a `background: true` or `pty: true` task with a timeout, then
 /// polls its status until the timeout kill lands.
 fn assert_standalone_launched_task_is_capped(flag: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn();
@@ -1035,7 +1035,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path) {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "bash": { "background": true } })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "bash": { "background": true } })),
         })
         .to_string(),
     );
@@ -1110,10 +1110,10 @@ where
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let project = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path());
 
         let listener = write_connection_file(conn_dir.path()).await;
@@ -1149,6 +1149,7 @@ fn write_user_config(config_home: &Path) {
     std::fs::write(
         config_dir.join("aft.jsonc"),
         serde_json::to_string(&json!({
+            "project_detection": { "mode": "project" },
             "bash": { "background": true },
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))

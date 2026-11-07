@@ -29,7 +29,7 @@ fn symbol<'a>(symbols: &'a [Symbol], name: &str) -> &'a Symbol {
 
 #[test]
 fn ts_js_anonymous_default_exports_surface_and_resolve_as_default() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let ts = write_file(
         tmp.path(),
         "anonymous.ts",
@@ -62,7 +62,7 @@ fn ts_js_anonymous_default_exports_surface_and_resolve_as_default() {
 /// `export const VERSION = ...` in plain JavaScript.
 #[test]
 fn js_top_level_const_let_surface_as_variables() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let src = "export const VERSION = \"1.0\";\nconst internal = 42;\nlet counter = 0;\n";
     let js = write_file(tmp.path(), "vars.js", src);
     let ts = write_file(tmp.path(), "vars.ts", src);
@@ -93,7 +93,7 @@ fn common_module_and_stub_extensions_are_detected() {
 
 #[test]
 fn ts_js_top_level_function_expression_initializers_are_functions() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let ts = write_file(
         tmp.path(),
         "functions.ts",
@@ -114,7 +114,7 @@ fn ts_js_top_level_function_expression_initializers_are_functions() {
 
 #[test]
 fn solidity_receive_and_fallback_are_synthetic_methods() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = write_file(
         tmp.path(),
         "Vault.sol",
@@ -137,7 +137,7 @@ fn solidity_receive_and_fallback_are_synthetic_methods() {
 
 #[test]
 fn lua_top_level_local_variables_are_captured() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = write_file(
         tmp.path(),
         "module.lua",
@@ -152,7 +152,7 @@ fn lua_top_level_local_variables_are_captured() {
 
 #[test]
 fn swift_modifier_prefixed_structs_and_enums_keep_their_kind() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = write_file(
         tmp.path(),
         "Model.swift",
@@ -167,7 +167,7 @@ fn swift_modifier_prefixed_structs_and_enums_keep_their_kind() {
 
 #[test]
 fn scala3_enums_are_reported_as_enums() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = write_file(
         tmp.path(),
         "Color.scala",
@@ -241,7 +241,7 @@ fn zoom_content(root: &Path, file: &Path, symbol: &str) -> String {
 
 #[test]
 fn rust_inline_mod_functions_are_scoped_free_functions_not_dropped() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = r#"pub fn top_level() {}
 
 mod foo {
@@ -275,7 +275,7 @@ impl Worker {
 
 #[test]
 fn ts_js_multi_declarator_variable_ranges_do_not_overlap_siblings() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = "export const a = 1, b = 2;\n";
     let ts = write_file(tmp.path(), "vars.ts", source);
     let js = write_file(tmp.path(), "vars.js", source);
@@ -308,7 +308,7 @@ fn ts_js_multi_declarator_variable_ranges_do_not_overlap_siblings() {
 
 #[test]
 fn ts_js_jsdoc_attaches_only_without_blank_line() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = r#"/** attached doc */
 export function attached() {}
 
@@ -344,7 +344,7 @@ export function detached() {}
 
 #[test]
 fn markdown_heading_zoom_stops_before_next_same_level_heading() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = r#"# First
 
 first body
@@ -380,7 +380,7 @@ second body
 
 #[test]
 fn html_heading_zoom_stops_before_next_same_or_higher_heading() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = r#"<h1>First</h1>
 <p>first body</p>
 <h2>Child</h2>

@@ -148,6 +148,54 @@ pub(crate) fn project_root_volume(canonical_root: &Path, home: Option<&Path>) ->
     }
 }
 
+/// Decide whether a canonical directory is a filesystem or volume anchor.
+/// HOME, ordinary home ancestors, and a volume's children are not rejected by
+/// this rule. None means the filesystem identity could not establish the answer.
+pub(crate) fn project_root_is_volume_root(canonical_root: &Path) -> Option<bool> {
+    if !canonical_root.is_absolute() {
+        return None;
+    }
+    if canonical_root.parent().is_none() {
+        return Some(true);
+    }
+    // Windows can name the containing volume directly. Walking every ancestor
+    // and querying its volume serial spends admission's budget before evidence
+    // is examined, especially when filesystem metadata is being scanned.
+    #[cfg(windows)]
+    let volume = windows_volume_path(canonical_root)?;
+    #[cfg(not(windows))]
+    let volume = project_root_volume(canonical_root, None)?;
+    let root = crate::access_policy::policy_path(canonical_root);
+    let volume = crate::access_policy::policy_path(&volume);
+    if root == volume {
+        return Some(true);
+    }
+    // Only protect the volume identity, not HOME or root-level directories.
+    protected_directory_alias(&root, &volume, &volume)
+}
+
+#[cfg(windows)]
+fn windows_volume_path(root: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(path: *const u16, volume: *mut u16, length: u32) -> i32;
+    }
+    let path = crate::windows_path::win32_call_path(root)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut volume = vec![0_u16; 32768];
+    // Both buffers are NUL-terminated/initialized and live for the call; the
+    // length is the writable capacity of the output buffer in UTF-16 units.
+    if unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0 {
+        return None;
+    }
+    let end = volume.iter().position(|unit| *unit == 0)?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&volume[..end])))
+}
+
 /// Testable core of [`project_root_volume`]: `read` supplies the raw bytes of
 /// `/proc/self/mountinfo` and `volume_of` runs the device walk for a path.
 #[cfg(target_os = "linux")]
@@ -434,6 +482,41 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_project_directories_are_not_volume_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(super::project_root_is_volume_root(&root), Some(false));
+        let volume = super::project_root_volume(&root, None).unwrap();
+        assert_eq!(super::project_root_is_volume_root(&volume), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_is_a_structural_volume_root() {
+        assert_eq!(
+            super::project_root_is_volume_root(std::path::Path::new("/")),
+            Some(true)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_and_share_roots_are_structural_volume_roots() {
+        for root in [
+            r"C:\",
+            r"\\?\C:\",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert_eq!(
+                super::project_root_is_volume_root(std::path::Path::new(root)),
+                Some(true),
+                "{root}"
+            );
+        }
+    }
+
     #[test]
     fn project_root_volume_children_are_not_permission_scopes() {
         let volume = tempfile::tempdir().unwrap();

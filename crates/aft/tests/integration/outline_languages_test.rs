@@ -2,7 +2,6 @@ use super::helpers::AftProcess;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 fn write_file(root: &Path, relative: &str, content: &str) -> PathBuf {
     let path = root.join(relative);
@@ -46,7 +45,7 @@ fn assert_symbol_kind(text: &str, kind: &str, name: &str) {
 
 #[test]
 fn outline_c_header_symbols_include_macros_types_and_prototypes() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "include/sample.h",
@@ -84,7 +83,7 @@ int compute(int value);
 
 #[test]
 fn h_header_plain_c_outline_is_byte_identical_to_c() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let source = "#define LIMIT 8\ntypedef unsigned long Count;\nstruct Config { int size; };\nenum Mode { READY, BUSY };\nint compute(int value);\n";
     let header = write_file(dir.path(), "plain.h", source);
     let c_file = write_file(dir.path(), "plain.c", source);
@@ -101,10 +100,10 @@ fn h_header_plain_c_outline_is_byte_identical_to_c() {
 
 #[test]
 fn h_header_cpp_outline_zoom_and_method_callers() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let header = write_file(dir.path(), "widget.h", "namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\ninline int use_widget() { api::Widget widget; return widget.value(); }\n");
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    assert_eq!(aft.configure_project(dir.path())["success"], true);
     let text = outline_text(&mut aft, &header);
     for name in ["api", "Widget", "value", "use_widget"] {
         assert!(text.contains(name), "{text}");
@@ -134,7 +133,7 @@ fn h_header_cpp_outline_zoom_and_method_callers() {
 
 #[test]
 fn h_header_objc_outline_and_zoom() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let header = write_file(
         dir.path(),
         "greeter.h",
@@ -157,7 +156,7 @@ fn h_header_objc_outline_and_zoom() {
 
 #[test]
 fn outline_cpp_symbols_include_namespaces_templates_types_and_methods() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "include/sample.hpp",
@@ -214,7 +213,7 @@ inline void math::Worker::run() {}
 
 #[test]
 fn outline_html_symbols_include_heading_hierarchy() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "index.html",
@@ -268,7 +267,7 @@ fn outline_html_symbols_include_heading_hierarchy() {
 
 #[test]
 fn outline_scala3_symbols_include_enums_and_named_givens() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/main/scala/demo/Color.scala",
@@ -316,7 +315,7 @@ object Module {
 
 #[test]
 fn outline_java_symbols_include_types_members_and_fields() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/main/java/demo/Greeter.java",
@@ -361,7 +360,7 @@ record Point(int x, int y) {}
 
 #[test]
 fn outline_ruby_symbols_include_modules_classes_methods_and_constants() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "lib/demo/greeter.rb",
@@ -401,7 +400,7 @@ end
 
 #[test]
 fn outline_kotlin_symbols_include_classes_functions_properties_and_typealiases() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/main/kotlin/demo/Greeter.kt",
@@ -434,7 +433,7 @@ typealias Name = String
 
 #[test]
 fn outline_swift_symbols_include_types_protocols_functions_and_properties() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "Sources/Demo/Greeter.swift",
@@ -478,7 +477,7 @@ typealias Name = String
 
 #[test]
 fn outline_php_symbols_include_namespaces_types_functions_methods_and_properties() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/Greeter.php",
@@ -526,7 +525,7 @@ enum Color { case Red; case Green; }
 
 #[test]
 fn outline_lua_symbols_include_module_tables_functions_and_methods() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "lua/demo/greeter.lua",
@@ -561,7 +560,7 @@ return M
 
 #[test]
 fn outline_perl_symbols_include_packages_subroutines_constants_and_variables() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "lib/Demo/Greeter.pm",
@@ -600,7 +599,7 @@ my $counter = 0;
 
 #[test]
 fn zoom_html_heading_returns_content_with_context() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "page.html",
@@ -655,7 +654,7 @@ fn zoom_html_heading_returns_content_with_context() {
 
 #[test]
 fn zoom_html_heading_accepts_outline_style_prefix() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "page.html",
@@ -702,7 +701,7 @@ fn zoom_html_heading_accepts_outline_style_prefix() {
 
 #[test]
 fn zoom_html_heading_normalizes_identity_variants() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "decorated-headings.html",
@@ -756,7 +755,7 @@ fn zoom_html_heading_normalizes_identity_variants() {
 
 #[test]
 fn zoom_html_heading_resolves_explicit_and_legacy_anchors_without_changing_outline() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "custom-anchors.html",
@@ -849,7 +848,7 @@ fn zoom_html_heading_resolves_explicit_and_legacy_anchors_without_changing_outli
 
 #[test]
 fn zoom_html_explicit_anchor_collisions_are_ambiguous() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "anchor-collisions.html",
@@ -910,7 +909,7 @@ fn zoom_html_explicit_anchor_collisions_are_ambiguous() {
 
 #[test]
 fn zoom_html_last_heading_range_stays_within_file() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "last-heading.html",
@@ -952,7 +951,7 @@ fn zoom_html_last_heading_range_stays_within_file() {
 /// just the single heading element line.
 #[test]
 fn zoom_html_heading_returns_section_extent_not_just_heading_line() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "docs.html",
@@ -1021,7 +1020,7 @@ fn zoom_html_heading_returns_section_extent_not_just_heading_line() {
 
 #[test]
 fn outline_zig_symbols_include_containers_consts_tests_and_functions() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/sample.zig",
@@ -1079,7 +1078,7 @@ test "config init" {}
 
 #[test]
 fn outline_csharp_symbols_include_namespace_types_members_and_properties() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "src/Sample.cs",
@@ -1138,7 +1137,7 @@ public enum Mode
 
 #[test]
 fn outline_supports_requested_new_extensions() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let files = vec![
         write_file(
             dir.path(),
@@ -1214,7 +1213,7 @@ fn outline_supports_requested_new_extensions() {
 
 #[test]
 fn outline_bash_symbols_include_functions() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "scripts/deploy.sh",
@@ -1272,7 +1271,7 @@ main "$@"
 
 #[test]
 fn outline_solidity_symbols_include_contracts_functions_events_and_errors() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "contracts/Vault.sol",
@@ -1386,7 +1385,7 @@ contract Vault {
 
 #[test]
 fn outline_solidity_zoom_returns_function_body() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "contracts/Counter.sol",

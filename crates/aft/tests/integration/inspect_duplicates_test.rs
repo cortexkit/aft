@@ -16,7 +16,7 @@ fn write_file(root: &Path, relative: &str, contents: &str) -> PathBuf {
 }
 
 fn fixture_root() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project");
     (temp_dir, root)

@@ -7,6 +7,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::mark_project(root).unwrap();
     let resp = aft.send(
         &json!({
             "id": "configure",
@@ -17,6 +18,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
         .to_string(),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn trace_to_symbol(

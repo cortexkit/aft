@@ -92,7 +92,7 @@ fn assert_primary_hand_off(label: &str, text: &str) {
 
 #[test]
 fn worker_role_reaches_the_bash_hand_off_text_over_standalone() {
-    let project = tempfile::tempdir().expect("worker session project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     aft.configure(project.path());
 
@@ -230,7 +230,7 @@ fn assert_detached_at_limit(
 /// run once held a worker this way for fifteen hours.
 #[test]
 fn worker_wait_detaches_at_the_worker_wait_limit_and_keeps_running() {
-    let project = tempfile::tempdir().expect("worker wait project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
     let (response, elapsed) = foreground_bash(
@@ -254,7 +254,7 @@ fn worker_wait_detaches_at_the_worker_wait_limit_and_keeps_running() {
 /// `bash.subagent_background` is false), which is never auto-promoted.
 #[test]
 fn worker_blocking_foreground_detaches_at_the_worker_wait_limit() {
-    let project = tempfile::tempdir().expect("worker block project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
     let (response, elapsed) = foreground_bash(
@@ -276,7 +276,7 @@ fn worker_blocking_foreground_detaches_at_the_worker_wait_limit() {
 /// A worker's command that finishes before the limit returns its result.
 #[test]
 fn worker_wait_returns_the_result_before_the_limit() {
-    let project = tempfile::tempdir().expect("worker fast project");
+    let project = crate::test_helpers::tempdir();
     // The gate, not shell startup speed, determines when this command finishes.
     // A minute leaves headroom for a loaded runner; the held-command case below
     // independently checks promotion with the short test limit.
@@ -301,7 +301,7 @@ fn worker_wait_returns_the_result_before_the_limit() {
 
 #[test]
 fn worker_wait_promotes_a_held_command_at_the_limit() {
-    let project = tempfile::tempdir().expect("worker held project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
     let (marker, release) = queue_gated_worker_wait(&mut aft, project.path());
@@ -386,7 +386,7 @@ fn read_gated_worker_wait(aft: &mut AftProcess) -> Value {
 /// Head blocking calls share the worker wait limit without killing the task.
 #[test]
 fn head_wait_detaches_at_the_configured_wait_limit_and_keeps_running() {
-    let project = tempfile::tempdir().expect("primary wait project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
     let (response, elapsed) = foreground_bash(
@@ -407,7 +407,7 @@ fn head_wait_detaches_at_the_configured_wait_limit_and_keeps_running() {
 
 #[test]
 fn head_blocking_foreground_detaches_at_the_configured_wait_limit() {
-    let project = tempfile::tempdir().expect("head block project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
     let (response, elapsed) = foreground_bash(
@@ -428,7 +428,7 @@ fn head_blocking_foreground_detaches_at_the_configured_wait_limit() {
 
 #[test]
 fn head_wait_returns_the_result_before_the_limit() {
-    let project = tempfile::tempdir().expect("head fast project");
+    let project = crate::test_helpers::tempdir();
     // Shell startup can be slow on loaded Windows runners; this case checks
     // completion before the limit, while sibling tests cover the short limit.
     let mut aft = AftProcess::spawn_with_env(&[(

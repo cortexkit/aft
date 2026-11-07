@@ -387,7 +387,7 @@ fn file_urls_decode_to_local_paths_in_translate() {
 // resolves to a successful appendContent write on disk.
 #[test]
 fn edit_all_empty_sentinel_edits_resolves_to_append_write() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = root.join("sentinel.txt");
     fs::write(&target, "before\n").expect("write fixture");
@@ -439,7 +439,7 @@ fn edit_all_empty_sentinel_edits_resolves_to_append_write() {
 // the mode conflict.
 #[test]
 fn edit_empty_old_string_surfaces_batch_match_error() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = root.join("empty-match.txt");
     fs::write(&target, "some content\n").expect("write fixture");
@@ -485,7 +485,7 @@ fn edit_empty_old_string_surfaces_batch_match_error() {
 
 #[test]
 fn edit_sentinel_item_alongside_real_match_applies_batch() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = root.join("mixed.txt");
     fs::write(&target, "one two\n").expect("write fixture");
@@ -627,7 +627,7 @@ fn placeholder_tool_call(aft: &mut AftProcess, id: &str, name: &str, arguments: 
 
 #[test]
 fn relative_import_operations_edit_the_project_root_file() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = root.join("src/import-target.ts");
     fs::create_dir_all(target.parent().expect("target parent")).expect("create src");
@@ -707,7 +707,7 @@ fn relative_import_operations_edit_the_project_root_file() {
 // there" that sat in exactly those lines. It must now be refused by name.
 #[test]
 fn tool_call_read_refuses_recorded_inverted_range() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let content = (1..=300).map(|n| format!("line {n}\n")).collect::<String>();
     fs::write(root.join("conversion-lane.ts"), content).expect("write fixture");
@@ -776,7 +776,7 @@ fn tool_call_read_refuses_recorded_inverted_range() {
 // answered, and the unresolvable `x` target must report its own error line.
 #[test]
 fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::write(
         root.join("lane.ts"),
@@ -864,12 +864,12 @@ fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
 // both entry points: the native NDJSON command and the translated tool call.
 #[test]
 fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::write(root.join("lib.rs"), "pub fn load() {}\n").expect("write fixture");
 
     let mut aft = AftProcess::spawn();
-    let configure = aft.configure(root);
+    let configure = aft.configure_project(root);
     assert_eq!(
         configure["success"], true,
         "configure failed: {configure:#}"
@@ -909,7 +909,7 @@ fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
 
 #[test]
 fn tool_call_zoom_batch_errors_keep_original_entry_index_after_symbol_expansion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(
         dir.path().join("lane.ts"),
         "export function alpha() {}\nexport function beta() {}\n",
@@ -941,7 +941,7 @@ fn tool_call_zoom_batch_errors_keep_original_entry_index_after_symbol_expansion(
 
 #[test]
 fn tool_call_zoom_conflicting_http_locations_name_both_values() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
     let path = "https://example.test/path";
@@ -983,7 +983,7 @@ fn assert_zoom_lookup_names(response: &Value, expected: &[&str]) {
 
 #[test]
 fn tool_call_zoom_code_comma_list_returns_both_symbols() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(
         dir.path().join("code.ts"),
         "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
@@ -1000,7 +1000,7 @@ fn tool_call_zoom_code_comma_list_returns_both_symbols() {
 
 #[test]
 fn tool_call_zoom_code_strings_clean_up_arrays_and_pasted_menu_entries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(
         dir.path().join("code.ts"),
         "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
@@ -1025,7 +1025,7 @@ fn tool_call_zoom_code_strings_clean_up_arrays_and_pasted_menu_entries() {
 
 #[test]
 fn tool_call_zoom_comma_headings_stay_single_lookups() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(
         dir.path().join("guide.md"),
         "# Alpha, beta\n\nBoth topics belong to one section.\n",
@@ -1051,7 +1051,7 @@ fn tool_call_zoom_comma_headings_stay_single_lookups() {
 
 #[test]
 fn tool_call_zoom_symbol_array_entries_are_not_comma_lists() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("code.ts"), "export function alpha() {}\n").unwrap();
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);

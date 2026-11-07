@@ -221,12 +221,12 @@ pub(super) struct SubcBridgeTestRoots {
 
 impl SubcBridgeTestRoots {
     fn new() -> Self {
-        let root1 = tempfile::tempdir().expect("root1 tempdir");
-        let root2 = tempfile::tempdir().expect("root2 tempdir");
-        let failed_root = tempfile::tempdir().expect("failed root tempdir");
-        let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
-        let slow_root = tempfile::tempdir().expect("slow root tempdir");
-        let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
+        let root1 = crate::test_helpers::project::project_tempdir();
+        let root2 = crate::test_helpers::project::project_tempdir();
+        let failed_root = crate::test_helpers::tempdir();
+        let push_burst_root = crate::test_helpers::project::project_tempdir();
+        let slow_root = crate::test_helpers::project::project_tempdir();
+        let callgraph_root = crate::test_helpers::project::project_tempdir();
         let canonical_callgraph_root = std::fs::canonicalize(callgraph_root.path())
             .unwrap_or_else(|_| callgraph_root.path().to_path_buf());
         // Register the fixture's writer capability before transport timing begins.
@@ -243,8 +243,8 @@ impl SubcBridgeTestRoots {
             "pub fn caller() { callee(); }\npub fn callee() {}\n",
         )
         .expect("callgraph source file");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
 
         Self {
             root1,
@@ -380,7 +380,7 @@ fn remove_test_env(key: &'static str) -> EnvVarGuard {
 
 #[test]
 fn storage_override_holds_shared_process_settings_guard() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     {
         let _setting = set_test_env("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
         assert!(
@@ -772,6 +772,7 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     if !configured.success {
         return configured;
     }
+    crate::test_helpers::admission::settle(ctx);
     let root = match req.params.get("project_root").and_then(Value::as_str) {
         Some(root) => std::path::PathBuf::from(root),
         None => {
@@ -1982,8 +1983,8 @@ where
     let _serial = bridge_test_serial_guard();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_dir = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
     let user_config_path = storage.path().join("user-aft.jsonc");
 
@@ -2999,7 +3000,7 @@ fn subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes() {
             let _ = std::fs::remove_file(&self.resume);
         }
     }
-    let gate_dir = tempfile::tempdir().unwrap();
+    let gate_dir = crate::test_helpers::tempdir();
     let gates = DatabaseGates {
         open: gate_dir.path().join("database-open"),
         resume: gate_dir.path().join("database-resume"),
@@ -3221,9 +3222,9 @@ fn subc_bridge_first_party_bash_permission_required_stays_in_band() {
 
 #[test]
 fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -3385,7 +3386,7 @@ fn subc_bridge_new_manifest_tools_route_in_production() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_new_manifest_tools_route_in_production",
         Duration::from_secs(90),
-        r#"{ "disabled_tools": [] }"#,
+        r#"{ "disabled_tools": [], "project_detection": { "mode": "project" } }"#,
         drive_manifest_reachability_daemon,
         |_, _, _| {},
         bridge_dispatch,
@@ -3408,7 +3409,7 @@ fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_disabled_tools_are_refused_at_dispatch",
         Duration::from_secs(30),
-        r#"{ "disabled_tools": ["aft_delete", "bash"] }"#,
+        r#"{ "disabled_tools": ["aft_delete", "bash"], "project_detection": { "mode": "project" } }"#,
         drive_disabled_tools_daemon,
         |_, _, _| {},
         tool_disabled_bridge_dispatch,
@@ -3425,7 +3426,7 @@ fn subc_bridge_host_tool_names_follow_each_route_not_the_root() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_host_tool_names_follow_each_route_not_the_root",
         Duration::from_secs(60),
-        r#"{ "backup": { "enabled": false } }"#,
+        r#"{ "backup": { "enabled": false }, "project_detection": { "mode": "project" } }"#,
         drive_host_tool_names_per_route_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
@@ -3451,7 +3452,7 @@ fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
         Duration::from_secs(30),
-        r#"{ "disabled_tools": [] }"#,
+        r#"{ "disabled_tools": [], "project_detection": { "mode": "project" } }"#,
         drive_module_hello_health_manifest_daemon,
         |_, _, _| {},
         bridge_dispatch,
@@ -4040,7 +4041,7 @@ fn slow_shell_startup_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
@@ -4075,7 +4076,7 @@ fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
@@ -4106,7 +4107,7 @@ fn slow_started_promotion_dispatch(req: RawRequest, ctx: &AppContext) -> Respons
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive",
@@ -4171,9 +4172,9 @@ fn malformed_fed_bind_production_dispatch(req: RawRequest, ctx: &AppContext) -> 
 fn subc_rejects_forwarded_configure_tool_call_in_production() {
     S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -4381,9 +4382,9 @@ async fn drive_s1_rejection_daemon(
 /// the retry and subsequent route bind must still work normally.
 #[test]
 fn subc_registers_not_ready_and_noop_warmer_flips_ready_without_live_roots_query() {
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -5413,10 +5414,10 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         "repeat-breaker-bash-session",
-        json!({
+        crate::test_helpers::project::admitted_config(json!({
             "bash": { "rewrite": true },
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-        }),
+        })),
     )
     .await;
     expect_route_bind_ack(&mut stream, 10).await;
@@ -10736,7 +10737,7 @@ async fn reclaim_bound_test_root_with_database_gates(
     database_gates: Option<(&std::path::Path, &std::path::Path)>,
 ) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
     let mut session = open_fake_daemon_session(input).await;
-    let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let root_dir = crate::test_helpers::tempdir();
     let root = root_dir.path();
     let root_id = ProjectRootId::from_path(root).expect("reclaimed root id");
     for channel in [121, 122, 123] {
@@ -10967,7 +10968,7 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
     // bound is one no code path will ever close, not a slow one.
     const TERMINAL_BOUND: Duration = Duration::from_secs(4);
 
-    let reclaimed_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let reclaimed_dir = crate::test_helpers::tempdir();
     let reclaimed_root = reclaimed_dir.path().to_path_buf();
     let reclaimed_root_id = ProjectRootId::from_path(&reclaimed_root).expect("reclaimed root id");
 

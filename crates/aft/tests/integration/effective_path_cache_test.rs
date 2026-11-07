@@ -194,7 +194,7 @@ fn wait_for_marker(marker: &Path) {
 
 #[test]
 fn valid_cache_skips_sleeping_shell_and_returns_ping_quickly() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let shell = fixture.path().join("bash");
@@ -236,7 +236,7 @@ fn valid_cache_skips_sleeping_shell_and_returns_ping_quickly() {
 #[test]
 fn changing_or_creating_a_recorded_rc_file_invalidates_the_cache() {
     for initially_exists in [true, false] {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::test_helpers::tempdir();
         let storage = fixture.path().join("storage");
         let home = fixture.path().join("home");
         let shell = fixture.path().join("bash");
@@ -291,7 +291,7 @@ fn changing_or_creating_a_recorded_rc_file_invalidates_the_cache() {
 
 #[test]
 fn timed_out_probe_is_retried_on_second_binary_start() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let shell = fixture.path().join("bash");
@@ -328,7 +328,7 @@ fn timed_out_probe_is_retried_on_second_binary_start() {
 
 #[test]
 fn fallback_result_is_cached_for_the_requested_hanging_shell() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let hanging_shell = fixture.path().join("hanging-bash");
@@ -375,7 +375,7 @@ fn fallback_result_is_cached_for_the_requested_hanging_shell() {
 
 #[test]
 fn inline_probe_total_budget_caps_two_hanging_candidates() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let first = fixture.path().join("first-bash");
@@ -440,7 +440,7 @@ fn inline_probe_total_budget_caps_two_hanging_candidates() {
 
 #[test]
 fn cache_hit_starts_a_detached_refresh_helper_in_production() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
     let shell = fixture.path().join("bash");

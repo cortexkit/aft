@@ -12,10 +12,10 @@ use aft::cache_freshness::{
 use aft::search_index::SearchIndex;
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::project::project_tempdir();
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -51,18 +51,22 @@ fn normalize_display_path(path: &str) -> String {
 }
 
 fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value {
-    send(
+    let response = send(
         aft,
         json!({
             "id": id,
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": true, "semantic": false }
             })),
         }),
-    )
+    );
+    if response["success"] == true {
+        aft.wait_for_folder_admission();
+    }
+    response
 }
 
 fn status(aft: &mut AftProcess) -> Value {
@@ -98,12 +102,12 @@ fn wait_for_search_index_ready(aft: &mut AftProcess, timeout: Duration) -> Value
 #[test]
 fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() {
     let project = setup_project(&[("src/lib.rs", "pub fn needle() -> usize { 1 }\n")]);
-    let marker_dir = tempfile::tempdir().expect("create marker dir");
+    let marker_dir = crate::test_helpers::tempdir();
     let marker = marker_dir.path().join("rebuild-spawned");
     // Both processes must share one cache dir: the harness default mints a
     // fresh AFT_CACHE_DIR per spawn, which would leave the restarted process
     // with no disk cache to warm-load.
-    let shared_cache = tempfile::tempdir().expect("create shared cache dir");
+    let shared_cache = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_TEST_SEARCH_REBUILD_THREAD_MARKER", marker.as_os_str()),
         ("AFT_CACHE_DIR", shared_cache.path().as_os_str()),

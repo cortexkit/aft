@@ -1,7 +1,7 @@
 //! Prompt-free real macOS launch coverage. Only process attribution and ordinary
 //! temporary files/terminal IO are observed; no TCC-protected API is exercised.
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
@@ -24,7 +24,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, sandbox: bool
     let response = aft.send(&json!({
         "id": "cfg-privacy", "session_id": SESSION, "command": "configure",
         "harness": "opencode", "project_root": project, "storage_dir": storage,
-        "config": user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "enabled": sandbox } })),
+        "config": crate::test_helpers::project_detection_user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "enabled": sandbox } })),
     }).to_string());
     assert_eq!(response["success"], true, "{response}");
 }
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
 #[test]
 fn disclaimed_foreground_background_and_pty_preserve_attribution_io_and_exit_with_seatbelt() {
     let project = macos_native_fixture_project();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     attribution_probe(project.path());
     let mut aft = AftProcess::spawn();
     for sandbox in [false, true] {
@@ -271,7 +271,7 @@ fn await_group_exit(group: i32, deadline: Instant) -> Result<(), String> {
 #[test]
 fn disclaimed_timeout_kills_foreground_background_and_pty_groups_with_seatbelt() {
     let project = macos_native_fixture_project();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     attribution_probe(project.path());
     let mut aft = AftProcess::spawn_with_env(&[("RUST_LOG", std::ffi::OsStr::new("aft=debug"))]);
     let only_sandboxed_foreground =

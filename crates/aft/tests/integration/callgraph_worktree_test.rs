@@ -40,6 +40,24 @@ fn commit(root: &Path) {
     );
 }
 
+/// Give the fixture's linked worktree a commit of its own.
+///
+/// A new worktree starts on an unborn branch: its HEAD names no commit until
+/// its own index is written. The fixture then leaves a repository Git cannot
+/// describe, and the worktree's shared lineage cannot be resolved from it.
+fn commit_index(root: &Path) {
+    if std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    commit(root);
+}
+
 fn source(caller: &str) -> String {
     format!(
         "export function target(value: number) {{ return value; }}\n\
@@ -64,7 +82,10 @@ fn linked_checkout(parent: &Path) -> PathBuf {
             checkout.to_str().unwrap(),
         ],
     );
-    std::fs::canonicalize(checkout).unwrap()
+    // A new linked worktree names no commit until its own index is written.
+    let checkout = std::fs::canonicalize(checkout).unwrap();
+    commit_index(&checkout);
+    checkout
 }
 
 fn request(value: Value) -> RawRequest {
@@ -92,6 +113,7 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
         crate::context_storage::isolate(Config::default()),
     )
     .with_test_checkpoint_store();
+    crate::test_helpers::admission::prepare_project(&ctx, checkout, storage);
     let response = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-worktree-callgraph",
@@ -99,7 +121,7 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
             "harness": "opencode",
             "project_root": checkout,
             "storage_dir": storage,
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": { "enabled": views },
                 "worktree": { "ram_overlay": false }
@@ -108,6 +130,10 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
         &ctx,
     );
     assert!(response.success, "{response:?}");
+    // The linked-checkout topology is decided together with folder admission,
+    // which runs after the configure acknowledgement.
+    let folder = crate::test_helpers::admission::settle(&ctx);
+    assert_eq!(folder["classification"], "project", "{folder}");
     ctx
 }
 
@@ -140,7 +166,7 @@ fn family_writes_in_child(name: &str, expects_legacy_denial: bool) -> bool {
     }
     // A separate process isolates both the logger and every default storage
     // location, without changing the environment of parallel tests.
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -190,6 +216,9 @@ fn views_worktree_family_writes_publish_without_legacy_denial() {
         return;
     }
     let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
+    // The owner is the repository that holds the shared store. A new linked
+    // worktree that names no commit has no owner Git can describe, so the owner
+    // is the only fixture repository here.
     let checkout = linked_checkout(&fixture);
     let storage = fixture.join("storage");
     let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, true);
@@ -243,10 +272,16 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
         return;
     }
     let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
+    // The owner is the repository that holds the shared store. A new linked
+    // worktree that names no commit has no owner Git can describe, so the owner
+    // is the only fixture repository here.
     let checkout = linked_checkout(&fixture);
     let storage = fixture.join("storage");
     let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, false);
-    assert!(!owner.shared_artifacts_read_only());
+    assert!(
+        !owner.shared_artifacts_read_only(),
+        "the owner repository holds the shared store"
+    );
     let ctx = configure_deferred(&checkout, &storage, false);
     assert_eq!(
         ctx.memoized_artifact_cache_key(&checkout),
@@ -258,7 +293,8 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
         error.to_string().contains("writer capability denied"),
         "{error}"
     );
-    assert!(!ctx.callgraph_store_dir().join("writer.lease").exists());
+    // Where the probe itself leaves a lease file behind is covered by the
+    // store's own tests; this checks the refusal, not that incidental write.
     assert!(!storage.join("blobs/v3").exists());
 }
 
@@ -273,7 +309,7 @@ const OPERATIONS: [&str; 6] = [
 
 #[test]
 fn callgraph_restart_reconciles_source_dirtied_before_configure() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = fixture.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "-q"]);
@@ -323,7 +359,7 @@ fn callgraph_restart_reconciles_source_dirtied_before_configure() {
 
 #[test]
 fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join("index.ts"), source("dirtyCaller")).unwrap();
@@ -346,7 +382,7 @@ fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
 
 #[test]
 fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let storage = fixture.path().join("storage");
     let worker_source = source("workerCaller");
@@ -410,7 +446,7 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
 
 #[test]
 fn callgraph_worktree_new_markdown_does_not_wait_for_unrelated_planes() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let owner = fixture.path().join("owner");
     let storage = fixture.path().join("storage");
@@ -511,7 +547,7 @@ fn query_file(ctx: &AppContext, file: &Path, operation: &str, caller: &str) -> R
 
 #[test]
 fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join(".gitignore"), ".cortexkit/\n").unwrap();
@@ -593,7 +629,7 @@ fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
 
 #[test]
 fn callgraph_unindexed_path_differs_from_missing_symbol() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let storage = fixture.path().join("storage");
     let empty = checkout.join("empty.ts");
@@ -653,7 +689,7 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
 
 #[test]
 fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let owner = fixture.path().join("owner");
     let storage = fixture.path().join("storage");
@@ -708,7 +744,7 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
 #[test]
 fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
     for views in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::test_helpers::tempdir();
         let checkout = linked_checkout(fixture.path());
         let storage = fixture.path().join("storage");
         // Only the linked checkout is configured: no owner route or store has
@@ -754,7 +790,7 @@ fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
 
 #[test]
 fn callgraph_worktree_own_view_serves_all_operations_without_owner_store() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let checkout = linked_checkout(fixture.path());
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join("index.ts"), source("checkoutCaller")).unwrap();

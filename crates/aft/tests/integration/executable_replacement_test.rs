@@ -168,7 +168,7 @@ fn copy_and_warm_aft(destination: &Path) {
 
 #[test]
 fn pinned_executable_standalone_creates_no_pin() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = fixture.path().canonicalize().unwrap();
     let home = root.join("home");
     let storage = home.join("storage");
@@ -197,7 +197,7 @@ fn pinned_executable_standalone_creates_no_pin() {
 
 #[tokio::test]
 async fn pinned_executable_daemon_creates_pin_and_removes_it_on_clean_exit() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = fixture.path().canonicalize().unwrap();
     let home = root.join("home");
     let project = home.join("project");
@@ -218,7 +218,7 @@ async fn pinned_executable_daemon_creates_pin_and_removes_it_on_clean_exit() {
 async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_dead_pins() {
     use std::os::unix::fs::MetadataExt;
 
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = fixture.path().canonicalize().unwrap();
     let home = root.join("home");
     let project = home.join("project");

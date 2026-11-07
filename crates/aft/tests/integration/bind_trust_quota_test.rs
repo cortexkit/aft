@@ -18,7 +18,7 @@ fn bound(storage: &Path, family: &str, trust: BindTrust, view: &str) -> BoundBlo
 }
 
 fn assert_untrusted_bind_class(trust: BindTrust) {
-    let storage = tempfile::tempdir().expect("tempdir");
+    let storage = crate::test_helpers::tempdir();
     let full_key = key();
     let mut owner = bound(storage.path(), "family-a", BindTrust::FirstParty, "view-a");
     assert!(matches!(
@@ -66,7 +66,7 @@ fn federation_bind_trust_gates_put_read_and_manifest_write() {
 
 #[test]
 fn bound_puts_cache_usage_below_the_quota_threshold() {
-    let storage = tempfile::tempdir().expect("tempdir");
+    let storage = crate::test_helpers::tempdir();
     let mut store = BoundBlobStore::with_quota(
         BlobStore::open(storage.path(), "family-a", BlobPlane::Semantic).expect("open blob store"),
         BindTrust::FirstParty,
@@ -101,7 +101,7 @@ fn bound_puts_cache_usage_below_the_quota_threshold() {
 
 #[test]
 fn injected_value_coverage_refuses_byte_quota_and_requests_sweep() {
-    let storage = tempfile::tempdir().expect("tempdir");
+    let storage = crate::test_helpers::tempdir();
     let full_key = key();
     let mut store = BoundBlobStore::with_quota(
         BlobStore::open(storage.path(), "family-a", BlobPlane::Semantic).expect("open blob store"),
@@ -132,7 +132,7 @@ fn injected_value_coverage_refuses_byte_quota_and_requests_sweep() {
 
 #[test]
 fn injected_value_coverage_refuses_row_quota_and_requests_sweep() {
-    let storage = tempfile::tempdir().expect("tempdir");
+    let storage = crate::test_helpers::tempdir();
     let full_key = key();
     let mut store = BoundBlobStore::with_quota(
         BlobStore::open(storage.path(), "family-a", BlobPlane::Semantic).expect("open blob store"),

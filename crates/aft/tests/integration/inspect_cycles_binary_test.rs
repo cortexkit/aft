@@ -5,10 +5,11 @@ use serde_json::{json, Value};
 use super::helpers::AftProcess;
 
 fn inspect_cycles(files: &[(&str, &str)]) -> Value {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let project = temp.path().join("project");
     let storage = temp.path().join("storage");
     fs::create_dir_all(&project).expect("create project");
+    crate::test_helpers::project::mark_project(&project).unwrap();
     for (relative, source) in files {
         let path = project.join(relative);
         if let Some(parent) = path.parent() {
@@ -32,6 +33,7 @@ fn inspect_cycles(files: &[(&str, &str)]) -> Value {
         configured["success"], true,
         "configure failed: {configured:#}"
     );
+    aft.wait_for_project_ready();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let response = loop {

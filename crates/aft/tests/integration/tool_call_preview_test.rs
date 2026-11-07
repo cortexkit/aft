@@ -9,7 +9,7 @@ const SESSION_ID: &str = "tool-call-preview-session";
 
 #[test]
 fn tool_call_top_level_preview_does_not_mutate_edit_or_write_modes() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::create_dir_all(root.join("src")).expect("create src dir");
 
@@ -124,7 +124,7 @@ fn tool_call_top_level_preview_does_not_mutate_edit_or_write_modes() {
 
 #[test]
 fn agent_supplied_argument_preview_is_ignored_and_normal_tool_call_mutates() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::create_dir_all(root.join("src")).expect("create src dir");
 
@@ -194,7 +194,7 @@ fn agent_supplied_argument_preview_is_ignored_and_normal_tool_call_mutates() {
 
 #[test]
 fn tool_call_bash_preserves_command_argument_for_standalone_dispatch() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
 
     let mut aft = AftProcess::spawn();
@@ -254,7 +254,7 @@ fn tool_call_bash_preserves_command_argument_for_standalone_dispatch() {
 
 #[test]
 fn tool_call_bash_wait_rejects_stringified_background_and_pty() {
-    let dir = tempfile::tempdir().expect("temp project");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
 
     let mut aft = AftProcess::spawn();
@@ -422,7 +422,7 @@ fn send_tool_call(
 
 #[test]
 fn identity_edits_preserve_mtime_and_undo_history() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let path = dir.path().join("identity.ts");
     let body = "function identity() { return 1; }\n";
     fs::write(&path, body).unwrap();
@@ -475,7 +475,7 @@ fn identity_edits_preserve_mtime_and_undo_history() {
 
 #[test]
 fn mutation_modes_supply_host_diff_without_include_diff() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
     let cases = [
@@ -529,10 +529,10 @@ fn mutation_modes_supply_host_diff_without_include_diff() {
 
 #[test]
 fn delete_accepts_model_shaped_recursive_and_files_at_both_boundaries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     // `aft_delete` is off by default; this test is about argument shapes, so
     // enable it through a user config outside the project.
-    let config_dir = tempfile::tempdir().unwrap();
+    let config_dir = crate::test_helpers::tempdir();
     let user_config = config_dir.path().join("user-aft.jsonc");
     fs::write(&user_config, r#"{ "disabled_tools": [] }"#).unwrap();
     let mut aft = AftProcess::spawn();

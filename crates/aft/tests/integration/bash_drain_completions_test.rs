@@ -2,17 +2,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let response = aft.send(
         &json!({
             "id": "cfg-drain-bg",
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

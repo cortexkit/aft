@@ -154,7 +154,7 @@ fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
         &ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    test_helpers::admission::settle(&ctx);
     wait_until_ready(&ctx);
     ctx
 }
@@ -166,6 +166,7 @@ fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
 fn wait_until_ready(ctx: &AppContext) {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
+        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         aft::runtime_drain::drain_watcher_events(ctx);
         aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_callgraph_store_events(ctx);

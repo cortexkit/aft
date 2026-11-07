@@ -11,7 +11,7 @@ use aft::protocol::RawRequest;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
@@ -35,6 +35,7 @@ fn request(payload: Value) -> RawRequest {
 }
 
 fn configured_context(root: &Path) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     fs::write(root.join(".aftignore"), "**/tsconfig*.json\npackage.json\n")
         .expect("ignore config-only diagnostics files");
@@ -53,13 +54,14 @@ fn configured_context(root: &Path) -> AppContext {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false }
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     // Configure records which language servers apply on a background
     // thread; the status bar reads diagnostics as pending until it has.
     assert!(

@@ -1440,7 +1440,7 @@ mod production {
                 "harness": "opencode",
                 "project_root": root,
                 "storage_dir": storage,
-                "config": crate::helpers::user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": true, "semantic": true, "callgraph": false },
                     "views": { "enabled": views },
                     "semantic": {
@@ -1459,6 +1459,7 @@ mod production {
     }
 
     fn drain(ctx: &AppContext) {
+        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         aft::runtime_drain::drain_watcher_events(ctx);
         aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_semantic_index_events(ctx);

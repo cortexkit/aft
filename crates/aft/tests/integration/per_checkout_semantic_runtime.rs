@@ -306,7 +306,7 @@ fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) ->
         .with_test_checkpoint_store(),
     );
     send_configure(&ctx, root, storage, server, views, MODEL);
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -370,6 +370,7 @@ fn configure_payload(
 }
 
 fn drain(ctx: &AppContext) {
+    aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
     aft::runtime_drain::drain_watcher_events(ctx);
     aft::runtime_drain::drain_search_index_events(ctx);
     aft::runtime_drain::drain_semantic_index_events(ctx);

@@ -111,7 +111,7 @@ fn response_text(resp: &Value) -> &str {
 
 #[test]
 fn conflicts_found_when_project_root_is_sibling_subdir() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "packages/a/x.txt");
 
     let project_root = dir.path().join("packages/b");
@@ -129,7 +129,7 @@ fn conflicts_found_when_project_root_is_sibling_subdir() {
 
 #[test]
 fn deleted_unmerged_file_is_reported_as_incomplete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "deleted.txt");
     fs::remove_file(dir.path().join("deleted.txt")).expect("delete working-tree copy");
 
@@ -159,7 +159,7 @@ fn deleted_unmerged_file_is_reported_as_incomplete() {
 
 #[test]
 fn mixed_readable_and_deleted_unmerged_files_are_both_reported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflicts(dir.path(), &["readable.txt", "deleted.txt"]);
     fs::remove_file(dir.path().join("deleted.txt")).expect("delete working-tree copy");
 
@@ -188,7 +188,7 @@ fn mixed_readable_and_deleted_unmerged_files_are_both_reported() {
 fn marker_sweep_permission_error_preserves_unmerged_conflict_as_named_gap() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "conflict.txt");
     let unreadable = dir.path().join("packages/b/.keep");
     let original_mode = fs::metadata(&unreadable)
@@ -221,7 +221,7 @@ fn marker_sweep_permission_error_preserves_unmerged_conflict_as_named_gap() {
 
 #[test]
 fn staged_but_still_marked_file_is_reported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "packages/a/x.txt");
     git(dir.path(), &["add", "packages/a/x.txt"]);
 
@@ -236,7 +236,7 @@ fn staged_but_still_marked_file_is_reported() {
 
 #[test]
 fn conflict_during_rebase_detached_head_is_reported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let repo = dir.path();
     let base_branch = init_repo(repo);
     write_file(repo, "src/rebased.txt", "base\n");
@@ -268,7 +268,7 @@ fn conflict_during_rebase_detached_head_is_reported() {
 
 #[test]
 fn bare_separator_line_does_not_create_false_positive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let repo = dir.path();
     init_repo(repo);
     write_file(repo, "README.md", "heading\n=======\nbody\n");
@@ -287,7 +287,7 @@ fn bare_separator_line_does_not_create_false_positive() {
 
 #[test]
 fn toplevel_relative_conflict_path_reads_nested_file_content() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "nested/deep/x.txt");
 
     let (aft, resp) = configure_and_conflicts(dir.path());
@@ -303,7 +303,7 @@ fn toplevel_relative_conflict_path_reads_nested_file_content() {
 
 #[test]
 fn conflicts_in_non_ascii_filename_are_reported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "nested/café.txt");
 
     let (aft, resp) = configure_and_conflicts(dir.path());
@@ -324,7 +324,7 @@ fn conflicts_in_non_ascii_filename_are_reported() {
 #[cfg(unix)]
 #[test]
 fn conflicts_in_newline_filename_are_reported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     create_merge_conflict(dir.path(), "nested/conflict\nname.txt");
 
     let (aft, resp) = configure_and_conflicts(dir.path());
@@ -341,11 +341,11 @@ fn conflicts_in_newline_filename_are_reported() {
 
 #[test]
 fn optional_path_can_inspect_external_repo_and_reports_checked_root() {
-    let conflicted_dir = tempfile::tempdir().unwrap();
+    let conflicted_dir = crate::test_helpers::tempdir();
     create_merge_conflict(conflicted_dir.path(), "packages/a/x.txt");
     let r1_root = repo_toplevel(conflicted_dir.path());
 
-    let clean_dir = tempfile::tempdir().unwrap();
+    let clean_dir = crate::test_helpers::tempdir();
     init_repo(clean_dir.path());
     write_file(clean_dir.path(), "clean.txt", "clean\n");
     git(clean_dir.path(), &["add", "."]);

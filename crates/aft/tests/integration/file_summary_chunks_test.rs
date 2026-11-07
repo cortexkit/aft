@@ -6,7 +6,7 @@ use aft::semantic_index::{build_file_summary_chunk, SemanticIndex, SemanticIndex
 use aft::symbols::SymbolKind;
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -120,7 +120,7 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
         "src/index.ts",
         "export function initializePlugin() {\n  return true;\n}\n",
     )]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let file = project.path().join("src/index.ts");
     let (mut index, _) = build_index_with_captured_texts(project.path(), &[file]);
     let fingerprint = SemanticIndexFingerprint {
@@ -164,7 +164,7 @@ fn reindex_roundtrip_after_chunking_version_bump_is_deterministic() {
 
 #[test]
 fn build_file_summary_chunk_uses_documented_fields_for_empty_inputs() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let file = project.path().join("src/index.ts");
     fs::create_dir_all(file.parent().expect("parent")).expect("create parent");
 

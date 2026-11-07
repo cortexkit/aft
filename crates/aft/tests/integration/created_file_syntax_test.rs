@@ -46,7 +46,7 @@ fn text(resp: &Value) -> &str {
 
 #[test]
 fn write_new_broken_file_reports_first_error_line_last() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
 
     let resp = tool_call(
@@ -76,7 +76,7 @@ fn write_new_broken_file_reports_first_error_line_last() {
 
 #[test]
 fn write_new_valid_file_has_no_syntax_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
 
     let resp = tool_call(
@@ -105,7 +105,7 @@ const BROKEN_BASH: &str = "set -u\necho a\ncase x in\n  a) echo ;;\n  b echo ;;\
 #[cfg(unix)]
 #[test]
 fn bash_grammar_gap_written_or_appended_is_not_called_broken() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     for (name, arguments) in [
         (
@@ -128,7 +128,7 @@ fn bash_grammar_gap_written_or_appended_is_not_called_broken() {
 #[cfg(unix)]
 #[test]
 fn bash_broken_written_or_appended_reports_real_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     for (name, arguments) in [
         (
@@ -150,7 +150,7 @@ fn bash_broken_written_or_appended_reports_real_line() {
 
 #[test]
 fn existing_clean_file_broken_by_write_or_edit_keeps_rollback_reply() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("src/clean.ts");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, VALID_TS).unwrap();
@@ -190,7 +190,7 @@ fn existing_clean_file_broken_by_write_or_edit_keeps_rollback_reply() {
 
 #[test]
 fn edit_append_creating_broken_file_reports_first_error_line_last() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
 
     let resp = tool_call(
@@ -229,7 +229,7 @@ fn edit_append_creating_broken_file_reports_first_error_line_last() {
 
 #[test]
 fn apply_patch_places_notice_under_the_broken_created_file_only() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
 
     let mut patch = String::from("*** Begin Patch\n*** Add File: src/good.ts\n");
@@ -296,7 +296,7 @@ fn swift_new_file_does_not_report_unconfirmed_syntax_error() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let content = "_ = (Int, Result<String, Error>).self\n";
 
@@ -352,7 +352,7 @@ fn metadata_syntax_line(resp: &Value, rel: &str) -> Option<Value> {
 /// and metadata keeps `syntax_error_line`.
 #[test]
 fn apply_patch_add_broken_then_update_still_broken_reports_final_error_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let patch = add_then(
         "src/bad.ts",
@@ -385,7 +385,7 @@ fn apply_patch_add_broken_then_update_still_broken_reports_final_error_line() {
 /// A later hunk fixes the broken new file: no notice and no metadata field.
 #[test]
 fn apply_patch_add_broken_then_update_fixed_has_no_syntax_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let patch = add_then(
         "src/bad.ts",
@@ -415,7 +415,7 @@ fn apply_patch_add_broken_then_update_fixed_has_no_syntax_line() {
 /// appears under the Created line.
 #[test]
 fn apply_patch_add_valid_then_update_broken_reports_under_created_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let patch = add_then(
         "src/good.ts",
@@ -452,7 +452,7 @@ fn apply_patch_add_valid_then_update_broken_reports_under_created_line() {
 /// A broken new file that a later hunk deletes gets no notice.
 #[test]
 fn apply_patch_add_broken_then_delete_has_no_syntax_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let patch = add_then("src/bad.ts", BROKEN_TS, "*** Delete File: src/bad.ts\n");
 
@@ -477,7 +477,7 @@ fn apply_patch_add_broken_then_delete_has_no_syntax_line() {
 /// line that created its final path.
 #[test]
 fn apply_patch_add_broken_then_move_reports_under_moved_line() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = configured(dir.path());
     let patch = add_then(
         "src/bad.ts",

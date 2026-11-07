@@ -210,13 +210,13 @@ fn canonicalized(path: &Path) -> Option<PathBuf> {
 
 /// Parse a `.git` file's `gitdir:` line into its (possibly relative) target.
 /// The read is capped: a `.git` file is one short line, never bulk data.
-fn read_gitdir_target(dot_git: &Path) -> Option<PathBuf> {
+pub(crate) fn read_gitdir_target(dot_git: &Path) -> Option<PathBuf> {
     parse_gitdir_bytes(&capped_read(dot_git, 4096)?)
 }
 
 /// The `commondir` file a linked worktree's gitdir carries, naming the shared
 /// git dir (absolute, or relative to the gitdir).
-fn read_commondir_target(gitdir: &Path) -> Option<PathBuf> {
+pub(crate) fn read_commondir_target(gitdir: &Path) -> Option<PathBuf> {
     let bytes = capped_read(&gitdir.join("commondir"), 4096)?;
     let line = bytes.split(|byte| *byte == b'\n').next()?;
     let trimmed = trim_ascii_whitespace(line);
@@ -406,6 +406,28 @@ pub(crate) fn read_bounded(
     #[cfg(test)]
     record_open(path);
     crate::bounded_io::read(path, deadline)
+}
+
+pub(crate) fn read_limited(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    limit: usize,
+    authorized_task_artifact: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    if authorized_task_artifact {
+        if is_sqlite_or_metadata(path) || std::fs::symlink_metadata(path)?.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SQLite files and aliases are not readable task content",
+            ));
+        }
+    } else {
+        admit(path, None)?;
+    }
+    #[cfg(test)]
+    record_open(path);
+    crate::bounded_io::read_limited(path, deadline, limit)
 }
 
 /// Guard direct source reads as well as enumeration. Watcher deltas and queued

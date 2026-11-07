@@ -140,12 +140,12 @@ fn outline_files_reports_unsupported_language_skips() {
 
 #[test]
 fn outline_directory_reports_parse_error_skips() {
-    let dir = tempdir().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(dir.path(), "src/valid.ts", "export function valid() {}\n");
     write_file(dir.path(), "src/invalid.ts", "export function broken( {\n");
 
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    assert_eq!(aft.configure_project(dir.path())["success"], true);
 
     let resp = send(
         &mut aft,

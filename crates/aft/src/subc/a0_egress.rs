@@ -1423,7 +1423,7 @@ mod ordering_tests {
             body.find("completion=control_completion_rx.recv()")
                 .unwrap()
                 < body
-                    .find("(maybe_frame,database_waited,ledger_waited)")
+                    .find("(maybe_frame,database_waited,ledger_waited,folder_waited)")
                     .unwrap()
         );
         let egress = include_str!("a0_egress.rs");

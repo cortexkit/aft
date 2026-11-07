@@ -37,7 +37,7 @@ fn run_job(job: &InspectJob) -> InspectScanSuccess {
 
 #[test]
 fn inspect_todos_empty_directory_returns_zero_count() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let job = inspect_todos_job(temp_dir.path(), Vec::new());
 
     let success = run_job(&job);
@@ -49,7 +49,7 @@ fn inspect_todos_empty_directory_returns_zero_count() {
 
 #[test]
 fn inspect_todos_counts_mixed_markers_and_items() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let src = temp_dir.path().join("src");
     fs::create_dir_all(&src).expect("create src");
     let rust_file = src.join("app.rs");
@@ -91,7 +91,7 @@ fn inspect_todos_counts_mixed_markers_and_items() {
 
 #[test]
 fn inspect_todos_requires_comment_syntax_before_marker() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("strings.rs");
     fs::write(
         &file,
@@ -114,7 +114,7 @@ fn inspect_todos_requires_comment_syntax_before_marker() {
 
 #[test]
 fn inspect_todos_caps_drill_down_at_one_hundred_items() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("many.rs");
     let content = (0..200)
         .map(|index| format!("// TODO item {index}"))
@@ -133,7 +133,7 @@ fn inspect_todos_caps_drill_down_at_one_hundred_items() {
 
 #[test]
 fn inspect_todos_skips_binary_files_without_panic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("image.bin");
     fs::write(&file, [0, 159, 146, 150]).expect("write binary fixture");
     let job = inspect_todos_job(temp_dir.path(), vec![file]);
@@ -147,7 +147,7 @@ fn inspect_todos_skips_binary_files_without_panic() {
 
 #[test]
 fn inspect_todos_unsupported_text_fallback_ignores_quoted_comment_tokens() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("notes.txt");
     fs::write(
         &file,
@@ -172,7 +172,7 @@ fn inspect_todos_unsupported_text_fallback_ignores_quoted_comment_tokens() {
 
 #[test]
 fn inspect_todos_binary_uses_comment_nodes_without_regressing_real_comments() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let src = temp_dir.path().join("src");
     fs::create_dir_all(&src).expect("create src");
     fs::write(

@@ -16,10 +16,10 @@ use aft::inspect::{
 use aft::parser::SymbolCache;
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     let src = root.join("src");
     fs::create_dir_all(&src).expect("create src");
@@ -210,7 +210,7 @@ fn inspect_engine_cache_persists_tier2_contributions_and_aggregate() {
 
 #[test]
 fn inspect_engine_freshness_treats_hot_and_content_fresh_as_fresh() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("a.rs");
     fs::write(&file, "alpha").expect("write file");
     let freshness = cache_freshness::collect(&file).expect("collect freshness");
@@ -545,7 +545,7 @@ fn inspect_engine_command_returns_lane_a_shape() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "lsp": { "disabled": ["rust"] }
             })),
         })
@@ -555,6 +555,7 @@ fn inspect_engine_command_returns_lane_a_shape() {
         configure["success"], true,
         "configure should succeed: {configure:?}"
     );
+    aft.wait_for_project_ready();
 
     let response = aft.send(
         &json!({

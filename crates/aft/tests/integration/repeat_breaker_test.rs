@@ -24,6 +24,7 @@ pub(super) fn transport_fixture_arguments(root: &Path, description: &str) -> Val
 pub(super) const REWRITE_FIXTURE_FILE: &str = "historian.repeat-fixture";
 
 pub(super) fn write_rewritten_grep_fixture(root: &Path) {
+    crate::test_helpers::project::mark_project(root).expect("mark rewritten grep project");
     std::fs::write(
         root.join(REWRITE_FIXTURE_FILE),
         "historian response dumped\n",
@@ -264,7 +265,7 @@ fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
     // request from a delegated worker: inside the `tool_call` envelope, and at
     // the top level of a raw `bash` request (whose own arguments are nested
     // under `params`).
-    let project = tempfile::tempdir().expect("worker repeat project");
+    let project = crate::test_helpers::tempdir();
     std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
         .expect("write repeat fixture");
     let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
@@ -272,7 +273,7 @@ fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
         "AFT_TEST_FOREGROUND_WAIT_MS",
         std::ffi::OsStr::new(&wait_ms),
     )]);
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut tool_texts = Vec::new();
     let mut bash_texts = Vec::new();
 
@@ -981,11 +982,11 @@ fn repeat_breaker_discards_occurrences_beyond_the_record_cap() {
 
 #[test]
 fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
-    let project = tempfile::tempdir().expect("repeat breaker NDJSON project");
+    let project = crate::test_helpers::tempdir();
     std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
         .expect("write repeat fixture");
     let mut aft = AftProcess::spawn();
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut texts = Vec::new();
 
     for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
@@ -1042,7 +1043,7 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
 
 #[test]
 fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
-    let project = tempfile::tempdir().expect("rewritten bash repeat project");
+    let project = crate::test_helpers::tempdir();
     write_rewritten_grep_fixture(project.path());
     let mut aft = AftProcess::spawn();
     let configured = aft.send(
@@ -1051,7 +1052,7 @@ fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
@@ -1093,7 +1094,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
     // The Pi plugin and the OpenCode plugin in standalone mode send each model
     // bash call as a top-level `bash` request, arguments nested under `params`,
     // and show the model the response's `output`.
-    let project = tempfile::tempdir().expect("raw bash repeat project");
+    let project = crate::test_helpers::project::project_tempdir();
     write_rewritten_grep_fixture(project.path());
     let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
     let mut aft = AftProcess::spawn_with_env(&[(
@@ -1106,7 +1107,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
             "command": "configure",
             "harness": "pi",
             "project_root": project.path(),
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
@@ -1114,6 +1115,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
         .to_string(),
     );
     assert_eq!(configured["success"], true, "configure: {configured:?}");
+    aft.wait_for_folder_admission();
     let mut rewritten = Vec::new();
     let mut finished = Vec::new();
     let mut promoted = Vec::new();
@@ -1180,10 +1182,10 @@ fn repeat_breaker_never_steers_previewed_mutations() {
     // Hoisted mutations send a preview and then the apply for one model call.
     // Neither half is polling, even after three identical applied writes span
     // the breaker's time threshold.
-    let project = tempfile::tempdir().expect("preview repeat project");
+    let project = crate::test_helpers::tempdir();
     let target = project.path().join("notes.txt");
     let mut aft = AftProcess::spawn();
-    aft.configure(project.path());
+    aft.configure_project(project.path());
     let mut texts = Vec::new();
 
     for cycle in 0..3 {

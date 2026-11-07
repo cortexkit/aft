@@ -90,7 +90,7 @@ fn metrics_payload(job: &InspectJob) -> serde_json::Value {
 
 #[test]
 fn inspect_metrics_empty_project_reports_zero_files() {
-    let project = tempfile::tempdir().expect("temp project");
+    let project = crate::test_helpers::tempdir();
     let cache = shared_cache();
     let job = metrics_job(project.path(), Vec::new(), cache);
 
@@ -105,7 +105,7 @@ fn inspect_metrics_empty_project_reports_zero_files() {
 
 #[test]
 fn inspect_metrics_mixed_rust_and_typescript_uses_cached_symbol_counts() {
-    let project = tempfile::tempdir().expect("temp project");
+    let project = crate::test_helpers::tempdir();
     let rust_file = write_file(
         project.path(),
         "src/lib.rs",
@@ -133,7 +133,7 @@ fn inspect_metrics_mixed_rust_and_typescript_uses_cached_symbol_counts() {
 
 #[test]
 fn inspect_metrics_loc_totals_match_known_fixture() {
-    let project = tempfile::tempdir().expect("temp project");
+    let project = crate::test_helpers::tempdir();
     let first = write_file(project.path(), "src/first.rs", "alpha\nbeta\n");
     let second = write_file(project.path(), "src/second.ts", "one\ntwo\nthree");
     let third = write_file(project.path(), "README.md", "single");
@@ -148,7 +148,7 @@ fn inspect_metrics_loc_totals_match_known_fixture() {
 
 #[test]
 fn inspect_metrics_top_files_by_loc_is_sorted_descending_and_capped() {
-    let project = tempfile::tempdir().expect("temp project");
+    let project = crate::test_helpers::tempdir();
     let mut files = Vec::new();
     let cache = shared_cache();
     for line_count in 1..=25 {

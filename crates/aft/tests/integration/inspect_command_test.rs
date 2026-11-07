@@ -27,7 +27,7 @@ use aft::protocol::RawRequest;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
@@ -136,6 +136,7 @@ fn configured_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -156,7 +157,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": {
                 "trigram": false,
                 "semantic": false,
@@ -167,6 +168,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -174,6 +176,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
 /// reserves terminal-egress time inside this value, and timeout detail still
 /// carries the configured budget.
 fn configured_restricted_context(root: &Path) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -191,7 +194,7 @@ fn configured_restricted_context(root: &Path) -> AppContext {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false },
             "restrict_to_project_root": true
         })),
@@ -199,10 +202,12 @@ fn configured_restricted_context(root: &Path) -> AppContext {
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -220,7 +225,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
@@ -228,6 +233,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -1866,7 +1872,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         &request(json!({
             "id": "configure-view", "command": "configure", "harness": "opencode",
             "project_root": linked, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": {"enabled": true}
             }))
@@ -1874,6 +1880,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         &ctx,
     );
     assert!(configured.success, "{configured:?}");
+    crate::test_helpers::admission::settle(&ctx);
     assert!(
         !ctx.callgraph_writer(),
         "worktree must remain borrow-only for legacy artifacts"
@@ -3012,7 +3019,7 @@ fn inspect_tool_call_refuses_space_separated_scope_as_one_missing_path() {
 #[test]
 fn inspect_tool_call_distinguishes_outside_root_from_missing_scope() {
     let (_temp_dir, root) = fixture_project();
-    let outside = tempfile::tempdir().expect("outside project tempdir");
+    let outside = crate::test_helpers::tempdir();
     let ctx = configured_restricted_context(&root);
 
     let outside_response = inspect_tool_call(
@@ -4564,7 +4571,7 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
         .status()
         .unwrap()
         .success());
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let trace = storage.path().join("cargo-runs");
     let wrapper = storage.path().join("cargo-wrapper");
     let source = format!(
@@ -4696,7 +4703,7 @@ fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
         .status()
         .unwrap()
         .success());
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let wrapper = storage.path().join("cargo-wrapper");
     let pid_file = storage.path().join("check-pid");
     let source = format!(
@@ -5305,7 +5312,7 @@ fn python_progress_fixture_with_timeout(
     mode: Option<&str>,
     timeout_ms: u64,
 ) -> (tempfile::TempDir, AppContext) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join("pyproject.toml"),
@@ -8671,6 +8678,7 @@ fn configured_context_with_held_applicability(
     root: &Path,
     timeout_ms: u64,
 ) -> (AppContext, aft::context::ProjectApplicabilityHold) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -8689,7 +8697,7 @@ fn configured_context_with_held_applicability(
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
@@ -8697,6 +8705,7 @@ fn configured_context_with_held_applicability(
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     (ctx, hold)
 }
 
@@ -8960,11 +8969,12 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
 
 #[test]
 fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     let storage_dir = root.join(".aft-test-storage");
     fs::create_dir_all(&root).expect("create project root");
     write_file(&root, "src/app.customts", "export const value = 1;\n");
+    crate::test_helpers::project::mark_project(&root).unwrap();
 
     let server_id = "needs-marker-ls";
     let ctx = AppContext::new(
@@ -8992,7 +9002,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false }
         })),
     }));
@@ -9002,6 +9012,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         configure_response["success"], true,
         "configure failed: {configure_response:#}"
     );
+    crate::test_helpers::admission::settle(&ctx);
     ctx.lsp().override_binary(
         ServerKind::Custom(std::sync::Arc::from(server_id)),
         fake_server_path(),
@@ -9994,7 +10005,7 @@ fn wait_for_completed_rust_check(
 #[test]
 fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
     crate::helpers::disable_in_process_file_watcher();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("checkout");
     let storage = temp.path().join("storage");
     write_file(
@@ -10021,7 +10032,7 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             &request(json!({
                 "id": "gated-configure", "command": "configure", "project_root": root,
                 "storage_dir": storage, "harness": "opencode",
-                "config": crate::helpers::user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": false, "semantic": false },
                     "inspect": { "diagnostics_timeout_ms": 40_000 }
                 }))
@@ -10029,6 +10040,7 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx
@@ -10153,6 +10165,7 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         configure_fake_rust_lsp(&ctx);
         for flag in [
             "AFT_FAKE_LSP_PULL",
@@ -10217,7 +10230,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     ) {
         return;
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("checkout");
     let storage = temp.path().join("storage");
     write_file(
@@ -10251,7 +10264,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         let response = handle_configure(
             &request(json!({
                 "id": "saved-configure", "command": "configure", "project_root": root, "storage_dir": storage,
-                "harness": "opencode", "config": crate::helpers::user_config(json!({
+                "harness": "opencode", "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": false, "semantic": false },
                     "inspect": {"diagnostics_timeout_ms": 40_000}
                 }))
@@ -10259,6 +10272,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx.lsp()
@@ -10388,7 +10402,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
 
 fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
     crate::helpers::disable_in_process_file_watcher();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let storage = temp.path().join("storage");
     let records = || {
         fs::read_dir(storage.join("rust-completed-checks"))
@@ -10423,11 +10437,12 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         let response = handle_configure(
             &request(
                 json!({"id":"unsuccessful-configure", "command":"configure", "harness":"opencode", "project_root":root,"storage_dir":storage,
-            "config":crate::helpers::user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
+            "config":crate::test_helpers::project_detection_user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
             ),
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         configure_fake_rust_lsp(&ctx);
         // Default fake startup is already quiescent; its check therefore begins
         // after workspace load. The warming variant settles only on didOpen,

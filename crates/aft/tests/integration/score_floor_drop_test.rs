@@ -4,7 +4,7 @@ use aft::semantic_index::SemanticIndex;
 
 #[test]
 fn zero_score_tail_can_surface_without_evicting_positive_hits() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
     fs::write(

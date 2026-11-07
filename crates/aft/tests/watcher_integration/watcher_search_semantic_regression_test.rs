@@ -18,6 +18,7 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
 }
 
 fn configure_search_index(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::mark_project(root).unwrap();
     let response = send(
         aft,
         json!({
@@ -86,7 +87,12 @@ fn exact_memo_watcher_content_changes(views: bool) {
     fs::write(&seed, format!("// {phrase}\n")).unwrap();
     fs::write(&edited, "// unrelated initial content\n").unwrap();
 
-    let mut aft = AftProcess::spawn_with_real_watcher_env(&[]);
+    // Keep this project marker-free: after its source files change, AFT must
+    // check again whether it is a project instead of reusing a manifest or Git marker.
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "GIT_CEILING_DIRECTORIES",
+        project.path().parent().unwrap().as_os_str(),
+    )]);
     let configured = send(
         &mut aft,
         json!({
@@ -104,6 +110,12 @@ fn exact_memo_watcher_content_changes(views: bool) {
     wait_for_ready_grep(&mut aft, "initial exact corpus", phrase, |r| {
         r["total_matches"] == 1
     });
+    let status = send(
+        &mut aft,
+        json!({"id": "exact-memo-admission", "command": "status"}),
+    );
+    assert_eq!(status["folder"]["classification"], "project", "{status}");
+    assert_eq!(status["folder"]["reason"], "small_source_tree", "{status}");
 
     let search = |aft: &mut AftProcess, label: &str| {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -563,6 +575,7 @@ fn configure_semantic_openai(
     storage_dir: &Path,
     base_url: &str,
 ) {
+    crate::test_helpers::project::mark_project(root).unwrap();
     let response = send(
         aft,
         json!({

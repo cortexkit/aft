@@ -479,7 +479,7 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         })),
     }))
@@ -490,6 +490,7 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         configured["success"], true,
         "configure failed: {configured:#}"
     );
+    crate::test_helpers::admission::settle(&ctx);
     assert!(
         !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
             .ensure_server_for_file(&file, &ctx.config()))
@@ -558,6 +559,7 @@ fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
     let root = dir.path().join("workspace");
     let bin_dir = dir.path().join("bin");
     fs::create_dir_all(&root).expect("create workspace");
+    crate::test_helpers::project::mark_project(&root).unwrap();
     fs::create_dir_all(&bin_dir).expect("create binary directory");
     fs::write(root.join(".rumdl.toml"), "[global]\n").expect("write root marker");
     let file = root.join("README.md");
@@ -587,7 +589,7 @@ fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
             "harness": "opencode",
             "project_root": root,
             "lsp_paths_extra": [bin_dir],
-            "config": crate::helpers::user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "pull-only-markdown": {
@@ -606,6 +608,7 @@ fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    aft.wait_for_folder_admission();
 
     let edit = aft.send(
         &serde_json::json!({
@@ -1662,6 +1665,7 @@ fn test_lsp_diagnostics_command_response_format() {
         crate::helpers::json_string(&root.display())
     ));
     assert_eq!(configure["success"], true);
+    aft.wait_for_folder_admission();
 
     let write = aft.send(&format!(
         r#"{{"id":"write-1","command":"write","file":{},"content":"fn main() {{ println!(\"hello\"); }}\n"}}"#,
@@ -3026,7 +3030,7 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "lsp": lsp
         })),
@@ -3036,6 +3040,7 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
         serde_json::to_value(aft::commands::configure::handle_configure(&configure, &ctx))
             .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 

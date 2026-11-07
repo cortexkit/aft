@@ -10,6 +10,9 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle a `call_tree` request.
 pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = answer_call_tree(req, ctx);
     disclose_borrowed_answer(
         ctx,

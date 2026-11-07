@@ -648,6 +648,11 @@ impl StandingActor {
         let executor_request_id = format!("subc-standing-pass-{}", entry.literal_path);
         let response_request_id = executor_request_id.clone();
         let job = Box::new(move |ctx: &AppContext| {
+            if let Some(response) =
+                crate::folder_admission_runtime::refusal(ctx, &response_request_id, "__standing__")
+            {
+                return response;
+            }
             if let Some(reason) = ctx.cache_unavailable_reason() {
                 return crate::protocol::Response::error(
                     &response_request_id,
@@ -729,6 +734,10 @@ impl StandingActor {
     }
 
     fn ensure_actor(&self, entry: &StandingRootEntry, snapshot: &Config) -> Option<ProjectRootId> {
+        let folder =
+            crate::folder_admission_runtime::standalone(&entry.resolved_target, snapshot).ok()?;
+        let project =
+            folder.classification == crate::folder_admission::FolderClassification::Project;
         let root_id = match ProjectRootId::from_path(&entry.resolved_target) {
             Ok(root_id) => root_id,
             Err(error) => {
@@ -741,6 +750,32 @@ impl StandingActor {
             }
         };
         if let Some(ctx) = self.executor.actor_context(&root_id) {
+            if project
+                && crate::folder_admission_runtime::blocked(&ctx)
+                && (ctx.harness_opt().is_none() || ctx.subc_unbound_quiesced())
+            {
+                ctx.update_config(|config| {
+                    config.project_detection = snapshot.project_detection.clone();
+                    config.indexes.trigram = entry.indexes.contains(&IndexKind::Search);
+                    config.indexes.semantic = entry.indexes.contains(&IndexKind::Semantic);
+                    config.indexes.callgraph = entry.indexes.contains(&IndexKind::Callgraph);
+                });
+                crate::folder_admission_runtime::install_standalone(
+                    &ctx,
+                    (*ctx.config()).clone(),
+                    folder.clone(),
+                );
+            }
+            if !project {
+                if ctx.harness_opt().is_none() || ctx.subc_unbound_quiesced() {
+                    crate::folder_admission_runtime::install_standalone(
+                        &ctx,
+                        snapshot.clone(),
+                        folder,
+                    );
+                }
+                return None;
+            }
             ctx.set_standing_artifact_exempt(true);
             self.owned_actors
                 .lock()
@@ -756,18 +791,34 @@ impl StandingActor {
         config.indexes.trigram = entry.indexes.contains(&IndexKind::Search);
         config.indexes.semantic = entry.indexes.contains(&IndexKind::Semantic);
         config.indexes.callgraph = entry.indexes.contains(&IndexKind::Callgraph);
+        let requested = config.clone();
+        if !project {
+            config.indexes = crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: false,
+            };
+            config.views.enabled = false;
+        }
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&self.app), config));
         ctx.set_canonical_cache_root(entry.resolved_target.clone());
+        crate::folder_admission_runtime::install_standalone(&ctx, requested, folder);
         ctx.set_standing_artifact_exempt(true);
         // A standing actor is not configured through the session path and thus
         // must install the same root-keyed write capability before it can ever
         // acquire a WriterLease. It does not install a filesystem watcher.
-        root_cache::configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
+        if project {
+            root_cache::configure_artifact_access(
+                &entry.resolved_target,
+                &entry.artifact_key,
+                false,
+            );
+        }
         self.executor.register_actor(root_id.clone(), ctx);
         self.owned_actors
             .lock()
             .insert(entry.literal_path.clone(), (root_id.clone(), true));
-        Some(root_id)
+        project.then_some(root_id)
     }
 }
 

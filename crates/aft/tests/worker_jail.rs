@@ -31,6 +31,8 @@ const FAKE_DAEMON_VERSION: &str = "0.39.0";
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
+#[path = "helpers/timeout_forensics.rs"]
+mod timeout_forensics;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
@@ -115,10 +117,21 @@ struct Jail {
 
 impl Drop for Jail {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "worker-jail module stacks:\n{}",
+                timeout_forensics::capture_stacks(self.child.id())
+            );
+        }
         let process_groups = sandbox_task_process_groups(&self.data);
         self.read_router.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            if let Ok(stderr) = std::fs::read_to_string(self.base.join("module.stderr")) {
+                eprintln!("worker-jail module stderr:\n{stderr}");
+            }
+        }
 
         // The daemon is killed on fixture teardown, but each detached shell
         // owns a new process group and can outlive that direct child.
@@ -706,7 +719,7 @@ impl Jail {
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(std::fs::File::create(base.join("module.stderr")).unwrap());
         command
             .env_remove("SCCACHE_SERVER_PORT")
             .env_remove("SCCACHE_SERVER_UDS");

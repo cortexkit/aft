@@ -366,14 +366,21 @@ impl AppContext {
                 "status": "disabled", "state": "disabled", "reason": "root_too_broad",
             })
         };
-        let search_index_info = if self.root_too_broad() {
+        let search_index_info = if let Some(reason) = crate::folder_admission_runtime::reason(self)
+        {
+            serde_json::json!({"status": "off", "reason": reason})
+        } else if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.trigram {
             refused_info(crate::feature_status::IndexPlane::Trigram).unwrap_or(search_index_info)
         } else {
             search_index_info
         };
-        let mut semantic_index_info = if self.root_too_broad() {
+        let mut semantic_index_info = if let Some(reason) =
+            crate::folder_admission_runtime::reason(self)
+        {
+            serde_json::json!({"status": "off", "reason": reason})
+        } else if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
@@ -495,7 +502,8 @@ impl AppContext {
         // subsystems are auto-disabled in that mode; the plugin / TUI sidebar
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
-        let mut degraded_reasons = self.degraded_reasons();
+        let mut degraded_reasons =
+            crate::folder_admission_runtime::public_degraded_reasons(self, self.degraded_reasons());
         if let Some(reason) = self.cache_unavailable_reason() {
             let code = crate::root_cache::cache_status_code(&reason);
             if !degraded_reasons.iter().any(|reason| reason == code) {
@@ -622,6 +630,7 @@ impl AppContext {
         });
 
         let mut payload = serde_json::json!({
+            "folder": crate::folder_admission_runtime::snapshot(self),
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),

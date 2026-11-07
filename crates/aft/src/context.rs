@@ -1301,6 +1301,8 @@ pub struct SuspendedDomainHealthSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_unavailable_reason: Option<&'static str>,
     pub project_root: String,
     pub actor_count: usize,
@@ -1343,6 +1345,7 @@ pub struct RootHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootHealthSummary {
+    folder: Option<serde_json::Value>,
     cache_unavailable: Option<&'static str>,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
@@ -1365,6 +1368,7 @@ pub(crate) struct RootHealthSummary {
 impl RootHealthSummary {
     fn busy() -> Self {
         Self {
+            folder: None,
             state: RootHealthState::Busy,
             cache_unavailable: None,
             search_index_status: None,
@@ -1410,7 +1414,9 @@ impl RootHealthSummary {
 
     pub(crate) fn into_snapshot(self, project_root: &Path) -> RootHealthSnapshot {
         if self.is_busy() {
-            return RootHealthSnapshot::busy(project_root);
+            let mut snapshot = RootHealthSnapshot::busy(project_root);
+            snapshot.folder = self.folder;
+            return snapshot;
         }
         // Health snapshots may be assembled by the maintenance refresh, but the
         // public snapshot helper also has latency-sensitive callers. Never derive
@@ -1431,6 +1437,7 @@ impl RootHealthSummary {
                 _ => (None, None),
             };
         RootHealthSnapshot {
+            folder: self.folder,
             cache_unavailable_reason: self.cache_unavailable,
             project_root: project_root.display().to_string(),
             actor_count: 1,
@@ -1466,6 +1473,7 @@ impl RootHealthSummary {
 impl RootHealthSnapshot {
     fn busy(project_root: &Path) -> Self {
         Self {
+            folder: None,
             cache_unavailable_reason: None,
             project_root: project_root.display().to_string(),
             actor_count: 1,
@@ -4773,6 +4781,7 @@ pub struct AppContext {
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
     daemonless_query_mode: AtomicBool,
+    parent_query_only: AtomicBool,
     /// The search reranker backend, rebuilt off the search path whenever the
     /// published config or the daemon mode changes.
     rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
@@ -4999,7 +5008,8 @@ pub struct AppContext {
     /// The configure-tail stage running on this root and when it started, or
     /// `None` between units. Read by the pending-bind diagnostics.
     configure_tail_stage: parking_lot::Mutex<Option<(&'static str, Instant)>>,
-    configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
+    /// Latest bind generation and whether configure restored the session's saved bash tasks.
+    configured_session_roots: parking_lot::Mutex<BTreeMap<(PathBuf, String), (u64, bool)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     // 0: never configured, 1: opening, 2: ready, 3: failed,
@@ -5030,6 +5040,7 @@ pub struct AppContext {
     /// The background identity retry armed when aft.db was busy at this
     /// root's bind. See [`crate::provisional_identity_retry`].
     provisional_identity_retry: crate::provisional_identity_retry::RetrySlot,
+    folder_admission: crate::folder_admission_runtime::State,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     /// Only successful configure binds may populate this memo. Build-derived
     /// keys remain observable by status but cannot skip identity verification.
@@ -5727,7 +5738,9 @@ impl AppContext {
             .downcast_ref::<TreeSitterProvider>()
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
+        let folder_admission = crate::folder_admission_runtime::State::default();
         let mut lsp_manager = LspManager::new();
+        lsp_manager.set_folder_work_gate(folder_admission.work_gate());
         lsp_manager.set_child_registry(app.lsp_child_registry());
         lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
@@ -5773,6 +5786,7 @@ impl AppContext {
             linked_main_root: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
+            parent_query_only: AtomicBool::new(false),
             rerank_slot: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
@@ -5902,7 +5916,7 @@ impl AppContext {
             callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configure_tail_stage: parking_lot::Mutex::new(None),
-            configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
+            configured_session_roots: parking_lot::Mutex::new(BTreeMap::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             database_runtime_state: AtomicU8::new(0),
@@ -5917,6 +5931,7 @@ impl AppContext {
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             provisional_identity_retry: Default::default(),
+            folder_admission,
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6129,6 +6144,29 @@ impl AppContext {
         &self,
         cache_dir: Option<&Path>,
     ) -> RootHealthSummary {
+        let mut summary = self.try_health_summary_inner(cache_dir);
+        summary.folder = crate::folder_admission_runtime::try_snapshot(self);
+        if crate::folder_admission_runtime::blocked(self) {
+            summary.search_index_status = Some("disabled");
+            summary.callgraph_store_status = Some("disabled");
+            summary.tier2_status = Some("disabled");
+            summary.semantic_index = Some(SemanticHealthComponentSnapshot {
+                status: "disabled",
+                reason: crate::folder_admission_runtime::reason(self),
+                since_ms: None,
+                next_retry_ms: None,
+                paused_until_ms: None,
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            });
+        }
+        summary
+    }
+
+    fn try_health_summary_inner(&self, cache_dir: Option<&Path>) -> RootHealthSummary {
         // Read lifecycle state before taking artifact locks. Worker admission takes
         // the lifecycle lock first and then installs artifact receivers, so the
         // reverse order here would deadlock a health poll against worker startup.
@@ -6479,6 +6517,7 @@ impl AppContext {
         };
 
         RootHealthSummary {
+            folder: None,
             cache_unavailable: cache_unavailable_reason,
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
@@ -7334,15 +7373,19 @@ impl AppContext {
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
         #[cfg(test)]
         record_configure_bind_effect_for_test(&root, &session_id, ConfigureBindEffect::Session);
-        self.configured_session_roots
-            .lock()
-            .insert((root, session_id))
+        let generation = self.configure_generation();
+        let mut bindings = self.configured_session_roots.lock();
+        let key = (root, session_id);
+        let ready = bindings
+            .get(&key)
+            .is_some_and(|&(previous, ready)| previous == generation && ready);
+        bindings.insert(key, (generation, ready)).is_none()
     }
 
     pub(crate) fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
         self.configured_session_roots
             .lock()
-            .contains(&(root.to_path_buf(), session_id.to_string()))
+            .contains_key(&(root.to_path_buf(), session_id.to_string()))
     }
 
     /// Undo [`Self::note_configure_session_binding`] when the maintenance job
@@ -7353,6 +7396,64 @@ impl AppContext {
             .lock()
             .remove(&(root.to_path_buf(), session_id.to_string()));
         self.repeat_breaker.clear_session(session_id);
+    }
+
+    pub(crate) fn forget_configure_session_binding_for_generation(
+        &self,
+        root: &Path,
+        session_id: &str,
+        generation: u64,
+    ) {
+        let key = (root.to_path_buf(), session_id.to_owned());
+        let mut bindings = self.configured_session_roots.lock();
+        // Admission replays configure before an earlier maintenance job can be
+        // retired. The old job must not erase the newer bind or its repeat observations.
+        if bindings
+            .get(&key)
+            .is_some_and(|&(bound, _)| bound == generation)
+        {
+            bindings.remove(&key);
+            self.repeat_breaker.clear_session(session_id);
+        }
+    }
+
+    pub(crate) fn finish_configure_session_replay(&self, session_id: &str) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            return;
+        };
+        if let Some((generation, ready)) = self
+            .configured_session_roots
+            .lock()
+            .get_mut(&(root, session_id.to_owned()))
+        {
+            if *generation == self.configure_generation() {
+                *ready = true;
+            }
+        }
+    }
+
+    /// Admission can finish before configure restores saved bash tasks. A queued
+    /// task lookup or completion drain must not overtake that session replay.
+    pub fn wait_for_standalone_session_replay(&self, session_id: &str, deadline: Instant) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            return;
+        };
+        let key = (root, session_id.to_owned());
+        while self.database_runtime_state.load(Ordering::Acquire) == 2
+            && self
+                .configured_session_roots
+                .lock()
+                .get(&key)
+                .is_some_and(|&(generation, ready)| {
+                    generation == self.configure_generation() && !ready
+                })
+            && Instant::now() < deadline
+        {
+            if crate::executor::current_job_cancelled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     pub fn repeat_breaker(&self) -> &crate::response_finalize::repeat_breaker::RepeatBreaker {
@@ -7715,7 +7816,7 @@ impl AppContext {
                 .try_lock()
                 .is_none_or(|tail| tail.as_ref().is_some_and(|state| state.has_ready_job()))
             || !self.configure_warnings_rx.is_empty()
-            || self.provisional_identity_retry.is_due()
+            || crate::provisional_identity_retry::due(self)
     }
 
     /// No configure-tail work is queued or parked. The background identity
@@ -7733,6 +7834,10 @@ impl AppContext {
         &self,
     ) -> &crate::provisional_identity_retry::RetrySlot {
         &self.provisional_identity_retry
+    }
+
+    pub(crate) fn folder_admission(&self) -> &crate::folder_admission_runtime::State {
+        &self.folder_admission
     }
 
     /// Hold the lock behind one maintenance probe for the duration of
@@ -8870,6 +8975,26 @@ impl AppContext {
             && self.database_runtime_state.load(Ordering::Acquire) == 1
     }
 
+    /// A standalone call released by folder admission still owes the database
+    /// readiness barrier that configure normally runs before tool dispatch.
+    /// Wait off the request loop and without a config pin or executor lease.
+    pub fn wait_for_standalone_database_runtime(
+        self: &Arc<Self>,
+        command: &str,
+        deadline: Instant,
+    ) {
+        if !self.database_runtime_pending(command) {
+            return;
+        }
+        crate::database_open::dispatch(self);
+        while self.database_runtime_pending(command) && Instant::now() < deadline {
+            if crate::executor::current_job_cancelled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Wait outside executor admission. Register before checking state so an
     /// open completing between the check and await cannot lose its notification.
     pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
@@ -9958,6 +10083,16 @@ impl AppContext {
         self.reconcile_rerank_backend(&self.config_unpinned());
     }
 
+    pub(crate) fn set_parent_query_only(&self) {
+        self.parent_query_only.store(true, Ordering::SeqCst);
+        self.folder_admission.close();
+        self.set_heavy_root_work_allowed(false);
+    }
+
+    pub(crate) fn parent_query_only(&self) -> bool {
+        self.parent_query_only.load(Ordering::SeqCst)
+    }
+
     /// The search reranker's backend slot.
     pub(crate) fn rerank_slot(
         &self,
@@ -10199,10 +10334,13 @@ impl AppContext {
     }
 
     pub fn root_too_broad(&self) -> bool {
-        self.degraded_reasons
-            .lock()
-            .iter()
-            .any(|reason| reason == "root_too_broad")
+        (crate::folder_admission_runtime::blocked(self)
+            && !crate::folder_admission_runtime::workspace_watcher_allowed(self))
+            || self
+                .degraded_reasons
+                .lock()
+                .iter()
+                .any(|reason| reason == "root_too_broad")
     }
 
     /// The bound root's artifact identity was provisional at its last bind
@@ -12227,7 +12365,7 @@ impl AppContext {
         let mut roots = self
             .configured_session_roots
             .lock()
-            .iter()
+            .keys()
             .map(|(root, _session)| root.clone())
             .collect::<BTreeSet<_>>();
         roots.insert(current_root.to_path_buf());
@@ -15292,6 +15430,16 @@ impl AppContext {
             .as_ref()
             .is_some_and(|runtime| !runtime.is_finished());
         thread_live && self.watcher_rx.lock().is_some()
+    }
+
+    pub(crate) fn try_watcher_runtime_active(&self) -> Option<bool> {
+        let _runtime_guard = self.watcher_runtime_lock.try_lock()?;
+        let thread_live = self
+            .watcher_thread
+            .try_lock()?
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished());
+        Some(thread_live && self.watcher_rx.try_lock()?.is_some())
     }
 
     /// Return whether artifact eviction would discard work that still needs a
@@ -19885,7 +20033,7 @@ mod callgraph_store_for_ops_tests {
     /// them. Callers bind the directories for the whole test, first, so they
     /// are removed when it ends and only after the context is dropped.
     fn cold_build_context() -> ([TempDir; 2], Arc<AppContext>) {
-        let project = TempDir::new().expect("project tempdir");
+        let project = crate::test_project::project_tempdir();
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");
         std::fs::create_dir_all(&source_dir).expect("source dir");
@@ -19928,10 +20076,15 @@ mod callgraph_store_for_ops_tests {
 
         let _serial = v3::serial_for_test();
         let (_dirs, ctx) = cold_build_context();
+        let root = ctx
+            .callgraph_project_root()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
         let mut config = (*ctx.config()).clone();
+        config.project_root = Some(root.clone());
         config.views.enabled = true;
         ctx.set_config(config);
-        let root = ctx.callgraph_project_root().unwrap();
         ctx.set_canonical_cache_root(root.clone());
         assert!(matches!(
             ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
@@ -20991,6 +21144,7 @@ mod callgraph_store_for_ops_tests {
 
     fn configure_context(project_root: &Path, storage_dir: &Path) -> AppContext {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        crate::test_admission::prepare_folder(&ctx, project_root);
         let response = crate::commands::configure::handle_configure(
             &configure_request_with_params(json!({
                 "project_root": project_root,
@@ -21003,6 +21157,7 @@ mod callgraph_store_for_ops_tests {
             &ctx,
         );
         assert!(response.success, "configure should succeed: {response:?}");
+        crate::test_admission::settle(&ctx);
         ctx
     }
 
@@ -21028,7 +21183,7 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn home_root_gate_blocks_callgraph_store_entry_points() {
+    fn unadmitted_home_folder_blocks_callgraph_store_entry_points() {
         let home = TempDir::new().expect("home tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = home.path().join("src");
@@ -21044,17 +21199,20 @@ mod callgraph_store_for_ops_tests {
             let _wait_guard = force_async_callgraph_builds(&ctx);
             assert!(
                 !ctx.heavy_root_work_allowed(),
-                "HOME root configure must close the heavy-root-work gate"
+                "an unadmitted folder must close the heavy-root-work gate"
             );
             assert!(
                 !ctx.config().indexes.callgraph,
-                "HOME root configure must force-disable the callgraph store"
+                "an unadmitted folder must force-disable the callgraph store"
             );
-            assert!(ctx.is_home_root());
+            assert!(!ctx.is_home_root());
             assert!(ctx
                 .degraded_reasons()
                 .iter()
-                .any(|reason| reason == "home_root"));
+                .any(|reason| reason == "folder_not_admitted"));
+            let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+            assert_eq!(folder["classification"], "not_project");
+            assert_eq!(folder["reason"], "no_project_evidence");
             let status_request = RawRequest {
                 id: "home-status".to_string(),
                 command: "status".to_string(),
@@ -21067,7 +21225,7 @@ mod callgraph_store_for_ops_tests {
             crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
             assert!(
                 ctx.callgraph_store_rx().lock().is_none(),
-                "HOME root maintenance must not schedule a callgraph build"
+                "an unadmitted folder must not schedule a callgraph build"
             );
             assert_eq!(
                 ctx.try_health_snapshot(home.path())
@@ -21075,7 +21233,7 @@ mod callgraph_store_for_ops_tests {
                     .as_ref()
                     .map(|component| component.status),
                 Some("disabled"),
-                "HOME root health must not advertise callgraph building"
+                "an unadmitted folder must not advertise callgraph building"
             );
 
             assert!(matches!(
@@ -21091,7 +21249,7 @@ mod callgraph_store_for_ops_tests {
             assert_eq!(
                 ctx.callgraph_cold_build_spawn_count_for_test(),
                 0,
-                "HOME root gate must not spawn a cold callgraph build"
+                "an unadmitted folder must not spawn a cold callgraph build"
             );
 
             let navigation = RawRequest {
@@ -21106,17 +21264,10 @@ mod callgraph_store_for_ops_tests {
             };
             let response = crate::commands::callers::handle_callers(&navigation, &ctx);
             assert!(!response.success);
-            // HOME is an unavailable callgraph with a named cause, never a
-            // retryable build.
-            assert_eq!(response.data["code"], "callgraph_unavailable");
-            assert_eq!(
-                response.data["index"],
-                json!({"callgraph": {"status": "unavailable", "reason": "home_root"}})
-            );
+            assert_eq!(response.data["code"], "folder_not_admitted");
+            assert_eq!(response.data["reason"], "no_project_evidence");
             assert!(response.data["results"].is_null());
-            assert!(response.data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("disabled for home roots")));
+            assert_eq!(response.data["folder"]["classification"], "not_project");
         });
     }
 

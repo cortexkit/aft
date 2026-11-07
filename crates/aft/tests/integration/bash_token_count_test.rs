@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 const SESSION: &str = "bash-token-count-test";
 
@@ -16,7 +16,7 @@ fn configure_background(aft: &mut AftProcess, project_root: &std::path::Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": project_root,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": {
                     "bash": {
                         "background": true,
@@ -73,7 +73,7 @@ fn wait_for_completed_frame(aft: &mut AftProcess, task_id: &str) -> Value {
 }
 
 fn run_background_command(command: &str) -> Value {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path());
     let task_id = spawn_background(&mut aft, command, None);
@@ -170,7 +170,7 @@ fn bash_completed_frame_compressed_tokens_reflect_compression() {
         return;
     }
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut command = Command::new("git");
     assert!(
         crate::test_helpers::apply_hermetic_git_env(command.current_dir(project.path()))

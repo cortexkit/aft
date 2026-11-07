@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -51,7 +51,7 @@ fn configure_native_policy(
             "project_root": project,
             "storage_dir": storage,
             "bash_permissions": true,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "background": true, "rewrite": true },
                 "sandbox": {
                     "enabled": enabled,
@@ -106,7 +106,7 @@ impl CortexkitFloorFixture {
     }
 
     fn with_private_shim_image(copy_shim: bool) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_helpers::tempdir();
         let home = root.path().canonicalize().unwrap().join("home");
         let data = home.join(".local/share/cortexkit");
         let project = data.join("alfonso/worktrees/own");
@@ -140,7 +140,7 @@ impl CortexkitFloorFixture {
                 "id": "configure-cortexkit-floor", "command": "configure",
                 "harness": "opencode", "project_root": project, "storage_dir": storage,
                 "bash_permissions": true,
-                "config": user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
                     "sandbox": { "enabled": true },
                     "subc": { "connection_file": "~/daemon/connection.json" },
@@ -523,7 +523,7 @@ fn wait_for_terminal(aft: &mut AftProcess, task_id: &str, output_mode: Option<&s
 #[test]
 fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
     let home = fixture.path().join("home");
@@ -679,7 +679,7 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
 #[test]
 fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("storage");
     std::fs::create_dir_all(&project).unwrap();
@@ -760,7 +760,7 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
 #[test]
 fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
     let home = fixture.path().join("home");
@@ -961,7 +961,7 @@ fn native_sandbox_non_worker_strict_project_git_config_remains_writable() {
 #[cfg(target_os = "macos")]
 #[test]
 fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_macos() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
     let home = fixture.path().join("home");
@@ -1073,7 +1073,7 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
 #[test]
 fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let private = project.join("private");
     let storage = fixture.path().join("artifacts");
@@ -1131,7 +1131,7 @@ fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
 #[test]
 fn linked_worktree_reads_shared_git_metadata_but_not_hooks() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let main = fixture.path().join("main");
     let worktree = fixture.path().join("worktree");
     let storage = fixture.path().join("artifacts");
@@ -1214,7 +1214,7 @@ fn linked_worktree_reads_shared_git_metadata_but_not_hooks() {
 #[test]
 fn native_secret_floor_refuses_home_write_allow_and_home_project_root() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
     let home = fixture.path().join("home");
@@ -1259,7 +1259,7 @@ fn native_secret_floor_refuses_home_write_allow_and_home_project_root() {
 #[test]
 fn native_sandbox_pty_denies_outside_write_and_renders_screen() {
     skip_if_landlock_absent!();
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
     let home = fixture.path().join("home");

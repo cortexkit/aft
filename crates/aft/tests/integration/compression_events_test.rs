@@ -139,8 +139,8 @@ fn unix_millis() -> i64 {
 
 #[test]
 fn completed_task_records_compression_event() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -169,8 +169,8 @@ fn completed_task_with_large_output_records_event_from_tail() {
     // tokenizes the last 128KB of each stream so an event IS recorded
     // — `tokens_skipped` stays false, and the bash_tasks/compression_events
     // join still works for downstream analytics.
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -194,8 +194,8 @@ fn completed_task_with_large_output_records_event_from_tail() {
 
 #[test]
 fn compression_event_has_correct_harness_and_project_key() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Pi);
 
     let task_id = spawn_task(
@@ -220,8 +220,8 @@ fn compression_event_has_correct_harness_and_project_key() {
 
 #[test]
 fn compression_event_links_to_bash_task_via_task_id() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(&registry, storage.path(), project.path(), "echo join-task");
@@ -251,8 +251,8 @@ fn compression_event_links_to_bash_task_via_task_id() {
 /// inline credential, so the real completion path stores none.
 #[test]
 fn compression_event_does_not_store_the_command() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
     let command = "printf 'diagnostic-command'";
 
@@ -268,8 +268,8 @@ fn compression_event_does_not_store_the_command() {
 
 #[test]
 fn completion_re_entry_does_not_duplicate_event() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -291,8 +291,8 @@ fn completion_re_entry_does_not_duplicate_event() {
 
 #[test]
 fn compression_event_for_compressed_output_shows_savings() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
     registry.set_compressor(|_, _| "short".to_string().into());
 
@@ -315,8 +315,8 @@ fn compression_event_for_compressed_output_shows_savings() {
 
 #[test]
 fn compression_event_record_resilient_to_db_pool_absent() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(
@@ -335,8 +335,8 @@ fn compression_event_record_resilient_to_db_pool_absent() {
 
 #[test]
 fn multiple_tasks_in_session_each_get_event() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_ids = [
@@ -379,8 +379,8 @@ fn multiple_tasks_in_session_each_get_event() {
 
 #[test]
 fn compression_event_created_at_is_close_to_completion_time() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(

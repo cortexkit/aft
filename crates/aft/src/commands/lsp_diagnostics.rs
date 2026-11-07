@@ -888,6 +888,7 @@ pub(crate) fn startup_unavailable_response(
 impl ServerStatusEntry {
     fn from_attempt(attempt: &crate::lsp::manager::ServerAttempt, scope: ServerScope) -> Self {
         let status = match &attempt.result {
+            ServerAttemptResult::FolderNotAdmitted => "folder_not_admitted".into(),
             ServerAttemptResult::ProjectClosed => {
                 "project closed; reopen the project and retry".into()
             }

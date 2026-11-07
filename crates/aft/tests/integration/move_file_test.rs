@@ -74,7 +74,7 @@ fn notify_and_wait_for_publish(ctx: &AppContext, file_path: &Path, content: &str
 
 #[test]
 fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
     let source = root.join("src").join("open.ts");
     let src_config = root.join("tsconfig.json");
@@ -124,7 +124,7 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
 
 #[test]
 fn undo_after_move_file_restores_source_and_removes_destination() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
     let source = root.join("before.txt");
     let destination = root.join("nested").join("after.txt");
@@ -168,7 +168,7 @@ fn undo_after_move_file_restores_source_and_removes_destination() {
 #[cfg(unix)]
 #[test]
 fn restricted_move_file_moves_symlink_instead_of_its_target() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
     let target = root.join("target.txt");
     let source = root.join("before-link.txt");
@@ -221,7 +221,7 @@ fn restricted_move_file_moves_symlink_instead_of_its_target() {
 #[cfg(unix)]
 #[test]
 fn undo_after_move_file_restores_symlink_source_and_removes_destination() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
     let target = root.join("target.txt");
     let source = root.join("before-link.txt");
@@ -290,7 +290,7 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
         return;
     }
 
-    let src_tmp = tempfile::tempdir().expect("create source temp dir");
+    let src_tmp = crate::test_helpers::tempdir();
     let dst_tmp = tempfile::tempdir_in("/dev/shm").expect("create destination temp dir");
     let src_path = src_tmp.path().join("source.txt");
     let dst_path = dst_tmp.path().join("destination.txt");
@@ -362,7 +362,7 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
 /// error class is unchanged.
 #[test]
 fn move_file_already_moved_hints_at_destination() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
 
     // Simulate the "already moved" state: source missing, destination
@@ -422,7 +422,7 @@ fn move_file_already_moved_hints_at_destination() {
 /// file).
 #[test]
 fn move_file_missing_source_without_existing_destination_keeps_short_message() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
 
     let mut aft = AftProcess::spawn();

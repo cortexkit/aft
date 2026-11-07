@@ -220,7 +220,7 @@ fn complete_read(start: GithubReadStart) -> GithubReadCompletion {
 
 #[test]
 fn sequential_reads_always_fetch_live_and_refresh_the_fallback_copy() {
-    let storage = tempfile::tempdir().expect("create cache storage");
+    let storage = crate::test_helpers::tempdir();
     let fetcher = Arc::new(ProbeFetcher::ordinary());
     let engine = GithubReadEngine::new(
         sqlite_cache_store(storage.path().join("aft.db")),
@@ -266,7 +266,7 @@ fn sequential_reads_always_fetch_live_and_refresh_the_fallback_copy() {
 
 #[test]
 fn live_fetches_keep_authentication_and_unresolved_short_contexts_isolated() {
-    let storage = tempfile::tempdir().expect("create cache storage");
+    let storage = crate::test_helpers::tempdir();
     let fetcher = Arc::new(ProbeFetcher::ordinary());
     let engine = GithubReadEngine::new(
         sqlite_cache_store(storage.path().join("aft.db")),
@@ -360,7 +360,7 @@ fn live_fetches_keep_authentication_and_unresolved_short_contexts_isolated() {
 
 #[test]
 fn successful_same_resource_invalidation_removes_the_disclosed_fallback_copy() {
-    let storage = tempfile::tempdir().expect("create cache storage");
+    let storage = crate::test_helpers::tempdir();
     let fetcher = Arc::new(FailingAfterFirstFetcher(AtomicUsize::new(0)));
     let engine = GithubReadEngine::new(
         sqlite_cache_store(storage.path().join("aft.db")),
@@ -462,7 +462,7 @@ fn successful_same_resource_invalidation_removes_the_disclosed_fallback_copy() {
 
 #[test]
 fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_true() {
-    let storage = tempfile::tempdir().expect("create cache storage");
+    let storage = crate::test_helpers::tempdir();
     let first = "https://user-images.githubusercontent.com/1234/first.png";
     let second = "https://github.com/user-attachments/files/73/second.png";
     let outcomes = BTreeMap::from([
@@ -558,7 +558,7 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
 
 #[test]
 fn invalid_or_failed_attachment_candidates_leave_the_text_read_complete_without_partial_data() {
-    let storage = tempfile::tempdir().expect("create cache storage");
+    let storage = crate::test_helpers::tempdir();
     let unsupported = "https://github.com/user-attachments/files/73/unsupported.svg";
     let redirected = "https://user-images.githubusercontent.com/1234/redirected.png";
     let failed = "https://github.com/user-attachments/files/73/failure.png";

@@ -2,7 +2,7 @@ use aft::blob_store::{BlobPlane, BlobStore, CallgraphKey, PutOutcome, SemanticKe
 
 #[test]
 fn rename_changes_only_the_semantic_key_and_manifest_removal_does_not_delete_blobs() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let storage = temp.path();
     let family = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let source = b"pub fn preserved() {}\n";

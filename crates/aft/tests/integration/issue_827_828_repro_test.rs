@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use super::helpers::AftProcess;
 
 fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("create temp project");
+    let dir = crate::test_helpers::tempdir();
     // Canonical root so fixture paths agree with the paths the tool reports.
     let root = fs::canonicalize(dir.path()).expect("canonical project root");
     for (name, body) in files {

@@ -4,7 +4,7 @@ use aft::semantic_index::SemanticIndex;
 
 #[test]
 fn exported_symbol_boost_ranks_export_above_equivalent_private_symbol() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let private_file = project.path().join("src/private.rs");
     let public_file = project.path().join("src/public.rs");
     fs::create_dir_all(private_file.parent().expect("source parent")).expect("create src dir");

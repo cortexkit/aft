@@ -1,6 +1,5 @@
 use crate::helpers::AftProcess;
 use std::fs;
-use tempfile::TempDir;
 
 const SAMPLE_MD: &str = r#"# Project Title
 
@@ -34,7 +33,7 @@ Final notes.
 
 #[test]
 fn markdown_outline_extracts_headings() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("readme.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
 
@@ -120,7 +119,7 @@ fn markdown_outline_extracts_headings() {
 
 #[test]
 fn markdown_outline_section_ranges_cover_content() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("doc.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
 
@@ -165,7 +164,7 @@ fn markdown_outline_section_ranges_cover_content() {
 
 #[test]
 fn markdown_zoom_by_heading_name() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("readme.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
 
@@ -200,7 +199,7 @@ fn markdown_zoom_by_heading_name() {
 
 #[test]
 fn markdown_zoom_accepts_copied_heading_prefixes() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("readme.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
 
@@ -251,7 +250,7 @@ fn markdown_zoom_accepts_copied_heading_prefixes() {
 
 #[test]
 fn markdown_zoom_normalizes_heading_identity_variants() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("decorated-headings.md");
     fs::write(
         &md_file,
@@ -360,7 +359,7 @@ HTTP flow details.
 
 #[test]
 fn markdown_zoom_normalization_collision_is_ambiguous() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("ambiguous-headings.md");
     fs::write(
         &md_file,
@@ -400,7 +399,7 @@ fn markdown_zoom_normalization_collision_is_ambiguous() {
 
 #[test]
 fn markdown_zoom_heading_not_found() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("readme.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
 
@@ -421,7 +420,7 @@ fn markdown_zoom_heading_not_found() {
 
 #[test]
 fn markdown_write_preserves_content() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let md_file = dir.path().join("new.md");
 
     let mut aft = AftProcess::spawn();
@@ -444,7 +443,7 @@ fn markdown_write_preserves_content() {
 
 #[test]
 fn markdown_mdx_extension_supported() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mdx_file = dir.path().join("doc.mdx");
     fs::write(&mdx_file, "# MDX Doc\n\nSome content.\n").unwrap();
 

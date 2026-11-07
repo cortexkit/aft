@@ -17,7 +17,7 @@
 
 #![allow(unused_imports)]
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -176,7 +176,7 @@ fn windows_bash_blocks_path_env_case_insensitively() {
 #[test]
 #[cfg(target_os = "windows")]
 fn windows_cmd_background_wrapper_allows_bang_in_path() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = crate::test_helpers::tempdir();
     let project = parent.path().join("project!bang");
     std::fs::create_dir_all(&project).unwrap();
     let storage = parent.path().join("storage!bang");
@@ -190,7 +190,7 @@ fn windows_cmd_background_wrapper_allows_bang_in_path() {
             "harness":"opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

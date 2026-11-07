@@ -73,7 +73,7 @@ fn golden_dir() -> PathBuf {
 
 /// Apply a scenario's op sequence to a fresh temp file and return the final content.
 fn run_scenario(aft: &mut AftProcess, scenario: &Scenario) -> String {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!("input.{}", scenario.ext));
     fs::write(&file, scenario.input).expect("write input");
     let file_str = file.display().to_string();

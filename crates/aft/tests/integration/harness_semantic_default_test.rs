@@ -5,13 +5,13 @@
 
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn semantic_feature_after_configure(
     aft: &mut AftProcess,
     config: Option<serde_json::Value>,
 ) -> bool {
-    let project = tempfile::tempdir().expect("project dir");
+    let project = crate::test_helpers::project::project_tempdir();
     std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
     let mut request = json!({
         "id": "cfg",
@@ -27,6 +27,7 @@ fn semantic_feature_after_configure(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    aft.wait_for_folder_admission();
     let status = aft.send(&json!({ "id": "status", "command": "status" }).to_string());
     status["features"]["semantic_search"]
         .as_bool()
@@ -40,7 +41,9 @@ fn default_spawn_configures_semantic_off() {
     // A test's own user config without a semantic decision gets the same default.
     assert!(!semantic_feature_after_configure(
         &mut aft,
-        Some(user_config(json!({ "format_on_edit": true })))
+        Some(crate::test_helpers::project_detection_user_config(
+            json!({ "format_on_edit": true })
+        ))
     ));
     assert!(aft.shutdown().success());
 }
@@ -57,7 +60,9 @@ fn an_explicit_semantic_choice_in_the_request_is_respected() {
     let mut aft = AftProcess::spawn();
     assert!(semantic_feature_after_configure(
         &mut aft,
-        Some(user_config(json!({ "indexes": { "semantic": true } })))
+        Some(crate::test_helpers::project_detection_user_config(
+            json!({ "indexes": { "semantic": true } })
+        ))
     ));
     assert!(aft.shutdown().success());
 }

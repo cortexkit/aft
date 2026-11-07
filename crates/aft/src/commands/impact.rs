@@ -10,6 +10,9 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle an `impact` request.
 pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = answer_impact(req, ctx);
     disclose_borrowed_answer(
         ctx,

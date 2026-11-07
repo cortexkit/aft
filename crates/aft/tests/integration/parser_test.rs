@@ -2,7 +2,7 @@ use aft::parser::FileParser;
 
 #[test]
 fn swift_try_cast_coalescing_expressions_have_no_parse_errors() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("CastExpressions.swift");
     let mut failures = Vec::new();
     let mut checked = 0;
@@ -65,7 +65,7 @@ fn swift_try_cast_coalescing_expressions_have_no_parse_errors() {
 
 #[test]
 fn swift_json_serialization_cast_and_split_workaround_have_no_parse_errors() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("Transcript.swift");
     for body in [
         "let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]",
@@ -87,7 +87,7 @@ fn swift_json_serialization_cast_and_split_workaround_have_no_parse_errors() {
 
 #[test]
 fn swift_optional_binding_try_await_conditions_have_no_parse_errors() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("ViewModel.swift");
     for condition in [
         "if let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
@@ -111,7 +111,7 @@ fn swift_optional_binding_try_await_conditions_have_no_parse_errors() {
 
 #[test]
 fn python_decorated_function_range_includes_decorators() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("decorated.py");
     std::fs::write(&file, "@cache\n@profile\ndef f():\n    pass\n").expect("write python file");
 
@@ -135,7 +135,7 @@ fn symbol_cache_trusts_matching_size_and_mtime_until_invalidated() {
     // only mtime-preserving tools (rsync --times, explicit utimes) produce
     // that shape, and the file watcher's cache reset is the invalidation
     // path that covers them.
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("cached.rs");
     std::fs::write(&file, "pub fn alpha() {}\n").expect("write rust file");
     let original_mtime = std::fs::metadata(&file)
@@ -176,7 +176,7 @@ fn symbol_cache_detects_mtime_moved_content_edit_of_same_size() {
     // The other direction stays guarded: when mtime moves, same-size content
     // changes must be detected (the content hash runs on the mtime-moved
     // path and catches them).
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("cached.rs");
     std::fs::write(&file, "pub fn alpha() {}\n").expect("write rust file");
 
@@ -199,7 +199,7 @@ fn symbol_cache_detects_mtime_moved_content_edit_of_same_size() {
 
 #[test]
 fn ts_export_clause_marks_local_symbol_exported() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("exports.ts");
     std::fs::write(&file, "function foo() { return 1; }\nexport { foo };\n")
         .expect("write ts file");
@@ -215,7 +215,7 @@ fn ts_export_clause_marks_local_symbol_exported() {
 
 #[test]
 fn ts_export_default_identifier_marks_local_symbol_exported() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("default.ts");
     std::fs::write(&file, "function foo() { return 1; }\nexport default foo;\n")
         .expect("write ts file");
@@ -234,7 +234,7 @@ fn ts_export_default_identifier_marks_local_symbol_exported() {
 
 #[test]
 fn swift_try_await_control_flow_expressions_have_no_parse_errors() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("ControlFlow.swift");
     let cases = [
         (

@@ -138,6 +138,19 @@ pub(crate) fn without_project_watcher() -> ProjectWatcherDisabledGuard {
     }
 }
 
+pub(crate) struct ProjectWatcherEnabledGuard {
+    _setting: ScopedEnvVar,
+    _lock: ProcessEnvLockGuard,
+}
+
+pub(crate) fn with_project_watcher() -> ProjectWatcherEnabledGuard {
+    let lock = process_env_lock();
+    ProjectWatcherEnabledGuard {
+        _setting: ScopedEnvVar::set("AFT_TEST_DISABLE_FILE_WATCHER", "0"),
+        _lock: lock,
+    }
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,

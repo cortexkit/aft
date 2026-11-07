@@ -1,0 +1,154 @@
+#![allow(dead_code)]
+
+use std::io;
+use std::path::Path;
+
+/// Give a tool-behavior fixture project evidence without turning it into a Git
+/// repository or adding source files to its symbol and search results.
+pub fn mark_project(root: &Path) -> io::Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join("Makefile"))
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn project_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create test project directory");
+    mark_project(directory.path()).expect("mark test project");
+    directory
+}
+
+/// Use Git evidence when a fixture asserts the exact visible file inventory.
+/// Git metadata is excluded by project walkers, unlike an added root manifest.
+pub fn git_project_tempdir() -> tempfile::TempDir {
+    git_tempdir(true)
+}
+
+pub fn unborn_git_project_tempdir() -> tempfile::TempDir {
+    git_tempdir(false)
+}
+
+fn git_tempdir(commit: bool) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create test Git project");
+    let root = directory.path();
+    let ignored_config = root.join(".git/aft-no-user-config");
+    let git = || {
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", &ignored_config)
+            .env("GIT_CONFIG_SYSTEM", &ignored_config)
+            .env("GIT_CONFIG_COUNT", "0");
+        command
+    };
+    let output = git()
+        .args(["init", "--quiet", "--template="])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if commit {
+        let output = git()
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+            ])
+            .arg(format!("fixture at {}", root.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    directory
+}
+
+/// Preserve existing Git or workspace evidence. Marker-free source fixtures
+/// need a project marker before test storage adds non-source files, so the
+/// resulting change in file proportions cannot change project detection.
+pub fn ensure_project(root: &Path) -> io::Result<()> {
+    let decision = aft::folder_admission::probe(
+        root,
+        &Default::default(),
+        aft::folder_admission::ProbeBudgets {
+            time: std::time::Duration::from_secs(5),
+            ..Default::default()
+        },
+    );
+    if decision.classification == aft::folder_admission::FolderClassification::NotProject
+        || decision.reason == aft::folder_admission::AdmissionReason::SmallSourceTree
+    {
+        mark_project(root)?;
+    }
+    Ok(())
+}
+
+/// Declare a known project when a fixture tests tool replies, not detection.
+/// The classifier's wall-clock cutoff must not change those replies under load.
+pub fn admitted_config(mut config: serde_json::Value) -> serde_json::Value {
+    config["project_detection"] = serde_json::json!({ "mode": "project" });
+    config
+}
+
+/// Keep project detection consistent between direct and parent reads.
+/// Folder decisions are saved with the detection mode used to make them. A
+/// parent using auto for a child opened as project must recheck that child
+/// before reading its indexes. Exact child overrides avoid that extra check
+/// while the parent itself still uses automatic workspace detection.
+pub fn repository_fixture_config(root: &Path, mut config: serde_json::Value) -> serde_json::Value {
+    if root.join(".git").exists() {
+        return admitted_config(config);
+    }
+    let overrides = std::fs::read_dir(root)
+        .expect("list fixture repositories")
+        .map(|entry| entry.expect("read fixture repository").path())
+        .filter(|path| path.join(".git").exists())
+        .map(|path| serde_json::json!({"path": path, "mode": "project"}))
+        .collect::<Vec<_>>();
+    config["project_detection"] = serde_json::json!({"mode": "auto", "overrides": overrides});
+    config
+}
+
+#[test]
+fn repository_fixture_policy_matches_direct_and_parent_child_reads() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    let nested = child.join("src");
+    std::fs::create_dir_all(child.join(".git")).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let config = repository_fixture_config(parent.path(), serde_json::json!({}));
+    let policy: aft::folder_admission::ProjectDetectionConfig =
+        serde_json::from_value(config["project_detection"].clone()).unwrap();
+    assert_eq!(
+        policy.mode_for_root(parent.path()),
+        aft::folder_admission::DetectionMode::Auto
+    );
+    assert_eq!(
+        policy.mode_for_root(&child),
+        aft::folder_admission::DetectionMode::Project
+    );
+    assert_eq!(
+        policy.mode_for_root(&nested),
+        aft::folder_admission::DetectionMode::Auto
+    );
+    let direct = repository_fixture_config(&child, serde_json::json!({}));
+    assert_eq!(direct["project_detection"]["mode"], "project");
+}

@@ -6,22 +6,22 @@ use std::time::{Duration, Instant};
 use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 
-use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
+use super::helpers::{link_cached_path, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = if files.iter().any(|(path, _)| path.starts_with(".git/")) {
+        crate::test_helpers::project::unborn_git_project_tempdir()
+    } else {
+        crate::test_helpers::project::project_tempdir()
+    };
+    setup_project_in(temp_dir, files)
+}
 
-    // Ignore-rule fixtures need a real repository: a partial .git directory is
-    // corrupt metadata, not evidence that this project is outside Git.
-    if files.iter().any(|(path, _)| path.starts_with(".git/")) {
-        let output = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(temp_dir.path())
-            .output()
-            .expect("initialize fixture repository");
-        assert!(output.status.success(), "{output:?}");
-    }
+fn setup_git_project(files: &[(&str, &str)]) -> tempfile::TempDir {
+    setup_project_in(crate::test_helpers::project::git_project_tempdir(), files)
+}
 
+fn setup_project_in(temp_dir: tempfile::TempDir, files: &[(&str, &str)]) -> tempfile::TempDir {
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -44,13 +44,15 @@ fn configure(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "indexes": { "trigram": false } }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "indexes": { "trigram": false } }))
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     let resp = send(
         aft,
         json!({
@@ -58,10 +60,11 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "indexes": { "trigram": true } }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "indexes": { "trigram": true } }))
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
@@ -305,7 +308,7 @@ fn grep_regex_over_em_dash_does_not_panic() {
 
 #[test]
 fn grep_reports_empty_scope_separately() {
-    let project = setup_project(&[]);
+    let project = setup_git_project(&[]);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path());
 
@@ -426,6 +429,8 @@ fn grep_and_glob_files(root: &Path, indexed: bool) -> (Vec<String>, Vec<String>)
 fn grep_and_glob_skip_gitignored_paths_in_non_git_root_like_git_root() {
     let plain = ignore_rules_project(false);
     let git = ignore_rules_project(true);
+    assert!(!plain.path().join(".git").exists());
+    assert!(git.path().join(".git/HEAD").is_file());
     let visible = vec![
         "src/main.rs".to_string(),
         "src/nested/keep.rs".to_string(),
@@ -845,7 +850,7 @@ fn em_dash_patterns_match_the_same_lines_on_indexed_and_fallback_grep() {
 #[cfg(debug_assertions)]
 #[test]
 fn grep_while_index_builds_says_the_walk_searched_every_file() {
-    let project = setup_project(&[
+    let project = setup_git_project(&[
         (
             ".fixture-id",
             "grep_while_index_builds_says_the_walk_searched_every_file\n",
@@ -1207,7 +1212,7 @@ fn semantic_search_with_both_lanes_off_refuses_instead_of_walking() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": false, "semantic": false }
             })),
         }),
@@ -1268,7 +1273,7 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
             "harness": "opencode",
             "project_root": project.path(),
             "lsp_paths_extra": [fake_bin_dir],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "disabled": ["typescript", "oxlint", "biome"],
                     "servers": {
@@ -1677,7 +1682,7 @@ fn explicit_ignored_and_symlinked_dirs_are_searched_indexed() {
 #[cfg(unix)]
 #[test]
 fn explicit_symlink_escaping_root_is_refused_when_restricted() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside-store/pkg");
     fs::create_dir_all(root.join("node_modules")).expect("create project");
@@ -1699,7 +1704,7 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "restrict_to_project_root": true,
                 "indexes": { "trigram": false }
             })),
@@ -1734,7 +1739,10 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
 #[test]
 fn filtered_scope_distinguishes_no_files_from_no_matches() {
     for indexed in [false, true] {
-        let project = setup_project(&[("src/a.txt", "hello\n"), ("src/b.rs", "hello\n")]);
+        let project = crate::test_helpers::project::git_project_tempdir();
+        fs::create_dir(project.path().join("src")).unwrap();
+        fs::write(project.path().join("src/a.txt"), "hello\n").unwrap();
+        fs::write(project.path().join("src/b.rs"), "hello\n").unwrap();
         fs::create_dir(project.path().join("empty")).unwrap();
         let mut aft = AftProcess::spawn();
         if indexed {
@@ -1923,7 +1931,7 @@ mod explicit_target_regressions {
             &mut aft,
             json!({
                 "id":"restricted", "command":"configure", "harness":"opencode", "project_root":project.path(),
-                "config":user_config(json!({"restrict_to_project_root":true, "indexes":{"trigram":false}}))
+                "config":crate::test_helpers::project_detection_user_config(json!({"restrict_to_project_root":true, "indexes":{"trigram":false}}))
             }),
         );
         assert_eq!(response["success"], true, "{response}");

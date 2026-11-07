@@ -1296,7 +1296,7 @@ fn work_root(ctx: &AppContext, root: &Path, storage: &Path) {
         let response = crate::commands::configure::handle_configure(&configure, ctx);
         assert!(response.success, "configure failed: {response:?}");
     }
-    crate::commands::configure::drain_deferred_configure_maintenance(ctx);
+    crate::test_admission::settle(ctx);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         crate::runtime_drain::drain_search_index_events(ctx);

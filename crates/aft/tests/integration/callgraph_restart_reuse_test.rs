@@ -104,13 +104,14 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::test_helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": true },
             "views": { "enabled": false }
         }))
     });
     let response = aft.send(&request.to_string());
     assert_eq!(response["success"], true, "configure: {response:?}");
+    aft.wait_for_folder_admission();
 }
 
 /// Ask for `target`'s callers until the store answers. The test harness lets
@@ -200,7 +201,7 @@ fn published_generation(storage: &Path) -> String {
 
 #[test]
 fn legacy_callgraph_restart_reuses_the_published_generation() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = project(fixture.path(), 3);
     let storage = fixture.path().join("storage");
 
@@ -224,7 +225,7 @@ fn legacy_callgraph_restart_reuses_the_published_generation() {
 
 #[test]
 fn legacy_callgraph_restart_first_query_answers_without_waiting_for_comparison() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = project(fixture.path(), 3);
     let storage = fixture.path().join("storage");
     let mut first = AftProcess::spawn();
@@ -249,7 +250,7 @@ fn legacy_callgraph_restart_first_query_answers_without_waiting_for_comparison()
 
 #[test]
 fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = project(fixture.path(), 3);
     let storage = fixture.path().join("storage");
 
@@ -292,7 +293,7 @@ fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
 
 #[test]
 fn legacy_callgraph_second_live_engine_on_the_same_root_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = project(fixture.path(), 3);
     let storage = fixture.path().join("storage");
 
@@ -316,7 +317,7 @@ fn legacy_callgraph_second_live_engine_on_the_same_root_reuses_the_generation() 
 
 #[test]
 fn legacy_callgraph_restart_while_another_engine_holds_the_root_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = project(fixture.path(), 3);
     let storage = fixture.path().join("storage");
 
@@ -348,7 +349,7 @@ fn legacy_callgraph_restart_while_another_engine_holds_the_root_reuses_the_gener
 #[test]
 #[ignore = "fails today (#746): independent clones share one store key, so a clone is served the other clone's graph"]
 fn legacy_callgraph_two_clones_of_one_repository_keep_their_stores_across_restarts() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let first_root = project_named(fixture.path(), "first", 3);
     let clone_root = diverged_clone(&first_root, fixture.path());
     let storage = fixture.path().join("storage");
@@ -391,7 +392,7 @@ fn legacy_callgraph_two_clones_of_one_repository_keep_their_stores_across_restar
 #[test]
 #[ignore = "fails today (#746): a clone opened while another clone runs reads that clone's graph"]
 fn legacy_callgraph_clone_opened_while_another_clone_runs_sees_its_own_files() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let first_root = project_named(fixture.path(), "first", 3);
     let clone_root = diverged_clone(&first_root, fixture.path());
     let storage = fixture.path().join("storage");

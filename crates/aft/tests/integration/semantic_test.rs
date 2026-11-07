@@ -24,10 +24,10 @@ mod aft {
 use aft::search_index::artifact_cache_key;
 use serde_json::{json, Value};
 
-use crate::helpers::{user_config, AftProcess};
+use crate::helpers::AftProcess;
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::project::project_tempdir();
 
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
@@ -50,7 +50,7 @@ fn configure_semantic(
     storage_dir: &Path,
     enabled: bool,
 ) -> Value {
-    send(
+    let response = send(
         aft,
         json!({
             "id": "cfg-semantic",
@@ -62,13 +62,17 @@ fn configure_semantic(
             // tests assert the bounded-walk ("literal") fallback, and a trigram
             // index that finishes building before the query would instead
             // answer through the ranked lexical engine.
-            "config": user_config(if enabled {
+            "config": crate::test_helpers::project_detection_user_config(if enabled {
                 serde_json::json!({ "indexes": { "semantic": true } })
             } else {
                 serde_json::json!({ "indexes": { "semantic": false, "trigram": false } })
             }),
         }),
-    )
+    );
+    if response["success"] == true {
+        aft.wait_for_folder_admission();
+    }
+    response
 }
 
 fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {
@@ -132,7 +136,7 @@ fn semantic_search_refuses_before_any_index_lane_is_ready() {
 #[test]
 fn semantic_search_with_both_index_lanes_off_refuses_with_no_search_lanes_enabled() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
 
     let configure = configure_semantic(&mut aft, project.path(), storage.path(), false);
@@ -172,7 +176,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
             "pub fn normalize_user_id(input: &str) -> String {\n    input.trim().to_lowercase()\n}\n",
         ),
     ]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let project_key = artifact_cache_key(project.path());
     let semantic_file = storage
         .path()
@@ -231,7 +235,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
 #[test]
 fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
 
     for base_url in &[
         "http://127.0.0.1:11434", // Ollama default
@@ -247,7 +251,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
                 "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "ollama",
@@ -270,7 +274,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
 #[test]
 fn configure_accepts_user_private_base_url() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
 
     for base_url in &[
         "http://192.168.1.50:8080",
@@ -286,7 +290,7 @@ fn configure_accepts_user_private_base_url() {
                 "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "openai_compatible",

@@ -8,7 +8,7 @@ use aft::bash_background::persistence::{
     read_exit_marker, resolve_task_layout, session_tasks_dir, ExitMarker,
 };
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
+use super::helpers::{wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 
 const SESSION: &str = "bash-arch-session";
 
@@ -21,7 +21,7 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -111,8 +111,8 @@ fn wait_terminal_with_drain_completion(
 
 #[test]
 fn foreground_bash_returns_immediately_and_does_not_block_dispatch_loop() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path(), storage.path());
     let read_path = project.path().join("probe.txt");
@@ -153,8 +153,8 @@ fn foreground_bash_returns_immediately_and_does_not_block_dispatch_loop() {
 
 #[test]
 fn foreground_bash_with_daemonized_child_does_not_wait_for_inherited_fds() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path(), storage.path());
 
@@ -182,8 +182,8 @@ fn foreground_bash_with_daemonized_child_does_not_wait_for_inherited_fds() {
 
 #[test]
 fn no_notify_foreground_poll_completion_does_not_enqueue_completion() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path(), storage.path());
 
@@ -200,8 +200,8 @@ fn no_notify_foreground_poll_completion_does_not_enqueue_completion() {
 
 #[test]
 fn bash_promote_reenables_completion_delivery() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path(), storage.path());
 
@@ -230,8 +230,8 @@ fn bash_promote_reenables_completion_delivery() {
 
 #[test]
 fn promoted_foreground_completion_while_daemon_is_down_replays_once() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let release = project.path().join("release-command");
     let release_guard = ReleaseOnDrop::new(release.clone());
     let mut first = AftProcess::spawn();
@@ -327,8 +327,8 @@ fn promoted_foreground_completion_while_daemon_is_down_replays_once() {
 
 #[test]
 fn long_running_reminder_frame_fires_after_configured_interval() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configure = aft.send(
         &json!({
@@ -338,7 +338,7 @@ fn long_running_reminder_frame_fires_after_configured_interval() {
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": {
                     "bash": {
                         "background": true,

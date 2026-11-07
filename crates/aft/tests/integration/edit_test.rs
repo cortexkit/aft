@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-use super::helpers::{fixture_path, user_config, AftProcess};
+use super::helpers::{fixture_path, AftProcess};
 #[cfg(unix)]
 use super::helpers::{link_cached_executable, warm_executable};
 
@@ -43,7 +43,7 @@ fn inline_lsp_diagnostics_fixture_with_status(
     configure_id: &str,
     server_status: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, AftProcess) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().to_path_buf();
     let file = root.join("main.rs");
     fs::write(
@@ -74,6 +74,7 @@ fn inline_lsp_diagnostics_fixture_with_status(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    aft.wait_for_project_ready();
 
     (dir, file, aft)
 }
@@ -84,7 +85,7 @@ fn inline_lsp_diagnostics_fixture_with_status(
 #[test]
 fn write_creates_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_new.txt");
     // Ensure file doesn't exist
     let _ = fs::remove_file(&target);
@@ -119,7 +120,7 @@ fn write_creates_new_file() {
 #[test]
 fn write_created_file_undo_removes_created_parent_dirs() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("newdir").join("sub").join("created.txt");
 
     let resp = aft.send(&format!(
@@ -147,7 +148,7 @@ fn write_created_file_undo_removes_created_parent_dirs() {
 #[test]
 fn write_auto_rollback_discards_fake_undo_entry() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("rolled_back.ts");
     fs::write(&target, "const value = 1;\n").unwrap();
 
@@ -182,8 +183,8 @@ fn write_auto_rollback_discards_fake_undo_entry() {
 #[test]
 fn configured_storage_writes_backups_under_harness_namespace() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let target = dir.path().join("namespaced-backup.txt");
     fs::write(&target, "before").unwrap();
 
@@ -223,7 +224,7 @@ fn configured_storage_writes_backups_under_harness_namespace() {
 #[test]
 fn write_backups_existing_file() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_backup.txt");
     fs::write(&target, "original content").unwrap();
 
@@ -264,7 +265,7 @@ fn write_backups_existing_file() {
 #[test]
 fn write_syntax_valid() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_valid.ts");
     let _ = fs::remove_file(&target);
 
@@ -287,7 +288,7 @@ fn write_syntax_valid() {
 #[test]
 fn write_syntax_invalid() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_invalid.ts");
     let _ = fs::remove_file(&target);
 
@@ -315,7 +316,7 @@ fn write_syntax_invalid() {
 #[test]
 fn single_file_write_rolls_back_on_invalid_syntax() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_rollback_valid_to_invalid.ts");
     let original = "export function ok(): string { return \"ok\"; }\n";
     fs::write(&target, original).unwrap();
@@ -345,7 +346,7 @@ fn single_file_write_rolls_back_on_invalid_syntax() {
 #[test]
 fn single_file_write_does_not_rollback_when_pre_was_invalid() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_no_rollback_pre_invalid.ts");
     fs::write(&target, "export function { already broken\n").unwrap();
     let replacement = "export const = still_broken\n";
@@ -375,7 +376,7 @@ fn single_file_write_does_not_rollback_when_pre_was_invalid() {
 #[test]
 fn single_file_write_does_not_rollback_when_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("write_no_rollback_new_invalid.ts");
     let _ = fs::remove_file(&target);
 
@@ -410,7 +411,7 @@ fn single_file_write_does_not_rollback_when_new_file() {
 #[test]
 fn edit_symbol_replace() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("edit_replace.ts");
 
     // Copy fixture
@@ -459,7 +460,7 @@ fn edit_symbol_replace() {
 }
 
 fn assert_empty_symbol_replacement(source: &str, expected: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     for extension in ["ts", "tsx", "js"] {
         let target = dir.path().join(format!("delete_const.{extension}"));
@@ -530,7 +531,7 @@ fn edit_symbol_deletion_removes_whole_crlf_lines_and_eof() {
 
 #[test]
 fn edit_symbol_refuses_multi_declarator_by_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("shared.ts");
     let mut aft = AftProcess::spawn();
     for source in [
@@ -565,7 +566,7 @@ fn edit_symbol_refuses_multi_declarator_by_name() {
 #[test]
 fn edit_symbol_delete() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("edit_delete.ts");
 
     // Copy fixture
@@ -603,7 +604,7 @@ fn edit_symbol_delete() {
 #[test]
 fn edit_symbol_ambiguous() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("edit_ambig.ts");
 
     // Copy ambiguous fixture
@@ -679,7 +680,7 @@ fn edit_symbol_not_found() {
 #[test]
 fn edit_match_single_occurrence() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("match_single.ts");
 
     // Copy fixture
@@ -887,7 +888,7 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
 #[test]
 fn edit_match_multiple_occurrences_returns_candidates() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("match_ambig.ts");
 
     // Write a file with a repeated string
@@ -947,7 +948,7 @@ fn edit_match_multiple_occurrences_returns_candidates() {
 #[test]
 fn edit_match_with_occurrence_selector() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("match_occ.ts");
 
     // Write a file with a repeated string
@@ -1023,7 +1024,7 @@ fn edit_match_no_match() {
 #[test]
 fn edit_match_handles_brackets_in_literal_path() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let subdir = dir.path().join("[another]");
     fs::create_dir_all(&subdir).unwrap();
     let target = subdir.join("file.ts");
@@ -1066,7 +1067,7 @@ fn edit_match_handles_brackets_in_literal_path() {
 #[test]
 fn edit_match_handles_parentheses_in_literal_path() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let subdir = dir.path().join("(something)");
     fs::create_dir_all(&subdir).unwrap();
     let target = subdir.join("file.ts");
@@ -1108,7 +1109,7 @@ fn edit_match_handles_parentheses_in_literal_path() {
 #[test]
 fn edit_match_handles_brackets_in_relative_literal_path() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let subdir = root.join("[another]");
     fs::create_dir_all(&subdir).unwrap();
@@ -1121,7 +1122,7 @@ fn edit_match_handles_brackets_in_relative_literal_path() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true }))
         })
         .to_string(),
     );
@@ -1177,7 +1178,7 @@ fn edit_tool_call(
 // the single-file batch command instead of refusing it as a glob target.
 #[test]
 fn edit_tool_batches_and_line_ranges_on_existing_bracketed_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let route = root.join("app/[id]");
     fs::create_dir_all(&route).unwrap();
@@ -1232,7 +1233,7 @@ fn edit_tool_batches_and_line_ranges_on_existing_bracketed_path() {
 // anything is written.
 #[test]
 fn edit_tool_keeps_glob_behaviour_when_bracketed_path_does_not_exist() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let src = root.join("src");
     fs::create_dir_all(&src).unwrap();
@@ -1333,7 +1334,7 @@ fn edit_tool_keeps_glob_behaviour_when_bracketed_path_does_not_exist() {
 #[test]
 fn batch_table_replace_all_preserves_fuzzy_boundaries() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("table.md");
     fs::write(
         &target,
@@ -1356,7 +1357,7 @@ fn batch_table_replace_all_preserves_fuzzy_boundaries() {
 #[test]
 fn batch_multiple_edits() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_multi.ts");
 
     let content = "const greeting = \"hello\";\nconst farewell = \"goodbye\";\nconst count = 42;\n";
@@ -1405,7 +1406,7 @@ fn batch_reports_aggregate_diff_counts() {
     // content changed. With include_diff, batch must return aggregate
     // additions/deletions across all edits (computed source -> final content).
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_diff.ts");
 
     // Two line replacements (each is -1/+1) plus one pure insertion line.
@@ -1445,7 +1446,7 @@ fn batch_reports_aggregate_diff_counts() {
 #[test]
 fn batch_rollback_on_failure() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_rollback.ts");
 
     let content = "const greeting = \"hello\";\nconst count = 42;\n";
@@ -1485,7 +1486,7 @@ fn batch_rollback_on_failure() {
 #[test]
 fn batch_fuzzy_match() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_fuzzy.ts");
 
     // Source has specific whitespace; edits use slightly different whitespace
@@ -1531,7 +1532,7 @@ fn batch_fuzzy_match() {
 #[test]
 fn batch_near_miss_reports_candidate_and_divergence() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_near_miss.ts");
     let original = "const first = 1;\nconst actual = 2;\nconst last = 3;\n";
     fs::write(&target, original).unwrap();
@@ -1572,7 +1573,7 @@ fn batch_near_miss_reports_candidate_and_divergence() {
 #[test]
 fn batch_fuzzy_preserves_trailing_newline() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_nl.ts");
     // Trailing spaces force the rstrip fuzzy pass (pass 2).
     fs::write(
@@ -1612,7 +1613,7 @@ fn batch_fuzzy_preserves_trailing_newline() {
 #[test]
 fn batch_line_range_edit() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_linerange.ts");
 
     let content = "line zero\nline one\nline two\nline three\n";
@@ -1656,7 +1657,7 @@ fn batch_line_range_edit() {
 #[test]
 fn batch_line_range_edit_with_bare_cr_replaces_the_requested_lf_line() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_bare_cr.txt");
     fs::write(&target, "alpha\rbeta\ngamma\n").unwrap();
 
@@ -1686,7 +1687,7 @@ fn batch_line_range_edit_with_bare_cr_replaces_the_requested_lf_line() {
 #[test]
 fn batch_line_range_append_to_empty_file_does_not_prepend_newline() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_empty_append.txt");
     fs::write(&target, b"").unwrap();
 
@@ -1717,7 +1718,7 @@ fn batch_line_range_append_to_empty_file_does_not_prepend_newline() {
 #[test]
 fn batch_with_undo() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_undo.ts");
 
     let original = "const x = 1;\nconst y = 2;\n";
@@ -1764,7 +1765,7 @@ fn batch_with_undo() {
 #[test]
 fn batch_overlapping_ranges_returns_overlapping_edits_error() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_overlap.txt");
     let original = "abcdefghij\n";
     fs::write(&target, original).unwrap();
@@ -1792,7 +1793,7 @@ fn batch_overlapping_ranges_returns_overlapping_edits_error() {
 #[test]
 fn batch_accepts_old_string_new_string_keys() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_old_new.txt");
     let original = "alpha beta gamma\n";
     fs::write(&target, original).unwrap();
@@ -1819,7 +1820,7 @@ fn batch_accepts_old_string_new_string_keys() {
 #[test]
 fn batch_fuzzy_matching_covers_all_progressive_passes() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_fuzzy_passes.txt");
     let original = concat!(
         "exact = 1\n",
@@ -1861,7 +1862,7 @@ fn batch_fuzzy_matching_covers_all_progressive_passes() {
 #[test]
 fn batch_replace_all_replaces_every_occurrence() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_replace_all.txt");
     fs::write(&target, "hello hello hello\n").unwrap();
 
@@ -1886,7 +1887,7 @@ fn batch_replace_all_replaces_every_occurrence() {
 #[test]
 fn batch_replace_all_and_plain_edit_apply_atomically() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_replace_all_mixed.txt");
     fs::write(&target, "red red blue\n").unwrap();
 
@@ -1912,7 +1913,7 @@ fn batch_replace_all_and_plain_edit_apply_atomically() {
 #[test]
 fn batch_replace_all_and_occurrence_are_mutually_exclusive() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_replace_all_occurrence.txt");
     let original = "same same\n";
     fs::write(&target, original).unwrap();
@@ -1942,7 +1943,7 @@ fn batch_replace_all_and_occurrence_are_mutually_exclusive() {
 #[test]
 fn batch_replace_all_expansion_uses_overlap_guard() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_replace_all_overlap.txt");
     let original = "alpha alpha\n";
     fs::write(&target, original).unwrap();
@@ -1969,7 +1970,7 @@ fn batch_replace_all_expansion_uses_overlap_guard() {
 #[test]
 fn batch_replace_all_supports_empty_replacement_deletion() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_replace_all_delete.txt");
     fs::write(&target, "drop keep drop\n").unwrap();
 
@@ -1993,7 +1994,7 @@ fn batch_replace_all_supports_empty_replacement_deletion() {
 #[test]
 fn batch_ambiguity_error_mentions_occurrence_and_replace_all() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("batch_ambiguous.txt");
     let original = "same same\n";
     fs::write(&target, original).unwrap();
@@ -2033,7 +2034,7 @@ fn batch_ambiguity_error_mentions_occurrence_and_replace_all() {
 #[test]
 fn edit_match_replace_all_replaces_multiple_occurrences() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("match_replace_all.txt");
     let original = "hello hello hello\n";
     fs::write(&target, original).unwrap();
@@ -2064,7 +2065,7 @@ fn edit_match_replace_all_replaces_multiple_occurrences() {
 #[test]
 fn replace_byte_range_invalid_ranges_return_errors() {
     let aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("replace_invalid.txt");
     fs::write(&target, "abcdef").unwrap();
     let source = fs::read_to_string(&target).unwrap();
@@ -2088,7 +2089,7 @@ fn replace_byte_range_invalid_ranges_return_errors() {
 #[test]
 fn replace_byte_range_rejects_non_char_boundaries() {
     let aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("replace_utf8.txt");
     fs::write(&target, "aéz").unwrap();
     let source = fs::read_to_string(&target).unwrap();
@@ -2118,7 +2119,7 @@ fn replace_byte_range_rejects_non_char_boundaries() {
 #[test]
 fn edit_match_glob_replaces_across_files() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let dir_path = dir.path();
 
     fs::write(dir_path.join("a.ts"), "const x = \"OLD_VALUE\";\n").unwrap();
@@ -2177,7 +2178,7 @@ fn edit_match_glob_replaces_across_files() {
 #[test]
 fn edit_match_glob_no_matches_in_files() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let dir_path = dir.path();
 
     fs::write(dir_path.join("a.ts"), "const x = 1;\n").unwrap();
@@ -2200,7 +2201,7 @@ fn edit_match_glob_no_matches_in_files() {
 #[test]
 fn edit_match_glob_no_files_matched() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let dir_path = dir.path();
 
     let req = serde_json::json!({
@@ -2221,7 +2222,7 @@ fn edit_match_glob_no_files_matched() {
 #[test]
 #[cfg(unix)]
 fn edit_match_glob_formats_each_matched_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::write(root.join("biome.json"), "{}\n").unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
@@ -2254,7 +2255,7 @@ exit 0
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome" }
             }))
@@ -2295,7 +2296,7 @@ exit 0
 #[test]
 #[cfg(unix)]
 fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.ts"), "export const a = \"OLD\";\n").unwrap();
@@ -2314,7 +2315,7 @@ fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome" }
             }))
@@ -2355,7 +2356,7 @@ fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
 #[test]
 fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::write(root.join("biome.json"), "{}\n").unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
@@ -2367,7 +2368,7 @@ fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({ "format_on_edit": false }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "format_on_edit": false }))
         })
         .to_string(),
     );
@@ -2405,7 +2406,7 @@ fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
 #[test]
 #[cfg(unix)]
 fn edit_match_glob_mixed_success_and_skip_reasons() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.ts"), "export   const   a=\"OLD\";\n").unwrap();
@@ -2434,7 +2435,7 @@ exit 0
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome", "python": "biome" }
             }))
@@ -2491,7 +2492,7 @@ exit 0
 #[test]
 fn edit_match_no_op_when_old_string_equals_new_string() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("identity.txt");
     fs::write(&target, "hello world\nfoo bar\n").unwrap();
     let original = fs::read(&target).unwrap();
@@ -2523,7 +2524,7 @@ fn edit_match_no_op_when_old_string_equals_new_string() {
 #[test]
 fn edit_match_no_op_absent_when_real_change_applied() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("real_change.txt");
     fs::write(&target, "hello world\nfoo bar\n").unwrap();
 
@@ -2554,7 +2555,7 @@ fn edit_match_no_op_absent_when_real_change_applied() {
 #[test]
 fn write_no_op_when_content_identical_to_existing_file() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("same.txt");
     let body = "identical content\n";
     fs::write(&target, body).unwrap();
@@ -2584,7 +2585,7 @@ fn write_no_op_absent_when_file_created() {
     // Creating a new file is not a "no-op" — there was no pre-state to compare
     // against. `created: true` is the signal; `no_op` should be unset.
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("brand_new.txt");
     let _ = fs::remove_file(&target);
 
@@ -2612,7 +2613,7 @@ fn write_no_op_absent_when_file_created() {
 #[test]
 fn write_no_op_absent_when_content_actually_differs() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("differs.txt");
     fs::write(&target, "original\n").unwrap();
 

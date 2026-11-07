@@ -82,6 +82,9 @@ pub fn is_lsp_navigation_command(command: &str) -> bool {
 }
 
 pub fn handle_lsp_navigation_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    if let Some(response) = crate::folder_admission_runtime::refusal(&ctx, &req.id, req.session()) {
+        return DispatchOutcome::Immediate(response);
+    }
     handle_lsp_navigation_deferred_with_restriction(req, ctx, false)
 }
 

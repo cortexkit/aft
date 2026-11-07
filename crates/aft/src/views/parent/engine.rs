@@ -38,8 +38,10 @@ impl ChildEngine {
         config.indexes.semantic = session.planes.semantic;
         config.indexes.callgraph = false;
         config.semantic = session.semantic_config.clone();
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_parent_query_only();
         Self {
-            ctx: AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config),
+            ctx,
             trigram: None,
             semantic: None,
         }
@@ -341,6 +343,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     let run = |child: &Child,
                lent: Option<crate::semantic_index::EmbeddingModel>,
                vector: Option<&Vec<f32>>| {
+        super::worker::admit_child(session, child);
         let mut engine = lock(&child.engine);
         let engine = engine.get_or_insert_with(|| ChildEngine::new(session, child));
         let mut params = json!({
@@ -545,6 +548,14 @@ pub(super) mod tests {
 
     pub(crate) fn session(root: &Path, storage: &Path) -> ParentSession {
         ParentSession {
+            lifecycle_bound: false,
+            classified: Discovery {
+                root: root.to_path_buf(),
+                children: Vec::new(),
+                skipped: Vec::new(),
+                outside: Vec::new(),
+            },
+            project_detection: Default::default(),
             root: root.to_path_buf(),
             storage: storage.to_path_buf(),
             planes: RequestedPlanes {

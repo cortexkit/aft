@@ -19,7 +19,7 @@ use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
+use super::helpers::{wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 use super::test_helpers::{init_test_logger, take_logs};
 
 const SESSION: &str = "persist-session";
@@ -27,13 +27,18 @@ const TASK_LAYOUT_RESOLVE_RETRY_WINDOW: Duration = Duration::from_millis(500);
 const TASK_LAYOUT_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 fn spawn_storage_dir(name: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join(name)).unwrap();
     dir
 }
 
-fn configure_background(aft: &mut AftProcess, project: &Path, storage: &Path, session: &str) {
-    configure_background_for_harness(aft, project, storage, session, "opencode");
+fn configure_background(
+    aft: &mut AftProcess,
+    project: &Path,
+    storage: &Path,
+    session: &str,
+) -> Value {
+    configure_background_for_harness(aft, project, storage, session, "opencode")
 }
 
 fn configure_background_for_harness(
@@ -42,7 +47,7 @@ fn configure_background_for_harness(
     storage: &Path,
     session: &str,
     harness: &str,
-) {
+) -> Value {
     let response = aft.send(
         &json!({
             "id": format!("cfg-{session}"),
@@ -51,7 +56,7 @@ fn configure_background_for_harness(
             "harness": harness,
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -59,6 +64,7 @@ fn configure_background_for_harness(
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
+    response
 }
 
 fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, session: &str) {
@@ -69,7 +75,7 @@ fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, se
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -314,10 +320,13 @@ fn wait_for_frame_with_forensics(
 
 #[test]
 fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
-    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let configured = configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    if configured["warnings_pending"] == true {
+        aft.merge_configure_warnings(configured);
+    }
     let forensics = TaskForensics {
         storage: storage.path(),
         spawned_at: Instant::now(),
@@ -391,7 +400,7 @@ fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn short_background_completion_is_not_held_behind_spawn_response() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let gate = project.path().join("spawn-response-gate");
     fs::write(&gate, "hold").unwrap();
@@ -641,8 +650,8 @@ fn task_file_with_resolver(
 
 #[test]
 fn task_file_does_not_mistake_a_transient_resolution_error_for_legacy_layout() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000001";
     let task = create_task_layout(storage.path(), SESSION, task_id).unwrap();
     let metadata = PersistedTask::starting(
@@ -781,8 +790,8 @@ fn fake_task(
 
 #[test]
 fn configure_repairs_legacy_root_bash_tasks_into_harness_namespace() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000100";
     fake_task(
         storage.path(),
@@ -859,8 +868,8 @@ fn write_legacy_task_json(storage: &Path, session: &str, task_id: &str, project:
 
 #[test]
 fn bash_status_same_session_cold_bridge_replays_from_disk() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let first = registry();
     let task_id = first
         .spawn(
@@ -897,8 +906,8 @@ fn bash_status_same_session_cold_bridge_replays_from_disk() {
 
 #[test]
 fn bash_status_cross_session_same_project_finds_task_by_id() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let first = registry();
     let task_id = first
         .spawn(
@@ -934,8 +943,8 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
 
 #[test]
 fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000199";
     let paths = task_paths(storage.path(), "session-a", task_id).unwrap();
     let mut metadata = PersistedTask::starting(
@@ -1002,8 +1011,8 @@ fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
 #[test]
 fn replay_retires_old_id_once_without_touching_valid_id() {
     init_test_logger();
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let old_id = "bash-deadbeef";
     let valid_id = "bash-00000000deadbeef";
     let session_dir = session_tasks_dir(storage.path(), SESSION);
@@ -1068,8 +1077,8 @@ fn replay_retires_old_id_once_without_touching_valid_id() {
 #[test]
 fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
     init_test_logger();
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000200";
     let paths = task_paths(storage.path(), "session-a", task_id).unwrap();
     let mut metadata = PersistedTask::starting(
@@ -1131,8 +1140,8 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
 #[test]
 fn foreign_harness_replay_preserves_missing_layout_until_owner_retires_once() {
     init_test_logger();
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let task_id = "bash-00000000000002a1";
     let paths = task_paths(storage.path(), "retired-session", task_id).unwrap();
     let mut metadata = PersistedTask::starting(
@@ -1213,8 +1222,8 @@ fn replay_delete_failure_keeps_later_live_tasks_and_retries_orphan() {
 
     for resident in [false, true] {
         init_test_logger();
-        let storage = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
+        let project = crate::test_helpers::tempdir();
         let orphan_id = if resident {
             "bash-00000000000002a3"
         } else {
@@ -1385,7 +1394,7 @@ fn replay_delete_failure_keeps_later_live_tasks_and_retries_orphan() {
 
 #[test]
 fn foreign_session_replay_retires_completion_but_preserves_status_control() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let task_id = {
         let mut session_a = AftProcess::spawn();
@@ -1435,9 +1444,9 @@ fn foreign_session_replay_retires_completion_but_preserves_status_control() {
 
 #[test]
 fn bash_status_cross_session_different_project_returns_not_found() {
-    let project_a = tempfile::tempdir().unwrap();
-    let project_b = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project_a = crate::test_helpers::tempdir();
+    let project_b = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let first = registry();
     let task_id = first
         .spawn(
@@ -1476,7 +1485,7 @@ fn bash_status_cross_session_different_project_returns_not_found() {
 /// pinned destination across the sweep to drive that interleave exactly.
 #[test]
 fn persisted_gc_keeps_replays_open_quarantine_destination() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let session_id = "session-quarantine-race";
     let session_dir = session_tasks_dir(storage.path(), session_id);
     fs::create_dir_all(&session_dir).unwrap();
@@ -1519,8 +1528,8 @@ fn persisted_gc_keeps_replays_open_quarantine_destination() {
 
 #[test]
 fn replay_continues_after_invalid_entry_quarantine_failure() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let session_id = "session-quarantine-error";
     let task_id = "bash-aaaaaaaaaaaaaaaa";
     fake_task(
@@ -1574,8 +1583,8 @@ fn replay_continues_after_invalid_entry_quarantine_failure() {
 
 #[test]
 fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-legacy1";
     let legacy_path = write_legacy_task_json(storage.path(), "session-a", task_id, project.path());
 
@@ -1624,8 +1633,8 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
 
 #[test]
 fn bash_kill_cross_session_still_returns_not_found() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -1651,8 +1660,8 @@ fn bash_kill_cross_session_still_returns_not_found() {
 
 #[test]
 fn bash_kill_command_cross_session_same_project_finds_task_by_id() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), "session-a");
     let task_id = spawn_bg(&mut aft, "session-a", "sleep 5", None);
@@ -1674,8 +1683,8 @@ fn bash_kill_command_cross_session_same_project_finds_task_by_id() {
 
 #[test]
 fn bash_promote_cross_session_still_returns_not_found() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -1701,8 +1710,8 @@ fn bash_promote_cross_session_still_returns_not_found() {
 
 #[test]
 fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     for idx in 0..5 {
         let paths = fake_task(
             storage.path(),
@@ -1727,8 +1736,8 @@ fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
 
 #[test]
 fn gc_persisted_keeps_undelivered_terminals() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = fake_task(
         storage.path(),
         project.path(),
@@ -1745,8 +1754,8 @@ fn gc_persisted_keeps_undelivered_terminals() {
 
 #[test]
 fn gc_persisted_keeps_recent_files() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = fake_task(
         storage.path(),
         project.path(),
@@ -1763,7 +1772,7 @@ fn gc_persisted_keeps_recent_files() {
 
 #[test]
 fn gc_persisted_quarantines_corrupt_json() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let paths = task_paths(storage.path(), SESSION, "bash-0000000000000112").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(&paths.json, "not-json").unwrap();
@@ -1794,7 +1803,7 @@ fn gc_persisted_quarantines_corrupt_json() {
 
 #[test]
 fn maybe_gc_persisted_cleans_quarantine_older_than_30_days() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let quarantine_session = storage
         .path()
         .join("bash-tasks-quarantine")
@@ -1815,8 +1824,8 @@ fn maybe_gc_persisted_cleans_quarantine_older_than_30_days() {
 
 #[test]
 fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let failing = fake_task(
         storage.path(),
         project.path(),
@@ -1847,7 +1856,7 @@ fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
 
 #[test]
 fn quarantine_corrupt_json_moves_siblings_too() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let paths = task_paths(storage.path(), SESSION, "bash-0000000000000115").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(&paths.json, "not-json").unwrap();
@@ -1886,11 +1895,11 @@ fn quarantine_corrupt_json_moves_siblings_too() {
 
 #[test]
 fn bash_status_cross_session_canonicalizes_paths() {
-    let canonical_project = tempfile::tempdir().unwrap();
-    let alias_parent = tempfile::tempdir().unwrap();
+    let canonical_project = crate::test_helpers::tempdir();
+    let alias_parent = crate::test_helpers::tempdir();
     let alias_project = alias_parent.path().join("project-link");
     std::os::unix::fs::symlink(canonical_project.path(), &alias_project).unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000116";
     fake_task(
         storage.path(),
@@ -1916,8 +1925,8 @@ fn bash_status_cross_session_canonicalizes_paths() {
 
 #[test]
 fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -1968,8 +1977,8 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
 #[test]
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let removable = registry
         .spawn(
@@ -2087,8 +2096,8 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
 
 #[test]
 fn cleanup_finished_retains_undelivered_terminals() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -2128,8 +2137,8 @@ fn cleanup_finished_retains_undelivered_terminals() {
 /// on a very slow machine, but it can never fail on code that handles it.
 #[test]
 fn gc_persisted_keeps_a_task_whose_metadata_is_being_rewritten() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000119";
     // Running and undelivered: the sweep's delete path cannot apply to this
     // task at all, so anything that removes it came from the quarantine path.
@@ -2195,8 +2204,8 @@ fn gc_persisted_keeps_a_task_whose_metadata_is_being_rewritten() {
 /// at an exactly chosen point on either side of it.
 #[test]
 fn gc_persisted_defers_a_session_under_replay_recovery() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = fake_task(
         storage.path(),
         project.path(),
@@ -2233,8 +2242,8 @@ fn gc_persisted_defers_a_session_under_replay_recovery() {
 
 #[test]
 fn replay_session_recovers_killing_state() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = fake_task(
         storage.path(),
         project.path(),
@@ -2264,7 +2273,7 @@ fn replay_session_recovers_killing_state() {
 /// how long it took.
 #[test]
 fn replay_runs_persisted_gc_off_the_calling_thread() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
 
@@ -2289,8 +2298,8 @@ fn replay_runs_persisted_gc_off_the_calling_thread() {
 
 #[test]
 fn replay_runs_maybe_gc_persisted_once() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
     // The first replay's GC runs detached; the fixture below is aged past the
@@ -2324,7 +2333,7 @@ fn replay_runs_maybe_gc_persisted_once() {
 
 #[test]
 fn spawn_detached_survives_parent_restart() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
 
     // The task must still be running when the restarted process rehydrates
@@ -2375,8 +2384,8 @@ fn configure_replays_disk_only_completion_after_initial_batch() {
 }
 
 fn assert_configure_replays_from_default_storage(disk_only: bool) {
-    let project = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let cache = crate::test_helpers::tempdir();
     let storage = cache.path().join("aft");
     let mut forensics = TaskForensics {
         storage: &storage,
@@ -2461,7 +2470,7 @@ fn assert_configure_replays_from_default_storage(disk_only: bool) {
 
 #[test]
 fn exit_file_atomicity_many_short_tasks() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -2494,14 +2503,14 @@ fn exit_file_atomicity_many_short_tasks() {
 
 #[test]
 fn pre_spawn_metadata_starting_replays_as_failed() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000119";
     let metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
         "true".to_string(),
-        tempfile::tempdir().unwrap().path().to_path_buf(),
-        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+        crate::test_helpers::tempdir().path().to_path_buf(),
+        Some(crate::test_helpers::tempdir().path().to_path_buf()),
         None,
         true,
         true,
@@ -2529,7 +2538,7 @@ fn pre_spawn_metadata_starting_replays_as_failed() {
 
 #[test]
 fn terminal_state_monotonic_killed_wins_late_exit_file() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -2558,7 +2567,7 @@ fn terminal_state_monotonic_killed_wins_late_exit_file() {
 
 #[test]
 fn originating_session_restart_drains_completion_exactly_once_then_acks() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let task_id = {
         let mut first_session = AftProcess::spawn();
@@ -2616,7 +2625,7 @@ fn originating_session_restart_drains_completion_exactly_once_then_acks() {
 
 #[test]
 fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-erased-bundle");
 
@@ -2708,7 +2717,7 @@ fn erased_watch_is_process_local_and_never_replays_to_a_foreign_session() {
     const ORIGINATING_SESSION: &str = "session-a";
     const FOREIGN_SESSION: &str = "session-b";
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-foreign-erased-watch");
 
@@ -2822,8 +2831,8 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
     const ORIGINATING_SESSION: &str = "session-a";
     const FOREIGN_SESSION: &str = "session-b";
 
-    let project_a = tempfile::tempdir().unwrap();
-    let project_b = tempfile::tempdir().unwrap();
+    let project_a = crate::test_helpers::tempdir();
+    let project_b = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project_a.path().join("release-two-project-erased-watch");
 
@@ -2915,7 +2924,7 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
 fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
     const HARNESS: &str = "pi";
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join(if task_row_survives_restart {
         "release-erased-watch-with-task-row"
@@ -3050,7 +3059,7 @@ fn pi_erased_watch_with_restored_task_row_does_not_replay_tombstone() {
 
 #[test]
 fn per_match_ack_preserves_sibling_watch_and_rejects_stale_offset() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-matches");
     let exit = project.path().join("release-exit");
@@ -3123,8 +3132,8 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
     const WATCH_A: &str = "EARLY-WATCH-MATCH";
     const WATCH_B: &str = "LATE-WATCH-MATCH";
 
-    let project = tempfile::tempdir().unwrap();
-    let rebound_project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let rebound_project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release_a = project.path().join("release-watch-a");
     let release_b = project.path().join("release-watch-b");
@@ -3218,7 +3227,7 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
 fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
     const MATCH_TEXT: &str = "PENDING-ONCE-MATCH";
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-once-watch");
     let stop = project.path().join("stop-once-watch");
@@ -3270,7 +3279,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
         (task_id, child_pid, persisted_match)
     };
 
-    let phase_two_cache = tempfile::tempdir().unwrap();
+    let phase_two_cache = crate::test_helpers::tempdir();
     let phase_two_ready = project.path().join("phase-two-configured");
     let mut phase_two_command = Command::new(env!("CARGO_BIN_EXE_aft"));
     phase_two_command
@@ -3302,7 +3311,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
                 "harness": "opencode",
                 "project_root": project.path(),
                 "storage_dir": storage.path(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "experimental": { "bash": { "background": true } }
                 })),
                 "max_background_bash_tasks": 32,
@@ -3432,7 +3441,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
 
 #[test]
 fn persistence_restore_does_not_push_completion_frame() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let task_id = {
         let mut aft = AftProcess::spawn();
@@ -3483,7 +3492,7 @@ fn persistence_restore_does_not_push_completion_frame() {
 
 #[test]
 fn kill_marker_idempotency_terminal_and_racy_exit() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -3512,7 +3521,7 @@ fn kill_marker_idempotency_terminal_and_racy_exit() {
 
 #[test]
 fn disk_read_tail_does_not_truncate_live_file() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -3546,7 +3555,7 @@ fn disk_read_tail_does_not_truncate_live_file() {
 
 #[test]
 fn watchdog_deadline_enforcement_without_status_query() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -3563,8 +3572,8 @@ fn watchdog_deadline_enforcement_without_status_query() {
 
 #[test]
 fn session_isolation_on_replay() {
-    let project = tempfile::tempdir().unwrap();
-    let other_project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let other_project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft_a = AftProcess::spawn();
     configure_background(&mut aft_a, project.path(), storage.path(), "session-a");
@@ -3591,7 +3600,7 @@ fn session_isolation_on_replay() {
 
 #[test]
 fn restart_sweep_marks_dead_pid_fate_unknown_once() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     // The first replay's persisted GC runs detached. Let that storage-wide
     // sweep finish before planting a fixture, or it can observe and remove the
@@ -3611,8 +3620,8 @@ fn restart_sweep_marks_dead_pid_fate_unknown_once() {
         task_id.to_string(),
         SESSION.to_string(),
         "sleep 99".to_string(),
-        tempfile::tempdir().unwrap().path().to_path_buf(),
-        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+        crate::test_helpers::tempdir().path().to_path_buf(),
+        Some(crate::test_helpers::tempdir().path().to_path_buf()),
         None,
         true,
         true,
@@ -3646,8 +3655,8 @@ fn restart_sweep_marks_dead_pid_fate_unknown_once() {
 
 #[test]
 fn restart_sweep_marks_missing_pid_fate_unknown() {
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000121";
     let paths = task_paths(storage.path(), SESSION, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
@@ -3689,8 +3698,8 @@ fn restart_sweep_marks_missing_pid_fate_unknown() {
 
 #[test]
 fn watchdog_marks_rehydrated_detached_task_fate_unknown_when_pid_dies_without_marker() {
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let task_id = "bash-0000000000000122";
     let mut child = Command::new("sleep")
         .arg("60")
@@ -3783,8 +3792,8 @@ fn watchdog_marks_rehydrated_detached_task_fate_unknown_when_pid_dies_without_ma
 
 #[test]
 fn bash_kill_preserves_real_exit_code_when_marker_present() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -3812,8 +3821,8 @@ fn bash_kill_preserves_real_exit_code_when_marker_present() {
 
 #[test]
 fn failed_spawn_cleans_up_bundle() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let missing_workdir = project.path().join("does-not-exist");
     let registry = registry();
 
@@ -3844,8 +3853,8 @@ fn failed_spawn_cleans_up_bundle() {
 
 #[test]
 fn replay_completion_carries_preview() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = fake_task(
         storage.path(),
         project.path(),
@@ -3874,8 +3883,8 @@ fn background_bash_uses_bash_syntax_when_available() {
         eprintln!("skipping: bash not available on PATH");
         return;
     }
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let sender: aft::context::ProgressSender = Arc::new(Box::new(move |frame| {
         if let aft::protocol::PushFrame::BashCompleted(completed) = frame {
@@ -3925,7 +3934,7 @@ fn background_bash_uses_bash_syntax_when_available() {
 
 #[test]
 fn terminal_status_preserves_completion_until_explicit_acknowledges() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -4003,7 +4012,7 @@ fn spawn_redaction_task(aft: &mut AftProcess, command: &str, env: Value) -> Stri
 fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
     const SECRET: &str = "opaque deployment credential";
     const MASKED: &str = "<REDACTED_SECRET>";
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-watch");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4102,7 +4111,7 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
 
 #[test]
 fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-ticket");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4159,7 +4168,7 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
 
 #[test]
 fn redaction_replay_rebuilds_long_classifier_secret_after_preview_cut() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-long-classifier-secret");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4204,7 +4213,7 @@ fn redaction_replay_rebuilds_long_classifier_secret_after_preview_cut() {
 #[test]
 fn redaction_replay_withholds_new_secret_output() {
     const SECRET: &str = "opaque post-restart credential";
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-secret");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4271,7 +4280,7 @@ fn redaction_replay_withholds_new_secret_output() {
 #[test]
 fn redaction_replay_withholds_output_from_inherited_secret_environment() {
     const SECRET: &str = "planted inherited OpenAI API key";
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-inherited-secret");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4313,7 +4322,7 @@ fn redaction_replay_withholds_output_from_inherited_secret_environment() {
 
 #[test]
 fn redaction_replay_shows_new_output_with_only_revoked_ticket() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-ordinary");
     let release_guard = ReleaseOnDrop::new(release.clone());
@@ -4355,7 +4364,7 @@ fn redaction_replay_shows_new_output_with_only_revoked_ticket() {
 
 #[test]
 fn per_match_ack_wire_reports_settlement_only_after_last_terminal_watch() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-terminal-matches");
     let release_guard = ReleaseOnDrop::new(release.clone());

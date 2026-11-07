@@ -21,7 +21,7 @@ struct Fixture {
 /// Start a bridge configured from a user config file holding `user_doc`
 /// (`None` leaves the file absent).
 fn fixture(user_doc: Option<&str>) -> Fixture {
-    let dir = tempfile::tempdir().expect("tool-disabled tempdir");
+    let dir = crate::test_helpers::tempdir();
     let project = dir.path().join("project");
     std::fs::create_dir_all(&project).expect("create project");
     let user_config = dir.path().join("user-aft.jsonc");

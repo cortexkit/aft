@@ -20,7 +20,7 @@ impl BlobStoreBreaker for CountingBreaker {
 
 #[test]
 fn eight_concurrent_first_opens_create_one_schema_without_errors() {
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let barrier = Arc::new(Barrier::new(8));
     let mut handles = Vec::new();
 
@@ -56,7 +56,7 @@ fn eight_concurrent_first_opens_create_one_schema_without_errors() {
 
 #[test]
 fn garbled_header_is_preserved_and_records_one_breaker_death() {
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let database_dir = storage.path().join("blobs/family-a");
     fs::create_dir_all(&database_dir).expect("create family directory");
     let database = database_dir.join("semantic.sqlite");

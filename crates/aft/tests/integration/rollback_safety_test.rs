@@ -35,8 +35,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let project_dir = tempfile::tempdir().expect("project dir");
-        let storage_dir = tempfile::tempdir().expect("storage dir");
+        let project_dir = crate::test_helpers::project::project_tempdir();
+        let storage_dir = crate::test_helpers::tempdir();
         fs::write(
             project_dir.path().join("lib.rs"),
             "pub fn greet() -> &'static str { \"hi\" }\npub fn main() { greet(); }\n",
@@ -88,12 +88,12 @@ impl Fixture {
             "session_id": "rollback-safety",
             "project_root": self.project,
             "storage_dir": self.storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::test_helpers::project_detection_user_config(doc),
         }))
         .expect("configure request");
         let response = aft::commands::configure::handle_configure(&request, &ctx);
         assert!(response.success, "configure failed: {response:?}");
-        aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+        crate::test_helpers::admission::settle(&ctx);
         if indexes
             .as_object()
             .is_some_and(|planes| planes.values().any(|on| on == true))

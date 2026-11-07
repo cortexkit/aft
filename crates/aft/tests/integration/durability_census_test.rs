@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 const SESSION: &str = "durability-census";
 const INTERPOSER_SOURCE: &str = include_str!("durability_census_interposer.c");
@@ -426,9 +426,9 @@ fn wait_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
 /// daemon carries the tracer and the report lists per-store counts; without it
 /// only response times are reported, as an uninstrumented baseline.
 fn run_scenario(trace: bool, verify_counts: bool) -> String {
-    let scratch = tempfile::tempdir().unwrap();
-    let project_dir = tempfile::tempdir().unwrap();
-    let storage_dir = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
+    let project_dir = crate::test_helpers::tempdir();
+    let storage_dir = crate::test_helpers::tempdir();
     let project = std::fs::canonicalize(project_dir.path()).unwrap();
     let storage = std::fs::canonicalize(storage_dir.path()).unwrap();
     // F_GETPATH reports /private/var/...; compare without the prefix.
@@ -494,7 +494,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "experimental": { "bash": { "background": true } } })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "experimental": { "bash": { "background": true } } })),
         }),
     );
     assert_eq!(configured["success"], true, "{configured:?}");
@@ -678,7 +678,7 @@ fn durability_census_sync_flavour_costs() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let rounds = 40;
     let mut report = String::new();
     for (name, flavour) in [
@@ -750,7 +750,7 @@ fn durability_syscall_in_process_counts() {
 }
 
 fn trace_in_process_stores(verify_counts: bool) {
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
     let root = std::fs::canonicalize(scratch.path()).unwrap();
     let library = build_interposer(&root);
     let trace = root.join("trace.tsv");

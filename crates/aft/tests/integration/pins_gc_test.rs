@@ -34,8 +34,8 @@ fn sweep_request<'a>(
 
 #[test]
 fn assembly_pin_writes_sorted_keys_before_protecting_slow_puts() {
-    let storage = tempfile::tempdir().expect("create storage");
-    let view = tempfile::tempdir().expect("create view");
+    let storage = crate::test_helpers::tempdir();
+    let view = crate::test_helpers::tempdir();
     let first = semantic_key(b"first");
     let second = semantic_key(b"second");
     let mut store =
@@ -80,8 +80,8 @@ fn assembly_pin_writes_sorted_keys_before_protecting_slow_puts() {
 
 #[test]
 fn gc_never_evicts_retained_or_query_pinned_generation_blobs() {
-    let storage = tempfile::tempdir().expect("create storage");
-    let view = tempfile::tempdir().expect("create view");
+    let storage = crate::test_helpers::tempdir();
+    let view = crate::test_helpers::tempdir();
     let retained = semantic_key(b"retained");
     let query = semantic_key(b"query");
     let disposable = semantic_key(b"disposable");
@@ -115,8 +115,8 @@ fn gc_never_evicts_retained_or_query_pinned_generation_blobs() {
 
 #[test]
 fn expired_live_assembly_pin_is_kept_until_its_owner_releases_it() {
-    let storage = tempfile::tempdir().expect("create storage");
-    let view = tempfile::tempdir().expect("create view");
+    let storage = crate::test_helpers::tempdir();
+    let view = crate::test_helpers::tempdir();
     let key = semantic_key(b"expired");
     let mut store =
         BlobStore::open(storage.path(), "family-a", BlobPlane::Semantic).expect("open blob store");
@@ -157,8 +157,8 @@ fn expired_live_assembly_pin_is_kept_until_its_owner_releases_it() {
 
 #[test]
 fn retained_reference_check_is_the_gc_safety_boundary() {
-    let storage = tempfile::tempdir().expect("create storage");
-    let view = tempfile::tempdir().expect("create view");
+    let storage = crate::test_helpers::tempdir();
+    let view = crate::test_helpers::tempdir();
     let key = semantic_key(b"manifest-reference");
     let mut store =
         BlobStore::open(storage.path(), "family-a", BlobPlane::Semantic).expect("open blob store");

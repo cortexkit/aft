@@ -32,7 +32,6 @@
 import { createRequire } from "node:module";
 import {
   type AftTransportPool,
-  canonicalizeProjectRoot,
   createAftTransportPool,
   ensureBinary,
   ensureOnnxRuntime,
@@ -43,7 +42,6 @@ import {
   GITHUB_LSP_TABLE,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
-  isHomeDirectoryRoot,
   observeFreshSessionStart,
   RevivableTransportPool,
   resolveCortexKitStorageRoot,
@@ -851,24 +849,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // it removes first-tool-call latency without the bridge-storm downside.
   // "Eager" means at session start, not at extension load: a load with no
   // session (see the session-scoped startup note above) must not spawn one.
-  // The $HOME guard below is the only other case we skip. See the home-dir note.
   // pi-magic-context children also skip eager warmup because they are
   // short-lived and rarely call an AFT tool; see skipsEagerStartup.
   const warmBridge = async (onnxRuntimePromise: Promise<string | null> | null): Promise<void> => {
     try {
-      // Note #65: skip eager configure when Pi was launched from the user's
-      // home directory. Configuring on `$HOME` walks the entire user home
-      // tree (100k–10M files), times out the 30s configure budget, gets
-      // killed, then silently retries on every reload. The first real tool
-      // call from a session will still warm the correct project bridge.
+      // Core admission decides whether this root may start indexes, including
+      // home-shaped folders and explicit user overrides, before recursive work.
       const cwd = process.cwd();
-      if (isHomeDirectoryRoot(canonicalizeProjectRoot(cwd))) {
-        log(
-          `Eager configure skipped: cwd=${cwd} is the user home directory. ` +
-            `The first real tool call will warm the correct project bridge.`,
-        );
-        return;
-      }
       // Await ONNX runtime resolution BEFORE spawning the bridge — otherwise
       // the bridge starts without _ort_dylib_dir on its configure overrides,
       // and Rust falls back to a system-path dlopen("libonnxruntime.dylib")

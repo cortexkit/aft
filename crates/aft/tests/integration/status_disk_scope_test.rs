@@ -48,7 +48,7 @@ fn status_disk_bytes_only_count_current_project() {
     let storage_root_dir = tempdir().expect("storage root");
     let storage_root = storage_root_dir.path().to_path_buf();
 
-    let project_a_dir = tempdir().expect("project a");
+    let project_a_dir = crate::test_helpers::project::project_tempdir();
     let project_a = project_a_dir.path().to_path_buf();
     fs::create_dir_all(project_a.join("src")).expect("project a src");
     fs::write(project_a.join("src/lib.rs"), "pub fn a() {}\n").expect("project a file");
@@ -89,6 +89,7 @@ fn status_disk_bytes_only_count_current_project() {
     });
     let response = aft.send(&configure.to_string());
     assert_eq!(response["success"], true, "configure failed: {response}");
+    aft.wait_for_folder_admission();
 
     // Drain the configure_warnings push frame.
     let _ = aft.try_read_next_timeout(std::time::Duration::from_secs(2));

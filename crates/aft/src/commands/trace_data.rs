@@ -30,6 +30,9 @@ use crate::protocol::{RawRequest, Response};
 /// - call graph not initialized (configure not called)
 /// - symbol not found in the file
 pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = answer_trace_data(req, ctx);
     disclose_borrowed_answer(
         ctx,

@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+pub mod admission;
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
+pub mod project;
 mod timeout_forensics;
 
 #[path = "../../src/test_env.rs"]
@@ -56,11 +58,108 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// Shared host directories tried after the temp directory and the checkout's
+/// own parent, for a checkout mounted read-only next to nothing writable.
+const SYSTEM_FALLBACK_DIRECTORIES: [&str; 2] = ["/var/tmp", "/tmp"];
+
 thread_local! {
     static THREAD_SCRATCH_DIR: tempfile::TempDir = tempfile::Builder::new()
         .prefix("aft-test-scratch-")
         .tempdir()
         .expect("create per-test scratch dir");
+    static TEMP_FOR_FIXTURES: () = prepare_fixture_temp_directory();
+}
+
+/// Create a temporary fixture directory that carries no project evidence.
+///
+/// Folder admission treats any directory inside a Git work tree as a project.
+/// A build server runs its jobs with a temp directory inside the checkout it
+/// builds, so a bare `tempfile::tempdir()` there silently inherits that
+/// checkout's evidence and is admitted, while the same fixture is refused on
+/// CI runners whose temp directory lies outside every repository. Fixtures
+/// therefore create their roots through this function instead: it proves the
+/// process temp directory sits outside any work tree, or relocates it once
+/// (`TMPDIR`/`TEMP`/`TMP`) to an equivalent that does, and fails with the
+/// reason when the environment supports neither. The check runs once per test
+/// binary the first time a fixture is created.
+pub fn tempdir() -> tempfile::TempDir {
+    TEMP_FOR_FIXTURES.with(|_| ());
+    tempfile::tempdir().expect("create test project directory")
+}
+
+fn prepare_fixture_temp_directory() {
+    let inherited = std::env::temp_dir();
+    if temp_outside_git_work_tree(&inherited) {
+        return;
+    }
+    // A caller may isolate fixtures from an enclosing checkout by naming a Git
+    // ceiling directory (the admission tests do). Probe from inside a real
+    // temporary directory so the caller's ceiling applies to it too.
+    let probe = tempfile::Builder::new()
+        .prefix("aft-temp-check-")
+        .tempdir()
+        .expect("create temp check directory");
+    if git_work_tree_of(probe.path()).is_none() {
+        return;
+    }
+    drop(probe);
+    let within = git_work_tree_of(&inherited).expect("the temp probe found a work tree");
+    // A directory next to the checkout is preferred. `tempfile::tempdir()` would
+    // reuse the inherited path, so the fallback builds the same private layout
+    // by hand, and only when it carries no project evidence of its own.
+    let candidates = [
+        within
+            .parent()
+            .map(|parent| parent.join(format!("aft-fixture-tmp-{}", std::process::id()))),
+        Some(inherited.join(format!("aft-fixture-tmp-{}", std::process::id()))),
+    ];
+    let relocated = candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| temp_outside_git_work_tree(candidate))
+        .or_else(|| {
+            SYSTEM_FALLBACK_DIRECTORIES
+                .map(PathBuf::from)
+                .into_iter()
+                .map(|system| system.join(format!("aft-fixture-tmp-{}", std::process::id())))
+                .find(|candidate| temp_outside_git_work_tree(candidate))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the test temp directory {} is inside the Git work tree {}, and no directory \
+                 outside a work tree accepts new files; folder admission would treat every bare \
+                 fixture as a project. Point TMPDIR outside any repository",
+                inherited.display(),
+                within.display()
+            )
+        });
+    std::env::set_var("TMPDIR", &relocated);
+    std::env::set_var("TEMP", &relocated);
+    std::env::set_var("TMP", &relocated);
+}
+
+/// Whether fixtures can be created in `directory` without inheriting project
+/// evidence. An unwritable candidate is simply unusable, so the caller can try
+/// the next one; the last check reports why nothing worked.
+fn temp_outside_git_work_tree(directory: &Path) -> bool {
+    std::fs::create_dir_all(directory).is_ok() && git_work_tree_of(directory).is_none()
+}
+
+/// The work tree Git reports for `path`, or `None` when it is outside one.
+/// Git's own limits are inherited, including a caller's ceiling directories.
+fn git_work_tree_of(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!top.is_empty()).then(|| PathBuf::from(top))
 }
 
 /// A scratch directory private to the calling test's thread.
@@ -845,7 +944,8 @@ impl AftProcess {
         self.wait_for_child_exit(timeout, context)
     }
 
-    /// Send a configure command with project_root.
+    /// Configure a fixture and wait for its folder decision. Tests of the
+    /// acknowledgement itself use `send` or `send_silent` instead.
     pub fn configure(&mut self, project_root: &std::path::Path) -> serde_json::Value {
         // Build via serde_json so Windows paths (with backslashes) are
         // escaped correctly in the wire format. Hand-formatted JSON would
@@ -856,7 +956,92 @@ impl AftProcess {
             "harness": "opencode",
             "project_root": project_root.to_string_lossy(),
         });
-        self.send(&request.to_string())
+        let response = self.send(&request.to_string());
+        if response["success"] == true {
+            self.wait_for_folder_admission();
+        }
+        response
+    }
+
+    /// Configure an ordinary tool-behavior fixture, not a folder-admission test.
+    /// Mark the root as a project and explicitly configure project detection.
+    /// Tool tests must not receive a folder refusal just because the automatic
+    /// folder check ran out of time starting Git on a busy runner.
+    pub fn configure_project(&mut self, project_root: &std::path::Path) -> serde_json::Value {
+        project::ensure_project(project_root).expect("mark test project");
+        let response = self.send(
+            &serde_json::json!({
+                "id": "cfg", "command": "configure", "harness": "opencode",
+                "project_root": project_root,
+                "config": project_detection_user_config(serde_json::json!({})),
+            })
+            .to_string(),
+        );
+        if response["success"] == true {
+            let folder = self.wait_for_folder_admission();
+            assert_eq!(folder["classification"], "project", "{folder}");
+        }
+        response
+    }
+
+    /// Finish project setup before testing a tool that must not run against
+    /// initializing persistence. Database-lifecycle fixtures use the configure
+    /// acknowledgement directly instead.
+    pub fn wait_for_project_ready(&mut self) {
+        self.wait_for_folder_admission();
+        let response = self.send(
+            r#"{"id":"fixture-database-ready","command":"db_get_host_state","key":"fixture-readiness"}"#,
+        );
+        assert_eq!(
+            response["success"], true,
+            "database setup failed: {response}"
+        );
+    }
+
+    /// The configure acknowledgement precedes the folder decision. Fixtures
+    /// testing tools rather than the acknowledgement must wait until the folder
+    /// decision is complete.
+    pub fn wait_for_folder_admission(&mut self) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = self.send(r#"{"id":"fixture-folder-admission","command":"status"}"#);
+            assert_eq!(status["success"], true, "status failed: {status}");
+            let replay_pending = status["degraded_reasons"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason == "folder_admission_pending")
+                });
+            if status["folder"]["state"] == "decided" && !replay_pending {
+                return status["folder"].clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder admission did not settle: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Apply the fixture's folder decision after connecting to it.
+    ///
+    /// Folder admission reads its policy from user config, and a spawned bridge
+    /// starts from the indexes its last connection left behind. A fixture that
+    /// asks for a different index configuration therefore has to wait for the
+    /// decision (and its configuration replay) before it observes index state
+    /// or sends project tools.
+    pub fn apply_fixture_folder(&mut self) -> serde_json::Value {
+        self.wait_for_folder_admission()
+    }
+
+    /// The configure acknowledgement precedes the folder decision. Fixtures
+    /// that assert a non-project root must settle the decision and prove the
+    /// root really carries no project evidence before they use it.
+    pub fn wait_for_unadmitted_folder(&mut self) -> serde_json::Value {
+        let folder = self.wait_for_folder_admission();
+        assert_eq!(folder["classification"], "not_project", "{folder}");
+        folder
     }
 
     /// Send a configure command with `format_on_edit: true`.
@@ -1253,6 +1438,26 @@ fn child_storage_guard_rejects_non_temporary_roots() {
     assert_child_storage_isolated(&command);
 }
 
+#[test]
+fn configure_project_marks_a_bare_root_outside_git() {
+    let root = tempdir();
+    let inherited_git = git_work_tree_of(root.path());
+    eprintln!(
+        "fixture root={} temp={} enclosing_git={inherited_git:?}",
+        root.path().display(),
+        std::env::temp_dir().display()
+    );
+    assert!(inherited_git.is_none(), "{inherited_git:?}");
+    let mut aft = AftProcess::spawn();
+    let configured = aft.configure_project(root.path());
+    assert_eq!(configured["success"], true, "{configured}");
+    assert!(root.path().join("Makefile").is_file());
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["classification"], "project", "{folder}");
+    assert_eq!(folder["override_mode"], "project", "{folder}");
+    assert!(aft.shutdown().success());
+}
+
 fn spawn_stdout_capture_thread(
     stdout: std::process::ChildStdout,
     trace_log: Option<Arc<Mutex<std::fs::File>>>,
@@ -1582,6 +1787,47 @@ pub fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+/// Copy a committed fixture into a fresh temporary directory.
+///
+/// The fixture files live inside this checkout, so a fixture used as a project
+/// root would inherit the checkout's own Git repository as project evidence.
+/// Tests that measure a folder's own evidence use this copy instead; tests
+/// about committed fixture content keep reading them in place.
+pub fn fixture_copy(name: &str) -> tempfile::TempDir {
+    let directory = tempdir();
+    copy_tree(&fixture_path(name), directory.path());
+    directory
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    for entry in std::fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("read fixture {}: {error}", source.display()))
+    {
+        let entry = entry.expect("read fixture entry");
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type().expect("fixture entry type");
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).expect("create fixture directory");
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// A user-tier config entry that declares the fixture's own project intent.
+///
+/// Folder admission reads the policy from user config alone. Fixtures whose
+/// subject is a tool's behavior, not folder classification, declare `project`
+/// so their result cannot depend on where the temporary directory happens to
+/// live (a build server keeps it inside the checkout it builds). Folders that
+/// are meant to be refused say so explicitly instead.
+pub fn project_detection_user_config(doc: serde_json::Value) -> serde_json::Value {
+    let mut doc = doc;
+    doc["project_detection"] = serde_json::json!({ "mode": "project" });
+    user_config(doc)
 }
 
 /// Build a user-tier config entry for configure requests.

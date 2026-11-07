@@ -17,7 +17,7 @@ fn integration_context_storage_is_explicit_and_retained() {
 
 #[test]
 fn integration_context_storage_preserves_explicit_namespaces() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let config = isolate(Config {
         storage_dir: Some(dir.path().into()),
         ..Default::default()
@@ -32,7 +32,7 @@ fn integration_context_checkpoints_use_private_unbound_storage() {
         isolate(Config::default()),
     )
     .with_test_checkpoint_store();
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let file = project.path().join("source.txt");
     std::fs::write(&file, "checkpoint bytes").unwrap();
     let info = ctx

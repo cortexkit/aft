@@ -19,7 +19,7 @@ fn regular_path(path: &[u8], bytes: &[u8]) -> TrackedPath {
 
 #[test]
 fn aliases_require_a_regular_unfiltered_file_and_a_proven_git_blob_oid() {
-    let storage = tempfile::tempdir().expect("temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let mut aliases = AliasStore::open(storage.path(), "family-a").expect("open alias store");
     let bytes = b"fn main() {}\n";
     assert_eq!(
@@ -104,7 +104,7 @@ fn aliases_require_a_regular_unfiltered_file_and_a_proven_git_blob_oid() {
 
 #[test]
 fn zero_read_report_has_a_non_vacuous_95_percent_eligible_ratio_and_exclusions() {
-    let storage = tempfile::tempdir().expect("temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let mut aliases = AliasStore::open(storage.path(), "family-a").expect("open alias store");
     let mut paths = Vec::new();
 
@@ -162,7 +162,7 @@ fn zero_read_report_has_a_non_vacuous_95_percent_eligible_ratio_and_exclusions()
 #[test]
 fn head_tree_reads_only_git_metadata_and_marks_filter_attributes() {
     let _git_environment = crate::test_helpers::hermetic_git_env_guard();
-    let repo = tempfile::tempdir().expect("temporary repository");
+    let repo = crate::test_helpers::tempdir();
     run_git(repo.path(), &["init"]);
     std::fs::write(repo.path().join("regular.txt"), "regular\n").expect("write regular file");
     std::fs::write(
@@ -203,7 +203,7 @@ fn head_tree_reads_only_git_metadata_and_marks_filter_attributes() {
     assert!(lfs.filtered);
 
     let previous = BTreeSet::from([b"regular.txt".to_vec(), b"lfs-pointer.txt".to_vec()]);
-    let storage = tempfile::tempdir().expect("temporary alias storage");
+    let storage = crate::test_helpers::tempdir();
     let mut aliases = AliasStore::open(storage.path(), "family-a").expect("open aliases");
     aliases
         .seed_proven_alias(regular, b"regular\n")
@@ -266,7 +266,7 @@ fn manifests_use_raw_blob_paths_byte_order_and_b64_for_non_utf8() {
     assert_eq!(json["entries"][1]["target_bytes"]["b64"], "dGFyZ2V0/w==");
     assert_eq!(json["entries"][2]["rel_path"]["b64"], "/y5ycw==");
 
-    let directory = tempfile::tempdir().expect("temporary manifest storage");
+    let directory = crate::test_helpers::tempdir();
     let database = directory.path().join("manifest.sqlite");
     let mut store = ManifestSqliteStore::open(&database).expect("open manifest store");
     store.write(&manifest).expect("write manifest");

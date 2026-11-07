@@ -6,8 +6,8 @@ use super::helpers::AftProcess;
 
 #[test]
 fn edit_match_preview_returns_diff_and_leaves_disk_and_undo_untouched() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let file = dir.path().join("target.txt");
     let original = "hello old world\n";
     fs::write(&file, original).unwrap();

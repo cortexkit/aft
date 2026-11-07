@@ -358,6 +358,7 @@ fn configure_semantic_openai_with_overlay(
     base_url: &str,
     ram_overlay: bool,
 ) -> Value {
+    crate::test_helpers::project::mark_project(root).unwrap();
     send(
         aft,
         json!({

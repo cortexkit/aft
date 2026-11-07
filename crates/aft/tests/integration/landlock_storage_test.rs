@@ -166,7 +166,7 @@ fn confined_child_command(allowed: &Path, storage: &Path) -> Command {
 
 #[test]
 fn storage_lease_landlock_still_refuses_symlinked_ancestor() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let allowed = fixture.path().canonicalize().unwrap();
     let output = confined_child_command(&allowed, &allowed.join("storage"))
         .env("AFT_TEST_LANDLOCK_SYMLINK_PROBE", "1")
@@ -183,7 +183,7 @@ fn storage_lease_landlock_still_refuses_symlinked_ancestor() {
 #[tokio::test]
 async fn storage_lease_starts_without_reading_root_under_landlock() {
     for fresh_storage in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::test_helpers::tempdir();
         let allowed = fixture.path().canonicalize().unwrap();
         let storage = allowed.join("storage");
         if !fresh_storage {

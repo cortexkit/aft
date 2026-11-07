@@ -574,6 +574,61 @@ A hashline mutation attempts to register every affected path before changing fil
 
 Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` removes either, AFT keeps the ordinary edit/read behavior for the registered tools and emits exactly one configure-time warning per load: `hashline_read_disabled` when `read` is disabled (it takes precedence), otherwise `hashline_edit_disabled`. No other tool is unregistered.
 
+## Folder admission policy (`project_detection`)
+
+The user config at `~/.config/cortexkit/aft.jsonc` accepts this policy, including
+inside `harnesses.<name>`. Project config cannot set it: the resolver drops the
+entire project-tier block, including a project harness override. AFT checks the
+canonical root before recursive startup or loading saved indexes. While the
+bounded check is pending, indexes remain off; explicit-file outline/zoom and
+bounded grep/glob remain available.
+
+```jsonc
+{
+  "project_detection": {
+    "mode": "auto",
+    "overrides": [
+      { "path": "/absolute/path/to/source-export", "mode": "project" }
+    ]
+  }
+}
+```
+
+- `auto` uses project evidence: three or more immediate directories named Desktop,
+  Downloads, Documents, Pictures, Movies, Music, Library, Applications or Public
+  identify a personal container, taking precedence over Git or root project
+  markers. Otherwise the classifier checks concentrated child projects and a
+  completed small source tree. The default evidence budget is 4,096 entries,
+  100 ms, depth 6 and 256 entries per directory plus a counted look-ahead.
+- `project` explicitly admits the selected root, regardless of its size.
+- `workspace` selects separate child projects rather than a combined parent index.
+- `off` declines background indexing; it does not change file-access permissions.
+
+Only existing absolute override paths match. Matching uses the canonical root
+identity, never a path prefix or descendant inheritance; the first matching
+override wins. An `auto` override opts that exact root back into detection even
+when the global mode is forced. A user harness override replaces the entire
+`project_detection` block rather than appending to its override list. Counts
+from an incomplete probe are lower bounds, not estimates of the unseen tree.
+
+Workspace roots have no combined index. With views enabled, the parent reads
+already-published child indexes; a child's own indexes start only when that
+child is opened. With views disabled, grep/glob use bounded walks. An unadmitted
+root keeps every index plane off and uses no old index artifact after restart.
+Index-dependent tools return `folder_not_admitted` with the classification,
+reason, observed counts and coverage. Health retains the same decision. Counts
+describe the timestamped probe snapshot, not a new census on every tool call.
+
+Admission metadata is cached and checked against root/marker identities and
+the effective override. Root and sampled immediate-child marker changes request
+a recheck without a recursive watcher. Automatic probes are spaced by at least
+60 seconds; explicit configure refresh (`refresh: true`) and user policy changes
+can request fresh evidence. A rebind rechecks a negative decision after its
+60-second lifetime. A late result from an older root/configuration generation
+is ignored. Deep changes outside the sampled marker scope can require a refresh
+or opening the child directly. Project admission does not remove the semantic
+20,000-file limit or bypass file-access permissions.
+
 ## Search reranking
 
 `search.rerank` lets a cross-encoder reorder the head of `aft_search` results. It is off by default.

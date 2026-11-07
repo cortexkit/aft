@@ -5815,6 +5815,11 @@ where
         dispatch_path_metrics.mark_frame_loop_step("StatusPushes::drain_turn", "", 0);
         status_pushes.drain_turn(&writer_tx, &dispatch_path_metrics, &routes, &root_channels);
 
+        if database_waits.has_folder_waits() {
+            let soon = tokio::time::Instant::now() + Duration::from_millis(2);
+            next_drain_at = next_drain_at.min(soon);
+            next_maintenance_at = next_maintenance_at.min(soon);
+        }
         // The drain-tick arm below guarantees this select returns by
         // `next_drain_at`; publishing that promise lets the stall watchdog tell
         // an idle-but-ticking loop from one that stopped taking turns.
@@ -5886,15 +5891,15 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            (maybe_frame, database_waited, ledger_waited) = async {
+            (maybe_frame, database_waited, ledger_waited, folder_waited) = async {
                 if let Some(frame) = candidate_requests.next_ready() {
-                    return (Some(Ok(frame)), false, false);
+                    return (Some(Ok(frame)), false, false, false);
                 }
                 tokio::select! {
-                    frame = reader_rx.recv() => (frame, false, false),
-                    frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
-                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
-                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
+                    frame = reader_rx.recv() => (frame, false, false, false),
+                    frame = run_ready_rx.recv() => (frame.map(Ok), false, false, false),
+                    (frame, folder) = database_waits.next_with_kind(), if !database_waits.is_empty() => (Some(Ok(frame)), !folder, false, folder),
+                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true, false),
                 }
             } => {
                 let frame = match maybe_frame {
@@ -5933,7 +5938,7 @@ where
                     continue;
                 }
 
-                if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
+                if !database_waited && !ledger_waited && !folder_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
                 let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies } = frame;
@@ -6188,6 +6193,15 @@ where
                         let decoded = if let Some(identity) = routes_for_call.get(&route) {
                             match run_scopes.defer(decoded, identity, &run_ready_tx) {
                                 Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else { decoded };
+                        let decoded = if !folder_waited && !management_routes.contains_key(&route) {
+                            match database_waits.defer_folder(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
+                                Ok(()) => {
+                                    next_maintenance_at = tokio::time::Instant::now();
+                                    continue;
+                                }
                                 Err(decoded) => decoded,
                             }
                         } else { decoded };
@@ -12548,6 +12562,22 @@ async fn handle_tool_call_with_capabilities(
 /// gate, while a configure that changes the root must run as its exclusive
 /// writer (see `crate::provisional_identity_retry`).
 fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
+    // Finish admission and reapply the requested configuration before other
+    // maintenance; incoming tools are waiting without holding an executor lease.
+    if crate::provisional_identity_retry::folder_due(ctx) {
+        if let Some(identity_replay) = crate::provisional_identity_retry::poll(ctx) {
+            return MaintenanceJobOutcome {
+                identity_replay: Some(identity_replay),
+                ..MaintenanceJobOutcome::default()
+            };
+        }
+        if crate::folder_admission_runtime::waiting(ctx) {
+            return MaintenanceJobOutcome {
+                requeue_kind: Some(MaintenanceDrainKind::ConfigureTail),
+                ..MaintenanceJobOutcome::default()
+            };
+        }
+    }
     // Stepping aside leaves the rest parked on the context; the requeue (or
     // the next tick's tail probe) resumes it once the waiting writer has run.
     let stepped_aside = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
@@ -18850,11 +18880,16 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn parent_folder_last_route_close_stops_watcher_and_exclusion_retries() {
+    fn workspace_parent_last_route_close_releases_readers_and_rebinds_with_root_watcher() {
         let _env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = crate::test_env::with_project_watcher();
         let (dir, root) = test_root("parent-last-route");
         let storage = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("child/.git")).unwrap();
+        for name in ["child", "sibling"] {
+            let project = dir.path().join(name);
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            crate::test_project::mark_project(&project).unwrap();
+        }
         let ctx = test_ctx();
         ctx.mark_subc_bound();
         let request = crate::protocol::RawRequest {
@@ -18865,6 +18900,7 @@ mod tests {
             params: json!({
                 "project_root": dir.path(), "storage_dir": storage.path(), "harness": "runner",
                 "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
+                    "project_detection": {"mode": "workspace"},
                     "views": {"enabled": true},
                     "indexes": {"trigram": false, "semantic": false, "callgraph": false}
                 }).to_string()}],
@@ -18872,23 +18908,18 @@ mod tests {
         };
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        let folder = crate::test_admission::settle(&ctx);
+        assert_eq!(folder["classification"], "workspace", "{folder}");
         let parent = crate::views::parent::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while counters
+        let plan = counters
             .snapshot()
             .exclusion_planning
-            .is_none_or(|plan| plan.attempts < 2)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "backend must exercise exclusion retries"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            .expect("root watch plan");
+        assert!(plan.attempts > 0, "a views parent must plan its root watch");
+        assert_eq!(plan.last_failure, Some("io_deadline"));
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
@@ -18926,11 +18957,12 @@ mod tests {
         ctx.mark_subc_bound();
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        crate::test_admission::settle(&ctx);
         let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
+        assert!(ctx.watcher_runtime_active());
         quiesce_unbound_root(&root, &mut roots, &executor);
         wait_for_watcher_count(&ctx, 0);
     }
@@ -21779,6 +21811,7 @@ mod tests {
                     ..Config::default()
                 },
             ));
+            crate::test_admission::prepare_project(&ctx, dir.path());
             assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
             Self {
                 root,
@@ -22257,7 +22290,7 @@ mod tests {
         let configured = ConfiguredRoot::unconfigured(&executor);
         let canonical_root = configured.canonical_root.clone();
         let ctx = Arc::clone(&configured.ctx);
-        let standing_dir = tempfile::tempdir().unwrap();
+        let standing_dir = crate::test_project::project_tempdir();
         std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
         let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));

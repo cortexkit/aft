@@ -1,6 +1,5 @@
 use crate::helpers::AftProcess;
 use std::fs;
-use tempfile::TempDir;
 
 const SAMPLE_QMD: &str = r#"---
 title: My Quarto Document
@@ -29,7 +28,7 @@ Some text under section with attribute.
 
 #[test]
 fn quarto_outline_extracts_headings() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let qmd_file = dir.path().join("document.qmd");
     fs::write(&qmd_file, SAMPLE_QMD).unwrap();
 

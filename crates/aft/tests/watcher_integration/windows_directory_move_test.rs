@@ -130,6 +130,7 @@ fn directory_move(views: bool, large: bool) {
 }
 
 fn start(root: &Path, views: bool) -> AftProcess {
+    crate::test_helpers::project::mark_project(root).unwrap();
     let mut aft = AftProcess::spawn_with_real_watcher();
     let configured = aft.send(
         &json!({

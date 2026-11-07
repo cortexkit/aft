@@ -154,7 +154,7 @@ fn wait_for_semantic(
 }
 
 fn project() -> tempfile::TempDir {
-    let project = tempfile::tempdir().expect("project dir");
+    let project = test_helpers::project::project_tempdir();
     std::fs::write(
         project.path().join("app.ts"),
         "export function greetUser(name: string) {\n  return `hello ${name}`;\n}\n",

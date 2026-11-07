@@ -1,9 +1,9 @@
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
 fn exit_status_matrix(form: &str) {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configured = aft.send(
         &json!({
@@ -11,7 +11,7 @@ fn exit_status_matrix(form: &str) {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })
@@ -158,7 +158,7 @@ fn bash_waiter_kill_terminates_shell_and_descendants() {
     }
 
     for form in ["foreground", "background", "pty"] {
-        let project = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn();
         let configured = aft.send(&json!({
             "id":"configure-kill", "command":"configure", "harness":"opencode", "project_root":project.path(),
@@ -237,7 +237,7 @@ fn bash_waiter_kill_terminates_shell_and_descendants() {
 fn pty_console_round_trip(command: &str, input: &str, expected_code: i32, expected_output: &str) {
     const STARTUP_BUDGET: Duration = Duration::from_secs(120);
     const ROUND_TRIP_BUDGET: Duration = Duration::from_secs(30);
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configured = aft.send(&json!({
         "id":"configure-stdin", "command":"configure", "harness":"opencode", "project_root":project.path(),

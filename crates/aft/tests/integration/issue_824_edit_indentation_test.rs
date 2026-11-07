@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 /// The file from the issue. `oldString` below drops one indentation level.
 const CASE1_BEFORE: &str = "def f(x):\n    if x:\n        a = 1\n        b = 2\n    return x\n";
@@ -76,7 +76,7 @@ struct EditRun {
 /// `validate_on_edit: "syntax"` (the issue's setting), and return the reply
 /// and the file content afterwards.
 fn run_edit(shape: Shape, name: &str, before: &str, old: &str, new: &str) -> EditRun {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = fs::canonicalize(dir.path()).unwrap();
     let file = root.join(name);
     fs::write(&file, before).unwrap();
@@ -88,7 +88,7 @@ fn run_edit(shape: Shape, name: &str, before: &str, old: &str, new: &str) -> Edi
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "validate_on_edit": "syntax", "format_on_edit": false })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "validate_on_edit": "syntax", "format_on_edit": false })),
         })
         .to_string(),
     );

@@ -65,6 +65,18 @@ where
     );
 }
 
+fn initial_callgraph_response(aft: &mut AftProcess, query: &str) -> serde_json::Value {
+    // A cold store may still be building after the folder is configured.
+    // Retry only that signal; original result assertions still see all errors.
+    poll_watcher_update_after_mutation(
+        aft,
+        query,
+        |_| {},
+        |response| response["code"] != "callgraph_building",
+        "initial callgraph store should become ready",
+    )
+}
+
 /// File watcher: modify a file to add a new caller, verify it appears.
 #[test]
 fn callgraph_watcher_add_caller() {
@@ -73,10 +85,7 @@ fn callgraph_watcher_add_caller() {
     let mut aft = AftProcess::spawn_with_real_watcher();
 
     // Configure with temp dir
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(std::path::Path::new(&root));
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -84,10 +93,13 @@ fn callgraph_watcher_add_caller() {
     );
 
     // Query callers of validate — should show processData from utils.ts
-    let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
-        crate::helpers::json_string(&format!("{}/helpers.ts", root))
-    ));
+    let resp = initial_callgraph_response(
+        &mut aft,
+        &format!(
+            r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+            crate::helpers::json_string(&format!("{}/helpers.ts", root))
+        ),
+    );
     assert_eq!(
         resp["success"], true,
         "initial callers should succeed: {:?}",
@@ -157,10 +169,7 @@ fn callgraph_watcher_remove_caller() {
     let mut aft = AftProcess::spawn_with_real_watcher();
 
     // Configure with temp dir
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(std::path::Path::new(&root));
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -168,10 +177,13 @@ fn callgraph_watcher_remove_caller() {
     );
 
     // Query callers of validate — processData from utils.ts should be there
-    let resp = aft.send(&format!(
-        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
-        crate::helpers::json_string(&format!("{}/helpers.ts", root))
-    ));
+    let resp = initial_callgraph_response(
+        &mut aft,
+        &format!(
+            r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1}}"#,
+            crate::helpers::json_string(&format!("{}/helpers.ts", root))
+        ),
+    );
     assert_eq!(
         resp["success"], true,
         "initial callers should succeed: {:?}",

@@ -24,6 +24,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import { hermeticGitChildEnv } from "../../../../../tests/helpers/git-env.js";
 import { warmMacosExec } from "../../../../../tests/helpers/macos-exec-warm.js";
+import { markProject } from "../../../../../tests/helpers/project.js";
 import {
   type PreparedSubcLane,
   prepareSubcLane,
@@ -406,6 +407,7 @@ export async function createHarness(
 
   try {
     await copyFixturesToTempDir(tempDir, options.fixtureNames);
+    await markProject(tempDir);
 
     // Redirect the search index cache to a temp dir so tests don't pollute the
     // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child

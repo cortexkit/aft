@@ -52,7 +52,7 @@ fn symbols(items: &Value) -> Vec<String> {
 
 #[test]
 fn inspect_unused_exports_empty_project_reports_zero() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let success = scan(temp.path(), Vec::new());
 
     assert_eq!(success.aggregate["count"], 0);
@@ -66,7 +66,7 @@ fn inspect_unused_exports_empty_project_reports_zero() {
 
 #[test]
 fn inspect_unused_exports_imported_named_export_is_not_reported() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let exported = write_file(
         &root.join("src/a.ts"),
@@ -85,7 +85,7 @@ fn inspect_unused_exports_imported_named_export_is_not_reported() {
 
 #[test]
 fn inspect_unused_exports_unimported_function_is_reported() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let file = write_file(
         &root.join("src/a.ts"),
@@ -103,7 +103,7 @@ fn inspect_unused_exports_unimported_function_is_reported() {
 
 #[test]
 fn inspect_unused_exports_default_export_matches_default_import() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let exported = write_file(
         &root.join("src/a.ts"),
@@ -121,7 +121,7 @@ fn inspect_unused_exports_default_export_matches_default_import() {
 
 #[test]
 fn inspect_unused_exports_package_main_entry_is_public_api() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     write_file(
         &root.join("package.json"),
@@ -140,7 +140,7 @@ fn inspect_unused_exports_package_main_entry_is_public_api() {
 
 #[test]
 fn inspect_unused_exports_package_bin_is_not_public_api_but_main_is() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     write_file(
         &root.join("package.json"),
@@ -164,7 +164,7 @@ fn inspect_unused_exports_package_bin_is_not_public_api_but_main_is() {
 
 #[test]
 fn inspect_unused_exports_namespace_import_uses_only_accessed_members() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let exported = write_file(
         &root.join("src/a.ts"),
@@ -187,7 +187,7 @@ fn inspect_unused_exports_namespace_import_uses_only_accessed_members() {
 
 #[test]
 fn inspect_unused_exports_namespace_import_used_as_value_marks_all_exports_uncertain() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let exported = write_file(
         &root.join("src/a.ts"),
@@ -210,7 +210,7 @@ fn inspect_unused_exports_namespace_import_used_as_value_marks_all_exports_uncer
 
 #[test]
 fn inspect_unused_exports_non_js_ts_files_contribute_empty_and_are_skipped() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let rust_file = write_file(&root.join("src/lib.rs"), "pub fn ignored() {}\n");
 
@@ -231,7 +231,7 @@ fn inspect_unused_exports_non_js_ts_files_contribute_empty_and_are_skipped() {
 
 #[test]
 fn inspect_unused_exports_skips_kotlin_export_like_declarations() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let kotlin_file = write_file(
         &root.join("src/Sample.kt"),
@@ -254,7 +254,7 @@ fn inspect_unused_exports_skips_kotlin_export_like_declarations() {
 /// checks the paging itself.
 #[test]
 fn inspect_unused_exports_stores_every_item_past_one_hundred_for_paging() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path();
     let source = (0..101)
         .map(|index| format!("export function unused_{index}() {{ return {index}; }}\n"))

@@ -163,6 +163,7 @@ fn delay_before(attempts: u32, timing: Timing) -> Duration {
 enum RetryKind {
     Identity,
     CacheCoordination,
+    FolderAdmission,
 }
 
 #[derive(Clone)]
@@ -224,7 +225,9 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
         return;
     }
     let reasons = ctx.degraded_reasons();
-    let kind = if reasons
+    let kind = if crate::folder_admission_runtime::pending(ctx) {
+        Some(RetryKind::FolderAdmission)
+    } else if reasons
         .iter()
         .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
     {
@@ -249,7 +252,7 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
         return;
     };
     let now = now();
-    if slot.is_none() {
+    if slot.is_none() && kind != RetryKind::FolderAdmission {
         crate::slog_info!(
             "bind met transient coordination contention for root={}; retrying in the background",
             ctx.canonical_cache_root_opt()
@@ -272,6 +275,10 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
                 match kind {
                     RetryKind::Identity => timing(),
                     RetryKind::CacheCoordination => cache_timing(),
+                    RetryKind::FolderAdmission => Timing {
+                        first_delay: Duration::ZERO,
+                        ..timing()
+                    },
                 },
             ),
         exhausted: false,
@@ -282,6 +289,7 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
 /// Stop retrying, for a root that unbound or quiesced. Returns whether a
 /// retry was armed.
 pub(crate) fn cancel(ctx: &AppContext) -> bool {
+    crate::folder_admission_runtime::quiesce(ctx);
     ctx.provisional_identity_retry().0.lock().take().is_some()
 }
 
@@ -327,6 +335,11 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
         return Some("superseded");
     }
     match retry.kind {
+        RetryKind::FolderAdmission => {
+            if retry.connect_generation != ctx.connect_generation() {
+                return Some("superseded");
+            }
+        }
         RetryKind::CacheCoordination => {
             if retry.connect_generation != ctx.connect_generation() {
                 return Some("newer_connect");
@@ -365,11 +378,14 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
 /// Called only from configure-tail maintenance, never from an interactive
 /// request.
 pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
+    if let Some(request) = crate::folder_admission_runtime::arm_recheck(ctx) {
+        note_configure_outcome(ctx, &request, true);
+    }
     let slot = ctx.provisional_identity_retry();
     if !slot.is_due() {
         return None;
     }
-    let (retry, cache_claim) = {
+    let (mut retry, cache_claim) = {
         let mut pending = slot.0.lock();
         let retry = pending.as_mut()?;
         if retry.exhausted || retry.cache_claim.strong_count() > 0 || now() < retry.next_attempt_at
@@ -388,6 +404,13 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
         }
     };
     if stale_reason(ctx, &retry).is_some() {
+        #[cfg(debug_assertions)]
+        if retry.kind == RetryKind::FolderAdmission {
+            crate::folder_admission_runtime::trace_for_test(format_args!(
+                "retry dropped: {:?}",
+                stale_reason(ctx, &retry)
+            ));
+        }
         let mut pending = slot.0.lock();
         if pending.as_ref().is_some_and(|current| {
             current.generation == retry.generation
@@ -399,6 +422,25 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
         return None;
     }
     let root = retry.root.clone();
+    if retry.kind == RetryKind::FolderAdmission {
+        match crate::folder_admission_runtime::resolve(ctx) {
+            crate::folder_admission_runtime::ResolveResult::Ready(generation) => {
+                #[cfg(debug_assertions)]
+                crate::folder_admission_runtime::trace_for_test(format_args!(
+                    "replay ready generation={generation}"
+                ));
+                retry.generation = generation
+            }
+            crate::folder_admission_runtime::ResolveResult::Wait => {
+                retry.next_attempt_at =
+                    now() + crate::folder_admission_runtime::wait_until_probe(ctx);
+                *slot.0.lock() = Some(retry);
+                return None;
+            }
+            crate::folder_admission_runtime::ResolveResult::Settled
+            | crate::folder_admission_runtime::ResolveResult::Stale => return None,
+        }
+    }
     if retry.kind == RetryKind::Identity {
         let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
         if !crate::root_identity::legacy_pins_readable(&root, &storage) {
@@ -411,6 +453,30 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
         root,
         _cache_claim: cache_claim,
     })
+}
+
+pub(crate) fn due(ctx: &AppContext) -> bool {
+    ctx.provisional_identity_retry().is_due() || crate::folder_admission_runtime::recheck_due(ctx)
+}
+
+pub(crate) fn folder_due(ctx: &AppContext) -> bool {
+    let slot = ctx.provisional_identity_retry();
+    slot.is_due()
+        && slot
+            .0
+            .lock()
+            .as_ref()
+            .is_some_and(|retry| retry.kind == RetryKind::FolderAdmission)
+}
+
+pub(crate) fn finish_folder_check(ctx: &AppContext) {
+    let mut slot = ctx.provisional_identity_retry().0.lock();
+    if slot
+        .as_ref()
+        .is_some_and(|retry| retry.kind == RetryKind::FolderAdmission)
+    {
+        slot.take();
+    }
 }
 
 /// Poll and, when the database is free, replay the bind on this thread.
@@ -499,6 +565,9 @@ impl PreparedReplay {
             retry.attempts = retry.attempts.saturating_add(1);
         }
         let run = || match retry.kind {
+            RetryKind::FolderAdmission => {
+                crate::commands::configure::handle_folder_admission_replay(&retry.request, ctx)
+            }
             RetryKind::Identity => {
                 crate::commands::configure::handle_configure(&retry.request, ctx)
             }
@@ -545,6 +614,9 @@ fn finish_replay(
     retry: PendingRetry,
     response: &crate::protocol::Response,
 ) {
+    if retry.kind == RetryKind::FolderAdmission {
+        return;
+    }
     let timing = timing();
     let slot = ctx.provisional_identity_retry();
     if ctx.subc_unbound_quiesced() {

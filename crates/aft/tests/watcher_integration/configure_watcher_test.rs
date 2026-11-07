@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::helpers::{user_config, AftProcess};
 
 fn configure_with_search_index(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::mark_project(root).unwrap();
     let configure = aft.send(
         &json!({
             "id": "cfg-search-index",
@@ -158,6 +159,7 @@ fn self_matching_root_gitignore_reload_updates_search_index() {
 fn dispatch_stays_responsive_under_ignored_event_flood() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let dir = tempfile::tempdir().unwrap();
+    crate::test_helpers::project::mark_project(dir.path()).unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     let source = dir.path().join("src/main.ts");
     fs::write(&source, "export function main() { return 1; }\n").unwrap();

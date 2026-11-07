@@ -38,7 +38,7 @@ struct FakeManagementSurfaceDaemon {
 
 impl FakeManagementSurfaceDaemon {
     fn spawn(census: Value) -> Self {
-        let connection_dir = tempfile::tempdir().expect("connection tempdir");
+        let connection_dir = crate::test_helpers::tempdir();
         let connection_file = connection_dir.path().join("subc-connection.json");
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
         listener.set_nonblocking(true).expect("set nonblocking");
@@ -312,8 +312,8 @@ fn fake_census() -> Value {
 #[test]
 fn profile_memory_renders_fake_management_surface_census() {
     let daemon = FakeManagementSurfaceDaemon::spawn(fake_census());
-    let config_home = tempfile::tempdir().expect("config home");
-    let project = tempfile::tempdir().expect("profile project");
+    let config_home = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     write_profile_config(config_home.path(), daemon.connection_file());
 
     let output = run_profile_memory(config_home.path(), project.path(), true);
@@ -352,8 +352,8 @@ fn profile_memory_renders_fake_management_surface_census() {
 
 #[test]
 fn profile_memory_without_connection_file_reports_unavailable() {
-    let config_home = tempfile::tempdir().expect("config home");
-    let project = tempfile::tempdir().expect("profile project");
+    let config_home = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
 
     let output = run_profile_memory(config_home.path(), project.path(), false);
 

@@ -102,7 +102,7 @@ fn create_terminal_layout(storage: &Path, task_id: &str) {
 
 #[test]
 fn terminal_pruner_preserves_every_delivery_and_layout_invariant() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
 
     let running = task_id(1);
@@ -154,7 +154,7 @@ fn terminal_pruner_preserves_every_delivery_and_layout_invariant() {
 
 #[test]
 fn terminal_pruner_handles_legacy_ids_without_deleting_surviving_artifacts() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     let absent = "bash-deadbeef";
     let present = "bash-cafebabe";
@@ -175,7 +175,7 @@ fn terminal_pruner_handles_legacy_ids_without_deleting_surviving_artifacts() {
 
 #[test]
 fn terminal_pruner_never_removes_more_than_five_hundred_rows() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     for index in 0..501 {
         insert_task(&conn, &task_id(index + 1_000), "failed", Some(OLD_MS), true);
@@ -190,7 +190,7 @@ fn terminal_pruner_never_removes_more_than_five_hundred_rows() {
 
 #[test]
 fn retention_sweep_drains_backlog_in_bounded_transactions() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     let backlog = BASH_TASK_STEADY_STATE_ROWS * 2 + 1;
     for index in 0..backlog {
@@ -220,7 +220,7 @@ fn retention_sweep_drains_backlog_in_bounded_transactions() {
 
 #[test]
 fn retention_steady_state_keeps_single_batch_ceiling_without_backlog() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     for index in 0..3 {
         insert_task(
@@ -247,7 +247,7 @@ fn retention_steady_state_keeps_single_batch_ceiling_without_backlog() {
 
 #[test]
 fn retention_catch_up_never_deletes_a_row_for_a_live_pid() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     let live = task_id(30_000);
     insert_task(&conn, &live, "completed", Some(OLD_MS), true);
@@ -281,7 +281,7 @@ fn retention_catch_up_never_deletes_a_row_for_a_live_pid() {
 
 #[test]
 fn retention_tick_rolls_back_task_delete_when_event_pruning_fails() {
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let storage = crate::test_helpers::tempdir();
     let mut conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
     let task_id = task_id(9_000);
     insert_task(&conn, &task_id, "completed", Some(OLD_MS), true);

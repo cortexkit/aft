@@ -140,7 +140,7 @@ fn ordinals_with_prefix(text: &str, prefix: &str) -> std::collections::BTreeSet<
 
 #[test]
 fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
-    let temp = tempfile::tempdir().expect("create fake gh root");
+    let temp = crate::test_helpers::tempdir();
     write_fake_gh(&temp.path().join("bin"));
     let mut aft = spawned_with_fake_gh(&temp.path().join("bin"));
     configure_gh_read_enabled(&mut aft, temp.path());
@@ -176,7 +176,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
 
 #[test]
 fn github_outline_zoom_and_read_share_timeline_ordinals() {
-    let temp = tempfile::tempdir().expect("create timeline fixture root");
+    let temp = crate::test_helpers::tempdir();
     write_timeline_fake_gh(&temp.path().join("bin"));
     let mut aft = spawned_with_fake_gh(&temp.path().join("bin"));
     configure_gh_read_enabled(&mut aft, temp.path());
@@ -279,7 +279,7 @@ fn github_outline_zoom_and_read_share_timeline_ordinals() {
 
 #[test]
 fn github_diff_outline_and_zoom_refuse_with_read_hint() {
-    let project = tempfile::tempdir().expect("create diff refusal project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure_gh_read_enabled(&mut aft, project.path());
     for target in ["pr://42/diff", "pr://owner/repo/42/diff/src/new.rs"] {
@@ -303,7 +303,7 @@ fn github_diff_outline_and_zoom_refuse_with_read_hint() {
 
 #[test]
 fn github_diff_recorded_gh_reads_and_pages_through_protocol() {
-    let project = tempfile::tempdir().expect("create diff fixture project");
+    let project = crate::test_helpers::tempdir();
     let bin = project.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let metadata = include_str!("../../src/github_read/fixtures/pr-42-diff-metadata.json");
@@ -407,7 +407,7 @@ esac
 
 #[test]
 fn github_outline_and_zoom_refuse_when_gh_read_is_disabled() {
-    let project = tempfile::tempdir().expect("create gate project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configured = aft.send(
         &json!({
@@ -439,7 +439,7 @@ fn github_outline_and_zoom_refuse_when_gh_read_is_disabled() {
 
 #[test]
 fn standalone_deferred_github_read_keeps_interleaved_request_responsive() {
-    let temp = tempfile::tempdir().expect("create slow fake gh root");
+    let temp = crate::test_helpers::tempdir();
     let bin_dir = temp.path().join("bin");
     write_fake_gh(&bin_dir);
     let fetch_started = temp.path().join("gh-fetch-started");
@@ -526,7 +526,7 @@ fn github_read_subc_translation_preserves_uri_selector_and_hidden_vision_capabil
 
 #[test]
 fn github_read_returns_identical_selected_content_through_standalone_and_subc_paths() {
-    let temp = tempfile::tempdir().expect("create fake gh root");
+    let temp = crate::test_helpers::tempdir();
     write_fake_gh(&temp.path().join("bin"));
     let mut standalone = spawned_with_fake_gh(&temp.path().join("bin"));
     let mut subc = spawned_with_fake_gh(&temp.path().join("bin"));
@@ -585,7 +585,7 @@ fn github_read_returns_identical_selected_content_through_standalone_and_subc_pa
 
 #[test]
 fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
-    let project = tempfile::tempdir().expect("create restricted project");
+    let project = crate::test_helpers::tempdir();
     let ctx = AppContext::new(
         default_language_provider_factory(),
         crate::context_storage::isolate(Config {
@@ -621,7 +621,7 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
 
 #[test]
 fn github_zoom_batch_ordinals_fetch_each_discussion_once() {
-    let temp = tempfile::tempdir().expect("create counted discussion fixture");
+    let temp = crate::test_helpers::tempdir();
     let bin = temp.path().join("bin");
     let calls = temp.path().join("gh-calls");
     fs::create_dir_all(&bin).unwrap();
