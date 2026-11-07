@@ -2089,22 +2089,7 @@ fn clean_old_caches_resolved(
                 "old-cache cleanup requires the resolved durable storage root",
             ));
         }
-        let owned = match storage_pin.repair_read_file(std::ffi::OsStr::new("aft.db")) {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match storage_pin.repair_read_file(std::ffi::OsStr::new(OWNER)) {
-                    Ok(marker) => {
-                        let marker = read_marker_identity(marker)?;
-                        marker.owner == pinned_identity(&storage_pin)?
-                            && !marker.registration.is_empty()
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        if !owned {
+        if !storage_root_proven(&storage_pin)? {
             report.reason = Some("old_cache_storage_root_unproven");
             return Err(io::Error::other(
                 "old-cache cleanup requires aft.db or the storage root's AFT owner marker",
@@ -2155,6 +2140,35 @@ pub(crate) fn clean_old_caches_for_test(
         .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
     clean_old_caches_resolved(tiers, storage, storage, confirm)
 }
+
+/// Whether `storage` holds AFT's database (`aft.db`) or an owner marker that
+/// names this very folder. Bulk deletions ask for this proof before treating a
+/// folder as AFT's storage, so a mistyped `AFT_STORAGE_DIR` cannot point them
+/// at someone else's data.
+fn storage_root_proven(storage: &PinnedDir) -> io::Result<bool> {
+    match storage.repair_read_file(std::ffi::OsStr::new("aft.db")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match storage.repair_read_file(std::ffi::OsStr::new(OWNER)) {
+                Ok(marker) => {
+                    let marker = read_marker_identity(marker)?;
+                    Ok(
+                        marker.owner == pinned_identity(storage)?
+                            && !marker.registration.is_empty(),
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub use prune_legacy::{
+    prune_legacy_stores, LegacyStore, LegacyStoreSkip, PruneLegacyError, PruneLegacyEvent,
+    PruneLegacyReport,
+};
 
 /// Cache location is storage-wide: only the user base is resolved here, never
 /// a harness override or a project redirect. Unavailable roots abort repair.
@@ -2601,4 +2615,1231 @@ fn ensure_no_legacy_daemon() -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// `aft cache prune-legacy`: deletes the index stores AFT used before version
+/// 0.64. From 0.64 every index lives in `data/` and nothing opens the old
+/// stores, so this runs while AFT daemons keep running. It never deletes on its
+/// own initiative; the command is the only caller.
+///
+/// Safety rules, in the order a run applies them:
+/// - The storage root must prove it is AFT's (`aft.db` or its owner marker).
+///   An external `storage.cache_dir` root must carry an owner marker naming
+///   that storage root and be listed in the storage root's record of the cache
+///   roots it prepared (`retention/cache-roots.json`).
+/// - Only the fixed folder names below are candidates, plus each child of
+///   `semantic/` except the live `semantic/models/`. Each is opened without
+///   following symlinks and must be a real folder on the root's own device and
+///   mount; a symlink, a mount point or a folder on another device is skipped.
+/// - A bounded walk sizes each candidate and refuses one that holds a mount, a
+///   hard-linked file or a special file within the part it read.
+/// - With `--yes`, each candidate is first renamed into
+///   `<root>/.prune-legacy-<time>-<pid>/` on the same filesystem, and only that
+///   moved copy is deleted. A folder that cannot be renamed (on Windows, a
+///   file open inside it) is skipped, never deleted in place.
+/// - Deletion runs in bounded passes that never follow links or cross mounts.
+///   A run that stops early leaves the moved folder behind, and the next run
+///   deletes every `.prune-legacy-*` leftover.
+mod prune_legacy {
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use super::{
+        known_harness, marker_matches_pinned, paths_overlap, pin_storage_root, pinned_identity,
+        storage_root_proven, DAEMON_USE,
+    };
+    use crate::bash_background::persistence::{PinnedDir, RepairBudget, RepairLimitExceeded};
+
+    /// The stores AFT kept directly under a storage or cache root before 0.64.
+    /// `semantic/` is handled apart (see `SEMANTIC_DIR`).
+    pub(super) const LEGACY_STORE_DIRS: [&str; 8] = [
+        "views",
+        "blobs",
+        "callgraph",
+        "index",
+        "symbols",
+        "artifact-owners",
+        "migration",
+        "semantic-batch-leases-v1",
+    ];
+    /// Each harness folder (`opencode/`, `pi/`, ...) once held its own call
+    /// graph store under this name. Nothing else in a harness folder is touched.
+    pub(super) const LEGACY_HARNESS_STORE_DIR: &str = "callgraph";
+    /// `semantic/` mixes old per-project indexes with this live folder: the
+    /// embedding and reranker models AFT downloads (`FASTEMBED_CACHE_DIR`
+    /// and `semantic.local_cache_dir` point here). It is kept, so every other
+    /// child of `semantic/` is a candidate on its own instead of the folder.
+    pub(super) const SEMANTIC_DIR: &str = "semantic";
+    pub(super) const SEMANTIC_MODELS_DIR: &str = "models";
+    /// Name prefix of the folder a run moves stores into before deleting them.
+    pub(super) const ASIDE_PREFIX: &str = ".prune-legacy-";
+    /// Held exclusively for a whole `--yes` run so two runs never delete the
+    /// same moved folder at once. Lives in `retention/` with the other
+    /// storage-root locks.
+    const RUN_LOCK: &str = "prune-legacy.lock";
+    /// Most entries one size walk reads before it reports a lower bound.
+    const SIZE_ENTRY_LIMIT: usize = 500_000;
+    /// Longest one size walk runs before it reports a lower bound.
+    const SIZE_TIME_LIMIT: Duration = Duration::from_secs(20);
+    /// Deepest folder nesting the deletion walk accepts (see `RepairBudget`).
+    const MAX_DEPTH: usize = 64;
+    /// Most bounded deletion passes over one folder. Each pass removes up to
+    /// one `RepairBudget` worth of entries, and a pass that removes nothing
+    /// ends the deletion, so this only caps a pathological tree.
+    const MAX_DELETE_PASSES: usize = 10_000;
+
+    #[cfg(test)]
+    thread_local! {
+        /// Folder names whose rename aside fails, as it does on Windows while
+        /// a file inside the folder is open.
+        pub(super) static RENAME_REFUSED: std::cell::RefCell<Vec<OsString>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// Stop a `--yes` run right after the moves, as a crash would.
+        pub(super) static STOP_AFTER_MOVE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// One folder a run found.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LegacyStore {
+        /// Where the folder was found, before any move.
+        pub path: PathBuf,
+        /// Bytes counted by the bounded size walk.
+        pub bytes: u64,
+        /// False when the size walk stopped at its bound, so `bytes` is only
+        /// a lower bound.
+        pub complete: bool,
+        /// A `.prune-legacy-*` folder that an earlier, interrupted run left.
+        pub leftover: bool,
+    }
+
+    /// A folder the run left in place, with the reason in plain words.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LegacyStoreSkip {
+        pub path: PathBuf,
+        pub reason: String,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct PruneLegacyReport {
+        /// Every root the run examined, the storage root first. Empty when
+        /// the storage root does not exist.
+        pub roots: Vec<PathBuf>,
+        /// Folders a dry run would delete, or a `--yes` run tried to delete.
+        pub stores: Vec<LegacyStore>,
+        /// Folders a `--yes` run deleted.
+        pub removed: Vec<LegacyStore>,
+        /// Folders (or a whole cache root) the run left in place.
+        pub skipped: Vec<LegacyStoreSkip>,
+        /// Things the run could not check, such as an unreadable config.
+        pub notes: Vec<String>,
+    }
+
+    /// Reported while a `--yes` run works, so a long deletion shows progress.
+    #[derive(Debug)]
+    pub enum PruneLegacyEvent<'a> {
+        Deleting(&'a LegacyStore),
+        Removed(&'a LegacyStore),
+        Skipped(&'a LegacyStoreSkip),
+    }
+
+    #[derive(Debug)]
+    pub enum PruneLegacyError {
+        /// The run stopped before changing anything; the text says why.
+        Refused(String),
+        /// An unexpected I/O failure.
+        Failed(io::Error),
+    }
+
+    impl From<io::Error> for PruneLegacyError {
+        fn from(error: io::Error) -> Self {
+            Self::Failed(error)
+        }
+    }
+
+    /// One root to clean: the storage root or the external cache root.
+    struct Root {
+        dir: PinnedDir,
+        /// Identities of the directories kept at the top of this root. A
+        /// deletion walk that meets one of them (through a bind mount or an
+        /// aliased directory) stops instead of deleting it.
+        protected: Vec<(u64, u64)>,
+        candidates: Vec<Candidate>,
+    }
+
+    /// A folder that passed every check and may be moved and deleted.
+    struct Candidate {
+        store: LegacyStore,
+        /// The folder that holds it: the root, or a harness folder.
+        parent: PinnedDir,
+        name: OsString,
+        identity: (u64, u64),
+    }
+
+    /// Lists (and with `yes`, deletes) the legacy stores under `storage` and
+    /// under the external cache root `storage.cache_dir` from `tiers`.
+    pub fn prune_legacy_stores(
+        tiers: &[crate::config_resolve::ConfigTier],
+        storage: &Path,
+        yes: bool,
+        on_event: &mut dyn FnMut(PruneLegacyEvent<'_>),
+    ) -> Result<PruneLegacyReport, PruneLegacyError> {
+        let mut report = PruneLegacyReport::default();
+        match fs::symlink_metadata(storage) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let storage_dir = pin_storage_root(storage).map_err(|error| {
+            PruneLegacyError::Refused(format!(
+                "Cannot open the AFT storage folder {}: {error}",
+                storage.display()
+            ))
+        })?;
+        if !storage_root_proven(&storage_dir)? {
+            return Err(PruneLegacyError::Refused(format!(
+                "{} does not look like an AFT storage folder: it has no aft.db and no AFT owner marker.",
+                storage.display()
+            )));
+        }
+        // A dry run only reads, so it takes no lock and writes nothing.
+        let _locks = if yes {
+            Some(lock_run(&storage_dir, storage)?)
+        } else {
+            None
+        };
+        let mut roots = vec![storage_dir.repair_clone()?];
+        if let Some(cache) = external_cache_root(tiers, storage, &storage_dir, &mut report)? {
+            roots.push(cache);
+        }
+        let mut planned = Vec::new();
+        for dir in roots {
+            report.roots.push(dir.path().to_path_buf());
+            planned.push(plan_root(dir, &mut report)?);
+        }
+        if !yes {
+            return Ok(report);
+        }
+        for root in planned {
+            delete_root(root, &mut report, on_event)?;
+        }
+        Ok(report)
+    }
+
+    /// Takes the run lock and a shared hold on the storage root's daemon lock.
+    /// Daemons share that lock too, so AFT keeps running; an old-cache cleanup
+    /// takes it exclusively and so never deletes the same folders at once.
+    fn lock_run(
+        storage_dir: &PinnedDir,
+        storage: &Path,
+    ) -> Result<Vec<fs::File>, PruneLegacyError> {
+        let retention = storage_dir.repair_descendant(Path::new("retention"), true)?;
+        let busy = || {
+            PruneLegacyError::Refused(format!(
+                "Another cleanup is running on {}. Try again when it has finished.",
+                storage.display()
+            ))
+        };
+        let run = retention.repair_coordination_file(OsStr::new(RUN_LOCK))?;
+        match run.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(busy()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let daemon = retention.repair_coordination_file(OsStr::new(DAEMON_USE))?;
+        match daemon.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(busy()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        Ok(vec![run, daemon])
+    }
+
+    /// The `aft/` folder under a configured `storage.cache_dir`, once it is
+    /// proven to belong to `storage`. Anything that prevents checking it is
+    /// reported, never treated as "nothing there".
+    fn external_cache_root(
+        tiers: &[crate::config_resolve::ConfigTier],
+        storage: &Path,
+        storage_dir: &PinnedDir,
+        report: &mut PruneLegacyReport,
+    ) -> io::Result<Option<PinnedDir>> {
+        let resolved = crate::config_resolve::resolve_config(tiers);
+        if !resolved.errors.is_empty() {
+            report.notes.push(
+                "Your AFT config has errors, so a cache folder set by storage.cache_dir was not checked."
+                    .to_string(),
+            );
+            return Ok(None);
+        }
+        if let Some(reason) = &resolved.config.cache_config_unknown {
+            report.notes.push(format!(
+                "AFT could not tell whether storage.cache_dir is set, so no cache folder was checked: {reason}"
+            ));
+            return Ok(None);
+        }
+        let Some(cache_dir) = resolved.config.cache_dir else {
+            return Ok(None);
+        };
+        let root = cache_dir.join("aft");
+        match fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let skip = |report: &mut PruneLegacyReport, reason: String| {
+            report.skipped.push(LegacyStoreSkip {
+                path: root.clone(),
+                reason,
+            });
+            Ok(None)
+        };
+        if !root.is_absolute() {
+            return skip(
+                report,
+                "storage.cache_dir is not an absolute path, so this folder was not checked."
+                    .to_string(),
+            );
+        }
+        let dir = match pin_storage_root(&root) {
+            Ok(dir) => dir,
+            Err(error) => return skip(report, format!("It could not be opened: {error}")),
+        };
+        if pinned_identity(&dir)? == pinned_identity(storage_dir)? {
+            // The same folder as the storage root, which is already checked.
+            return Ok(None);
+        }
+        if paths_overlap(&root, storage) {
+            return skip(
+                report,
+                "It is inside the storage folder or contains it, so it was not checked separately."
+                    .to_string(),
+            );
+        }
+        if let Err(error) = marker_matches_pinned(&dir, storage_dir) {
+            return skip(
+                report,
+                format!("It is not proven to belong to this AFT storage folder: {error}"),
+            );
+        }
+        Ok(Some(dir))
+    }
+
+    /// Finds and checks every candidate under one root. Adds each admitted
+    /// folder to `report.stores` and each refused one to `report.skipped`.
+    fn plan_root(dir: PinnedDir, report: &mut PruneLegacyReport) -> io::Result<Root> {
+        let mut protected = vec![dir.directory_identity()?];
+        // (parent, name, leftover) for every folder that may be a candidate.
+        let mut found: Vec<(PinnedDir, OsString, bool)> = Vec::new();
+        let mut names = dir.repair_names(&mut RepairBudget::new())?;
+        names.sort();
+        for name in names {
+            let text = name.to_str();
+            if text == Some(SEMANTIC_DIR) {
+                match dir.repair_child(&name) {
+                    Ok(semantic) => {
+                        protected.push(semantic.directory_identity()?);
+                        let mut inner_names = semantic.repair_names(&mut RepairBudget::new())?;
+                        inner_names.sort();
+                        for inner in inner_names {
+                            if inner == OsStr::new(SEMANTIC_MODELS_DIR) {
+                                if let Ok(models) = semantic.repair_child(&inner) {
+                                    protected.push(models.directory_identity()?);
+                                }
+                                continue;
+                            }
+                            // Old indexes are per-project folders. A plain
+                            // file here is no store, so it stays unmentioned;
+                            // a link is still listed and refused.
+                            let plain_file = fs::symlink_metadata(semantic.path().join(&inner))
+                                .is_ok_and(|metadata| metadata.is_file());
+                            if !plain_file {
+                                found.push((semantic.repair_clone()?, inner, false));
+                            }
+                        }
+                    }
+                    // Not a real folder: the check below names the reason.
+                    Err(_) => found.push((dir.repair_clone()?, name, false)),
+                }
+                continue;
+            }
+            if text.is_some_and(|text| LEGACY_STORE_DIRS.contains(&text)) {
+                found.push((dir.repair_clone()?, name, false));
+                continue;
+            }
+            if text.is_some_and(|text| text.starts_with(ASIDE_PREFIX)) {
+                found.push((dir.repair_clone()?, name, true));
+                continue;
+            }
+            // Everything else at the top of the root is kept. Remember the
+            // identity of each kept folder so no deletion walk can reach it.
+            let Ok(child) = dir.repair_child(&name) else {
+                continue;
+            };
+            protected.push(child.directory_identity()?);
+            if !text.is_some_and(known_harness) {
+                continue;
+            }
+            for inner in child.repair_names(&mut RepairBudget::new())? {
+                if inner == OsStr::new(LEGACY_HARNESS_STORE_DIR) {
+                    found.push((child.repair_clone()?, inner, false));
+                } else if let Ok(kept) = child.repair_child(&inner) {
+                    protected.push(kept.directory_identity()?);
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for (parent, name, leftover) in found {
+            let path = parent.path().join(&name);
+            match check_candidate(&dir, &parent, &name, &protected) {
+                Ok(None) => {}
+                Ok(Some((identity, bytes, complete))) => {
+                    let store = LegacyStore {
+                        path,
+                        bytes,
+                        complete,
+                        leftover,
+                    };
+                    report.stores.push(store.clone());
+                    candidates.push(Candidate {
+                        store,
+                        parent,
+                        name,
+                        identity,
+                    });
+                }
+                Err(reason) => report.skipped.push(LegacyStoreSkip { path, reason }),
+            }
+        }
+        Ok(Root {
+            dir,
+            protected,
+            candidates,
+        })
+    }
+
+    /// Opens `name` in `parent` without following a link and sizes it. `None`
+    /// when it is gone; `Err` holds the reason it must be left in place.
+    fn check_candidate(
+        root: &PinnedDir,
+        parent: &PinnedDir,
+        name: &OsStr,
+        protected: &[(u64, u64)],
+    ) -> Result<Option<((u64, u64), u64, bool)>, String> {
+        let folder = match parent.repair_child(name) {
+            Ok(folder) => folder,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if leaf_error(&error) => {
+                // Looking up the path's own metadata (without following a
+                // link) only names the entry's kind for the message; the
+                // entry itself is never opened through the link.
+                let link = fs::symlink_metadata(parent.path().join(name))
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
+                return Err(if link {
+                    "It is a symbolic link. This command never follows links.".to_string()
+                } else {
+                    "It is not a folder.".to_string()
+                });
+            }
+            Err(error) => return Err(format!("It could not be opened: {error}")),
+        };
+        if folder.repair_check_boundary(root, protected).is_err() {
+            return Err(
+                "It is on another disk or is a mount point, so it was left alone.".to_string(),
+            );
+        }
+        let identity = folder
+            .directory_identity()
+            .map_err(|error| format!("It could not be checked: {error}"))?;
+        let mut walk = SizeWalk {
+            bytes: 0,
+            entries: 0,
+            deadline: Instant::now() + SIZE_TIME_LIMIT,
+            budget: RepairBudget::new(),
+        };
+        match walk.measure(&folder, root, protected, 0) {
+            Ok(()) => Ok(Some((identity, walk.bytes, true))),
+            Err(SizeStop::Bound) => Ok(Some((identity, walk.bytes, false))),
+            Err(SizeStop::Refuse(reason)) => Err(reason),
+        }
+    }
+
+    /// Whether opening an entry as a folder failed because it is not one: a
+    /// file, or a symlink that a no-follow open refuses.
+    fn leaf_error(error: &io::Error) -> bool {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return true;
+        }
+        error.kind() == io::ErrorKind::NotADirectory
+    }
+
+    fn budget_stop(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RepairLimitExceeded>())
+    }
+
+    enum SizeStop {
+        /// The walk reached its entry or time bound; the count is a lower bound.
+        Bound,
+        /// The folder holds something this command must not delete.
+        Refuse(String),
+    }
+
+    /// A bounded size walk that also refuses what deletion must not touch.
+    /// It checks its bound before every entry, not after a whole folder.
+    struct SizeWalk {
+        bytes: u64,
+        entries: usize,
+        deadline: Instant,
+        budget: RepairBudget,
+    }
+
+    impl SizeWalk {
+        fn measure(
+            &mut self,
+            folder: &PinnedDir,
+            root: &PinnedDir,
+            protected: &[(u64, u64)],
+            depth: usize,
+        ) -> Result<(), SizeStop> {
+            if depth > MAX_DEPTH {
+                return Err(SizeStop::Refuse(format!(
+                    "It is nested more than {MAX_DEPTH} folders deep."
+                )));
+            }
+            if folder.repair_check_boundary(root, protected).is_err() {
+                return Err(SizeStop::Refuse(format!(
+                    "It contains {}, which is a mount point or on another disk.",
+                    folder.path().display()
+                )));
+            }
+            let names = match folder.repair_names(&mut self.budget) {
+                Ok(names) => names,
+                Err(error) if budget_stop(&error) => return Err(SizeStop::Bound),
+                Err(error) => {
+                    return Err(SizeStop::Refuse(format!(
+                        "{} could not be listed: {error}",
+                        folder.path().display()
+                    )))
+                }
+            };
+            for name in names {
+                self.entries += 1;
+                if self.entries > SIZE_ENTRY_LIMIT || Instant::now() >= self.deadline {
+                    return Err(SizeStop::Bound);
+                }
+                match folder.repair_child(&name) {
+                    Ok(child) => self.measure(&child, root, protected, depth + 1)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) if leaf_error(&error) => match folder.repair_read_file(&name) {
+                        Ok(file) => {
+                            let length = file.metadata().map(|metadata| metadata.len());
+                            self.bytes = self.bytes.saturating_add(length.unwrap_or(0));
+                        }
+                        // A symlink is deleted as a link; its target is never
+                        // opened or counted.
+                        Err(error) if leaf_error(&error) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(SizeStop::Refuse(format!(
+                                "It contains {}, which has more than one hard link or is not a regular file ({error}).",
+                                folder.path().join(&name).display()
+                            )))
+                        }
+                    },
+                    Err(error) => {
+                        return Err(SizeStop::Refuse(format!(
+                            "{} could not be opened: {error}",
+                            folder.path().join(&name).display()
+                        )))
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Moves every admitted folder of one root aside, then deletes what moved
+    /// and every leftover from earlier runs.
+    fn delete_root(
+        root: Root,
+        report: &mut PruneLegacyReport,
+        on_event: &mut dyn FnMut(PruneLegacyEvent<'_>),
+    ) -> io::Result<()> {
+        let Root {
+            dir,
+            protected,
+            candidates,
+        } = root;
+        let (leftovers, stores): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| candidate.store.leftover);
+        // Each moved folder is deleted from inside the aside folder:
+        // (store, its name there, its identity).
+        let mut moved: Vec<(LegacyStore, OsString, (u64, u64))> = Vec::new();
+        let mut aside: Option<(PinnedDir, OsString)> = None;
+        for (index, candidate) in stores.into_iter().enumerate() {
+            if aside.is_none() {
+                aside = Some(create_aside(&dir)?);
+            }
+            let (aside_dir, _) = aside.as_ref().expect("aside folder was just created");
+            // A harness store keeps its harness in its moved name so two
+            // `callgraph` folders never collide.
+            let target = OsString::from(format!(
+                "{index}-{}",
+                candidate
+                    .store
+                    .path
+                    .strip_prefix(dir.path())
+                    .unwrap_or(&candidate.store.path)
+                    .to_string_lossy()
+                    .replace(['/', '\\'], "-")
+            ));
+            match move_aside(&candidate, aside_dir, &target) {
+                Ok(()) => moved.push((candidate.store, target, candidate.identity)),
+                Err(error) => {
+                    let skip = LegacyStoreSkip {
+                        path: candidate.store.path,
+                        reason: format!(
+                            "It could not be moved aside, so nothing in it was deleted: {error}"
+                        ),
+                    };
+                    on_event(PruneLegacyEvent::Skipped(&skip));
+                    report.skipped.push(skip);
+                }
+            }
+        }
+        #[cfg(test)]
+        if STOP_AFTER_MOVE.with(|stop| stop.get()) {
+            return Ok(());
+        }
+        if let Some((aside_dir, aside_name)) = &aside {
+            for (store, name, identity) in moved {
+                on_event(PruneLegacyEvent::Deleting(&store));
+                match delete_in_passes(aside_dir, &name, identity, &protected) {
+                    Ok(()) => {
+                        on_event(PruneLegacyEvent::Removed(&store));
+                        report.removed.push(store);
+                    }
+                    Err(error) => {
+                        let skip = LegacyStoreSkip {
+                            reason: format!(
+                                "It was moved to {} but not fully deleted: {error}. The next run tries again.",
+                                aside_dir.path().join(&name).display()
+                            ),
+                            path: store.path,
+                        };
+                        on_event(PruneLegacyEvent::Skipped(&skip));
+                        report.skipped.push(skip);
+                    }
+                }
+            }
+            // The aside folder is empty unless something above was kept.
+            let aside_identity = aside_dir.directory_identity()?;
+            if aside_dir.repair_names(&mut RepairBudget::new())?.is_empty() {
+                delete_in_passes(&dir, aside_name, aside_identity, &protected)?;
+            }
+        }
+        for leftover in leftovers {
+            on_event(PruneLegacyEvent::Deleting(&leftover.store));
+            match delete_in_passes(
+                &leftover.parent,
+                &leftover.name,
+                leftover.identity,
+                &protected,
+            ) {
+                Ok(()) => {
+                    on_event(PruneLegacyEvent::Removed(&leftover.store));
+                    report.removed.push(leftover.store);
+                }
+                Err(error) => {
+                    let skip = LegacyStoreSkip {
+                        path: leftover.store.path,
+                        reason: format!(
+                            "It was not fully deleted: {error}. The next run tries again."
+                        ),
+                    };
+                    on_event(PruneLegacyEvent::Skipped(&skip));
+                    report.skipped.push(skip);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates `<root>/.prune-legacy-<unix-millis>-<pid>[-n]/`.
+    fn create_aside(root: &PinnedDir) -> io::Result<(PinnedDir, OsString)> {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let base = format!("{ASIDE_PREFIX}{millis}-{}", std::process::id());
+        for attempt in 0..16 {
+            let name = OsString::from(if attempt == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{attempt}")
+            });
+            match root.repair_create_dir(&name) {
+                Ok(created) => return Ok((created, name)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("every {base}-* name is taken"),
+        ))
+    }
+
+    /// Renames one folder into the aside folder with a single rename that
+    /// never replaces anything, after checking it is still the folder sized
+    /// earlier.
+    fn move_aside(candidate: &Candidate, aside: &PinnedDir, target: &OsStr) -> io::Result<()> {
+        #[cfg(test)]
+        if RENAME_REFUSED.with(|names| names.borrow().iter().any(|name| *name == candidate.name)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a file inside it is open (simulated)",
+            ));
+        }
+        let entry = candidate.parent.repair_entry_for_rename(&candidate.name)?;
+        if entry.identity()? != candidate.identity {
+            return Err(io::Error::other("it changed while it was being checked"));
+        }
+        candidate
+            .parent
+            .repair_rename_entry_to(&candidate.name, &entry, aside, target)
+    }
+
+    /// Deletes folder `name` inside `parent` in bounded passes. Each pass reads
+    /// at most one `RepairBudget` of entries, never follows a link and stops
+    /// at a mount or a protected folder. Passes repeat while they make
+    /// progress, so a large store is deleted in one run.
+    fn delete_in_passes(
+        parent: &PinnedDir,
+        name: &OsStr,
+        identity: (u64, u64),
+        protected: &[(u64, u64)],
+    ) -> io::Result<()> {
+        let mut warnings = Vec::new();
+        for _ in 0..MAX_DELETE_PASSES {
+            let mut removed = 0;
+            match parent.repair_remove_child_with_budget(
+                name,
+                identity,
+                protected,
+                &mut removed,
+                &mut warnings,
+                &mut RepairBudget::new(),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) if removed > 0 && budget_stop(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::other(RepairLimitExceeded))
+    }
+}
+
+#[cfg(test)]
+mod prune_legacy_tests {
+    use super::prune_legacy::{ASIDE_PREFIX, RENAME_REFUSED, STOP_AFTER_MOVE};
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    /// Every legacy entry the fixture plants, relative to the storage root.
+    const LEGACY: [&str; 12] = [
+        "views/view-1/derived.sqlite",
+        "blobs/ab/cdef",
+        "callgraph/key-1/build-breaker.sqlite",
+        "index/key-1/cache.bin",
+        "semantic/key-1/semantic.bin",
+        "semantic/key-2/semantic.bin",
+        "symbols/key-1/symbols.sqlite",
+        "artifact-owners/owner.json",
+        "migration/state.json",
+        "semantic-batch-leases-v1/lease.json",
+        "opencode/callgraph/key-1/graph.sqlite",
+        "pi/callgraph/key-2/graph.sqlite",
+    ];
+    /// The folders a run must find for `LEGACY`, written out by hand so the
+    /// expectation does not reuse the code's own list.
+    const LEGACY_FOLDERS: [&str; 12] = [
+        "artifact-owners",
+        "blobs",
+        "callgraph",
+        "index",
+        "migration",
+        "opencode/callgraph",
+        "pi/callgraph",
+        "semantic-batch-leases-v1",
+        "semantic/key-1",
+        "semantic/key-2",
+        "symbols",
+        "views",
+    ];
+    /// What a run must leave byte-identical.
+    const PROTECTED: [&str; 15] = [
+        "aft.db",
+        "aft.db-wal",
+        "cache-keys.json",
+        "data/store/main.sqlite",
+        "inspect/key-1/inspect.sqlite",
+        "retention/daemon-use.lock",
+        "root-identities/key-1.json",
+        "backups/session/stack",
+        "opencode/inspect/key-1/inspect.sqlite",
+        "opencode/sessions/one.json",
+        "pi/settings.json",
+        "semantic/models/models--Qdrant--all-MiniLM-L6-v2-onnx/model.onnx",
+        "semantic/notes.txt",
+        "unknown-folder/views/keep",
+        "views.txt",
+    ];
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        base: PathBuf,
+        storage: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        // Canonical, so test hooks keyed by path match the pinned spelling
+        // (macOS reaches temp folders through /var -> /private/var).
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let storage = base.join("storage");
+        for relative in LEGACY.iter().chain(&PROTECTED) {
+            let path = storage.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("contents of {relative}")).unwrap();
+        }
+        Fixture {
+            _temp: temp,
+            base,
+            storage,
+        }
+    }
+
+    /// Every file and folder under `root` with its bytes (folders map to
+    /// nothing), read without following links.
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let kind = fs::symlink_metadata(&path).unwrap().file_type();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if kind.is_dir() {
+                    pending.push(path);
+                    found.insert(relative, None);
+                } else if kind.is_symlink() {
+                    found.insert(relative, Some(b"<link>".to_vec()));
+                } else {
+                    found.insert(relative, Some(fs::read(&path).unwrap()));
+                }
+            }
+        }
+        found
+    }
+
+    fn protected_bytes(storage: &Path) -> Vec<(String, Vec<u8>)> {
+        PROTECTED
+            .iter()
+            .map(|relative| {
+                (
+                    relative.to_string(),
+                    fs::read(storage.join(relative)).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn legacy_folders(storage: &Path) -> Vec<PathBuf> {
+        let mut paths = LEGACY_FOLDERS
+            .iter()
+            .map(|relative| storage.join(relative))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn run(storage: &Path, yes: bool) -> PruneLegacyReport {
+        run_with_tiers(&[], storage, yes)
+    }
+
+    fn run_with_tiers(
+        tiers: &[crate::config_resolve::ConfigTier],
+        storage: &Path,
+        yes: bool,
+    ) -> PruneLegacyReport {
+        match prune_legacy_stores(tiers, storage, yes, &mut |_| {}) {
+            Ok(report) => report,
+            Err(PruneLegacyError::Refused(reason)) => panic!("refused: {reason}"),
+            Err(PruneLegacyError::Failed(error)) => panic!("failed: {error}"),
+        }
+    }
+
+    fn found_paths(stores: &[LegacyStore]) -> Vec<PathBuf> {
+        let mut paths = stores
+            .iter()
+            .map(|store| store.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn asides(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(ASIDE_PREFIX))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prune_legacy_dry_run_lists_exactly_the_legacy_stores_and_changes_nothing() {
+        let fixture = fixture();
+        let before = tree(&fixture.base);
+        let report = run(&fixture.storage, false);
+        assert_eq!(tree(&fixture.base), before, "a dry run changed the disk");
+        assert_eq!(
+            found_paths(&report.stores),
+            legacy_folders(&fixture.storage)
+        );
+        assert!(report
+            .stores
+            .iter()
+            .all(|store| store.complete && !store.leftover));
+        let views = report
+            .stores
+            .iter()
+            .find(|store| store.path.ends_with("views"))
+            .unwrap();
+        assert_eq!(
+            views.bytes,
+            "contents of views/view-1/derived.sqlite".len() as u64
+        );
+        assert!(report.removed.is_empty());
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        assert_eq!(report.roots, vec![fixture.storage.clone()]);
+    }
+
+    #[test]
+    fn prune_legacy_yes_removes_the_stores_and_keeps_everything_else_byte_identical() {
+        let fixture = fixture();
+        let kept = protected_bytes(&fixture.storage);
+        let mut events = Vec::new();
+        let report = prune_legacy_stores(&[], &fixture.storage, true, &mut |event| {
+            events.push(format!("{event:?}"));
+        })
+        .unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(
+            found_paths(&report.removed),
+            legacy_folders(&fixture.storage)
+        );
+        for path in legacy_folders(&fixture.storage) {
+            assert!(
+                fs::symlink_metadata(&path).is_err(),
+                "{} survived",
+                path.display()
+            );
+        }
+        assert_eq!(protected_bytes(&fixture.storage), kept);
+        assert!(
+            asides(&fixture.storage).is_empty(),
+            "the aside folder stayed"
+        );
+        // The run lock is the only new file.
+        assert!(fixture
+            .storage
+            .join("retention/prune-legacy.lock")
+            .is_file());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("Removed"))
+                .count(),
+            legacy_folders(&fixture.storage).len()
+        );
+        // Harness folders keep everything except their call graph store.
+        assert!(fixture.storage.join("opencode/inspect").is_dir());
+        assert!(fixture.storage.join("unknown-folder/views/keep").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_legacy_refuses_a_symlinked_store_and_never_follows_it() {
+        let fixture = fixture();
+        let outside = fixture.base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("precious"), "keep me").unwrap();
+        fs::remove_dir_all(fixture.storage.join("views")).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.storage.join("views")).unwrap();
+        fs::remove_dir_all(fixture.storage.join("opencode/callgraph")).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.storage.join("opencode/callgraph")).unwrap();
+        for yes in [false, true] {
+            let report = run(&fixture.storage, yes);
+            let skipped = report
+                .skipped
+                .iter()
+                .map(|skip| (skip.path.clone(), skip.reason.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(skipped.len(), 2, "{skipped:?}");
+            for (path, reason) in &skipped {
+                assert!(
+                    path.ends_with("views") || path.ends_with("opencode/callgraph"),
+                    "{skipped:?}"
+                );
+                assert!(reason.contains("symbolic link"), "{reason}");
+            }
+            assert!(!found_paths(&report.stores).contains(&fixture.storage.join("views")));
+        }
+        assert_eq!(
+            fs::read_to_string(outside.join("precious")).unwrap(),
+            "keep me"
+        );
+        assert!(fs::symlink_metadata(fixture.storage.join("views"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn prune_legacy_refuses_a_store_on_another_device() {
+        use crate::bash_background::persistence::REPAIR_IDENTITIES;
+        let fixture = fixture();
+        let blobs = fixture.storage.join("blobs");
+        let (device, inode) = PinnedDir::open(&blobs)
+            .unwrap()
+            .directory_identity()
+            .unwrap();
+        REPAIR_IDENTITIES.with(|ids| {
+            ids.borrow_mut()
+                .insert(blobs.clone(), (device.wrapping_add(1), inode));
+        });
+        let dry = run(&fixture.storage, false);
+        let report = run(&fixture.storage, true);
+        REPAIR_IDENTITIES.with(|ids| ids.borrow_mut().clear());
+        for report in [&dry, &report] {
+            assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+            assert_eq!(report.skipped[0].path, blobs);
+            assert!(
+                report.skipped[0].reason.contains("another disk"),
+                "{:?}",
+                report.skipped
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(blobs.join("ab/cdef")).unwrap(),
+            "contents of blobs/ab/cdef"
+        );
+        assert!(!fixture.storage.join("views").exists());
+    }
+
+    #[test]
+    fn prune_legacy_skips_and_reports_a_store_that_cannot_be_moved_aside() {
+        let fixture = fixture();
+        let kept = fs::read(fixture.storage.join("index/key-1/cache.bin")).unwrap();
+        RENAME_REFUSED.with(|names| names.borrow_mut().push(OsString::from("index")));
+        let mut skipped_events = 0;
+        let report = prune_legacy_stores(&[], &fixture.storage, true, &mut |event| {
+            if matches!(event, PruneLegacyEvent::Skipped(_)) {
+                skipped_events += 1;
+            }
+        });
+        RENAME_REFUSED.with(|names| names.borrow_mut().clear());
+        let report = report.unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(skipped_events, 1);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert_eq!(report.skipped[0].path, fixture.storage.join("index"));
+        assert!(
+            report.skipped[0]
+                .reason
+                .contains("could not be moved aside"),
+            "{}",
+            report.skipped[0].reason
+        );
+        assert_eq!(
+            fs::read(fixture.storage.join("index/key-1/cache.bin")).unwrap(),
+            kept
+        );
+        assert_eq!(
+            report.removed.len(),
+            legacy_folders(&fixture.storage).len() - 1
+        );
+        assert!(!fixture.storage.join("views").exists());
+        assert!(asides(&fixture.storage).is_empty());
+    }
+
+    #[test]
+    fn prune_legacy_rerun_removes_what_an_interrupted_run_moved_aside() {
+        let fixture = fixture();
+        let kept = protected_bytes(&fixture.storage);
+        STOP_AFTER_MOVE.with(|stop| stop.set(true));
+        let interrupted = prune_legacy_stores(&[], &fixture.storage, true, &mut |_| {});
+        STOP_AFTER_MOVE.with(|stop| stop.set(false));
+        interrupted.unwrap_or_else(|error| panic!("{error:?}"));
+        let left = asides(&fixture.storage);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].join("0-artifact-owners/owner.json").is_file());
+        for path in legacy_folders(&fixture.storage) {
+            assert!(fs::symlink_metadata(&path).is_err(), "{}", path.display());
+        }
+
+        let dry = run(&fixture.storage, false);
+        assert_eq!(found_paths(&dry.stores), left);
+        assert!(dry.stores[0].leftover);
+        assert!(dry.stores[0].bytes > 0);
+
+        let report = run(&fixture.storage, true);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(found_paths(&report.removed), left);
+        assert!(asides(&fixture.storage).is_empty());
+        assert_eq!(protected_bytes(&fixture.storage), kept);
+    }
+
+    #[test]
+    fn prune_legacy_refuses_a_folder_that_is_not_aft_storage() {
+        let fixture = fixture();
+        fs::remove_file(fixture.storage.join("aft.db")).unwrap();
+        let before = tree(&fixture.base);
+        for yes in [false, true] {
+            match prune_legacy_stores(&[], &fixture.storage, yes, &mut |_| {}) {
+                Err(PruneLegacyError::Refused(reason)) => {
+                    assert!(reason.contains("does not look like"), "{reason}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(tree(&fixture.base), before);
+    }
+
+    #[test]
+    fn prune_legacy_reports_a_missing_storage_folder_as_nothing_to_do() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = run(&temp.path().join("absent"), true);
+        assert!(report.roots.is_empty());
+        assert!(!temp.path().join("absent").exists());
+    }
+
+    #[test]
+    fn prune_legacy_refuses_while_another_run_holds_the_lock() {
+        let fixture = fixture();
+        let retention = fixture.storage.join("retention");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(retention.join("prune-legacy.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        match prune_legacy_stores(&[], &fixture.storage, true, &mut |_| {}) {
+            Err(PruneLegacyError::Refused(reason)) => {
+                assert!(reason.contains("Another cleanup"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(fixture
+            .storage
+            .join("views/view-1/derived.sqlite")
+            .is_file());
+    }
+
+    #[test]
+    fn prune_legacy_also_cleans_the_enrolled_external_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let storage = base.join("storage");
+        let parent = base.join("cache-volume");
+        fs::create_dir(&parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(parent.clone()),
+            ..Default::default()
+        };
+        let warning = prepare_cache_root_for_test(&mut config);
+        assert!(warning.is_none(), "{warning:?}");
+        drop(config);
+        fs::write(storage.join("aft.db"), "db").unwrap();
+        let cache = parent.join("aft");
+        for (relative, contents) in [
+            ("views/a", "old"),
+            ("index/key-1/cache.bin", "old"),
+            ("semantic/key-1/semantic.bin", "old"),
+            ("semantic/models/model.onnx", "model"),
+            ("data/keep", "new"),
+        ] {
+            let path = cache.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let tiers = [crate::config_resolve::ConfigTier {
+            tier: "user".into(),
+            source: "test".into(),
+            doc: serde_json::json!({"storage": {"cache_dir": parent}}).to_string(),
+        }];
+        let dry = run_with_tiers(&tiers, &storage, false);
+        assert_eq!(dry.roots, vec![storage.clone(), cache.clone()]);
+        // Only the cache root's part: preparing the cache root above may
+        // leave its own folders under the storage root.
+        let in_cache = |stores: &[LegacyStore]| {
+            found_paths(stores)
+                .into_iter()
+                .filter(|path| path.starts_with(&cache))
+                .collect::<Vec<_>>()
+        };
+        let expected = ["index", "semantic/key-1", "views"].map(|name| cache.join(name));
+        assert_eq!(in_cache(&dry.stores), expected);
+        let report = run_with_tiers(&tiers, &storage, true);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(in_cache(&report.removed), expected);
+        for path in expected {
+            assert!(!path.exists(), "{}", path.display());
+        }
+        assert_eq!(fs::read_to_string(cache.join("data/keep")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(cache.join("semantic/models/model.onnx")).unwrap(),
+            "model"
+        );
+        assert!(cache.join(OWNER).is_file());
+        assert!(asides(&cache).is_empty());
+    }
+
+    #[test]
+    fn prune_legacy_skips_an_external_cache_root_it_cannot_prove() {
+        let fixture = fixture();
+        let parent = fixture.base.join("cache-volume");
+        fs::create_dir_all(parent.join("aft/views")).unwrap();
+        fs::write(parent.join("aft/views/a"), "someone else's").unwrap();
+        let tiers = [crate::config_resolve::ConfigTier {
+            tier: "user".into(),
+            source: "test".into(),
+            doc: serde_json::json!({"storage": {"cache_dir": parent}}).to_string(),
+        }];
+        let report = run_with_tiers(&tiers, &fixture.storage, true);
+        assert_eq!(report.roots, vec![fixture.storage.clone()]);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert_eq!(report.skipped[0].path, parent.join("aft"));
+        assert!(
+            report.skipped[0].reason.contains("not proven"),
+            "{}",
+            report.skipped[0].reason
+        );
+        assert!(parent.join("aft/views/a").is_file());
+    }
 }

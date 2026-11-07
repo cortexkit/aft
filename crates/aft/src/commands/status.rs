@@ -311,21 +311,13 @@ impl AppContext {
             semantic_index_info
         };
 
-        // Disk cache sizes — scoped to the **current project** only.
-        //
-        // Both trigram (`<storage_dir>/index/<key>/`) and semantic
-        // (`<storage_dir>/semantic/<key>/`) caches are partitioned per project by
-        // `project_cache_key(project_root)`. Earlier this function reported the
-        // recursive size of the entire `index/` and `semantic/` directories,
-        // which summed disk usage across **every** project the user had ever
-        // opened. The TUI sidebar surfaced that total as if it were the current
-        // project's footprint, which was misleading (e.g. a 4.8 MB project with
-        // 9 sibling projects appeared to use 16+ GB).
-        //
-        // We now resolve the per-project key from `config.project_root` and
-        // size only that project's slice. When the project key can't be
-        // resolved (no project_root), fall back to zeros — the cross-project
-        // total is never the right answer to display per-session.
+        // Disk sizes. The trigram and semantic indexes used to live in
+        // `<cache_dir>/index/<key>/` and `<cache_dir>/semantic/<key>/`; from
+        // 0.64 every index lives in the index store, whose size the data layer
+        // adds as `data_store_bytes` (see `data_layer::surfaces::apply_to_status`).
+        // The old folders are never read and `aft cache prune-legacy` deletes
+        // them, so status no longer sizes them. The two byte fields stay, at 0,
+        // because plugins and the status push contract read them.
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
         let cache_dir = config.cache_storage_dir();
         let disk_info = match (&cache_dir, &config.project_root) {
@@ -334,29 +326,14 @@ impl AppContext {
                     .canonical_cache_root_opt()
                     .unwrap_or_else(|| root.clone());
                 // Passive read only: status must never trigger a key
-                // derivation (git probe). Artifact-backed features derive and
-                // memoize the key at configure; when none are enabled there is
-                // no per-project artifact slice to size.
-                match self.cached_artifact_cache_key(&key_root) {
-                    Some(key) => {
-                        let trigram_size = dir_size(&dir.join("index").join(&key));
-                        let semantic_size = dir_size(&dir.join("semantic").join(&key));
-                        serde_json::json!({
-                            "storage_dir": storage_dir,
-                            "cache_dir": dir.display().to_string(),
-                            "project_cache_key": key,
-                            "trigram_disk_bytes": trigram_size,
-                            "semantic_disk_bytes": semantic_size,
-                        })
-                    }
-                    None => serde_json::json!({
-                        "storage_dir": storage_dir,
-                        "cache_dir": dir.display().to_string(),
-                        "project_cache_key": null,
-                        "trigram_disk_bytes": 0,
-                        "semantic_disk_bytes": 0,
-                    }),
-                }
+                // derivation (git probe).
+                serde_json::json!({
+                    "storage_dir": storage_dir,
+                    "cache_dir": dir.display().to_string(),
+                    "project_cache_key": self.cached_artifact_cache_key(&key_root),
+                    "trigram_disk_bytes": 0,
+                    "semantic_disk_bytes": 0,
+                })
             }
             (Some(dir), None) => serde_json::json!({
                 "storage_dir": storage_dir,
@@ -708,35 +685,6 @@ impl AppContext {
     }
 }
 
-/// Recursively compute the total size of a directory.
-fn dir_size(path: &std::path::Path) -> u64 {
-    if !path.exists() {
-        return 0;
-    }
-    dir_size_recursive(path)
-}
-
-fn dir_size_recursive(path: &std::path::Path) -> u64 {
-    let mut total = 0u64;
-    let entries = match std::fs::read_dir(path) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-    for entry in entries.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-        } else if ft.is_dir() {
-            total += dir_size_recursive(&entry.path());
-        }
-        crate::run_tool_call::progress::report();
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1056,11 +1004,13 @@ mod tests {
     }
 
     /// A project with no source files still finishes its semantic build: the
-    /// index holds zero entries and a small persisted file. That is ready with
-    /// a real disk size, not an index still loading. A build that is genuinely
-    /// still running for the same project keeps reporting `loading`.
+    /// index holds zero entries. That is ready, not an index still loading. A
+    /// build that is genuinely still running for the same project keeps
+    /// reporting `loading`. The old `semantic/<key>/` file it persists is not
+    /// sized: from 0.64 status never reads the old index folders, which
+    /// `aft cache prune-legacy` deletes.
     #[test]
-    fn status_reports_an_empty_finished_semantic_index_as_ready_with_its_disk_size() {
+    fn status_reports_an_empty_finished_semantic_index_as_ready_without_sizing_old_folders() {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
         let root = std::fs::canonicalize(project.path()).expect("canonical project");
@@ -1085,11 +1035,12 @@ mod tests {
         let ready = ctx.build_status_snapshot();
         assert_eq!(ready["semantic_index"]["status"], "ready");
         assert_eq!(ready["semantic_index"]["entries"], 0);
-        assert!(
-            ready["disk"]["semantic_disk_bytes"].as_u64().unwrap_or(0) > 0,
-            "a persisted empty index has a real size: {}",
+        assert_eq!(
+            ready["disk"]["semantic_disk_bytes"], 0,
+            "status sized the old semantic/ folder: {}",
             ready["disk"]
         );
+        assert_eq!(ready["disk"]["project_cache_key"], key.as_str());
 
         *ctx.semantic_index_status().write().unwrap() =
             crate::context::SemanticIndexStatus::Building {

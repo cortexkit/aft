@@ -7,6 +7,7 @@ pub mod probe_login_shell_path;
 // CPU sampler (`sample`/`atos` on macOS, `perf`/`addr2line` on Linux) refuses
 // by name at runtime where it is unsupported.
 pub mod profile;
+pub mod prune_legacy;
 pub mod sandbox_launch;
 pub mod setup;
 pub mod warmup;

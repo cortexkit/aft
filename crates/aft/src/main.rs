@@ -362,6 +362,14 @@ fn main() {
         }
     }
 
+    // `aft cache prune-legacy` deletes the index folders AFT used before
+    // 0.64. Like `backups`, it runs before logging and the application start;
+    // it opens none of AFT's stores, so daemons can keep running meanwhile.
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::prune_legacy::run(args));
+    }
+
     // Keep the lease outside every context and module-loop lifetime. It is
     // acquired before any cache can be prepared and remains held until process
     // exit; process::exit releases its kernel handle even when Rust skips Drop.

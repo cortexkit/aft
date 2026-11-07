@@ -28,7 +28,7 @@ function printHelp(): void {
     "    backups purge    Remove undo backups by --path and/or --session (dry run unless --yes)",
   );
   console.log(
-    "    cache prune-legacy  Delete legacy index caches past their rollback window (dry run unless --yes)",
+    "    cache prune-legacy  Delete the index folders AFT used before 0.64 (dry run unless --yes)",
   );
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor --profile [seconds]  Profile a running AFT daemon");

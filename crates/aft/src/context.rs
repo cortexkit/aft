@@ -271,22 +271,6 @@ const STATUS_DEBOUNCE_MS: u64 = 1_000;
 /// `view_disk_limits_next_ms` while views are disabled: never due.
 const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 
-/// The call-graph build breaker database for one project under a resolved
-/// cache root, when it exists. Health callers pass a root they resolved once
-/// for the whole rollup tick rather than re-resolving it per context.
-pub(crate) fn build_breaker_path_for_health(
-    cache_dir: &Path,
-    project_key: Option<&str>,
-) -> Option<PathBuf> {
-    project_key.and_then(|key| {
-        let path = cache_dir
-            .join("callgraph")
-            .join(key)
-            .join("build-breaker.sqlite");
-        path.is_file().then_some(path)
-    })
-}
-
 thread_local! {
     /// Config snapshots pinned by the requests running on this thread, keyed
     /// by the address of the `AppContext` they belong to.
@@ -4402,10 +4386,6 @@ pub struct AppContext {
     callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
     callgraph_store_build_suspension:
         parking_lot::Mutex<Option<(u64, crate::build_breaker::BuildSuspension)>>,
-    /// Health probes run the durable query outside reply handling and copy its
-    /// results into this small snapshot. Reply handling uses only `try_read` on
-    /// this lock, avoiding SQLite and other blocking work.
-    health_build_suspensions: RwLock<Vec<SuspendedDomainHealthSnapshot>>,
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
@@ -5127,7 +5107,6 @@ impl AppContext {
             callgraph_store_rx_epoch: AtomicU64::new(0),
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
             callgraph_store_build_suspension: parking_lot::Mutex::new(None),
-            health_build_suspensions: RwLock::new(Vec::new()),
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -5475,10 +5454,10 @@ impl AppContext {
             Some(counts) => counts,
             None => return RootHealthSummary::busy(),
         };
-        let suspended_domains = match self.health_build_suspensions.try_read() {
-            Ok(snapshot) => snapshot.clone(),
-            Err(_) => return RootHealthSummary::busy(),
-        };
+        // Build suspensions were read from the call-graph build breaker under
+        // the old `callgraph/` store, which this release no longer builds;
+        // the index store reports its own failures in `data_store`.
+        let suspended_domains = Vec::new();
         // The index store's checkout planes stand in for the search index
         // and call-graph store below. Read here, ahead of the guards: it
         // takes the checkout's own locks.
@@ -8576,46 +8555,6 @@ impl AppContext {
     /// see [`Self::harness`] for the precondition and [`Self::harness_opt`] to check it.
     pub fn harness_dir(&self) -> PathBuf {
         self.storage_dir().join(self.harness().storage_segment())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn refresh_build_suspensions_for_health_at(
-        &self,
-        project_root: &Path,
-        project_key: Option<&str>,
-        now_ms: u64,
-    ) {
-        let suspensions = build_breaker_path_for_health(&self.cache_dir(), project_key)
-            .and_then(|path| crate::build_breaker::BuildDeathBreaker::open(path).ok())
-            .and_then(|breaker| {
-                breaker
-                    .active_suspensions_for_root_at(&project_root.display().to_string(), now_ms)
-                    .ok()
-            })
-            .unwrap_or_default();
-        self.publish_build_suspensions_for_health(suspensions, now_ms);
-    }
-
-    pub(crate) fn publish_build_suspensions_for_health(
-        &self,
-        suspensions: Vec<crate::build_breaker::BuildSuspension>,
-        now_ms: u64,
-    ) {
-        let suspended_domains = suspensions
-            .into_iter()
-            .map(|suspension| {
-                let age_s = suspension.age_seconds_at(now_ms);
-                SuspendedDomainHealthSnapshot {
-                    domain: suspension.domain.as_str().to_string(),
-                    reason: suspension.reason,
-                    death_count: suspension.death_count,
-                    age_s,
-                }
-            })
-            .collect();
-        if let Ok(mut snapshot) = self.health_build_suspensions.write() {
-            *snapshot = suspended_domains;
-        }
     }
 
     pub fn inspect_dir(&self) -> PathBuf {

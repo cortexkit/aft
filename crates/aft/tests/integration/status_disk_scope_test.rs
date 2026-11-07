@@ -1,13 +1,14 @@
-//! Tests for the per-project scoping of `disk.trigram_disk_bytes` and
-//! `disk.semantic_disk_bytes` in the `status` command response.
+//! Tests for `disk.trigram_disk_bytes` and `disk.semantic_disk_bytes` in the
+//! `status` command response.
 //!
-//! Regression: before this fix, status reported `dir_size("<storage>/index")`
-//! and `dir_size("<storage>/semantic")` recursively, which summed disk usage
-//! across **every** project the user had ever opened. The TUI sidebar then
-//! displayed that cross-project total as if it were the current project's
-//! footprint (e.g. a 4 MB project showed 16 GB because a sibling project's
-//! cache was huge). Status must scope to the current project's slice using
-//! `artifact_cache_key(project_root)`.
+//! These fields once sized the current project's slice of the old
+//! `<storage>/index/<key>/` and `<storage>/semantic/<key>/` folders (and,
+//! before that, the whole folders, which showed every project's total as the
+//! current one's). From 0.64 every index lives in the index store, reported as
+//! `data_store_bytes`; the old folders are never read and
+//! `aft cache prune-legacy` deletes them. Status keeps both fields at 0 so
+//! plugins that read them keep working, and must not size the old folders
+//! even when they still hold data.
 
 use std::fs;
 use std::path::PathBuf;
@@ -40,11 +41,10 @@ fn write_fake_cache_for_project(
 }
 
 #[test]
-fn status_disk_bytes_only_count_current_project() {
+fn status_disk_bytes_never_size_the_old_index_folders() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    // Set up two fake project caches under one shared storage_dir, where
-    // project A is what we'll configure aft against and project B is a
-    // sibling that should NOT contribute to A's disk numbers.
+    // Old index folders for the configured project A and a sibling B, under
+    // one shared storage_dir. None of their bytes may appear in status.
     let storage_root_dir = tempdir().expect("storage root");
     let storage_root = storage_root_dir.path().to_path_buf();
 
@@ -96,23 +96,16 @@ fn status_disk_bytes_only_count_current_project() {
     let status = aft.send(r#"{"id":"2","command":"status"}"#);
     assert_eq!(status["success"], true, "status failed: {status}");
 
-    let trigram = status["disk"]["trigram_disk_bytes"]
-        .as_u64()
-        .expect("trigram_disk_bytes is u64");
-    let semantic = status["disk"]["semantic_disk_bytes"]
-        .as_u64()
-        .expect("semantic_disk_bytes is u64");
-
-    // Project A's slice only.
+    // Project A's old slice holds 1 KB and 512 B; neither is counted.
     assert_eq!(
-        trigram, 1024,
-        "trigram_disk_bytes should reflect only project A's slice; \
-         got {trigram} (sibling B has 10 MB which would be visible without scoping)"
+        status["disk"]["trigram_disk_bytes"], 0,
+        "status sized the old index/ folder: {}",
+        status["disk"]
     );
     assert_eq!(
-        semantic, 512,
-        "semantic_disk_bytes should reflect only project A's slice; \
-         got {semantic} (sibling B has 5 MB which would be visible without scoping)"
+        status["disk"]["semantic_disk_bytes"], 0,
+        "status sized the old semantic/ folder: {}",
+        status["disk"]
     );
 
     // The status response must also expose the project_cache_key so the

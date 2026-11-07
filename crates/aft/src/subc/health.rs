@@ -2327,8 +2327,6 @@ pub(super) struct HealthRollupCache {
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
-    breakers:
-        std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
     allocator: std::sync::Mutex<Option<(u64, crate::memory::AllocatorObservation)>>,
     retention_count: std::sync::Mutex<Option<RetentionCountSample>>,
@@ -2400,7 +2398,6 @@ impl HealthRollupCache {
             #[cfg(test)]
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
-            breakers: std::sync::Mutex::new(HashMap::new()),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
             allocator: std::sync::Mutex::new(None),
             retention_count: std::sync::Mutex::new(None),
@@ -2547,64 +2544,6 @@ impl HealthRollupCache {
     #[cfg(test)]
     fn root_details_assembled_for_test(&self) -> usize {
         self.root_details_assembled.load(Ordering::Relaxed)
-    }
-
-    fn refresh_build_suspensions(
-        &self,
-        ctx: &AppContext,
-        project_root: &std::path::Path,
-        project_key: Option<&str>,
-        cache_dir: &std::path::Path,
-    ) -> Option<&'static str> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        // The caller resolved the cache root once for the whole tick; the
-        // breaker database lives under it for every context sharing the root.
-        let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
-        else {
-            ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-            return Some("breaker_location_unknown");
-        };
-        let breaker = {
-            let mut breakers = self
-                .breakers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(breaker) = breakers.get(&path) {
-                Arc::clone(breaker)
-            } else {
-                match crate::build_breaker::BuildDeathBreaker::open(&path) {
-                    Ok(breaker) => {
-                        let breaker = Arc::new(breaker);
-                        breakers.insert(path, Arc::clone(&breaker));
-                        breaker
-                    }
-                    Err(error) => {
-                        log::debug!("health breaker open failed; retrying next rollup: {error}");
-                        ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                        return Some("breaker_open_failed");
-                    }
-                }
-            }
-        };
-        match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
-            Ok(suspensions) => {
-                ctx.publish_build_suspensions_for_health(suspensions, now_ms);
-                None
-            }
-            Err(error) => {
-                log::debug!("health breaker read failed; reopening next rollup: {error}");
-                self.breakers
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
-                ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                Some("breaker_read_failed")
-            }
-        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -3544,16 +3483,6 @@ fn build_health_diagnostic_rollup_from_actors(
             .as_ref()
             .and_then(|entry| entry.artifact_key.as_deref())
             .or(project_key.as_deref());
-        // Durable breaker state is loaded during the off-path rollup, then the
-        // cached health reply reads only the context snapshot. Standing keys can
-        // be scoped or path-based, so they must not depend on the session-key memo.
-        let cache_dir = tick_paths.cache_dir(&config);
-        let breaker_error = cache.refresh_build_suspensions(
-            ctx.as_ref(),
-            root_id.as_path(),
-            artifact_key,
-            &cache_dir,
-        );
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -3599,7 +3528,10 @@ fn build_health_diagnostic_rollup_from_actors(
                     .map_or(backend.since_ms, |since| since.min(backend.since_ms)),
             );
         }
-        rollup_mark!(timer, "root disk probes / breaker / callgraph");
+        rollup_mark!(timer, "root disk probes / callgraph");
+        // The cache root is resolved once per tick and shared by every
+        // context on the same root.
+        let cache_dir = tick_paths.cache_dir(&config);
         let health_summary = ctx.try_health_summary_for_root(Some(&cache_dir));
         rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
@@ -3616,7 +3548,6 @@ fn build_health_diagnostic_rollup_from_actors(
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
             diagnostics_evidence: json!({
-                "build_breaker_error": breaker_error,
                 "database_open_failed": ctx.database_runtime_failed(),
                 "lsp_start_failures": ctx.try_lsp().map(|lsp| lsp.cached_start_failure_counts()),
             }),
@@ -7417,8 +7348,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    /// The call-graph build breaker under `callgraph/<key>/` belongs to the
+    /// stores AFT 0.64 no longer builds, and `aft cache prune-legacy` deletes
+    /// it. Health must not read it: a stale file would report suspended
+    /// domains for builds that never run.
     #[test]
-    fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
+    fn rollup_never_opens_the_legacy_callgraph_breaker() {
         let (storage, root) = test_root("health-breaker-cache");
         let mut config = crate::config::Config::default();
         config.storage_dir = Some(storage.path().join("state"));
@@ -7443,17 +7378,8 @@ mod tests {
         cache.refresh(&executor, &app);
         assert_eq!(
             crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            1,
-            "consecutive rollups over the same root reuse one cached breaker"
-        );
-
-        crate::build_breaker::BuildDeathBreaker::fail_next_active_suspensions_for_test();
-        cache.refresh(&executor, &app);
-        cache.refresh(&executor, &app);
-        assert_eq!(
-            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            2,
-            "a read error evicts the cached breaker and the next rollup reopens it"
+            0,
+            "the health rollup opened the legacy call-graph breaker"
         );
     }
 
@@ -9125,69 +9051,6 @@ mod tests {
             .expect("read retained record")
             .expect("retained record exists");
         assert_eq!(after.resolved_target, before.resolved_target);
-    }
-
-    #[test]
-    fn standing_health_preserves_durable_breaker_reason() {
-        let storage = tempfile::tempdir().expect("storage directory");
-        let root = tempfile::tempdir().expect("standing root");
-        let config = standing_config(root.path(), storage.path());
-        let standing = crate::standing_roots::StandingRoots::default();
-        standing
-            .reconcile(&config)
-            .expect("pin configured standing root");
-        let entry = standing
-            .entries()
-            .into_iter()
-            .next()
-            .expect("configured standing entry");
-        let breaker_path = storage
-            .path()
-            .join("callgraph")
-            .join(&entry.artifact_key)
-            .join("build-breaker.sqlite");
-        let breaker =
-            crate::build_breaker::BuildDeathBreaker::open(breaker_path).expect("durable breaker");
-        let breaker_root = ProjectRootId::from_path(root.path()).expect("standing root identity");
-        let breaker_key = crate::build_breaker::BreakerKey::new(
-            breaker_root.as_path().display().to_string(),
-            crate::build_breaker::BuildDomain::CallgraphCold,
-            "standing-health",
-        );
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_millis() as u64;
-        for _ in 0..3 {
-            let crate::build_breaker::BreakerAdmission::Admitted(attempt) = breaker
-                .admit_at(&breaker_key, 10, now_ms)
-                .expect("breaker admission")
-            else {
-                panic!("breaker must admit before the third attributed death");
-            };
-            breaker
-                .record_attributed_death_at(&breaker_key, &attempt.attempt_id, 10, 0, now_ms)
-                .expect("record attributed death");
-        }
-
-        let app = App::default_shared();
-        let executor = Executor::new();
-        register_standing_health_actor(&executor, &app, root.path(), config);
-        let metrics = DispatchPathMetrics::new();
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let metrics = report.metrics.expect("health metrics");
-        let root_row = metrics["roots"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|row| row["standing_entry"] == json!(entry.literal_path))
-            })
-            .expect("standing health row");
-        assert_eq!(root_row["standing"], true);
-        assert_eq!(
-            root_row["suspended_domains"][0]["reason"],
-            "zero_credit_death_limit"
-        );
     }
 
     #[test]

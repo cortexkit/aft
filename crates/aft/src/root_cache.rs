@@ -53,8 +53,9 @@ mod location;
 pub(crate) use location::acquire_cache_cleanup_lease;
 pub use location::{
     acquire_daemon_storage_lease, cache_root, cache_unavailable, cache_unavailable_for_root,
-    clean_old_caches, prepare_cache_root, reclaim_configured_inactive_caches, CacheLease,
-    CleanupCandidate, CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_BUSY,
+    clean_old_caches, prepare_cache_root, prune_legacy_stores, reclaim_configured_inactive_caches,
+    CacheLease, CleanupCandidate, CleanupReport, LegacyStore, LegacyStoreSkip, ProcessStorageLease,
+    PruneLegacyError, PruneLegacyEvent, PruneLegacyReport, StoragePaths, CACHE_DIR_BUSY,
     CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
