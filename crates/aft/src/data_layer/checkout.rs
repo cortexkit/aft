@@ -3784,6 +3784,15 @@ impl CheckoutView {
     pub fn current_state(&self) -> &CheckoutState {
         self.current.as_deref().unwrap_or(&self.published.state)
     }
+
+    /// Whether a rescan against the files on disk was pending when the view
+    /// was taken. Until it ends, [`current_state`](Self::current_state) can
+    /// miss changes made while the checkout was unbound, so a reader that
+    /// needs every current path asks the disk instead.
+    #[must_use]
+    pub fn rescanning(&self) -> bool {
+        self.rescanning
+    }
 }
 
 /// Outline's symbols for one file, from its stored content record.

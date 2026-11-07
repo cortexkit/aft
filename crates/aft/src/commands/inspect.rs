@@ -350,12 +350,26 @@ impl Drop for DeferredInspectRootPermit {
     }
 }
 
-#[derive(Debug)]
+/// The stats and manifest hashes of a root's sources, its inventory, and the
+/// index-store checkout the inventory came from, if any: the final listing
+/// reads the same checkout, so both listings come from the same source.
 struct InspectRootStatSnapshot(
     Vec<(PathBuf, u64, SystemTime)>,
     Arc<crate::inspect::inventory::InspectInventory>,
     Vec<(PathBuf, blake3::Hash)>,
+    Option<Arc<crate::data_layer::runtime::DataCheckout>>,
 );
+
+impl std::fmt::Debug for InspectRootStatSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("InspectRootStatSnapshot")
+            .field(&self.0)
+            .field(&self.1)
+            .field(&self.2)
+            .field(&self.3.is_some())
+            .finish()
+    }
+}
 
 impl PartialEq for InspectRootStatSnapshot {
     fn eq(&self, other: &Self) -> bool {
@@ -365,12 +379,25 @@ impl PartialEq for InspectRootStatSnapshot {
 
 impl Eq for InspectRootStatSnapshot {}
 
+#[cfg(test)]
 fn capture_inspect_root_stats_until(
     root: &Path,
     deadline: Option<InspectRequestDeadline>,
 ) -> Result<InspectRootStatSnapshot, String> {
+    capture_inspect_root_stats_from(root, deadline, None)
+}
+
+/// The root's stat snapshot, listing its sources from `checkout`'s current
+/// view when one is bound and stands in for a walk, and from a walk of the
+/// folder otherwise.
+fn capture_inspect_root_stats_from(
+    root: &Path,
+    deadline: Option<InspectRequestDeadline>,
+    checkout: Option<Arc<crate::data_layer::runtime::DataCheckout>>,
+) -> Result<InspectRootStatSnapshot, String> {
     capture_inspect_root_stats_while(
         root,
+        checkout,
         move || deadline.is_none_or(InspectRequestDeadline::has_work_budget),
         move || {
             deadline
@@ -382,6 +409,7 @@ fn capture_inspect_root_stats_until(
 
 fn capture_inspect_root_stats_while(
     root: &Path,
+    checkout: Option<Arc<crate::data_layer::runtime::DataCheckout>>,
     has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
@@ -390,10 +418,13 @@ fn capture_inspect_root_stats_while(
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
-    let inventory = Arc::new(crate::inspect::inventory::InspectInventory::collect(
-        root,
-        move || walk_budget(),
-    ));
+    let from_store = checkout
+        .as_ref()
+        .and_then(|checkout| checkout.view())
+        .and_then(|view| crate::inspect::inventory::InspectInventory::from_checkout(root, &view));
+    let inventory = Arc::new(from_store.unwrap_or_else(|| {
+        crate::inspect::inventory::InspectInventory::collect(root, move || walk_budget())
+    }));
     for file in &inventory.sources {
         if !has_work_budget() {
             return Err(timeout_detail());
@@ -443,7 +474,9 @@ fn capture_inspect_root_stats_while(
     if !has_work_budget() {
         return Err(timeout_detail());
     }
-    Ok(InspectRootStatSnapshot(files, inventory, manifests))
+    Ok(InspectRootStatSnapshot(
+        files, inventory, manifests, checkout,
+    ))
 }
 
 #[cfg(test)]
@@ -464,7 +497,7 @@ fn verify_final_root_stats(
         return Err(request_deadline_terminal(Some(phase_entry), deadline));
     }
     let stat_phase = phase_log.start(phase_entry);
-    match capture_inspect_root_stats_until(project_root, Some(deadline)) {
+    match capture_inspect_root_stats_from(project_root, Some(deadline), initial_stats.3.clone()) {
         Ok(final_stats) if final_stats == *initial_stats => {
             stat_phase.complete();
             Ok(())
@@ -1866,27 +1899,28 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    let initial_stats = match capture_inspect_root_stats_until(&project_root, Some(deadline)) {
-        Ok(snapshot) => snapshot,
-        Err(detail) if detail.contains("inspect_request_timeout") => {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                request_deadline_terminal(next_phase(&applicability), deadline),
-            );
-        }
-        Err(detail) => {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                InspectTerminal::PhaseFailed {
-                    failed_phase: None,
-                    failure_reason: "inspect_not_fresh",
-                    failure_detail: Some(detail),
-                },
-            );
-        }
-    };
+    let initial_stats =
+        match capture_inspect_root_stats_from(&project_root, Some(deadline), ctx.data_checkout()) {
+            Ok(snapshot) => snapshot,
+            Err(detail) if detail.contains("inspect_request_timeout") => {
+                return build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    request_deadline_terminal(next_phase(&applicability), deadline),
+                );
+            }
+            Err(detail) => {
+                return build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    InspectTerminal::PhaseFailed {
+                        failed_phase: None,
+                        failure_reason: "inspect_not_fresh",
+                        failure_detail: Some(detail),
+                    },
+                );
+            }
+        };
     wait_at_deferred_inspect_body_gate_for_test(deadline, &req.id);
     delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
@@ -8553,6 +8587,7 @@ mod deferred_terminal_tests {
         INSPECT_STAT_CALLS.with(|count| count.set(0));
         let result = capture_inspect_root_stats_while(
             root.path(),
+            None,
             || crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.get() < 8),
             || "inspect_request_timeout".to_string(),
         );

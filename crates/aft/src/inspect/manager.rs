@@ -3547,10 +3547,17 @@ impl InspectManager {
             .take()
             .filter(|inventory| inventory.matches(&job.project_root))
             .unwrap_or_else(|| {
-                Arc::new(super::inventory::InspectInventory::collect(
-                    &job.project_root,
-                    || !crate::executor::current_job_cancelled(),
-                ))
+                // The bound index-store checkout already lists the folder's
+                // files; walk it only when no checkout can stand in.
+                Arc::new(
+                    self.data_layer_dead_code
+                        .inventory(&job.project_root)
+                        .unwrap_or_else(|| {
+                            super::inventory::InspectInventory::collect(&job.project_root, || {
+                                !crate::executor::current_job_cancelled()
+                            })
+                        }),
+                )
             });
         let _inventory = inventory.install();
         if crate::executor::current_job_cancelled() {

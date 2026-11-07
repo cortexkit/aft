@@ -59,6 +59,24 @@ impl DeadCodeSources {
             .insert(project_root.to_path_buf(), Arc::downgrade(checkout));
     }
 
+    /// The inventory of `project_root` from its bound checkout's current
+    /// view, when the view can stand in for a walk of the folder (see
+    /// [`InspectInventory::from_checkout`]); `None` sends the caller to the
+    /// walk.
+    pub(crate) fn inventory(
+        &self,
+        project_root: &Path,
+    ) -> Option<crate::inspect::inventory::InspectInventory> {
+        let checkout = self
+            .checkouts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(project_root)
+            .and_then(Weak::upgrade)?;
+        let view = checkout.view()?;
+        crate::inspect::inventory::InspectInventory::from_checkout(project_root, &view)
+    }
+
     /// Whether `project_root` has no call graph to analyse yet: no checkout
     /// is bound for it, or its first call graph is not published. Checked
     /// without waiting, before a run opens the inspect cache and before a

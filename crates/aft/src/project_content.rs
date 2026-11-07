@@ -323,6 +323,20 @@ pub(crate) fn is_excluded_event(path: &Path) -> bool {
         || has_sqlite_suffix(path) && path.metadata().is_ok_and(|metadata| !metadata.is_dir())
 }
 
+/// The part of a walk's admission of a regular file that its path decides
+/// alone: AFT's own storage, watcher markers, OS metadata files, SQLite file
+/// names and registered database paths. It skips the inode check a walk
+/// makes for a file hard-linked to a live database, so use it only for paths
+/// another scan already admitted and read, such as an index-store
+/// checkout's members.
+pub(crate) fn is_excluded_file_by_path(path: &Path) -> bool {
+    crate::watcher_backend::flush::is_marker_path(path)
+        || is_storage_path(path)
+        || crate::os_metadata::is_os_metadata_path(path)
+        || has_sqlite_suffix(path)
+        || crate::db::file_identity::is_registered_file_path(path)
+}
+
 fn is_storage_path(path: &Path) -> bool {
     storage_roots()
         .read()
