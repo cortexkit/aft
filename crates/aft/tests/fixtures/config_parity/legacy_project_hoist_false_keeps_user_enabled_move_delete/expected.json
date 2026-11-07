@@ -1,5 +1,13 @@
 {
-  "rejected": [
-    "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix"
-  ]
+  "aft_search_registered": true,
+  "disabled_tools": [],
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "indexes": {
+    "callgraph": true,
+    "semantic": true,
+    "trigram": true
+  },
+  "restrict_to_project_root": false
 }

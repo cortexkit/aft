@@ -1,8 +1,18 @@
 {
-  "rejected": [
-    "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
-    "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
-    "removed_config_key:aft_glob; run npx @cortexkit/aft doctor --fix",
-    "removed_config_key:harnesses.opencode.tool_surface; run npx @cortexkit/aft doctor --fix"
-  ]
+  "aft_search_registered": true,
+  "disabled_tools": [
+    "aft_callgraph",
+    "aft_delete",
+    "aft_move",
+    "aft_zoom"
+  ],
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "indexes": {
+    "callgraph": true,
+    "semantic": true,
+    "trigram": false
+  },
+  "restrict_to_project_root": false
 }
