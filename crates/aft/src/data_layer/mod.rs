@@ -7,6 +7,8 @@ pub mod checkout;
 pub mod checkout_gate;
 pub mod content;
 pub(crate) mod dead_code;
+pub mod dead_code_gate;
+pub mod dead_code_graph;
 pub mod edit_gate;
 pub mod extract_gate;
 pub mod fragment;

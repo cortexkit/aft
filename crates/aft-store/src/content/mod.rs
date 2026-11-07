@@ -266,6 +266,12 @@ pub struct Body {
     /// The file's symbols as outline lists them, in the parser's order.
     /// `None` in a record from an extractor that did not store them.
     pub outline: Option<Vec<OutlineSymbol>>,
+    /// What dead-code analysis reads from the file's syntax tree, recorded
+    /// when the file is parsed so an analysis never parses it again. The
+    /// store does not read these bytes: their format belongs to the
+    /// extractor that wrote them, which the record's extractor version
+    /// names. `None` in a record from an extractor that did not store them.
+    pub dead_code: Option<Vec<u8>>,
 }
 
 /// What a content record holds.
@@ -304,6 +310,11 @@ const PARSED_WITH_ENTRIES: u8 = 4;
 /// [`PARSED_WITH_OUTLINE`], with each symbol's entry facts after the rest
 /// of the surface.
 const PARSED_WITH_ENTRIES_AND_OUTLINE: u8 = 5;
+/// [`PARSED_WITH_ENTRIES_AND_OUTLINE`], whose body ends with its dead-code
+/// facts after the outline.
+const PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE: u8 = 6;
+/// [`PARSED_WITH_ENTRIES`], whose body ends with its dead-code facts.
+const PARSED_WITH_ENTRIES_AND_DEAD_CODE: u8 = 7;
 
 impl ContentRecord {
     /// The surface part's bytes and the body part's bytes. A configuration
@@ -320,10 +331,11 @@ impl ContentRecord {
                 (head.finish(), Vec::new())
             }
             RecordBody::Parsed { surface, body } => {
-                head.byte(if body.outline.is_some() {
-                    PARSED_WITH_ENTRIES_AND_OUTLINE
-                } else {
-                    PARSED_WITH_ENTRIES
+                head.byte(match (body.outline.is_some(), body.dead_code.is_some()) {
+                    (true, true) => PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE,
+                    (true, false) => PARSED_WITH_ENTRIES_AND_OUTLINE,
+                    (false, true) => PARSED_WITH_ENTRIES_AND_DEAD_CODE,
+                    (false, false) => PARSED_WITH_ENTRIES,
                 });
                 encode_surface(&mut head, surface);
                 encode_entries(&mut head, surface);
@@ -355,16 +367,35 @@ impl ContentRecord {
             kind @ (PARSED
             | PARSED_WITH_OUTLINE
             | PARSED_WITH_ENTRIES
-            | PARSED_WITH_ENTRIES_AND_OUTLINE) => {
+            | PARSED_WITH_ENTRIES_AND_OUTLINE
+            | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+            | PARSED_WITH_ENTRIES_AND_DEAD_CODE) => {
                 let mut surface = decode_surface(&mut head)?;
-                if matches!(kind, PARSED_WITH_ENTRIES | PARSED_WITH_ENTRIES_AND_OUTLINE) {
+                if matches!(
+                    kind,
+                    PARSED_WITH_ENTRIES
+                        | PARSED_WITH_ENTRIES_AND_OUTLINE
+                        | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+                        | PARSED_WITH_ENTRIES_AND_DEAD_CODE
+                ) {
                     decode_entries(&mut head, &mut surface)?;
                 }
                 head.finish()?;
                 let mut tail = Decoder::new(body)?;
                 let mut body = decode_body(&mut tail)?;
-                if matches!(kind, PARSED_WITH_OUTLINE | PARSED_WITH_ENTRIES_AND_OUTLINE) {
+                if matches!(
+                    kind,
+                    PARSED_WITH_OUTLINE
+                        | PARSED_WITH_ENTRIES_AND_OUTLINE
+                        | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+                ) {
                     body.outline = Some(decode_outline(&mut tail)?);
+                }
+                if matches!(
+                    kind,
+                    PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE | PARSED_WITH_ENTRIES_AND_DEAD_CODE
+                ) {
+                    body.dead_code = Some(tail.blob()?.to_vec());
                 }
                 tail.finish()?;
                 RecordBody::Parsed {
@@ -609,6 +640,9 @@ fn encode_body(out: &mut Encoder, body: &Body) {
             out.opt_str(symbol.parent.as_deref());
         }
     }
+    if let Some(facts) = &body.dead_code {
+        out.blob(facts);
+    }
 }
 
 fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
@@ -683,6 +717,7 @@ fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
         references,
         call_sites,
         outline: None,
+        dead_code: None,
     })
 }
 
@@ -813,6 +848,7 @@ crate::heap_bytes_of_fields!(Body {
     references,
     call_sites,
     outline,
+    dead_code,
 });
 crate::heap_bytes_of_fields!(ContentRecord {
     language,
@@ -931,6 +967,7 @@ mod tests {
                         dynamic: false,
                     }],
                     outline: None,
+                    dead_code: None,
                 }),
             },
         }
@@ -1008,6 +1045,41 @@ mod tests {
         body.outline = Some(Vec::new());
         let (surface, body) = empty.encode();
         assert_eq!(ContentRecord::decode(&surface, &body).unwrap(), empty);
+    }
+
+    #[test]
+    fn dead_code_facts_round_trip_with_and_without_an_outline() {
+        for outline in [None, Some(outline())] {
+            let without = {
+                let mut record = sample();
+                let RecordBody::Parsed { body, .. } = &mut record.data else {
+                    unreachable!("the sample is parsed");
+                };
+                body.outline.clone_from(&outline);
+                record
+            };
+            let mut with = without.clone();
+            let RecordBody::Parsed { body, .. } = &mut with.data else {
+                unreachable!("the sample is parsed");
+            };
+            body.dead_code = Some(b"{\"facts\":1}".to_vec());
+            let (surface, body) = with.encode();
+            assert_eq!(ContentRecord::decode(&surface, &body).unwrap(), with);
+            let (plain_surface, plain_body) = without.encode();
+            assert_eq!(
+                ContentRecord::decode(&plain_surface, &plain_body).unwrap(),
+                without
+            );
+
+            // The record kind alone says whether facts follow: a body without
+            // them, or with facts the kind does not announce, is refused, as
+            // is every cut of a body with them.
+            assert!(ContentRecord::decode(&surface, &plain_body).is_err());
+            assert!(ContentRecord::decode(&plain_surface, &body).is_err());
+            for cut in 0..body.len() {
+                assert!(ContentRecord::decode(&surface, &body[..cut]).is_err());
+            }
+        }
     }
 
     #[test]

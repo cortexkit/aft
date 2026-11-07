@@ -490,6 +490,11 @@ pub struct CallgraphSnapshot {
     pub go_initializers: Vec<GoInitializerGroup>,
     pub entry_points: BTreeSet<PathBuf>,
     pub entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// The data layer's call graph the snapshot was taken from. Dead code
+    /// reads its calls from there one file at a time, so a snapshot from the
+    /// data layer holds no call rows, marked roots or initializer groups of
+    /// its own: only its files, exports and entry points.
+    pub data_layer: Option<crate::data_layer::dead_code_graph::ViewCallGraph>,
 }
 
 /// All confirmed callers in one Go file initialize the same package set.
@@ -1121,6 +1126,7 @@ aft_store::heap_bytes_of_fields!(CallgraphSnapshot {
     go_initializers,
     entry_points,
     entry_point_symbols,
+    data_layer,
 });
 aft_store::heap_bytes_of_fields!(GoInitializerGroup {
     caller_file,

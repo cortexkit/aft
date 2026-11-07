@@ -28,7 +28,7 @@ use crate::inspect::job::{
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 
 /// The kinds of reference an outbound call can come from.
-const OUTBOUND_KINDS: [&str; 5] = [
+pub(crate) const OUTBOUND_KINDS: [&str; 5] = [
     "call",
     "construction",
     "callback_ref",
@@ -37,13 +37,13 @@ const OUTBOUND_KINDS: [&str; 5] = [
 ];
 
 /// Store paths made absolute and canonical, as the snapshot names files.
-struct Paths<'a> {
-    root: &'a Path,
-    cache: HashMap<String, PathBuf>,
+pub(crate) struct Paths<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) cache: HashMap<String, PathBuf>,
 }
 
 impl Paths<'_> {
-    fn resolve(&mut self, store_path: &str) -> PathBuf {
+    pub(crate) fn resolve(&mut self, store_path: &str) -> PathBuf {
         if let Some(path) = self.cache.get(store_path) {
             return path.clone();
         }
@@ -59,7 +59,7 @@ impl Paths<'_> {
     }
 }
 
-fn path_key(path: &Path) -> &[u8] {
+pub(crate) fn path_key(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
 }
 
@@ -93,6 +93,7 @@ pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
         go_initializers: go_initializers(rows, &mut paths),
         files,
         entry_points,
+        data_layer: None,
     }
 }
 

@@ -94,6 +94,8 @@ pub const KNOWN_OPTIONAL: [KnownSection; 2] = [
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct FragmentKey(Digest128);
 
+crate::heap_bytes_none!(FragmentKey);
+
 impl FragmentKey {
     #[must_use]
     pub const fn from_digest(digest: Digest128) -> Self {

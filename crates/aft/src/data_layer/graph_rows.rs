@@ -111,14 +111,14 @@ pub(crate) struct GraphRows {
 /// row replaces any row with its id or with its file and source range, and
 /// a replacement is inserted last.
 #[derive(Default)]
-struct Nodes {
-    rows: BTreeMap<String, (u64, NodeRow)>,
+pub(crate) struct Nodes {
+    pub(crate) rows: BTreeMap<String, (u64, NodeRow)>,
     by_range: HashMap<(String, u32, u32, u32, u32, u32), String>,
     next: u64,
 }
 
 impl Nodes {
-    fn insert(&mut self, row: NodeRow) {
+    pub(crate) fn insert(&mut self, row: NodeRow) {
         let range = (
             row.file_path.clone(),
             row.start_line,
@@ -145,13 +145,13 @@ impl Nodes {
         self.next += 1;
     }
 
-    fn kind(&self, id: &str) -> Option<&str> {
+    pub(crate) fn kind(&self, id: &str) -> Option<&str> {
         self.rows.get(id).map(|(_, row)| row.kind.as_str())
     }
 
     /// `SELECT id FROM nodes WHERE file_path=? AND scoped_name=?`: the
     /// earliest inserted row that is still present.
-    fn by_scoped_name(&self) -> HashMap<(&str, &str), &str> {
+    pub(crate) fn by_scoped_name(&self) -> HashMap<(&str, &str), &str> {
         let mut first = HashMap::<(&str, &str), (u64, &str)>::new();
         for (sequence, row) in self.rows.values() {
             let key = (row.file_path.as_str(), row.scoped_name.as_str());
@@ -455,7 +455,7 @@ pub(crate) fn macro_body_call(kind: BlobRefKind, reference: &BlobRef) -> bool {
             .is_some_and(|caller| caller.ends_with('!'))
 }
 
-const fn ref_kind(kind: BlobRefKind) -> &'static str {
+pub(crate) const fn ref_kind(kind: BlobRefKind) -> &'static str {
     match kind {
         BlobRefKind::Call => "call",
         BlobRefKind::ValueRef => "value_ref",

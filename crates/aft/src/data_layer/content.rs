@@ -43,8 +43,10 @@ use crate::parser::LangId;
 /// a JavaScript workspace package lookup record the looked-up name's key
 /// rather than every member's manifest; 9 stored each file's call-graph
 /// slice as a record with its fragment, so publications written before it
-/// are built again with those records.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-9";
+/// are built again with those records; 10 added the facts dead-code
+/// analysis reads from the syntax tree, so an analysis never parses a file
+/// again.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-10";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -232,6 +234,13 @@ pub fn extract_parsed(
     let mut record = record_from_blob(&blob);
     if let RecordBody::Parsed { body, .. } = &mut record.data {
         body.outline = Some(outline.iter().map(outline_symbol).collect());
+        body.dead_code = Some(
+            crate::inspect::scanners::dead_code::StoredFileFacts::encode_for_record(
+                source,
+                tree.language,
+                &tree.tree,
+            ),
+        );
     }
     Ok(record)
 }
@@ -353,6 +362,7 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
                         })
                         .collect(),
                     outline: None,
+                    dead_code: None,
                 }),
             },
         },

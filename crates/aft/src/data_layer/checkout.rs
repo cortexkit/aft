@@ -324,6 +324,11 @@ struct Refreshed {
     replaced: BTreeMap<String, (String, Arc<ParseBlob>, Arc<FileResolution>)>,
     /// Files the publication has that the checkout no longer parses.
     removed: BTreeSet<String>,
+    /// The content record of each file whose content changed since the
+    /// publication, which dead code reads its stored facts from: the
+    /// publication holds the file's old record. Shared with the changes
+    /// that hold them.
+    records: BTreeMap<String, Arc<ContentRecord>>,
     /// The dead-code snapshot of this call graph, built on first use.
     dead_code: DeadCodeMemo,
 }
@@ -1929,6 +1934,20 @@ impl Checkout {
             engine.refreshed.state = engine.live.inputs.state.clone();
             for path in &changed {
                 engine.applied.insert(path.clone(), changes[path].sequence);
+                let Ok(name) = std::str::from_utf8(path) else {
+                    continue;
+                };
+                match &changes[path].extracted {
+                    Extracted::Parse(_, _, record) => {
+                        engine
+                            .refreshed
+                            .records
+                            .insert(name.to_string(), Arc::clone(record));
+                    }
+                    Extracted::Config(..) | Extracted::Nothing => {
+                        engine.refreshed.records.remove(name);
+                    }
+                }
             }
             stats = Some(update);
             // An update keeps every parse and resolution it decoded. A broad
@@ -2409,6 +2428,7 @@ impl Checkout {
                 state: published.state.clone(),
                 replaced: BTreeMap::new(),
                 removed: BTreeSet::new(),
+                records: BTreeMap::new(),
                 dead_code: DeadCodeMemo::default(),
             },
         })
@@ -2886,12 +2906,12 @@ impl CheckoutView {
     }
 
     #[cfg(test)]
-    /// The dead-code snapshot `aft_inspect` analyses, built from every
-    /// file's stored record and fragment in one pass.
+    /// [`Self::dead_code_snapshot_shared`] as an owned snapshot, for tests
+    /// that hand one to an inspect job.
     ///
     /// # Errors
     ///
-    /// When a record or fragment cannot be read.
+    /// When a stored parse cannot be read.
     pub(crate) fn dead_code_snapshot(
         &self,
     ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
@@ -2899,23 +2919,83 @@ impl CheckoutView {
             .map(|snapshot| crate::inspect::job::CallgraphSnapshot::clone(&snapshot))
     }
 
-    /// [`Self::dead_code_snapshot`], built once per call graph: every view
-    /// of the same publication and refresh shares it.
+    #[cfg(test)]
+    /// The dead-code snapshot `aft_inspect` analyses: the call graph's
+    /// files, exports and entry points, carrying this view's call graph for
+    /// the rollup to read one file at a time. The parts it holds are built
+    /// once per call graph: every view of the same publication and refresh
+    /// shares them.
     ///
     /// # Errors
     ///
-    /// When a record or fragment cannot be read.
+    /// When a stored parse cannot be read.
     pub(crate) fn dead_code_snapshot_shared(
         &self,
+    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+        self.dead_code_snapshot_in(None)
+    }
+
+    /// [`Self::dead_code_snapshot_shared`], whose rollup keeps the dead-code
+    /// graph of this view's publication under `section_dir` (see
+    /// `dead_code_graph::ViewCallGraph`).
+    ///
+    /// # Errors
+    ///
+    /// When a stored parse cannot be read.
+    pub(crate) fn dead_code_snapshot_in(
+        &self,
+        section_dir: Option<PathBuf>,
     ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
         let memo = match &self.refreshed {
             Some(refreshed) => &refreshed.dead_code,
             None => &self.published.dead_code,
         };
-        memo.get_or_build(|| self.build_dead_code_snapshot())
+        let parts = memo.get_or_build(|| self.build_dead_code_snapshot())?;
+        // The memo holds no view: a view holds its publication, which holds
+        // the memo.
+        Ok(Arc::new(crate::inspect::job::CallgraphSnapshot {
+            data_layer: Some(super::dead_code_graph::ViewCallGraph::new(
+                self.clone(),
+                section_dir,
+            )),
+            ..crate::inspect::job::CallgraphSnapshot::clone(&parts)
+        }))
     }
 
     fn build_dead_code_snapshot(
+        &self,
+    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+        // The snapshot lists the files and entry points only: its exports
+        // are read from the view's files by whoever needs them (see
+        // `dead_code_graph::ViewCallGraph::exported_symbols_of`), so a rollup
+        // that reads a kept dead-code graph never reads every file's parse,
+        // and the memo stays small.
+        let files = self.dead_code_files();
+        let snapshot_files =
+            super::dead_code_graph::snapshot_files_of(&self.published.root, &files);
+        let resolved = crate::inspect::resolve_entry_points(&self.published.root);
+        let entry_points = snapshot_files
+            .iter()
+            .filter(|file| resolved.is_entry_point(file))
+            .cloned()
+            .collect();
+        Ok(crate::inspect::job::CallgraphSnapshot {
+            generated_at: Some(std::time::SystemTime::now()),
+            files: snapshot_files,
+            entry_points,
+            ..crate::inspect::job::CallgraphSnapshot::default()
+        })
+    }
+
+    /// A dead-code snapshot holding every call row of the call graph, built
+    /// from every file's stored record and fragment in one pass. The rollup
+    /// reads the call graph file by file instead; the dead-code gate uses
+    /// this one as an independent check of that reading.
+    ///
+    /// # Errors
+    ///
+    /// When a record or fragment cannot be read.
+    pub(crate) fn rows_dead_code_snapshot(
         &self,
     ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
         let (mut parses, mut resolved) = self
@@ -2946,6 +3026,16 @@ impl CheckoutView {
         };
         let rows = super::graph_rows::assemble(&inputs, &resolved);
         Ok(super::dead_code::snapshot(&self.published.root, &rows))
+    }
+
+    /// The call graph dead code reads, file by file: the publication, with
+    /// what was resolved since replacing what it stored, read on demand
+    /// rather than all at once (see `dead_code_graph`).
+    pub(crate) fn dead_code_files(&self) -> ViewGraphFiles<'_> {
+        ViewGraphFiles {
+            published: &self.published.graph,
+            refreshed: self.refreshed.as_deref(),
+        }
     }
 
     /// The call graph as the call-graph commands read it: the publication,
@@ -3033,6 +3123,135 @@ impl CheckoutView {
                 Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
             })
             .collect()
+    }
+}
+
+/// A view's call graph read file by file: the publication's stored records
+/// and fragments, with each file resolved since the publication answered
+/// from memory and each file it no longer parses left out.
+pub(crate) struct ViewGraphFiles<'v> {
+    published: &'v StoredSlices,
+    refreshed: Option<&'v Refreshed>,
+}
+
+/// What identifies one file's facts in a view's call graph, so two views'
+/// files can be told apart without reading them: its content record key,
+/// and its resolution's fragment key when the publication's fragment is
+/// current, else a digest of the resolution's bytes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GraphIdentity {
+    pub(crate) record: String,
+    pub(crate) fragment: Option<String>,
+    pub(crate) digest: Option<String>,
+}
+
+impl ViewGraphFiles<'_> {
+    /// `path`'s identity in this view; `None` when the view does not parse
+    /// it.
+    pub(crate) fn identity(&self, path: &str) -> Option<GraphIdentity> {
+        if let Some(refreshed) = self.refreshed {
+            if refreshed.removed.contains(path) {
+                return None;
+            }
+            if let Some((key, _, resolution)) = refreshed.replaced.get(path) {
+                return Some(GraphIdentity {
+                    record: key.clone(),
+                    fragment: None,
+                    digest: Some(
+                        blake3::hash(&super::fragment::encode(resolution))
+                            .to_hex()
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        let (record, fragment) = self.published.identity_of(path)?;
+        Some(GraphIdentity {
+            record: record.to_string(),
+            fragment: Some(format!("{fragment:?}")),
+            digest: None,
+        })
+    }
+
+    /// The publication's own identity of `path` (ignoring what was resolved
+    /// since), with the digest of its stored fragment bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the fragment cannot be read.
+    pub(crate) fn published_identity(&self, path: &str) -> Result<Option<GraphIdentity>, String> {
+        let Some((record, fragment)) = self.published.identity_of(path) else {
+            return Ok(None);
+        };
+        Ok(Some(GraphIdentity {
+            record: record.to_string(),
+            fragment: Some(format!("{fragment:?}")),
+            digest: self.published.fragment_digest(path)?,
+        }))
+    }
+}
+
+impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
+    fn has_file(&self, path: &str) -> bool {
+        match self.refreshed {
+            Some(refreshed) if refreshed.removed.contains(path) => false,
+            Some(refreshed) if refreshed.replaced.contains_key(path) => true,
+            _ => self.published.has_parsed_file(path),
+        }
+    }
+
+    fn paths(&self) -> Vec<String> {
+        let mut paths = self
+            .published
+            .parsed_files()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(refreshed) = self.refreshed {
+            for path in &refreshed.removed {
+                paths.remove(path);
+            }
+            paths.extend(refreshed.replaced.keys().cloned());
+        }
+        paths.into_iter().collect()
+    }
+
+    fn parse(&self, path: &str) -> Result<Arc<ParseBlob>, String> {
+        if let Some((_, parse, _)) = self
+            .refreshed
+            .and_then(|refreshed| refreshed.replaced.get(path))
+        {
+            return Ok(Arc::clone(parse));
+        }
+        self.published
+            .parse_of(path)
+            .map(|(_, parse)| parse)
+            .ok_or_else(|| format!("no stored parse for {path}"))
+    }
+
+    fn resolution(&self, path: &str) -> Result<Arc<FileResolution>, String> {
+        if let Some((_, _, resolution)) = self
+            .refreshed
+            .and_then(|refreshed| refreshed.replaced.get(path))
+        {
+            return Ok(Arc::clone(resolution));
+        }
+        self.published
+            .resolution_of(path)
+            .map(Arc::new)
+            .ok_or_else(|| format!("no stored resolution for {path}"))
+    }
+
+    fn dead_code_facts(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(record) = self
+            .refreshed
+            .and_then(|refreshed| refreshed.records.get(path))
+        {
+            return Ok(match &record.data {
+                RecordBody::Parsed { body, .. } => body.dead_code.clone(),
+                RecordBody::Config { .. } => None,
+            });
+        }
+        self.published.dead_code_facts_of(path)
     }
 }
 
@@ -3607,11 +3826,14 @@ impl MemoryParts {
             state,
             replaced,
             removed,
+            records,
             dead_code,
         } = refreshed;
         self.shared += state.heap_bytes(seen);
-        self.callgraph +=
-            replaced.heap_bytes(seen) + removed.heap_bytes(seen) + dead_code.heap_bytes(seen);
+        self.callgraph += replaced.heap_bytes(seen)
+            + removed.heap_bytes(seen)
+            + records.heap_bytes(seen)
+            + dead_code.heap_bytes(seen);
     }
 }
 
@@ -3747,10 +3969,12 @@ impl Checkout {
                 state,
                 replaced: _,
                 removed,
+                records,
                 dead_code,
             } = refreshed;
             state.heap_bytes(&mut seen)
                 + removed.heap_bytes(&mut seen)
+                + records.heap_bytes(&mut seen)
                 + dead_code.heap_bytes(&mut seen)
         }));
         parts.push(("overlay", overlay.heap_bytes(&mut seen)));
@@ -5457,7 +5681,7 @@ pub fn other() { callee(); }
         // The dead-code snapshot follows the refreshed graph: `callee` is
         // still called (from src/extra.rs), and the snapshot equals a cold
         // build's.
-        let mut refreshed_snapshot = checkout.view().unwrap().dead_code_snapshot().unwrap();
+        let mut refreshed_snapshot = checkout.view().unwrap().rows_dead_code_snapshot().unwrap();
 
         // The answers equal a cold build of the same files.
         let cold_store = tempfile::tempdir().unwrap();
@@ -5473,7 +5697,7 @@ pub fn other() { callee(); }
             callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
             after
         );
-        let mut cold_snapshot = cold.view().unwrap().dead_code_snapshot().unwrap();
+        let mut cold_snapshot = cold.view().unwrap().rows_dead_code_snapshot().unwrap();
         refreshed_snapshot.generated_at = None;
         cold_snapshot.generated_at = None;
         assert_eq!(
@@ -5541,7 +5765,7 @@ pub fn other() { callee(); }
             Some(PathText::Indexed { distinct }) if distinct > 10
         ));
         assert_eq!(view.path_text(b"missing.rs").unwrap(), None);
-        let snapshot = view.dead_code_snapshot().unwrap();
+        let snapshot = view.rows_dead_code_snapshot().unwrap();
         assert_eq!(snapshot.files.len(), 2, "{:?}", snapshot.files);
         assert!(
             snapshot

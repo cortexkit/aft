@@ -467,6 +467,7 @@ struct Located {
     record_key: String,
     record: (u32, u32),
     fragment: (u32, u32),
+    fragment_key: FragmentKey,
 }
 
 /// A checkout's slices read from its segments.
@@ -606,6 +607,7 @@ impl StoredSlices {
                         record_key: key.clone(),
                         record,
                         fragment,
+                        fragment_key: *fragment_key,
                     },
                 );
             }
@@ -779,6 +781,56 @@ impl StoredSlices {
         }
     }
 
+    /// `file`'s stored record key and fragment key: together they identify
+    /// what the stored call graph says about the file.
+    pub(crate) fn identity_of(&self, file: &str) -> Option<(&str, FragmentKey)> {
+        let located = self.paths.get(file)?;
+        Some((located.record_key.as_str(), located.fragment_key))
+    }
+
+    /// A digest of `file`'s stored fragment bytes: equal digests mean the
+    /// same resolution.
+    ///
+    /// # Errors
+    ///
+    /// When the fragment cannot be read.
+    pub(crate) fn fragment_digest(&self, file: &str) -> Result<Option<String>, String> {
+        let Some(located) = self.paths.get(file) else {
+            return Ok(None);
+        };
+        let bytes = self
+            .graph(located.fragment.0)?
+            .fragment(located.fragment.1)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
+    }
+
+    /// Whether `file` is a parsed file of the stored call graph.
+    pub(crate) fn has_parsed_file(&self, file: &str) -> bool {
+        self.paths.contains_key(file)
+    }
+
+    /// The dead-code facts `file`'s stored record holds, `None` when it
+    /// holds none.
+    ///
+    /// # Errors
+    ///
+    /// When the file has no stored record or it cannot be read.
+    pub(crate) fn dead_code_facts_of(&self, file: &str) -> Result<Option<Vec<u8>>, String> {
+        let located = self
+            .paths
+            .get(file)
+            .ok_or_else(|| format!("no stored record for {file}"))?;
+        let record = self
+            .content(located.record.0)?
+            .record(located.record.1)
+            .map_err(|error| format!("record of {file}: {error}"))?;
+        Ok(match record.data {
+            aft_store::content::RecordBody::Parsed { body, .. } => body.dead_code,
+            aft_store::content::RecordBody::Config { .. } => None,
+        })
+    }
+
     /// `file`'s stored resolution, read and decoded now. A read that fails
     /// is recorded in [`Self::failures`].
     pub(crate) fn resolution_of(&self, file: &str) -> Option<FileResolution> {
@@ -937,6 +989,7 @@ aft_store::heap_bytes_of_fields!(Located {
     record_key,
     record,
     fragment,
+    fragment_key,
 });
 aft_store::heap_bytes_of_fields!(StoredSlices {
     segments,

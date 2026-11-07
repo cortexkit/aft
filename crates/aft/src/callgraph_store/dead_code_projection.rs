@@ -342,6 +342,7 @@ fn project_snapshot(
         // Package targets can change in a file whose callers did not. Rebuild
         // these small groups for both full and spliced ordinary-call snapshots.
         go_initializers: go_initializer_groups(&tx, &mut paths, None)?,
+        data_layer: None,
     };
     let projection_elapsed = projection_started.elapsed();
     tx.commit()?;

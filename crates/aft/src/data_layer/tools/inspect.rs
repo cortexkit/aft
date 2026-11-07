@@ -130,18 +130,14 @@ impl DeadCodeSources {
             }
         };
         let started = Instant::now();
-        match view.dead_code_snapshot_shared() {
+        // Each publication's dead-code graph is kept beside the family's
+        // store, so later rollups over the same publication read it.
+        let section_dir = checkout.checkout().family_dir().join("dead-code");
+        match view.dead_code_snapshot_in(Some(section_dir)) {
             Ok(snapshot) => {
                 crate::slog_info!(
-                    "perf tier2_callgraph_snapshot: source=data_layer files={} exports={} edges={} entry_points={} ms={}",
+                    "perf tier2_callgraph_snapshot: source=data_layer files={} entry_points={} ms={}",
                     snapshot.files.len(),
-                    snapshot.exported_symbols.len(),
-                    snapshot.outbound_calls.len()
-                        + snapshot
-                            .go_initializers
-                            .iter()
-                            .map(|group| group.edge_count())
-                            .sum::<usize>(),
                     snapshot.entry_points.len(),
                     started.elapsed().as_millis()
                 );
@@ -232,7 +228,7 @@ mod tests {
         let ours = checkout
             .view()
             .expect("published")
-            .dead_code_snapshot()
+            .rows_dead_code_snapshot()
             .expect("the data layer's snapshot");
         for ((name, theirs), (_, mine)) in parts(&today).into_iter().zip(parts(&ours)) {
             let theirs = theirs.iter().collect::<BTreeSet<_>>();

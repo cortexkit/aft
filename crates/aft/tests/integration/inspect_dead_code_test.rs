@@ -71,6 +71,7 @@ fn snapshot(
         go_initializers: Vec::new(),
         entry_points: entry_points.into_iter().collect::<BTreeSet<_>>(),
         entry_point_symbols: BTreeMap::new(),
+        data_layer: None,
     }
 }
 
