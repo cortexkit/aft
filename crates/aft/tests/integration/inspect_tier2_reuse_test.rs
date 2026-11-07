@@ -173,8 +173,9 @@ fn dead_code_graph(project_root: &Path) -> DeadCodeGraph {
         }
     }
     // The reply itself is not this helper's concern: without a language
-    // server its diagnostics never complete. The request binds the checkout
-    // for dead code before it looks at diagnostics.
+    // server its diagnostics never complete. Before it looks at diagnostics,
+    // the request hands the root's index-store checkout to the context's
+    // inspect manager, which then reads dead code from its call graph.
     let _ = aft::commands::inspect::handle_inspect_warm_for_test(
         &request(serde_json::json!({
             "id": "bind-dead-code",

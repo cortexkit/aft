@@ -6,15 +6,13 @@ use aft::callgraph_store::{
     callgraph_refresh_worker_test_counts, clear_callgraph_refresh_worker_test_seam,
     install_callgraph_refresh_worker_test_gate, live_callgraph_edge_snapshot,
     project_dead_code_snapshot, set_callgraph_refresh_worker_test_open_failure,
-    set_callgraph_refresh_worker_test_seam, CallGraphRead, CallGraphStore, StoredEdge,
+    set_callgraph_refresh_worker_test_seam, CallGraphStore, StoredEdge,
 };
 use aft::commands::callgraph_store_adapter;
 use aft::config::Config;
-use aft::context::{AppContext, CallgraphStoreAccess};
-use aft::harness::Harness;
 use aft::inspect::scanners::dead_code::run_dead_code_scan;
 use aft::inspect::{InspectCategory, InspectJob, JobKey};
-use aft::parser::{SymbolCache, TreeSitterProvider};
+use aft::parser::SymbolCache;
 use filetime::FileTime;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -23,10 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, Ordering},
+    atomic::{AtomicI64, Ordering},
     Arc, RwLock,
 };
-use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_800_000_000);
@@ -1084,65 +1081,6 @@ fn cold_edges(root: &Path) -> BTreeSet<StoredEdge> {
     store.edge_snapshot().unwrap()
 }
 
-fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppContext {
-    let ctx = AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config {
-            project_root: Some(root.to_path_buf()),
-            storage_dir: Some(storage.to_path_buf()),
-            indexes: aft::config::IndexesConfig {
-                trigram: false,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        }),
-    )
-    .with_test_checkpoint_store();
-    ctx.set_harness(Harness::Opencode);
-    ctx.set_canonical_cache_root(root.to_path_buf());
-    let project_key = artifact_cache_key_for_test(root);
-    aft::root_cache::configure_artifact_access(root, &project_key, worktree);
-    ctx.set_cache_role(worktree, None);
-    ctx
-}
-
-fn entry_leaf_from_store(store: &impl CallGraphRead) -> String {
-    store
-        .call_tree(Path::new("main.ts"), "entry", 1)
-        .unwrap()
-        .children[0]
-        .name
-        .clone()
-}
-
-fn wait_for_callgraph_background(ctx: &AppContext, budget: Duration) {
-    let deadline = Instant::now() + budget;
-    loop {
-        aft::runtime_drain::drain_callgraph_store_events(ctx);
-        if ctx.callgraph_store_rx().lock().is_none() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "callgraph background work did not finish in time"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn wait_for_root_keyed_callgraph(ctx: &AppContext, budget: Duration) {
-    wait_for_callgraph_background(ctx, budget);
-    assert!(
-        ctx.callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|store| !store.is_legacy_fallback()),
-        "background legacy migration did not publish and install a root-keyed store"
-    );
-}
-
 /// Drop `-wal`/`-shm` sidecars from a snapshot: SQLite rewrites them on any
 /// connection open/close, including strictly read-only ones, so byte-equality
 /// assertions about source preservation must compare only the data files.
@@ -1223,24 +1161,6 @@ fn init_git_repo(root: &Path) {
         "-m",
         "initial",
     ]);
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), target)?;
-        }
-        // Sockets, fifos, and other special files (e.g. git's fsmonitor
-        // daemon socket) cannot be fs::copy'd and are irrelevant to the
-        // clone fixture.
-    }
-    Ok(())
 }
 
 fn legacy_sqlite_path_for_root(store_dir: &Path, root: &Path) -> PathBuf {

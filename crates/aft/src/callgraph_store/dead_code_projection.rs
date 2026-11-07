@@ -106,13 +106,6 @@ fn update_running_estimate(estimate: &mut u64, observed: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn set_projection_before_open_observer(
-    observer: Option<std::sync::Arc<ProjectionBeforeOpenObserver>>,
-) {
-    PROJECTION_BEFORE_OPEN_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
-}
-
-#[cfg(test)]
 fn notify_projection_before_open_observer(db_path: &Path) {
     let observer = PROJECTION_BEFORE_OPEN_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {

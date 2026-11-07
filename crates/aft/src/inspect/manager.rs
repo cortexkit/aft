@@ -5170,23 +5170,6 @@ fn build_tier2_callgraph_snapshot(
 }
 
 #[cfg(test)]
-fn build_tier2_callgraph_snapshot_with_refresh(
-    job: &InspectJob,
-    allow_cold_build: bool,
-    refresh_paths: &[PathBuf],
-) -> Option<Arc<CallgraphSnapshot>> {
-    build_tier2_callgraph_snapshot_with_refresh_inner(
-        job,
-        allow_cold_build,
-        false,
-        refresh_paths,
-        None,
-    )
-    .expect("test snapshot readiness")
-    .map(|(snapshot, _, _)| snapshot)
-}
-
-#[cfg(test)]
 thread_local! {
     static LEGACY_VIEW_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

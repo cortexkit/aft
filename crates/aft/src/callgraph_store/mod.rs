@@ -1125,8 +1125,7 @@ pub(crate) use dead_code_projection::{
 };
 #[cfg(test)]
 pub(crate) use dead_code_projection::{
-    project_dead_code_snapshot_incremental, set_projection_before_open_observer,
-    take_projection_work,
+    project_dead_code_snapshot_incremental, take_projection_work,
 };
 
 #[doc(hidden)]
@@ -6275,17 +6274,6 @@ fn project_key_for_store(callgraph_dir: &Path, project_root: &Path) -> Result<St
 }
 
 impl CallGraphStore {
-    #[cfg(test)]
-    pub(crate) fn lock_readiness_for_test(&self) -> Connection {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute_batch("PRAGMA journal_mode=DELETE;")
-            .unwrap();
-        let blocker = Connection::open(self.sqlite_path()).unwrap();
-        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-        blocker
-    }
 
     pub fn open_if_enabled(
         options: CallGraphStoreOptions,
@@ -24321,17 +24309,6 @@ fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize())
-}
-
-#[cfg(test)]
-pub(crate) fn callgraph_corpus_fingerprint_for_test(
-    project_root: &Path,
-    _files: &[PathBuf],
-) -> Result<String> {
-    // The streaming fingerprint walks the corpus itself (order-independent
-    // accumulator, no resident file list); the test seam keeps its historical
-    // signature so callers need not thread a walk of their own.
-    callgraph_corpus_fingerprint(project_root)
 }
 
 fn hash_to_hex(hash: blake3::Hash) -> String {

@@ -52,12 +52,6 @@ impl Fixture {
         }
     }
 
-    fn artifact(&self, dir: &str, file: &str) -> PathBuf {
-        let path = self.storage.join(dir).join(&self.key).join(file);
-        fs::create_dir_all(path.parent().unwrap()).expect("artifact dir");
-        path
-    }
-
     fn configure(&self, indexes: Value) -> Arc<AppContext> {
         self.configure_with_embeddings(indexes, "http://127.0.0.1:9")
     }

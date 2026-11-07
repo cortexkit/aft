@@ -4365,8 +4365,6 @@ pub struct AppContext {
     callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
-    #[cfg(test)]
-    callgraph_reused_install_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     /// Refreshes the store must apply before it answers queries again.
     callgraph_catch_up: Arc<crate::callgraph_maintenance::CallgraphCatchUp>,
     /// Resolution fields of the watched workspace manifests at the last
@@ -5094,8 +5092,6 @@ impl AppContext {
             callgraph_corpus_memo: parking_lot::Mutex::new(None),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
-            #[cfg(test)]
-            callgraph_reused_install_gate: Mutex::new(None),
             callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),

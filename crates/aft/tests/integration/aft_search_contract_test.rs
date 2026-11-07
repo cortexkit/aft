@@ -14,7 +14,7 @@ use aft::context::{AppContext, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
 use aft::search_index::{artifact_cache_key, resolve_cache_dir, SearchIndex};
-use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+use aft::semantic_index::SemanticIndex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -222,22 +222,6 @@ fn git_head(root: &Path) -> String {
         .to_string()
 }
 
-fn clone_checkout(root: &Path) -> (tempfile::TempDir, std::path::PathBuf) {
-    let temp = tempfile::tempdir().expect("create clone dir");
-    let clone_root = temp.path().join("clone");
-    let mut command = std::process::Command::new("git");
-    let status = crate::test_helpers::apply_hermetic_git_env(&mut command)
-        .arg("clone")
-        .arg("--quiet")
-        .arg(root)
-        .arg(&clone_root)
-        .status()
-        .expect("git clone");
-    assert!(status.success(), "git clone failed");
-    let clone_root = std::fs::canonicalize(clone_root).expect("canonical clone root");
-    (temp, clone_root)
-}
-
 fn persist_search_index(root: &Path, storage_dir: &Path) {
     let canonical_root = std::fs::canonicalize(root).expect("canonical root");
     let cache_dir = resolve_cache_dir(&canonical_root, Some(storage_dir));
@@ -246,92 +230,11 @@ fn persist_search_index(root: &Path, storage_dir: &Path) {
     index.write_to_disk(&cache_dir, Some(&head));
 }
 
-fn persist_semantic_index_with_fingerprint(
-    root: &Path,
-    source_file: &Path,
-    storage_dir: &Path,
-    fingerprint: SemanticIndexFingerprint,
-) {
-    let canonical_root = std::fs::canonicalize(root).expect("canonical root");
-    let mut embed =
-        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
-    let canonical_source = std::fs::canonicalize(source_file).expect("canonical source file");
-    let mut index = SemanticIndex::build(&canonical_root, &[canonical_source], &mut embed, 8)
-        .expect("build semantic index");
-    index.set_fingerprint(fingerprint);
-    let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    index.write_to_disk(storage_dir, &artifact_cache_key(&canonical_root));
-}
-
-fn persist_matching_semantic_index(
-    root: &Path,
-    source_file: &Path,
-    storage_dir: &Path,
-    base_url: &str,
-) {
-    persist_semantic_index_with_fingerprint(
-        root,
-        source_file,
-        storage_dir,
-        SemanticIndexFingerprint {
-            backend: "openai_compatible".to_string(),
-            model: "test-embedding".to_string(),
-            base_url: base_url.to_string(),
-            dimension: 3,
-            chunking_version: 2,
-            ..Default::default()
-        },
-    );
-}
-
-fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_dir: &Path) {
-    persist_semantic_index_with_fingerprint(
-        root,
-        source_file,
-        storage_dir,
-        SemanticIndexFingerprint {
-            backend: "openai_compatible".to_string(),
-            model: "other-model".to_string(),
-            base_url: "http://127.0.0.1".to_string(),
-            dimension: 3,
-            chunking_version: 2,
-            ..Default::default()
-        },
-    );
-}
-
 fn openai_context(project_root: &Path, base_url: String) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
-            semantic: SemanticBackendConfig {
-                backend: SemanticBackend::OpenAiCompatible,
-                model: "test-embedding".to_string(),
-                base_url: Some(base_url),
-                api_key_env: None,
-                timeout_ms: 5_000,
-                query_timeout_ms: 3_000,
-                max_batch_size: 64,
-                max_files: 20_000,
-                ..Default::default()
-            },
-            ..Config::default()
-        }),
-    )
-    .with_test_checkpoint_store()
-}
-
-fn openai_context_with_storage(
-    project_root: &Path,
-    storage_dir: &Path,
-    base_url: String,
-) -> AppContext {
-    AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config {
-            project_root: Some(project_root.to_path_buf()),
-            storage_dir: Some(storage_dir.to_path_buf()),
             semantic: SemanticBackendConfig {
                 backend: SemanticBackend::OpenAiCompatible,
                 model: "test-embedding".to_string(),

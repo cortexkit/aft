@@ -1,19 +1,12 @@
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{CallGraphRead, CallGraphStore};
-use aft::config::Config;
-use aft::context::AppContext;
-use aft::harness::Harness;
-use aft::parser::TreeSitterProvider;
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::tempdir;
 
@@ -108,13 +101,6 @@ fn root_keyed_adversarial_child() {
     }
 }
 
-struct ObserverReset;
-
-impl Drop for ObserverReset {
-    fn drop(&mut self) {
-        aft::callgraph_store::set_cold_build_swap_observer(None);
-    }
-}
 
 struct MigrationFailReset;
 
@@ -124,13 +110,6 @@ impl Drop for MigrationFailReset {
     }
 }
 
-struct DiskOverrideReset;
-
-impl Drop for DiskOverrideReset {
-    fn drop(&mut self) {
-        aft::callgraph_store::set_legacy_migration_available_disk_for_test(None);
-    }
-}
 
 fn canonical_temp_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -170,35 +149,6 @@ fn entry_leaf(store: &impl CallGraphRead) -> String {
         .children[0]
         .name
         .clone()
-}
-
-fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
-    let ctx = AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config {
-            project_root: Some(root.to_path_buf()),
-            storage_dir: Some(storage.to_path_buf()),
-            indexes: aft::config::IndexesConfig {
-                trigram: false,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        }),
-    )
-    .with_test_checkpoint_store();
-    ctx.set_harness(Harness::Opencode);
-    ctx.set_canonical_cache_root(root.to_path_buf());
-    ctx.set_cache_role(false, None);
-    // The lease gate is fail-closed for unregistered roots; grant writer
-    // capability the way a real configure does so migrations and cold builds
-    // reach the failure seams these tests exercise.
-    aft::root_cache::configure_artifact_access(
-        root,
-        &aft::search_index::artifact_cache_key(root),
-        false,
-    );
-    ctx
 }
 
 fn pointer_path(store_dir: &Path, root: &Path) -> PathBuf {
@@ -251,25 +201,6 @@ fn newest_superseded_generation(store_dir: &Path, root: &Path) -> Option<PathBuf
     candidates.into_iter().next().map(|(_, path)| path)
 }
 
-fn incomplete_migration_artifacts(store_dir: &Path, root: &Path) -> Vec<String> {
-    let prefix = format!("{}.g", aft::search_index::artifact_cache_key(root));
-    let mut artifacts = fs::read_dir(store_dir)
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| {
-            if !name.starts_with(&prefix) || !name.contains(".migrated.") {
-                return false;
-            }
-            name.contains(".tmp.")
-                || (name.ends_with(".sqlite")
-                    && !store_dir.join(format!("{name}.migration.json")).is_file())
-        })
-        .collect::<Vec<_>>();
-    artifacts.sort();
-    artifacts
-}
-
 fn sqlite_member(path: &Path, suffix: &str) -> PathBuf {
     if suffix.is_empty() {
         path.to_path_buf()
@@ -291,43 +222,6 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) {
     }
 }
 
-fn sqlite_file_set_hash(path: &Path) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for (suffix, bytes, hash) in sqlite_file_set_parts(path) {
-        hasher.update(suffix.as_bytes());
-        hasher.update(bytes.to_string().as_bytes());
-        hasher.update(hash.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-fn sqlite_file_set_parts(path: &Path) -> Vec<(String, u64, String)> {
-    let mut parts = Vec::new();
-    for suffix in SQLITE_FILE_SET_SUFFIXES {
-        let member = sqlite_member(path, suffix);
-        if !member.is_file() {
-            continue;
-        }
-        // SQLite may refresh the shared-memory sidecar when a read-only
-        // connection attaches; the source data files must stay byte-stable.
-        if *suffix == "-shm" {
-            continue;
-        }
-        let bytes = fs::read(member).unwrap();
-        // SQLite can materialize empty rollback/WAL sidecars when attaching a
-        // read-only connection; only sidecars containing pages are source data.
-        if bytes.is_empty() && (*suffix == "-wal" || *suffix == "-journal") {
-            continue;
-        }
-        parts.push((
-            suffix.to_string(),
-            bytes.len() as u64,
-            blake3::hash(&bytes).to_hex().to_string(),
-        ));
-    }
-    parts
-}
-
 fn assert_sqlite_integrity_ok(path: &Path) {
     let conn = Connection::open(path).unwrap();
     let integrity: String = conn
@@ -339,21 +233,6 @@ fn assert_sqlite_integrity_ok(path: &Path) {
         "integrity_check failed for {}",
         path.display()
     );
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
 }
 
 fn spawn_adversarial_helper(mode: &str, root: &Path, store_dir: &Path, ready: &Path) -> Child {

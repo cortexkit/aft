@@ -305,21 +305,6 @@ impl CallgraphReconcileState {
         self.finished_at.lock().expect("comparison finished")
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_idle_for_test(&self, hang_cap: std::time::Duration) -> bool {
-        let mut queries = self.queries.lock();
-        let deadline = std::time::Instant::now() + hang_cap;
-        while self.completed() == 0 || self.outstanding() {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return false;
-            };
-            if self.settled.wait_for(&mut queries, remaining).timed_out() {
-                return self.completed() > 0 && !self.outstanding();
-            }
-        }
-        true
-    }
-
     /// Record that the owning context finished a read-only open before
     /// starting the next comparison.
     #[cfg(test)]

@@ -30,11 +30,6 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-/// A small git repository whose `target` function has one caller per module.
-fn project(parent: &Path, modules: usize) -> PathBuf {
-    project_named(parent, "project", modules)
-}
-
 fn project_named(parent: &Path, name: &str, modules: usize) -> PathBuf {
     let root = parent.join(name);
     std::fs::create_dir_all(&root).unwrap();
@@ -136,31 +131,6 @@ fn callers(aft: &mut AftProcess, root: &Path) -> Value {
             "callgraph never became ready: {response:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-fn callers_once(aft: &mut AftProcess, root: &Path) -> Value {
-    aft.send(
-        &json!({
-            "id": "immediate-callers", "command": "callers",
-            "file": root.join("target.ts"), "symbol": "target"
-        })
-        .to_string(),
-    )
-}
-
-fn callers_after_comparison(aft: &mut AftProcess, root: &Path) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        let response = callers(aft, root);
-        if response["complete"] != false {
-            return response;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "comparison never settled: {response:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
