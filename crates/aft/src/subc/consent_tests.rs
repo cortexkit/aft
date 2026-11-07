@@ -6330,7 +6330,7 @@ async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
     for (index, (tool, arguments, dispatch)) in [
         (
             "glob",
-            json!({"path":root,"pattern":"**/*.rs"}),
+            json!({"path":".","pattern":"**/*.rs"}),
             glob_dispatch as DispatchFn,
         ),
         (
@@ -6340,7 +6340,7 @@ async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
         ),
         (
             "search",
-            json!({"path":root,"query":"needle"}),
+            json!({"path":root,"pattern":"needle"}),
             aft_search_dispatch as DispatchFn,
         ),
         (
@@ -6353,10 +6353,26 @@ async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
             json!({"target":root,"files":true}),
             scope_dispatch as DispatchFn,
         ),
+        (
+            "search",
+            json!({"path":root,"query":"needle"}),
+            aft_search_dispatch as DispatchFn,
+        ),
     ]
     .into_iter()
     .enumerate()
     {
+        if arguments.get("query").is_some() {
+            f.ctx.update_config(|config| {
+                config.cache_unavailable = Some("injected unavailable index storage".into())
+            });
+        }
+        let expected = if index == 0 {
+            "macOS did not let AFT read 1 folder under ., so the result skips it: protected."
+                .to_string()
+        } else {
+            expected.clone()
+        };
         let reply = f
             .checkout_tool(&f.worker, tool, arguments, 70 + index as u64, dispatch)
             .await;

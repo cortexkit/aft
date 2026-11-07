@@ -217,6 +217,19 @@ pub(crate) struct PermissionObservation {
     pub(crate) readable: bool,
 }
 
+pub(crate) fn name_walk_root(root: &Path, name: &Path) {
+    if let Some(budget) = current() {
+        budget
+            .walk_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                crate::path_identity::lexical_normalize(root),
+                name.to_path_buf(),
+            );
+    }
+}
+
 fn walk_permission_gap(root: &Path, display_root: &Path, folders: &[PathBuf]) -> String {
     let count = folders.len();
     let mut names = folders
