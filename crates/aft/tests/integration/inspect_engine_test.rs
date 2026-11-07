@@ -537,7 +537,7 @@ fn inspect_engine_drain_routes_idle_scan_to_cache() {
 
 #[test]
 fn inspect_engine_command_returns_lane_a_shape() {
-    let (_temp_dir, root, _file) = fixture_project();
+    let (_temp_dir, root, file) = fixture_project();
     let mut aft = AftProcess::spawn();
     let configure = aft.send(
         &json!({
@@ -555,6 +555,9 @@ fn inspect_engine_command_returns_lane_a_shape() {
         configure["success"], true,
         "configure should succeed: {configure:?}"
     );
+    // Dead code answers only once the root's call graph is published; until
+    // then the inspect reply is partial, not fresh.
+    super::helpers::wait_for_published_call_graph(&mut aft, &file, "alive");
 
     let response = aft.send(
         &json!({

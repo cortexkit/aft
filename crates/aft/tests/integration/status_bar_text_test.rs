@@ -56,6 +56,9 @@ fn standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result() {
     std::fs::write(&file, "// TODO: first\nexport const a = 1;\n").expect("write fixture");
     let mut aft = AftProcess::spawn();
     aft.configure(project.path());
+    // Dead code counts only once the root's call graph is published; before
+    // that the bar shows it as unknown.
+    crate::helpers::wait_for_published_call_graph(&mut aft, &file, "a");
 
     // Inspect produces the Tier-2 and TODO counts, so its own result is the change.
     let text = inspect(&mut aft, "inspect-1");

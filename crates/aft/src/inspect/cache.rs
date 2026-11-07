@@ -4115,6 +4115,21 @@ pub(crate) mod tests {
         assert!(response.success, "{}", response.data);
         ctx.inspect_manager()
             .set_automatic_tier2_refresh_allowed(false);
+        // Dead code answers nothing, fresh or cached, until the root's
+        // index-store checkout has published a call graph. Bind the checkout,
+        // wait for that graph, and let the context's inspect manager read it,
+        // as an `inspect` request does.
+        let checkout = ctx.data_checkout().expect("the index store binds the root");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(Instant::now() < deadline, "the call graph never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ctx.inspect_manager()
+            .read_dead_code_from_data_layer(&ctx.canonical_cache_root(), &checkout);
         ctx
     }
 
@@ -4131,30 +4146,12 @@ pub(crate) mod tests {
         ctx: &crate::context::AppContext,
         category: InspectCategory,
     ) -> serde_json::Value {
-        let graph = if category == InspectCategory::DeadCode {
-            let root = ctx.canonical_cache_root();
-            let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-            let dir = ctx.callgraph_store_dir();
-            let store = crate::callgraph_store::CallGraphStore::open_ready_no_rebuild(
-                dir.clone(),
-                root.clone(),
-            )
-            .unwrap()
-            .unwrap_or_else(|| {
-                let store = crate::callgraph_store::CallGraphStore::open(dir, root).unwrap();
-                store.cold_build(&files).unwrap();
-                store
-            });
-            Some(Arc::new(
-                crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
-            ))
-        } else {
-            None
-        };
+        // Dead code reads the call graph of the checkout `upgrade_context`
+        // bound, so no graph is passed in.
         let result = ctx.inspect_manager().tier2_run_with_reuse_result(
             upgrade_snapshot(ctx),
             category,
-            graph,
+            None,
         );
         result.outcome.expect("upgrade scan succeeds").aggregate
     }

@@ -5970,6 +5970,9 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
     write_file(&root, "service.py", "def spare():\n    return 1\n");
     write_file(&root, "README.md", "documentation\n");
     let ctx = configured_context_with_callgraph_store(&root, true);
+    // Dead code answers only once the root's call graph is published; until
+    // then it reports pending, with no gaps.
+    crate::helpers::wait_for_published_call_graph_in(&ctx);
     ctx.update_status_bar_tier2(Some(99), Some(0), Some(0), Some(0), false);
     let response = inspect(
         &ctx,
