@@ -17,11 +17,9 @@ fn configure_background(aft: &mut AftProcess, project_root: &std::path::Path) {
             "harness": "opencode",
             "project_root": project_root,
             "config": user_config(serde_json::json!({
-                "experimental": {
-                    "bash": {
-                        "background": true,
-                        "compress": true
-                    }
+                "bash": {
+                    "background": true,
+                    "compress": true
                 }
             })),
         })

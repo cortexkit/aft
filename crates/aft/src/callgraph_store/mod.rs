@@ -1896,10 +1896,6 @@ impl RefreshOpenFailure {
 
 fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Result<bool> {
     use crate::fs_lock::LockAvailability;
-    #[cfg(test)]
-    if refresh_worker_test_seam(&root.project_root).writer_busy {
-        return Ok(false);
-    }
     let lease = crate::root_cache::writer_lease_path(&root.callgraph_dir);
     match crate::fs_lock::lock_availability(&lease)? {
         LockAvailability::Available | LockAvailability::Stale => Ok(true),
@@ -3461,15 +3457,10 @@ struct RefreshWorkerTestSeam {
     open_failure_replay_hold: Option<TestHold>,
     #[cfg(test)]
     open_lock_hold: Option<RefreshOpenLockHold>,
-    /// Makes the writer lease look held by another live process, so a
-    /// waiting batch stays waiting without a second process.
-    #[cfg(test)]
-    writer_busy: bool,
     delay: Duration,
     fail_refresh: bool,
     fail_open: bool,
     refresh_calls: usize,
-    worker_calls: usize,
     stale_marks: usize,
     received_paths: BTreeSet<PathBuf>,
 }
@@ -3740,7 +3731,6 @@ fn note_refresh_worker_batch_for_test(project_root: &Path, paths: &[PathBuf]) {
             .expect("callgraph refresh test seam mutex poisoned")
             .get_mut(project_root)
         {
-            seam.worker_calls += 1;
             seam.received_paths.extend(paths.iter().cloned());
         }
     }
@@ -3790,17 +3780,6 @@ pub fn set_callgraph_refresh_worker_test_seam(
         );
 }
 
-/// Make the root's writer lease look held by another live process (or free
-/// again), as the refresh worker's availability check sees it.
-#[cfg(test)]
-pub(crate) fn set_callgraph_refresh_worker_test_writer_busy(project_root: &Path, busy: bool) {
-    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
-        if let Some(seam) = seams.lock().unwrap().get_mut(project_root) {
-            seam.writer_busy = busy;
-        }
-    }
-}
-
 #[doc(hidden)]
 pub fn set_callgraph_refresh_worker_test_open_failure(project_root: PathBuf, enabled: bool) {
     if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
@@ -3818,11 +3797,6 @@ pub fn set_callgraph_refresh_worker_test_open_failure(project_root: PathBuf, ena
 pub fn callgraph_refresh_worker_test_counts(project_root: &Path) -> (usize, usize) {
     let seam = refresh_worker_test_seam(project_root);
     (seam.refresh_calls, seam.stale_marks)
-}
-
-#[doc(hidden)]
-pub fn callgraph_refresh_worker_test_worker_calls(project_root: &Path) -> usize {
-    refresh_worker_test_seam(project_root).worker_calls
 }
 
 #[doc(hidden)]

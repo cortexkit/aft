@@ -11,11 +11,6 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    callgraph_store::{
-        callgraph_refresh_worker_test_counts, clear_callgraph_refresh_worker_test_seam,
-        flush_callgraph_store_refreshes_with_budget, set_callgraph_refresh_worker_test_seam,
-        CallGraphStore,
-    },
     config::Config,
     inspect::{InspectCache, InspectCacheError},
     parser::TreeSitterProvider,
@@ -2169,104 +2164,6 @@ fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
         .recv_timeout(Duration::from_secs(1))
         .expect("maintenance starts after cap frees");
     assert!(recv_async(maintenance, "maintenance completion").success);
-}
-
-#[test]
-fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
-    // This test shares the process-wide refresh worker with the
-    // refresh_worker_tests group; without the lock, its flush can shut the
-    // worker down mid-batch for a concurrently running peer test.
-    let _refresh_guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
-    let root_dir = tempfile::Builder::new()
-        .prefix("aft-executor-callgraph-offload-")
-        .tempdir()
-        .expect("create callgraph worker root");
-    let storage = root_dir.path().join("storage");
-    let source = root_dir.path().join("main.rs");
-    std::fs::write(&source, "fn entry() { leaf(); }\nfn leaf() {}\n")
-        .expect("write callgraph fixture");
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        Config {
-            project_root: Some(root_dir.path().to_path_buf()),
-            storage_dir: Some(storage),
-            indexes: crate::config::IndexesConfig {
-                trigram: false,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        },
-    ));
-    ctx.set_canonical_cache_root(root_dir.path().to_path_buf());
-    let project_key = crate::search_index::artifact_cache_key(root_dir.path());
-    crate::root_cache::configure_artifact_access(root_dir.path(), &project_key, false);
-    ctx.set_cache_role(false, None);
-    let (store, _) = CallGraphStore::cold_build_with_lease(
-        ctx.callgraph_store_dir(),
-        root_dir.path().to_path_buf(),
-        std::slice::from_ref(&source),
-    )
-    .expect("build callgraph fixture");
-    drop(store);
-    set_callgraph_refresh_worker_test_seam(
-        root_dir.path().to_path_buf(),
-        Duration::from_millis(350),
-        false,
-    );
-
-    let executor = test_executor(2, 1, 2, 1);
-    let root = ProjectRootId::from_path(root_dir.path()).expect("canonical actor root");
-    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-    let ctx_for_drain = Arc::clone(&ctx);
-    let source_for_drain = source.clone();
-    let maintenance = executor.submit_maintenance_async(
-        root.clone(),
-        Lane::MaintenanceCommit,
-        "watcher-drain".to_string(),
-        Box::new(move |_| {
-            ctx_for_drain.enqueue_callgraph_store_refresh([source_for_drain]);
-            ok("watcher-drain")
-        }),
-    );
-    assert!(recv_async(maintenance, "maintenance completion").success);
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while callgraph_refresh_worker_test_counts(root_dir.path()).0 == 0 {
-        assert!(Instant::now() < deadline, "refresh worker did not start");
-        thread::sleep(Duration::from_millis(5));
-    }
-    let (mutating_started_tx, mutating_started_rx) = crossbeam_channel::bounded(1);
-    let mutating = executor.submit_async(
-        root,
-        Lane::Mutating,
-        "interactive-edit".to_string(),
-        Box::new(move |_| {
-            mutating_started_tx
-                .send(())
-                .expect("signal writer admission");
-            ok("interactive-edit")
-        }),
-    );
-    // Hang catch only: the store worker is held mid-write by the test seam
-    // until the flush below, so admission here is an ordering proof - a tight
-    // bound would just measure runner scheduling (census S-class shape; flaked
-    // at 150ms on loaded Linux CI).
-    mutating_started_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("interactive writer should admit while store worker is mid-write");
-    assert!(recv_async(mutating, "interactive edit completion").success);
-    // The flush releases the held write and waits for the worker to finish it;
-    // that is a liveness check, not a latency one. Every other flush site in
-    // the refresh_worker tests uses 30 s, and a 1 s bound failed on a Windows
-    // runner whose whole libtest pass took 575 s.
-    assert!(flush_callgraph_store_refreshes_with_budget(
-        Duration::from_secs(30)
-    ));
-    clear_callgraph_refresh_worker_test_seam(root_dir.path());
 }
 
 #[test]

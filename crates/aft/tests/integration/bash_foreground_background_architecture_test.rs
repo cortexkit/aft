@@ -339,12 +339,10 @@ fn long_running_reminder_frame_fires_after_configured_interval() {
             "project_root": project.path(),
             "storage_dir": storage.path(),
             "config": user_config(serde_json::json!({
-                "experimental": {
-                    "bash": {
-                        "background": true,
-                        "long_running_reminder_enabled": true,
-                        "long_running_reminder_interval_ms": 100
-                    }
+                "bash": {
+                    "background": true,
+                    "long_running_reminder_enabled": true,
+                    "long_running_reminder_interval_ms": 100
                 }
             })),
         })

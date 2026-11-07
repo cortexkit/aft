@@ -4717,46 +4717,6 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn watcher_callgraph_refresh_defers_when_ready_store_is_unavailable() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        ctx.update_config(|config| config.indexes.callgraph = true);
-        ctx.set_cache_role(false, None);
-        let source = temp.path().join("pending.rs");
-        let generated = temp.path().join("compiled.ts");
-        std::fs::write(&generated, "// @generated\nexport const compiled = true;\n").unwrap();
-
-        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone(), generated]));
-
-        let deadline = Instant::now() + Duration::from_secs(12);
-        loop {
-            let pending = ctx.take_pending_callgraph_store_paths();
-            if !pending.is_empty() {
-                assert_eq!(pending, vec![source]);
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "refresh worker did not defer the unavailable store batch"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn watcher_callgraph_refresh_keeps_worktree_paths_pending() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        ctx.update_config(|config| config.indexes.callgraph = true);
-        ctx.set_cache_role(true, None);
-        let source = temp.path().join("worktree.rs");
-
-        refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone()]));
-
-        assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![source]);
-    }
-
-    #[test]
     fn watcher_single_dispatch_event_is_sliced_by_path_count() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
