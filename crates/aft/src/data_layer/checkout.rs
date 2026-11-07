@@ -18,7 +18,9 @@ use std::time::Instant;
 
 use aft_store::cache::BlockCache;
 use aft_store::checkout::{CheckoutState, PathKind, PathRecord};
-use aft_store::content::{ContentRecord, ContentSegment, RecordBody, RecordKey};
+use aft_store::content::{
+    ContentRecord, ContentSectionsBuilder, ContentSegment, EncodedRecord, RecordBody, RecordKey,
+};
 use aft_store::family::{Family, Publication, Snapshot};
 use aft_store::graph::{FragmentKey, GraphSegment};
 use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId, SegmentId};
@@ -447,10 +449,13 @@ enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
     /// A parsed file: its parse key and parse, and the content record
-    /// they came from, which a publication of the change stores.
-    Parse(String, Arc<ParseBlob>, Arc<ContentRecord>),
-    /// A resolver configuration file's bytes, and its content record.
-    Config(Arc<[u8]>, Arc<ContentRecord>),
+    /// they came from, encoded, which a publication of the change stores.
+    /// Decoded, a large file's record takes about as much as its parse,
+    /// and nothing reads it before the publication.
+    Parse(String, Arc<ParseBlob>, Arc<EncodedRecord>),
+    /// A resolver configuration file's bytes, and its content record,
+    /// encoded.
+    Config(Arc<[u8]>, Arc<EncodedRecord>),
 }
 
 /// What publishing the changes since a publication wrote.
@@ -2081,8 +2086,9 @@ impl Checkout {
                 .collect::<BTreeMap<_, _>>();
             (engine.live.inputs.clone(), resolved)
         };
-        // The changed contents' records and text, each content once.
-        let mut records = HashMap::new();
+        // The changed contents' records, already encoded, and their text,
+        // each content once.
+        let mut records = ContentSectionsBuilder::new();
         let mut text_units = TextSectionsBuilder::new();
         let mut seen = HashSet::new();
         for (path, change) in &changes {
@@ -2092,7 +2098,7 @@ impl Checkout {
             let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
             match &change.extracted {
                 Extracted::Parse(_, _, stored) | Extracted::Config(_, stored) => {
-                    records.insert(key.digest().to_string(), (key, Arc::clone(stored)));
+                    records.add_encoded(key, Arc::clone(stored));
                 }
                 Extracted::Nothing => {}
             }
@@ -2120,6 +2126,7 @@ impl Checkout {
             }
         }
         let text_unit_count = text_units.len();
+        let record_count = records.len();
         // A path keeps the fragment the publication stored for it unless it
         // got a new one, or its content or language changed.
         let stored_fragments = published
@@ -2154,8 +2161,13 @@ impl Checkout {
             .map_err(DataError::store)?;
         let fragments = {
             // As `write_sections` writes them, from each file's resolution
-            // decoded in turn.
-            let mut sections = SectionsWriter::new(&inputs.state, &records, false, None);
+            // decoded in turn. The content sections hold exactly the changed
+            // records: every changed parsed file is resolved again, so its
+            // fragment is written here, and every changed configuration
+            // file is one of the state's.
+            let no_records = HashMap::new();
+            let mut sections =
+                SectionsWriter::new(&inputs.state, &no_records, false, Some(records));
             for (file, resolution) in &resolved {
                 sections
                     .add(&inputs, file, &resolution.decode(file))
@@ -2218,7 +2230,7 @@ impl Checkout {
         let report = DeltaReport {
             paths: changes.len(),
             fragments: fragments.len(),
-            records: records.len(),
+            records: record_count,
             text_units: text_unit_count,
             segments: read
                 .needed
@@ -3424,7 +3436,7 @@ fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
     let content = match &extracted.data {
         RecordBody::Config { source } => {
             let source = Arc::from(source.as_slice());
-            Extracted::Config(source, Arc::new(extracted))
+            Extracted::Config(source, Arc::new(EncodedRecord::of(&extracted)))
         }
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
@@ -3432,7 +3444,7 @@ fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
                 Extracted::Parse(
                     key.digest().to_string(),
                     Arc::new(parse),
-                    Arc::new(extracted),
+                    Arc::new(EncodedRecord::of(&extracted)),
                 )
             }
             _ => Extracted::Nothing,

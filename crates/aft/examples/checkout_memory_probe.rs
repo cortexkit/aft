@@ -41,6 +41,11 @@ use aft_store::ids::{Digest128, FamilyId};
 
 /// Paths changed past which the runtime publishes the changes at once.
 const PUBLISH_AT: usize = 64;
+/// Files re-resolved since the last publication at which the runtime
+/// publishes the changes too. With PROBE_REFRESHED_RULE=1 the probe applies
+/// it, and each edit's line also says what the call graph held after the
+/// refresh and before that publication (`refreshed_callgraph_mib`).
+const PUBLISH_AT_REFRESHED: usize = 256;
 /// Segments past which the runtime builds a checkout again whole.
 const COMPACT_AT: usize = 8;
 
@@ -240,6 +245,7 @@ fn main() {
         std::env::var_os("PROBE_ALLOC").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    let refreshed_rule = std::env::var_os("PROBE_REFRESHED_RULE").is_some_and(|value| value == "1");
     let mut args = std::env::args().skip(1);
     let pack = args.next().unwrap();
     let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
@@ -353,12 +359,25 @@ fn main() {
         let refresh_allocated = ALLOCATED.load(Ordering::Relaxed) - allocated - record_allocated;
         refresh_times.push(refresh_ms);
         let mut label = "edit".to_string();
-        if checkout.changed_paths() > PUBLISH_AT {
+        // With the runtime's second rule, what the refresh held before the
+        // publication it triggers, as the line after it no longer shows it.
+        let mut before_publishing = None;
+        let many_refreshed = refreshed_rule && checkout.refreshed_files() >= PUBLISH_AT_REFRESHED;
+        if refreshed_rule {
+            let memory = checkout.memory(&mut aft_store::heap::Seen::new());
+            let live = memory.live.unwrap_or_default();
+            before_publishing = Some((live.callgraph_bytes >> 20, live.refreshed_files));
+        }
+        if checkout.changed_paths() > PUBLISH_AT || many_refreshed {
             if let Some(done) = publish(&checkout) {
                 label = format!("edit, then {done}");
             }
         }
         let mut line = sample(&label, commit, path, &peaks, &checkout, &layer);
+        if let Some((callgraph_mib, refreshed_files)) = before_publishing {
+            line["refreshed_callgraph_mib"] = serde_json::json!(callgraph_mib);
+            line["refreshed_files_before_publishing"] = serde_json::json!(refreshed_files);
+        }
         line["refresh_ms"] = serde_json::json!((refresh_ms * 10.0).round() / 10.0);
         line["record_ms"] = serde_json::json!((record_ms * 100.0).round() / 100.0);
         if COUNTING.load(Ordering::Relaxed) {
