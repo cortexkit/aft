@@ -556,6 +556,10 @@ pub struct DeltaReport {
     /// afterwards. Vector segments and other checkouts' segments are not
     /// counted: a build of this checkout cannot fold them.
     pub segments: usize,
+    /// Segments no checkout read any more, and other checkouts whose folder
+    /// is gone, left out of the new generation as a build leaves them out.
+    pub retired_segments: usize,
+    pub retired_checkouts: usize,
     pub ms: f64,
 }
 
@@ -1358,7 +1362,7 @@ impl Checkout {
         // The new segment holds everything this checkout's new state needs,
         // so an older segment stays only while another checkout reads from
         // it. A checkout whose folder is gone reads nothing any more.
-        let unneeded = self.unneeded(&state)?;
+        let unneeded = self.unneeded(&state, false)?;
         report.retired_segments = unneeded.segments.len();
         report.retired_checkouts = unneeded.checkouts.len();
         session
@@ -1504,7 +1508,7 @@ impl Checkout {
         // A checkout without a call graph is built this way every time, so
         // what it no longer reads is retired here as a full build retires
         // it.
-        let unneeded = self.unneeded(&scanned.state)?;
+        let unneeded = self.unneeded(&scanned.state, false)?;
         report.retired_segments = unneeded.segments.len();
         report.retired_checkouts = unneeded.checkouts.len();
         session
@@ -1598,11 +1602,18 @@ impl Checkout {
     }
 
     /// Segments of the current generation that no other checkout's state
-    /// reads (see [`Self::segments_read_by`]). Vector segments follow their
-    /// own rule ([`super::vectors::needed_vector_segments`]), over every
-    /// other checkout's state and `own`, the state this build publishes,
-    /// since the build's new segment holds no vectors.
-    fn unneeded(&self, own: &CheckoutState) -> Result<Unneeded, DataError> {
+    /// reads (see [`Self::segments_read_by`]), nor `own`, the state this
+    /// publication publishes, when `own_reads` says it reads from them.
+    /// A build's new segment holds everything its state needs that other
+    /// checkouts do not already read, so a build passes `false`; a
+    /// publication of changes holds only what changed, so its state keeps
+    /// reading the rest from older segments. A unit only the new segment
+    /// holds counts as found nowhere, so it keeps any segment this build
+    /// cannot read; a unit the new segment holds again keeps its older
+    /// holder for one more publication. Vector segments follow their own
+    /// rule ([`super::vectors::needed_vector_segments`]), over every other
+    /// checkout's state and `own`, since no new segment holds vectors.
+    fn unneeded(&self, own: &CheckoutState, own_reads: bool) -> Result<Unneeded, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let (states, gone) = match self.other_states(&snapshot)? {
             OtherStates::Read { states, gone } => (states, gone),
@@ -1614,11 +1625,15 @@ impl Checkout {
                 });
             }
         };
-        let others = states.iter().collect::<Vec<_>>();
-        let read = self.segments_read_by(&snapshot, &others)?;
+        let mut readers = states.iter().collect::<Vec<_>>();
+        if own_reads {
+            readers.push(own);
+        }
+        let read = self.segments_read_by(&snapshot, &readers)?;
         let mut needed = read.needed;
-        let mut readers = others;
-        readers.push(own);
+        if !own_reads {
+            readers.push(own);
+        }
         let usable = read
             .usable
             .iter()
@@ -2313,11 +2328,22 @@ impl Checkout {
         let written = session
             .write_checkout_state(self.checkout, &state)
             .map_err(DataError::store)?;
+        // The new segment holds only what changed, so a segment whose every
+        // unit its readers now take from a newer one (an earlier publication
+        // of the same files, say) is read by no checkout. Builds are the
+        // only other place such a segment leaves, and a checkout that keeps
+        // editing the same files reads few segments and so is seldom built
+        // again: without this, every publication of its changes stayed in
+        // the store, one more open file each.
+        let unneeded = self.unneeded(&state, true)?;
+        let retired_segments = unneeded.segments.len();
+        let retired_checkouts = unneeded.checkouts.len();
         session
             .publish(&Publication {
                 add_segments: vec![segment],
+                remove_segments: unneeded.segments,
                 states: vec![written],
-                ..Publication::default()
+                retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
         // The state this one replaces, and older manifests, go once no
@@ -2348,6 +2374,8 @@ impl Checkout {
                 .zip(&others_read)
                 .filter(|(own, other)| **own && !**other)
                 .count(),
+            retired_segments,
+            retired_checkouts,
             ms: 0.0,
         };
         self.serve_new(snapshot, covered)?;
@@ -5151,6 +5179,75 @@ pub fn other() { callee(); }
         assert_eq!(view.status().callgraph, PlaneStatus::Ready);
         assert_eq!(ours, callers_of(&view, "src/util.rs", "callee"));
         assert_eq!(candidates_for(&view, "zzneedle"), ["notes.txt"]);
+    }
+
+    /// The live segments of the family store at `checkout`'s.
+    fn live_segments(checkout: &Checkout) -> usize {
+        checkout
+            .family
+            .snapshot()
+            .unwrap()
+            .manifest()
+            .segments()
+            .len()
+    }
+
+    /// A checkout that keeps editing the same file publishes each round of
+    /// changes in a segment of its own, which replaces everything the one
+    /// before held. That one is read by nothing and leaves the store with a
+    /// later publication, with no build in between; it used to stay until
+    /// a build, and such a checkout reads too few segments to be built.
+    #[test]
+    fn publications_of_the_same_files_leave_no_unread_segment_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let mut retired = 0;
+        for round in 0..12 {
+            write(
+                root.path(),
+                "src/util.rs",
+                &format!("pub fn callee() {{}}\npub fn other{round}() {{ callee(); }}\n"),
+            );
+            checkout.record_paths(&[b"src/util.rs".to_vec()]).unwrap();
+            checkout.refresh_callgraph().unwrap();
+            let report = checkout.publish_changes().unwrap().expect("published");
+            retired += report.retired_segments;
+            // The build's segment and this publication's, and at most the
+            // one before it: a unit this publication writes again keeps
+            // its older holder for one more publication.
+            assert!(
+                live_segments(&checkout) <= 3,
+                "round {round}: {} segments, {report:?}",
+                live_segments(&checkout)
+            );
+        }
+        assert!(retired >= 10, "{retired} segments retired");
+        let ours = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(
+            ours.contains("other11") && ours.contains("caller"),
+            "{ours}"
+        );
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        assert_eq!(
+            ours,
+            callers_of(&cold.view().unwrap(), "src/util.rs", "callee")
+        );
+        // A restart serves the last publication.
+        drop(checkout);
+        let restarted = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        assert_eq!(restarted.changed_paths(), 0);
+        assert_eq!(
+            ours,
+            callers_of(&restarted.view().unwrap(), "src/util.rs", "callee")
+        );
     }
 
     #[test]
