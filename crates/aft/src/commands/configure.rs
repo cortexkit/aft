@@ -9740,6 +9740,38 @@ mod tests {
         ctx.stop_watcher_runtime();
     }
 
+    /// Semantic search alone binds the root: its meaning plane fills from the
+    /// checkout the index store builds, so withholding the checkout when the
+    /// text index and call graph are off would leave semantic search with
+    /// nothing to serve it.
+    #[test]
+    fn configure_with_only_semantic_search_on_binds_the_index_store() {
+        let _env = home_env_mutex();
+        let _git = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        let configure = |semantic: bool| {
+            let req = configure_request_with_params(json!({
+                "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+                "config": [user_tier(json!({
+                    "indexes": {"trigram": false, "semantic": semantic, "callgraph": false},
+                    "semantic": {"backend": "openai_compatible", "base_url": "http://127.0.0.1:1"},
+                }))],
+            }));
+            let response = handle_configure_for_test(&req, &ctx);
+            assert!(response.success, "{response:?}");
+        };
+        configure(true);
+        assert!(ctx.data_layer_withheld().is_none());
+        assert!(ctx.data_layer_serves_meaning());
+        configure(false);
+        assert!(matches!(
+            ctx.data_layer_withheld(),
+            Some(crate::data_layer::surfaces::Withheld::IndexesOff)
+        ));
+    }
+
     #[test]
     fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
         let _guard = home_env_mutex();
