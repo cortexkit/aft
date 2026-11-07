@@ -439,8 +439,91 @@ struct Change {
     sequence: u64,
     /// Its record now; `None` once it left the checkout.
     record: Option<PathRecord>,
-    /// What the call graph reads from it now.
-    extracted: Extracted,
+    /// What the call graph reads from it now, extracted when first needed.
+    /// Every copy of the change shares the one extraction.
+    content: Arc<ChangeContent>,
+}
+
+impl Change {
+    /// Whether the change is a file in a parsed language whose extraction
+    /// ran and failed. Until a refresh extracts it, a changed file is
+    /// pending in the call graph, not unparsed.
+    fn failed(&self) -> bool {
+        self.content
+            .peek()
+            .is_some_and(|extracted| matches!(extracted, Extracted::Nothing))
+            && self.record.as_ref().is_some_and(is_unparsed)
+    }
+}
+
+/// What the call graph reads from one changed path, extracted the first
+/// time a call-graph refresh (or a publication of the changes) needs it
+/// rather than when the change is recorded: recording an edit only reads
+/// the file and indexes its text, so an edit tool's call returns without
+/// parsing the file, and a burst of edits to one file is parsed once, by
+/// the refresh that follows it.
+struct ChangeContent {
+    /// The bytes the recording read, with what they are parsed as, until
+    /// they are extracted; `None` once extracted, or when there is nothing
+    /// to extract.
+    source: Mutex<Option<RecordedSource>>,
+    extracted: std::sync::OnceLock<Extracted>,
+}
+
+/// A changed file's bytes as the recording read them, to extract later.
+struct RecordedSource {
+    /// The language the file's path and bytes chose (see `language_for`).
+    language: String,
+    content: ContentKey,
+    bytes: Vec<u8>,
+}
+
+impl ChangeContent {
+    /// Content the call graph reads nothing from: not a parsed language,
+    /// not text, or gone.
+    fn nothing() -> Arc<Self> {
+        Arc::new(Self {
+            source: Mutex::new(None),
+            extracted: std::sync::OnceLock::from(Extracted::Nothing),
+        })
+    }
+
+    /// `record`'s content, read by the recording as `bytes`: extracted when
+    /// first needed if the record is text in a parsed language (its
+    /// language already set), nothing otherwise.
+    fn recorded(record: &PathRecord, bytes: Vec<u8>) -> Arc<Self> {
+        if !matches!(record.kind, PathKind::Text | PathKind::Large) || record.language.is_empty() {
+            return Self::nothing();
+        }
+        Arc::new(Self {
+            source: Mutex::new(Some(RecordedSource {
+                language: record.language.clone(),
+                content: record.content,
+                bytes,
+            })),
+            extracted: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// What the call graph reads from the file, extracting it now if no
+    /// one has yet; the bytes are let go once extracted. An extraction that
+    /// panics leaves them, so the next refresh extracts them again.
+    fn get(&self) -> &Extracted {
+        self.extracted.get_or_init(|| {
+            let mut source = self
+                .source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let extracted = source.as_ref().map_or(Extracted::Nothing, extract_recorded);
+            *source = None;
+            extracted
+        })
+    }
+
+    /// What the call graph reads from the file, if it was extracted.
+    fn peek(&self) -> Option<&Extracted> {
+        self.extracted.get()
+    }
 }
 
 /// What the call graph reads from one changed path.
@@ -916,23 +999,23 @@ impl Checkout {
         generation: u64,
         mut state: CheckoutState,
         changed: &[Vec<u8>],
-        read: HashMap<Vec<u8>, Vec<u8>>,
+        mut read: HashMap<Vec<u8>, Vec<u8>>,
     ) -> bool {
         // A record the scan read again keeps its language when its content
         // did not change; a changed text file gets the language its path and
-        // bytes choose. Only changed paths are extracted: a file read again
-        // only because its stat moved (a touch, a copied checkout) has the
-        // content it had. The scanned state is this scan's own, so its
+        // bytes choose. Only changed paths get a language anew: a file read
+        // again only because its stat moved (a touch, a copied checkout) has
+        // the content it had. The scanned state is this scan's own, so its
         // records take their languages in place rather than being copied.
-        let mut extracted = HashMap::new();
+        // Choosing a language reads the path, and only for a C header parses
+        // the bytes; the changed files' extraction waits for the call graph
+        // (see `ChangeContent`).
         let mut languages = Vec::new();
         for path in changed {
             let (Some(bytes), Some(index)) = (read.get(path), state.position(path)) else {
                 continue;
             };
-            let (language, content) = extract_changed(&state.paths()[index], bytes);
-            languages.push((index, language));
-            extracted.insert(path.clone(), content);
+            languages.push((index, changed_language(&state.paths()[index], bytes)));
         }
         // Every other record without a language takes the base's when its
         // content is the same. Both states are in path order, so one pass
@@ -972,14 +1055,20 @@ impl Checkout {
         let mut entries = Vec::with_capacity(changed.len());
         for path in changed {
             let record = state.get(path).cloned();
-            let entry = match (&record, read.get(path)) {
+            // Text queries read the new trigrams at once; what the call graph
+            // reads is extracted from the same bytes when it first needs it.
+            let bytes = read.remove(path);
+            let entry = match (&record, &bytes) {
                 (None, _) => OverlayEntry::Deleted,
                 (Some(record), Some(bytes)) if record.kind == PathKind::Text => {
                     OverlayEntry::Content(Arc::new(ContentTrigrams::of(bytes)))
                 }
                 (Some(_), _) => OverlayEntry::Unindexed,
             };
-            let content = extracted.remove(path).unwrap_or(Extracted::Nothing);
+            let content = match (&record, bytes) {
+                (Some(record), Some(bytes)) => ChangeContent::recorded(record, bytes),
+                _ => ChangeContent::nothing(),
+            };
             entries.push((path.clone(), entry, record, content));
         }
         let mut guard = self.write_live();
@@ -997,22 +1086,18 @@ impl Checkout {
         let unparsed = Arc::make_mut(&mut live.unparsed);
         for (path, entry, record, content) in entries {
             pending.insert(path.clone());
-            let failed =
-                matches!(content, Extracted::Nothing) && record.as_ref().is_some_and(is_unparsed);
-            if failed {
+            let change = Change {
+                sequence,
+                record,
+                content,
+            };
+            if change.failed() {
                 unparsed.insert(path.clone());
             } else {
                 unparsed.remove(&path);
             }
             text.set(path.clone(), entry);
-            live.changes.insert(
-                path,
-                Change {
-                    sequence,
-                    record,
-                    extracted: content,
-                },
-            );
+            live.changes.insert(path, change);
         }
         live.text_members = Arc::default();
         live.state = Some(Arc::new(state));
@@ -1475,9 +1560,7 @@ impl Checkout {
             };
             let mut unparsed = published.unparsed.clone();
             for (path, change) in &live.changes {
-                let failed = matches!(change.extracted, Extracted::Nothing)
-                    && change.record.as_ref().is_some_and(is_unparsed);
-                if failed {
+                if change.failed() {
                     unparsed.insert(path.clone());
                 } else {
                     unparsed.remove(path);
@@ -1864,6 +1947,21 @@ impl Checkout {
                 .filter(|(_, change)| change.sequence <= covered)
                 .map(|(path, _)| path.clone())
                 .collect::<BTreeSet<_>>();
+            // The refresh extracted these changes, so each one whose
+            // extraction failed now counts as unparsed. The set is copied
+            // only when that changes it and a view still holds it.
+            let live = &mut *live;
+            for path in &resolved {
+                let failed = live.changes.get(path).is_some_and(Change::failed);
+                if failed != live.unparsed.contains(path) {
+                    let unparsed = Arc::make_mut(&mut live.unparsed);
+                    if failed {
+                        unparsed.insert(path.clone());
+                    } else {
+                        unparsed.remove(path);
+                    }
+                }
+            }
             live.callgraph_pending = Arc::new(
                 live.callgraph_pending
                     .iter()
@@ -1909,6 +2007,18 @@ impl Checkout {
             .collect::<BTreeSet<_>>();
         let mut stats = None;
         if !changed.is_empty() {
+            // The changed files are extracted here, all at once on the
+            // engine's threads, rather than each when its edit was recorded.
+            let extracting = changed
+                .iter()
+                .filter_map(|path| changes.get(path))
+                .collect::<Vec<_>>();
+            engine.live.install(|| {
+                use rayon::prelude::*;
+                extracting.par_iter().for_each(|change| {
+                    change.content.get();
+                });
+            });
             let next = next_inputs(state, &engine.live.inputs, changes, &changed);
             let changed_names = changed
                 .iter()
@@ -1979,7 +2089,7 @@ impl Checkout {
                 let Ok(name) = std::str::from_utf8(path) else {
                     continue;
                 };
-                match &changes[path].extracted {
+                match changes[path].content.get() {
                     Extracted::Parse(_, _, record) => {
                         engine
                             .refreshed
@@ -2096,7 +2206,7 @@ impl Checkout {
                 continue;
             };
             let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
-            match &change.extracted {
+            match change.content.get() {
                 Extracted::Parse(_, _, stored) | Extracted::Config(_, stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
@@ -3355,7 +3465,7 @@ fn next_inputs(
         };
         parses.remove(name);
         configs.remove(path);
-        match changes.get(path).map(|change| &change.extracted) {
+        match changes.get(path).map(|change| change.content.get()) {
             Some(Extracted::Parse(key, parse, _)) => {
                 parses.insert(name.to_string(), (key.clone(), Arc::clone(parse)));
             }
@@ -3418,29 +3528,33 @@ fn is_unparsed(record: &PathRecord) -> bool {
         && record.language != "config"
 }
 
-/// The language a changed file is parsed as, and what the call graph reads
-/// from it. As in a build, a file the extractor fails on is not parsed.
-fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
+/// The language a changed file is parsed as: the one its path and bytes
+/// choose, for a text file.
+fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
     if !matches!(record.kind, PathKind::Text | PathKind::Large) {
-        return (String::new(), Extracted::Nothing);
+        return String::new();
     }
-    let Some(language) = std::str::from_utf8(&record.path)
+    std::str::from_utf8(&record.path)
         .ok()
         .and_then(|path| language_for(path, bytes))
-    else {
-        return (String::new(), Extracted::Nothing);
+        .unwrap_or_default()
+}
+
+/// What the call graph reads from a changed file recorded as `source`. As
+/// in a build, a file the extractor fails on is not parsed.
+fn extract_recorded(source: &RecordedSource) -> Extracted {
+    let language = &source.language;
+    let Ok(extracted) = extract(&source.bytes, language) else {
+        return Extracted::Nothing;
     };
-    let Ok(extracted) = extract(bytes, &language) else {
-        return (language, Extracted::Nothing);
-    };
-    let content = match &extracted.data {
+    match &extracted.data {
         RecordBody::Config { source } => {
             let source = Arc::from(source.as_slice());
             Extracted::Config(source, Arc::new(EncodedRecord::of(&extracted)))
         }
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
-                let key = RecordKey::new(record.content, &language, EXTRACTOR_VERSION);
+                let key = RecordKey::new(source.content, language, EXTRACTOR_VERSION);
                 Extracted::Parse(
                     key.digest().to_string(),
                     Arc::new(parse),
@@ -3449,8 +3563,7 @@ fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
             }
             _ => Extracted::Nothing,
         },
-    };
-    (language, content)
+    }
 }
 
 /// The index of the newest segment `find` locates a key in.
@@ -3845,6 +3958,12 @@ impl aft_store::heap::HeapBytes for PathTextMemo {
 }
 
 aft_store::heap_bytes_of_fields!(RefreshedFile { resolution, parse });
+aft_store::heap_bytes_of_fields!(ChangeContent { source, extracted });
+aft_store::heap_bytes_of_fields!(RecordedSource {
+    language,
+    content,
+    bytes,
+});
 
 impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
@@ -3954,7 +4073,7 @@ impl Checkout {
         let extracted = live
             .changes
             .values()
-            .map(|change| change.extracted.heap_bytes(seen))
+            .map(|change| change.content.heap_bytes(seen))
             .sum();
         let pending = live.unparsed.heap_bytes(seen) + live.callgraph_pending.heap_bytes(seen);
         let served = live.graph.heap_bytes(seen);
@@ -4003,7 +4122,7 @@ impl Checkout {
             );
             for (path, change) in &live.changes {
                 parts.shared += path.heap_bytes(seen) + change.record.heap_bytes(seen);
-                parts.callgraph += change.extracted.heap_bytes(seen);
+                parts.callgraph += change.content.heap_bytes(seen);
             }
             parts.callgraph += live.unparsed.heap_bytes(seen)
                 + live.callgraph_pending.heap_bytes(seen)
@@ -5852,6 +5971,58 @@ pub fn other() { callee(); }
                 .any(|call| call.caller_file.ends_with("src/extra.rs")),
             "the new caller is in the snapshot: {refreshed_snapshot:?}"
         );
+    }
+
+    /// Recording an edit indexes its text at once and leaves parsing it to
+    /// the call graph: the tool call that records the edit returns without
+    /// running the extractor, text queries already see the new bytes, and
+    /// the refresh that follows extracts the file once and answers from it.
+    #[test]
+    fn an_edit_is_searchable_at_once_and_parsed_by_the_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+
+        let util = "pub fn callee() {}\npub fn zzfresh() { callee(); }\n";
+        write(root.path(), "src/util.rs", util);
+        checkout.record_paths(&[b"src/util.rs".to_vec()]).unwrap();
+        let extracted = || {
+            let live = checkout.live.read().unwrap();
+            live.changes[&b"src/util.rs".to_vec()]
+                .content
+                .peek()
+                .is_some()
+        };
+        assert!(!extracted(), "recording an edit does not parse it");
+        let view = checkout.view().unwrap();
+        let query = plan_pattern("zzfresh", false).unwrap();
+        assert_eq!(
+            view.text_candidates(&query, Scope::All).unwrap(),
+            vec![b"src/util.rs".to_vec()],
+            "text queries see the edit at once"
+        );
+        assert_eq!(
+            view.current_state().get(b"src/util.rs").unwrap().language,
+            "rust",
+            "the edited file keeps its language"
+        );
+        drop(view);
+
+        checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("one file changed");
+        assert!(extracted(), "the refresh parsed the edit");
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("zzfresh"), "{callers}");
+        assert_eq!(checkout.view().unwrap().status().unparsed, 0);
+        // The published change carries the record the refresh extracted.
+        checkout.publish_changes().unwrap().expect("one change");
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("zzfresh"), "{callers}");
     }
 
     #[test]
