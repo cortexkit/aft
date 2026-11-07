@@ -174,6 +174,8 @@ pub struct MemoryPolicy {
 }
 
 impl MemoryPolicy {
+    #[cfg(target_os = "linux")]
+    pub(crate) const TASK_SCOPE_MEMORY_KIND: &str = "Linux task scope memory.max";
     pub fn note(&self) -> String {
         format!("Memory cap: {} MiB ({}).", self.mib, self.kind)
     }
@@ -202,6 +204,8 @@ pub(crate) struct Monitor {
     bootstrap: Option<std::process::Child>,
     #[cfg(target_os = "linux")]
     retired_cgroup: Option<std::path::PathBuf>,
+    #[cfg(target_os = "linux")]
+    borrowed_scope: Option<super::task_scope::ScopeHandle>,
     #[cfg(windows)]
     job: windows::Job,
 }
@@ -237,6 +241,8 @@ impl Monitor {
             bootstrap,
             #[cfg(target_os = "linux")]
             retired_cgroup: None,
+            #[cfg(target_os = "linux")]
+            borrowed_scope: None,
             #[cfg(windows)]
             job,
         })
@@ -244,7 +250,12 @@ impl Monitor {
 
     pub fn attach(&mut self, pid: u32) -> Result<(), String> {
         #[cfg(target_os = "linux")]
-        if let Some(path) = &self.policy.cgroup {
+        if let Some(path) = self
+            .policy
+            .cgroup
+            .as_ref()
+            .filter(|_| self.borrowed_scope.is_none())
+        {
             if linux::attach(path, pid).is_err() {
                 self.use_watcher_fallback();
             }
@@ -274,11 +285,23 @@ impl Monitor {
         }
     }
 
-    pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Self, String> {
+    pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Option<Self>, String> {
+        #[cfg(target_os = "linux")]
+        if policy.kind == MemoryPolicy::TASK_SCOPE_MEMORY_KIND {
+            return match super::task_scope::lookup_local(task_id, policy.cgroup.as_deref())? {
+                super::task_scope::LocalScopeLookup::Present(scope) => {
+                    Ok(Some(Self::recover_task_scope(policy.mib, &scope)))
+                }
+                super::task_scope::LocalScopeLookup::Absent => Ok(None),
+                super::task_scope::LocalScopeLookup::Unknown => Err(format!(
+                    "task scope aft-task-{task_id}.scope location is unknown"
+                )),
+            };
+        }
         #[cfg(windows)]
         let job = windows::Job::new(policy.mib, task_id)?;
         let _ = task_id;
-        Ok(Self {
+        Ok(Some(Self {
             policy,
             last_sample: None,
             exceeded: false,
@@ -287,9 +310,11 @@ impl Monitor {
             bootstrap: None,
             #[cfg(target_os = "linux")]
             retired_cgroup: None,
+            #[cfg(target_os = "linux")]
+            borrowed_scope: None,
             #[cfg(windows)]
             job,
-        })
+        }))
     }
 
     pub fn exceeded(&mut self, pgid: i32) -> bool {
@@ -335,6 +360,11 @@ impl Monitor {
 
     pub fn terminate(&self) {
         #[cfg(target_os = "linux")]
+        if let Some(scope) = &self.borrowed_scope {
+            let _ = scope.kill();
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(path) = &self.policy.cgroup {
             let _ = linux::write_control(&path.join("cgroup.kill"), "1");
         }
@@ -347,6 +377,48 @@ impl Monitor {
             self.policy.accounting_failure_reason()
         } else {
             self.policy.exceeded_reason()
+        }
+    }
+
+    pub(crate) fn is_task_scope(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.borrowed_scope.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn task_scope(&self) -> Option<&super::task_scope::ScopeHandle> {
+        self.borrowed_scope.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_task_scope(
+        mib: u64,
+        scope: &super::task_scope::ScopeHandle,
+    ) -> Result<Self, String> {
+        scope.ensure_oom_group()?;
+        Ok(Self::recover_task_scope(mib, scope))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recover_task_scope(mib: u64, scope: &super::task_scope::ScopeHandle) -> Self {
+        Self {
+            policy: MemoryPolicy {
+                mib,
+                kind: MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
+                cgroup: Some(scope.cgroup().to_owned()),
+            },
+            last_sample: None,
+            exceeded: false,
+            accounting_failed: false,
+            bootstrap: None,
+            retired_cgroup: None,
+            borrowed_scope: Some(scope.clone()),
         }
     }
 
@@ -372,7 +444,12 @@ impl Drop for Monitor {
             linux::stop_bootstrap(helper);
         }
         #[cfg(target_os = "linux")]
-        if let Some(path) = &self.policy.cgroup {
+        if let Some(path) = self
+            .policy
+            .cgroup
+            .as_ref()
+            .filter(|_| self.borrowed_scope.is_none())
+        {
             let _ = std::fs::remove_dir(path);
         }
         #[cfg(target_os = "linux")]
@@ -396,40 +473,15 @@ mod linux {
     }
 
     fn helper_command(executable: &Path) -> std::process::Command {
-        let mut command = std::process::Command::new(executable);
-        // The user manager needs its session endpoint, not the daemon's credentials.
-        command.env_clear().env("PATH", "/usr/bin:/bin");
-        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        command
+        super::super::task_scope::user_manager_command(executable)
     }
 
-    fn systemd_run_path_with(mut exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {
-        for path in [
-            Path::new("/usr/bin/systemd-run"),
-            Path::new("/bin/systemd-run"),
-        ] {
-            if exists(path) {
-                return Some(path);
-            }
-        }
-        None
+    fn systemd_run_path_with(exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {
+        super::super::task_scope::systemd_run_path_with(exists)
     }
 
     fn current(pid: u32) -> Option<PathBuf> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
-        // Paths containing '..' are outside this process's cgroup namespace.
-        if Path::new(relative)
-            .components()
-            .any(|part| part == std::path::Component::ParentDir)
-        {
-            return None;
-        }
-        Some(Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+        super::super::task_scope::current_cgroup(pid)
     }
 
     fn delegated(parent: &Path, mib: u64, task_id: &str) -> Option<PathBuf> {
@@ -601,6 +653,43 @@ mod linux {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
             );
+        }
+
+        #[test]
+        fn task_scope_memory_monitor_borrows_and_detects_oom() {
+            for initial in ["1", "0"] {
+                let dir = tempfile::tempdir().unwrap();
+                let group = dir.path().join("memory.oom.group");
+                std::fs::write(&group, initial).unwrap();
+                std::fs::write(dir.path().join("memory.events"), "oom_kill 1\n").unwrap();
+                let scope = crate::bash_background::task_scope::handle_for_test(
+                    "bash-0123456789abcdef",
+                    dir.path().into(),
+                );
+                let mut monitor = super::super::Monitor::from_task_scope(64, &scope).unwrap();
+                monitor.attach(12345).unwrap();
+                assert!(
+                    !dir.path().join("cgroup.procs").exists(),
+                    "borrowed scope received a PID write"
+                );
+                assert_eq!(std::fs::read_to_string(&group).unwrap(), "1");
+                assert!(monitor.exceeded(0));
+                drop(monitor);
+                assert!(dir.path().exists(), "borrowed cgroup was removed");
+            }
+        }
+
+        #[test]
+        fn task_scope_memory_monitor_refuses_denied_group_write() {
+            let dir = tempfile::tempdir().unwrap();
+            let group = dir.path().join("memory.oom.group");
+            std::fs::create_dir(&group).unwrap();
+            let scope = crate::bash_background::task_scope::handle_for_test(
+                "bash-0123456789abcdef",
+                dir.path().into(),
+            );
+            assert!(super::super::Monitor::from_task_scope(64, &scope).is_err());
+            assert!(group.is_dir());
         }
 
         #[test]

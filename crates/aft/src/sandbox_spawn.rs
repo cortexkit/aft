@@ -368,6 +368,8 @@ struct SavedLocalLaunch {
     command: Vec<u8>,
     payload_digest: [u8; 32],
     linux_scope: bool,
+    #[serde(default = "default_scope_max_runtime_secs")]
+    linux_scope_max_runtime_secs: u64,
     // Snapshots without a stored ceiling represent originally uncapped launches.
     #[serde(default)]
     memory_limit_mib: Option<u64>,
@@ -375,6 +377,11 @@ struct SavedLocalLaunch {
 
 #[cfg(unix)]
 pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
+
+#[cfg(unix)]
+fn default_scope_max_runtime_secs() -> u64 {
+    crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS
+}
 
 #[cfg(unix)]
 pub(crate) fn save_local_launch(
@@ -385,6 +392,7 @@ pub(crate) fn save_local_launch(
     shell: &Path,
     linux_scope: bool,
     memory_limit_mib: Option<u64>,
+    linux_scope_max_runtime_secs: u64,
 ) -> Result<String, String> {
     let prepared = plan
         .prepared_task()
@@ -421,6 +429,7 @@ pub(crate) fn save_local_launch(
         payload_digest: *prepared.0.digest.as_bytes(),
         linux_scope,
         memory_limit_mib,
+        linux_scope_max_runtime_secs,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
     let mut file = crate::bash_background::persistence::create_control_file(
@@ -451,6 +460,7 @@ pub(crate) fn restore_local_launch(
         HashMap<String, String>,
         bool,
         Option<u64>,
+        u64,
     ),
     String,
 > {
@@ -511,6 +521,7 @@ pub(crate) fn restore_local_launch(
         env,
         snapshot.linux_scope,
         snapshot.memory_limit_mib,
+        snapshot.linux_scope_max_runtime_secs,
     ))
 }
 
@@ -6075,6 +6086,7 @@ fn sandboxed_child_environment(
         // Workers also drop session-bus discovery; Linux still reports that
         // direct connections to a known bus path are not isolated by Landlock.
         if crate::bash_env::is_preexec_hijack_env_key(key.as_str())
+            || key == crate::bash_background::registry::LINUX_SCOPE_ENV
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV

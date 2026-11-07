@@ -455,6 +455,8 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    #[serde(deserialize_with = "deserialize_opt_linux_scope_max_runtime_secs")]
+    pub linux_scope_max_runtime_secs: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
     pub memory_limit_mib: Option<u64>,
     pub disclaim_privacy: Option<bool>,
@@ -2132,6 +2134,7 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
                 .changed_files
                 .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
             features.linux_scope = None;
+            features.linux_scope_max_runtime_secs = None;
             features.runon_enabled = None;
             // `project_env` is carried separately: the resolver never applies a
             // project's environment, so it must not reach the user-tier map.
@@ -2263,6 +2266,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                linux_scope_max_runtime_secs: override_features
+                    .linux_scope_max_runtime_secs
+                    .or(base.linux_scope_max_runtime_secs),
                 memory_limit_mib: override_features.memory_limit_mib.or(base.memory_limit_mib),
                 disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
@@ -2312,6 +2318,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            linux_scope_max_runtime_secs: None,
             memory_limit_mib: None,
             disclaim_privacy: None,
             powershell_tool: None,
@@ -2601,6 +2608,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
     ) {
         push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
+    }
+    if raw.bash.as_ref().is_some_and(
+        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope_max_runtime_secs.is_some()),
+    ) {
+        push_drop(dropped, "bash.linux_scope_max_runtime_secs", tier, USER_ONLY_REASON);
     }
     for tool in feature_config::normalize_tool_list(
         raw.disabled_tools
@@ -3281,6 +3293,7 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    linux_scope_max_runtime_secs: u64,
     memory_limit_mib: Option<u64>,
     disclaim_privacy: bool,
     powershell_tool: bool,
@@ -3303,6 +3316,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.linux_scope_max_runtime_secs = bash.linux_scope_max_runtime_secs;
     config.bash.memory_limit_mib = bash.memory_limit_mib;
     config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
@@ -3360,7 +3374,7 @@ fn resolve_bash_config(
         .unwrap_or(DEFAULT_BASH_WORKER_WAIT_MAX_MS);
     let top_linux_scope = top_features
         .and_then(|features| features.linux_scope)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let top_powershell_tool = top_features
         .and_then(|features| features.powershell_tool)
         .unwrap_or(false);
@@ -3391,6 +3405,9 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        linux_scope_max_runtime_secs: top_features
+            .and_then(|features| features.linux_scope_max_runtime_secs)
+            .unwrap_or(crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS),
         memory_limit_mib: top_features.and_then(|features| features.memory_limit_mib),
         disclaim_privacy: top_features
             .and_then(|features| features.disclaim_privacy)
@@ -3612,6 +3629,22 @@ where
         Some(0) => Err(de::Error::custom("must be a positive integer")),
         other => Ok(other),
     }
+}
+
+fn deserialize_opt_linux_scope_max_runtime_secs<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)
+        .map_err(|error| de::Error::custom(format!("linux_scope_max_runtime_secs: {error}")))?;
+    if value.is_some_and(|value| !(1..=4_294_967_295).contains(&value)) {
+        return Err(de::Error::custom(
+            "linux_scope_max_runtime_secs must be from 1 to 4294967295",
+        ));
+    }
+    Ok(value)
 }
 
 fn deserialize_opt_memory_limit_mib<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -5834,8 +5867,8 @@ mod tests {
     }
 
     #[test]
-    fn bash_linux_scope_is_user_only_and_defaults_off() {
-        assert!(!resolve_config(&[]).config.bash.linux_scope);
+    fn bash_linux_scope_is_user_only_and_defaults_on() {
+        assert!(resolve_config(&[]).config.bash.linux_scope);
 
         let result = resolve_config(&[
             tier("user", r#"{ "bash": { "linux_scope": true } }"#),
@@ -5843,6 +5876,34 @@ mod tests {
         ]);
         assert!(result.config.bash.linux_scope);
         assert!(drop_keys(&result).contains(&"bash.linux_scope".to_string()));
+    }
+
+    #[test]
+    fn task_scope_config_contract() {
+        let direct = crate::config::BashConfig::default();
+        assert!(direct.linux_scope);
+        assert_eq!(direct.linux_scope_max_runtime_secs, 86_400);
+        let defaults = resolve_config(&[]).config.bash;
+        assert!(defaults.linux_scope);
+        assert_eq!(defaults.linux_scope_max_runtime_secs, 86_400);
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"linux_scope":false,"linux_scope_max_runtime_secs":7200}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"bash":{"linux_scope":true,"linux_scope_max_runtime_secs":1}}"#,
+            ),
+        ]);
+        assert!(!result.config.bash.linux_scope);
+        assert_eq!(result.config.bash.linux_scope_max_runtime_secs, 7200);
+        assert!(drop_keys(&result).contains(&"bash.linux_scope_max_runtime_secs".into()));
+        for value in ["0", "-1", "1.5", "4294967296", "true", "\"86400\""] {
+            let text = format!("{{\"linux_scope_max_runtime_secs\":{value}}}");
+            let error = serde_json::from_str::<RawBashFeatures>(&text).unwrap_err();
+            assert!(error.to_string().contains("linux_scope_max_runtime_secs"));
+        }
     }
 
     #[test]

@@ -26,6 +26,33 @@
       "source": "timeout",
       "role": "worker",
       "expected": "AFT kills this task at 2023-11-14 22:14:05Z, when it has run 45s (the `timeout` you passed); about 35s remain."
+    },
+    {
+      "name": "fixed scope worker",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700000000000,
+      "limit_ms": 1000,
+      "source": "scope",
+      "role": "worker",
+      "expected": "AFT kills this task at 2023-11-14 22:13:21Z, when it has run 1s (its fixed Linux task scope limit; waits cannot extend this limit); about 1s remain."
+    },
+    {
+      "name": "scoped default primary",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700001080000,
+      "limit_ms": 1800000,
+      "source": "scoped_default",
+      "role": "primary",
+      "expected": "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit) unless you pass a longer `timeout`; about 12 minutes remain."
+    },
+    {
+      "name": "renewable task within fixed scope",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700001080000,
+      "limit_ms": 1800000,
+      "source": "scoped_default",
+      "role": "worker",
+      "expected": "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit; worker waits can extend this deadline, but cannot extend the fixed Linux task scope limit); about 12 minutes remain."
     }
   ]
 }
