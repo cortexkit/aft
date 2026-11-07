@@ -6,6 +6,7 @@
 //! | fragment data, fragment index | each fragment's bytes, packed (see `packed`) |
 //! | term lookup, one key space per [`TermKind`] | each term's 64-bit hash to its posting list |
 //! | term postings, same key spaces | posting lists of fragment ordinals |
+//! | slice data, slice index (optional) | each fragment's slice record, packed, by the fragment's ordinal |
 //!
 //! A fragment is one file's call-graph resolution, as bytes the caller
 //! encodes; this plane does not interpret them. Terms let a query find the
@@ -16,6 +17,12 @@
 //! have changed are found the same way. A term is stored as a hash, which
 //! can collide, so a lookup returns candidates the caller confirms in the
 //! fragment itself.
+//!
+//! A slice record is the file's call graph as queries read it, which the
+//! caller derives from the fragment and the file's content record and
+//! stores so a read does not have to derive it again. Its sections are
+//! optional: a build that does not know them skips them, and a reader of a
+//! segment without them derives the slice itself.
 
 use std::collections::BTreeMap;
 
@@ -38,6 +45,12 @@ const TERM_POSTINGS: SectionKind = SectionKind::new(0x0304);
 /// separately. These sections are required, so raising this raises
 /// [`crate::segment::FORMAT_VERSION`] too.
 const VERSION: u16 = 4;
+const SLICE_DATA: SectionKind = SectionKind::new(0x0305);
+const SLICE_INDEX: SectionKind = SectionKind::new(0x0306);
+/// The version of the slice sections. They are optional, so raising it
+/// needs no format bump: a reader that does not know a version skips the
+/// sections and derives each slice instead.
+const SLICE_VERSION: u16 = 1;
 const UNIT_KEY_SPACE: KeySpace = KeySpace::new(0);
 
 /// The graph sections this build reads.
@@ -61,6 +74,18 @@ pub const KNOWN: [KnownSection; 5] = [
     KnownSection {
         kind: TERM_POSTINGS,
         version: VERSION,
+    },
+];
+
+/// The optional graph sections this build reads: the slice records.
+pub const KNOWN_OPTIONAL: [KnownSection; 2] = [
+    KnownSection {
+        kind: SLICE_DATA,
+        version: SLICE_VERSION,
+    },
+    KnownSection {
+        kind: SLICE_INDEX,
+        version: SLICE_VERSION,
     },
 ];
 
@@ -169,8 +194,9 @@ fn fits(list: PostingList, section_len: u64) -> bool {
         .is_some_and(|end| end <= section_len)
 }
 
-/// A fragment's bytes and the hashes of its terms.
-type PendingFragment = (Vec<u8>, Vec<(TermKind, u64)>);
+/// A fragment's bytes, its slice record's bytes (empty for none), and the
+/// hashes of its terms.
+type PendingFragment = (Vec<u8>, Vec<u8>, Vec<(TermKind, u64)>);
 
 /// Collects fragments for the graph sections of one segment.
 #[derive(Debug, Default)]
@@ -185,8 +211,10 @@ impl crate::heap::HeapBytes for GraphSectionsBuilder {
             + self
                 .fragments
                 .values()
-                .map(|(bytes, terms)| {
-                    bytes.capacity() + terms.capacity() * std::mem::size_of::<(TermKind, u64)>()
+                .map(|(bytes, slice, terms)| {
+                    bytes.capacity()
+                        + slice.capacity()
+                        + terms.capacity() * std::mem::size_of::<(TermKind, u64)>()
                 })
                 .sum::<usize>()
     }
@@ -206,6 +234,18 @@ impl GraphSectionsBuilder {
         bytes: Vec<u8>,
         terms: impl IntoIterator<Item = (TermKind, &'t [u8])>,
     ) {
+        self.add_with_slice(key, bytes, Vec::new(), terms);
+    }
+
+    /// [`Self::add`], with the fragment's slice record, which a reader gets
+    /// back from [`GraphSegment::slice`]. An empty record is none.
+    pub fn add_with_slice<'t>(
+        &mut self,
+        key: FragmentKey,
+        bytes: Vec<u8>,
+        slice: Vec<u8>,
+        terms: impl IntoIterator<Item = (TermKind, &'t [u8])>,
+    ) {
         self.fragments.entry(key).or_insert_with(|| {
             let mut hashed = terms
                 .into_iter()
@@ -213,7 +253,7 @@ impl GraphSectionsBuilder {
                 .collect::<Vec<_>>();
             hashed.sort_unstable();
             hashed.dedup();
-            (bytes, hashed)
+            (bytes, slice, hashed)
         });
     }
 
@@ -241,12 +281,14 @@ impl GraphSectionsBuilder {
     pub fn write(self, writer: &mut SegmentWriter) -> Result<(), SegmentError> {
         let mut table = UnitTableBuilder::new(Digest128::LEN);
         let mut data = PackedBuilder::with_capacity(self.fragments.len());
+        let mut slices = PackedBuilder::with_capacity(self.fragments.len());
         let mut lists = BTreeMap::<(TermKind, u64), Vec<u32>>::new();
-        for (key, (bytes, terms)) in self.fragments {
+        for (key, (bytes, slice, terms)) in self.fragments {
             // A fragment's bytes are found through the packed index by
             // ordinal, so the unit table carries no location.
             let ordinal = table.push(key.0.as_bytes(), UnitLocation { offset: 0, len: 0 });
             data.push(&bytes);
+            slices.push(&slice);
             for term in terms {
                 lists.entry(term).or_default().push(ordinal);
             }
@@ -256,6 +298,9 @@ impl GraphSectionsBuilder {
         let (data, index) = data.finish();
         writer.write_section(spec(DATA, UNIT_KEY_SPACE), &data, units)?;
         writer.write_section(spec(INDEX, UNIT_KEY_SPACE), &index, units)?;
+        let (slices, slice_index) = slices.finish();
+        writer.write_section(slice_spec(SLICE_DATA), &slices, units)?;
+        writer.write_section(slice_spec(SLICE_INDEX), &slice_index, units)?;
         for kind in TermKind::ALL {
             let mut postings = PostingsBuilder::new(layout());
             let mut lookup = LookupTableBuilder::new();
@@ -280,6 +325,15 @@ fn spec(kind: SectionKind, key_space: KeySpace) -> SectionSpec {
     }
 }
 
+fn slice_spec(kind: SectionKind) -> SectionSpec {
+    SectionSpec {
+        id: SectionId::new(kind, UNIT_KEY_SPACE),
+        version: SLICE_VERSION,
+        alignment: Alignment::Word,
+        requirement: Requirement::Optional,
+    }
+}
+
 /// The graph sections of one open segment.
 #[derive(Debug)]
 pub struct GraphSegment<'s> {
@@ -287,6 +341,8 @@ pub struct GraphSegment<'s> {
     units: UnitTable<'s>,
     data: SectionHandle,
     index: SectionHandle,
+    /// The slice data and index sections, when the segment has them.
+    slices: Option<(SectionHandle, SectionHandle)>,
     terms: Vec<(TermKind, LookupTable<'s>, SectionHandle)>,
 }
 
@@ -325,11 +381,35 @@ impl<'s> GraphSegment<'s> {
         for (kind, [lookup, postings]) in TermKind::ALL.into_iter().zip(pairs) {
             terms.push((kind, LookupTable::open(segment, *lookup)?, *postings));
         }
+        let slices = match (
+            section(SLICE_DATA, UNIT_KEY_SPACE),
+            section(SLICE_INDEX, UNIT_KEY_SPACE),
+        ) {
+            (None, None) => None,
+            (Some(data), Some(index)) => {
+                if segment.info(index).len
+                    != u64::from(units.len()) * packed::INDEX_ENTRY_LEN as u64
+                {
+                    return Err(malformed(
+                        segment,
+                        "the slice index does not match the unit table",
+                    ));
+                }
+                Some((data, index))
+            }
+            _ => {
+                return Err(malformed(
+                    segment,
+                    "a segment has only one of the slice sections",
+                ));
+            }
+        };
         Ok(Some(Self {
             segment,
             units,
             data: handles[1],
             index: handles[2],
+            slices,
             terms,
         }))
     }
@@ -377,6 +457,20 @@ impl<'s> GraphSegment<'s> {
     /// unpack.
     pub fn fragment(&self, ordinal: u32) -> Result<Vec<u8>, SegmentError> {
         packed::read(self.segment, self.data, self.index, ordinal)
+    }
+
+    /// The slice record stored with the fragment at `ordinal`, or `None`
+    /// when the segment has no slice sections or none was stored for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fragment`].
+    pub fn slice(&self, ordinal: u32) -> Result<Option<Vec<u8>>, SegmentError> {
+        let Some((data, index)) = self.slices else {
+            return Ok(None);
+        };
+        let bytes = packed::read(self.segment, data, index, ordinal)?;
+        Ok((!bytes.is_empty()).then_some(bytes))
     }
 
     /// The ordinals of the fragments added with `term` of `kind`, ascending.
@@ -449,10 +543,15 @@ mod tests {
     }
 
     fn open(path: &Path) -> Segment {
+        let known = KNOWN
+            .iter()
+            .chain(&KNOWN_OPTIONAL)
+            .copied()
+            .collect::<Vec<_>>();
         Segment::open(
             path,
             family(),
-            &KNOWN,
+            &known,
             Arc::new(BlockCache::new(16 * BLOCK_LEN)),
         )
         .unwrap()
@@ -521,9 +620,10 @@ mod tests {
                 (TermKind::Language, b"rust".as_slice()),
             ],
         );
-        builder.add(
+        builder.add_with_slice(
             key(2),
             b"two".to_vec(),
+            b"slice of two".to_vec(),
             [
                 (TermKind::CallTarget, b"lib.rs\0run".as_slice()),
                 (TermKind::ReferenceName, b"run".as_slice()),
@@ -531,7 +631,8 @@ mod tests {
             ],
         );
         builder.add(key(3), Vec::new(), []);
-        let segment = write(&dir.path().join("graph.seg"), Some(builder));
+        let path = dir.path().join("graph.seg");
+        let segment = write(&path, Some(builder));
         let graph = GraphSegment::open(&segment).unwrap().unwrap();
         assert_eq!(graph.len(), 3);
         let one = graph.find(key(1)).unwrap().unwrap();
@@ -541,6 +642,26 @@ mod tests {
         assert_eq!(graph.fragment(one).unwrap(), repeated);
         assert_eq!(graph.fragment(two).unwrap(), b"two");
         assert!(graph.fragment(three).unwrap().is_empty());
+        // A slice record comes back with its fragment; a fragment added
+        // without one has none.
+        assert_eq!(
+            graph.slice(two).unwrap().as_deref(),
+            Some(&b"slice of two"[..])
+        );
+        assert_eq!(graph.slice(one).unwrap(), None);
+        assert_eq!(graph.slice(three).unwrap(), None);
+        // A build that does not know the slice sections skips them, as they
+        // are optional, and reads the rest.
+        let older = Segment::open(
+            &path,
+            family(),
+            &KNOWN,
+            Arc::new(BlockCache::new(16 * BLOCK_LEN)),
+        )
+        .unwrap();
+        let older = GraphSegment::open(&older).unwrap().unwrap();
+        assert_eq!(older.fragment(two).unwrap(), b"two");
+        assert_eq!(older.slice(two).unwrap(), None);
         let mut both = vec![one, two];
         both.sort_unstable();
         assert_eq!(
@@ -589,6 +710,8 @@ mod tests {
         );
         let graph = GraphSegment::open(&segment).unwrap().unwrap();
         assert_eq!(graph.candidates(TermKind::CallTarget, b"t").unwrap(), [0]);
+        // An older writer stored no slice sections: no fragment has a slice.
+        assert_eq!(graph.slice(0).unwrap(), None);
         for (name, list) in [
             // 2^32 - 1 ordinals, 16 GiB, from a 12-byte section.
             (

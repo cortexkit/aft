@@ -34,7 +34,7 @@ impl<B: SliceSource> OverlaySlices<B> {
 
     /// Lays a file's new slice over the base.
     pub(crate) fn replace(&mut self, slice: FileSlice) {
-        self.removed.remove(&slice.path);
+        self.removed.remove(slice.path());
         self.replaced.insert(slice);
     }
 

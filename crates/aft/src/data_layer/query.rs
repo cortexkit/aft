@@ -12,7 +12,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::slice::{FileSlice, SliceEdge, SliceNode, SliceRef};
+use super::slice::{EdgeView, FileSlice, NodeView, RefView, TargetLookup};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     lang_from_label, lang_label, normalize_file_path, relative_path, CallGraphRead,
@@ -102,17 +102,20 @@ impl SliceKeys {
     fn of(slice: &FileSlice) -> Self {
         Self {
             callers: slice
-                .edges
-                .values()
-                .map(|edge| (edge.target_file.clone(), edge.target_symbol.clone()))
+                .edges()
+                .map(|edge| {
+                    (
+                        edge.target_file().to_string(),
+                        edge.target_symbol().to_string(),
+                    )
+                })
                 .collect(),
             ref_names: slice
-                .refs
-                .values()
-                .filter_map(|reference| reference.short_name.clone())
+                .references()
+                .filter_map(|reference| reference.short_name().map(str::to_string))
                 .collect(),
             symbol_names: symbol_keys(slice),
-            language: slice.language.clone(),
+            language: slice.language().to_string(),
         }
     }
 }
@@ -137,7 +140,7 @@ impl MemorySlices {
     /// Adds or replaces the slice of its file.
     pub(crate) fn insert(&mut self, slice: FileSlice) {
         let keys = SliceKeys::of(&slice);
-        let path = slice.path.clone();
+        let path = slice.path().to_string();
         self.file(&path, &keys);
         self.slices.insert(path, SliceEntry::Built(Arc::new(slice)));
     }
@@ -236,11 +239,11 @@ impl MemorySlices {
 /// The names a slice's symbols can be found by.
 pub(crate) fn symbol_keys(slice: &FileSlice) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
-    for node in &slice.nodes {
-        keys.insert(node.name.clone());
-        keys.insert(node.scoped_name.clone());
-        if slice.language == "rust" {
-            if let Some((_, implementation)) = node.scoped_name.split_once(" for ") {
+    for node in slice.nodes() {
+        keys.insert(node.name().to_string());
+        keys.insert(node.scoped_name().to_string());
+        if slice.language() == "rust" {
+            if let Some((_, implementation)) = node.scoped_name().split_once(" for ") {
                 keys.insert(implementation.to_string());
             }
         }
@@ -298,25 +301,25 @@ impl<S: SliceSource> SliceReader<S> {
     }
 }
 
-fn store_node(slice: &FileSlice, node: &SliceNode) -> StoreNode {
+fn store_node(slice: &FileSlice, node: NodeView<'_>) -> StoreNode {
     StoreNode::from_parts(
-        node.id.clone(),
-        slice.path.clone(),
-        node.scoped_name.clone(),
-        node.name.clone(),
-        node.kind.clone(),
-        node.start_line.saturating_add(1),
-        node.end_line.saturating_add(1),
-        node.signature.clone(),
-        node.exported,
-        node.entry_point,
-        lang_from_label(&slice.language).unwrap_or(LangId::TypeScript),
+        node.id().to_string(),
+        slice.path().to_string(),
+        node.scoped_name().to_string(),
+        node.name().to_string(),
+        node.kind().to_string(),
+        node.start_line().saturating_add(1),
+        node.end_line().saturating_add(1),
+        node.signature().map(str::to_string),
+        node.exported(),
+        node.entry_point(),
+        lang_from_label(slice.language()).unwrap_or(LangId::TypeScript),
     )
     .with_entry(EntryFacts {
-        is_test: node.is_test,
-        program_start: node.program_start,
-        entry_attribute: node.entry_attribute.clone(),
-        default_export: node.is_default_export,
+        is_test: node.is_test(),
+        program_start: node.program_start(),
+        entry_attribute: node.entry_attribute().map(str::to_string),
+        default_export: node.is_default_export(),
     })
 }
 
@@ -343,22 +346,43 @@ fn implementation_name(scoped: &str) -> String {
 }
 
 /// Whether `node` matches a symbol query as the database's node queries do.
-fn matches_symbol(slice: &FileSlice, node: &SliceNode, symbol: &str) -> bool {
+fn matches_symbol(slice: &FileSlice, node: NodeView<'_>, symbol: &str) -> bool {
+    let scoped = node.scoped_name();
     if symbol.contains("::") {
-        node.scoped_name == symbol
-            || (slice.language == "rust"
-                && node
-                    .scoped_name
+        scoped == symbol
+            || (slice.language() == "rust"
+                && scoped
                     .split_once(" for ")
                     .is_some_and(|(_, implementation)| implementation == symbol))
     } else {
-        node.scoped_name == symbol || node.name == symbol
+        scoped == symbol || node.name() == symbol
     }
 }
 
 /// `ORDER BY scoped_name, start_line, start_col`.
-fn node_order(a: &SliceNode, b: &SliceNode) -> std::cmp::Ordering {
-    (&a.scoped_name, a.start_line, a.start_col).cmp(&(&b.scoped_name, b.start_line, b.start_col))
+fn node_order(a: &NodeView<'_>, b: &NodeView<'_>) -> std::cmp::Ordering {
+    (a.scoped_name(), a.start_line(), a.start_col()).cmp(&(
+        b.scoped_name(),
+        b.start_line(),
+        b.start_col(),
+    ))
+}
+
+/// A reference as an unresolved call of `caller`, named by its short name,
+/// else by its full name.
+fn unresolved_call(caller: &StoreNode, reference: RefView<'_>) -> StoreUnresolvedCall {
+    StoreUnresolvedCall {
+        caller: caller.clone(),
+        symbol: reference
+            .short_name()
+            .or_else(|| reference.full_ref())
+            .unwrap_or_default()
+            .to_string(),
+        full_ref: reference.full_ref().map(str::to_string),
+        line: reference.line(),
+        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+    }
 }
 
 impl<S: SliceSource> SliceReader<S> {
@@ -367,11 +391,10 @@ impl<S: SliceSource> SliceReader<S> {
             return Vec::new();
         };
         let mut nodes = slice
-            .nodes
-            .iter()
-            .filter(|node| matches_symbol(&slice, node, symbol))
+            .nodes()
+            .filter(|node| matches_symbol(&slice, *node, symbol))
             .collect::<Vec<_>>();
-        nodes.sort_by(|a, b| node_order(a, b));
+        nodes.sort_by(node_order);
         let matched = nodes
             .into_iter()
             .map(|node| store_node(&slice, node))
@@ -396,11 +419,10 @@ impl<S: SliceSource> SliceReader<S> {
                 continue;
             };
             let mut found = slice
-                .nodes
-                .iter()
-                .filter(|node| matches_symbol(&slice, node, symbol))
+                .nodes()
+                .filter(|node| matches_symbol(&slice, *node, symbol))
                 .collect::<Vec<_>>();
-            found.sort_by(|a, b| node_order(a, b));
+            found.sort_by(node_order);
             nodes.extend(found.into_iter().map(|node| store_node(&slice, node)));
         }
         nodes
@@ -413,24 +435,23 @@ impl<S: SliceSource> SliceReader<S> {
             return Vec::new();
         };
         let mut nodes = slice
-            .nodes
-            .iter()
-            .filter(|node| node.scoped_name == symbol)
+            .nodes()
+            .filter(|node| node.scoped_name() == symbol)
             .collect::<Vec<_>>();
         nodes.sort_by(|a, b| {
             (
-                &a.scoped_name,
-                a.start_line,
-                a.end_line,
-                a.start_col,
-                a.range_ordinal,
+                a.scoped_name(),
+                a.start_line(),
+                a.end_line(),
+                a.start_col(),
+                a.range_ordinal(),
             )
                 .cmp(&(
-                    &b.scoped_name,
-                    b.start_line,
-                    b.end_line,
-                    b.start_col,
-                    b.range_ordinal,
+                    b.scoped_name(),
+                    b.start_line(),
+                    b.end_line(),
+                    b.start_col(),
+                    b.range_ordinal(),
                 ))
         });
         nodes
@@ -445,28 +466,28 @@ impl<S: SliceSource> SliceReader<S> {
         &self,
         file: &str,
         symbol: &str,
-        lookup: super::slice::TargetLookup,
+        lookup: TargetLookup,
     ) -> (Option<String>, Option<StoreNode>) {
         let Some(slice) = self.source.slice(file) else {
             return (None, None);
         };
-        let Some(id) = slice.target_node(symbol, lookup) else {
+        let Some(handle) = slice.target_node(symbol, lookup) else {
             return (None, None);
         };
-        let node = slice.node(id).map(|node| store_node(&slice, node));
-        (Some(id.to_string()), node)
+        let node = slice.node(handle).map(|node| store_node(&slice, node));
+        (Some(slice.node_id(handle).to_string()), node)
     }
 
     /// An edge's kind as stored: a construction is a call when its target
     /// is a function or method, otherwise a value reference.
-    fn edge_kind(&self, edge: &SliceEdge) -> &'static str {
-        if edge.kind != "construction" {
-            return edge.kind;
+    fn edge_kind(&self, edge: EdgeView<'_>) -> &'static str {
+        if edge.kind() != "construction" {
+            return edge.kind();
         }
-        let target_is_callable = self.source.slice(&edge.target_file).is_some_and(|slice| {
+        let target_is_callable = self.source.slice(edge.target_file()).is_some_and(|slice| {
             slice
-                .target_node(&edge.target_symbol, edge.lookup)
-                .and_then(|id| slice.node_kind(id))
+                .target_node(edge.target_symbol(), edge.lookup())
+                .and_then(|handle| slice.node_kind(handle))
                 .is_some_and(|kind| matches!(kind, "function" | "method"))
         });
         if target_is_callable {
@@ -487,43 +508,51 @@ impl<S: SliceSource> SliceReader<S> {
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
-            for edge in slice.edges.values() {
-                if edge.target_file != target_file || edge.target_symbol != target_symbol {
+            // A slice without both strings has no edge to the target.
+            let (Some(file_index), Some(symbol_index)) = (
+                slice.find_string(target_file),
+                slice.find_string(target_symbol),
+            ) else {
+                continue;
+            };
+            for edge in slice.edges() {
+                if !edge.targets(file_index, symbol_index) {
                     continue;
                 }
                 let kind = self.edge_kind(edge);
                 if !matches!(kind, "call" | "callback_ref") {
                     continue;
                 }
-                let Some(reference) = slice.refs.get(&edge.ref_id) else {
+                let Some(reference) = edge.reference() else {
                     continue;
                 };
-                let Some(source) = slice.node(&edge.source_node) else {
+                let Some(source) = slice.node(edge.source()) else {
                     continue;
                 };
-                let (target_node, target) = self.target_of(target_file, target_symbol, edge.lookup);
+                let (target_node, target) =
+                    self.target_of(target_file, target_symbol, edge.lookup());
                 sites.push((
                     CallerKey {
-                        source_node: edge.source_node.clone(),
-                        byte_start: reference.byte_start,
-                        line: reference.line,
-                        ref_id: reference.ref_id.clone(),
+                        source_node: source.id().to_string(),
+                        byte_start: reference.byte_start(),
+                        line: reference.line(),
+                        ref_id: reference.ref_id(),
                         target_node: target_node.clone(),
-                        provenance: edge.provenance,
+                        provenance: edge.provenance(),
                         kind,
                     },
                     StoreCallSite {
                         kind: kind.to_string(),
-                        caller_is_test: source.is_test,
+                        caller_is_test: source.is_test(),
                         caller: store_node(&slice, source),
                         target_file: target_file.to_string(),
                         target_symbol: target_symbol.to_string(),
                         target,
-                        line: edge.line,
-                        byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
-                        byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
-                        resolved: reference.resolved,
-                        provenance: edge.provenance.to_string(),
+                        line: edge.line(),
+                        byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                        byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                        resolved: reference.resolved(),
+                        provenance: edge.provenance().to_string(),
                     },
                 ));
             }
@@ -538,38 +567,42 @@ impl<S: SliceSource> SliceReader<S> {
         let Some(slice) = self.source.slice(&node.file) else {
             return Vec::new();
         };
+        // No edge has a source the slice does not hold.
+        let Some(source) = slice.handle_of(node.node_id()) else {
+            return Vec::new();
+        };
         let mut calls = Vec::new();
-        for edge in slice.edges.values() {
-            if edge.source_node != node.node_id() || self.edge_kind(edge) != "call" {
+        for edge in slice.edges() {
+            if edge.source() != source || self.edge_kind(edge) != "call" {
                 continue;
             }
-            let Some(reference) = slice.refs.get(&edge.ref_id) else {
+            let Some(reference) = edge.reference() else {
                 continue;
             };
             let (target_node, target) =
-                self.target_of(&edge.target_file, &edge.target_symbol, edge.lookup);
+                self.target_of(edge.target_file(), edge.target_symbol(), edge.lookup());
             calls.push((
                 OutgoingKey {
-                    byte_start: reference.byte_start,
-                    line: reference.line,
-                    ref_id: reference.ref_id.clone(),
-                    target_file: edge.target_file.clone(),
-                    target_symbol: edge.target_symbol.clone(),
+                    byte_start: reference.byte_start(),
+                    line: reference.line(),
+                    ref_id: reference.ref_id(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
                     target_node,
-                    provenance: edge.provenance,
+                    provenance: edge.provenance(),
                 },
                 StoreCallSite {
                     kind: "call".to_string(),
                     caller_is_test: None,
                     caller: node.clone(),
-                    target_file: edge.target_file.clone(),
-                    target_symbol: edge.target_symbol.clone(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
                     target,
-                    line: edge.line,
-                    byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
-                    byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
-                    resolved: reference.resolved,
-                    provenance: edge.provenance.to_string(),
+                    line: edge.line(),
+                    byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                    byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
+                    resolved: reference.resolved(),
+                    provenance: edge.provenance().to_string(),
                 },
             ));
         }
@@ -577,22 +610,23 @@ impl<S: SliceSource> SliceReader<S> {
         calls
     }
 
-    /// Whether a `call` edge exists for the reference `ref_id` of `slice`.
-    fn has_call_edge(&self, slice: &FileSlice, ref_id: &str) -> bool {
+    /// Whether a `call` edge exists for the reference at `reference` in
+    /// `slice`.
+    fn has_call_edge(&self, slice: &FileSlice, reference: u32) -> bool {
         slice
-            .edges
-            .values()
-            .any(|edge| edge.ref_id == ref_id && self.edge_kind(edge) == "call")
+            .edges()
+            .any(|edge| edge.reference_index() == Some(reference) && self.edge_kind(edge) == "call")
     }
 
     /// Unresolved call or construction references of `language`, one per
-    /// caller file and byte span, as the unresolved-site queries group them.
+    /// caller file and byte span, as the unresolved-site queries group them:
+    /// each span's references by their position in the slice.
     fn unresolved_spans(
         &self,
         language: &str,
         name: Option<&str>,
         member_call: bool,
-    ) -> Vec<(String, u64, u64, Vec<SliceRef>, Arc<FileSlice>)> {
+    ) -> Vec<(String, u64, u64, Vec<u32>, Arc<FileSlice>)> {
         let mut spans = Vec::new();
         self.visit_unresolved_spans(
             language,
@@ -620,7 +654,7 @@ impl<S: SliceSource> SliceReader<S> {
         language: &str,
         name: Option<&str>,
         member_call: bool,
-        mut visit: impl FnMut(&str, (u64, u64), &[SliceRef], &Arc<FileSlice>) -> ControlFlow<()>,
+        mut visit: impl FnMut(&str, (u64, u64), &[u32], &Arc<FileSlice>) -> ControlFlow<()>,
     ) {
         // The named count matches the name exactly, an empty one included;
         // the method-site query treats an empty name as every site.
@@ -638,43 +672,45 @@ impl<S: SliceSource> SliceReader<S> {
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
+            // A slice without the name has no reference of it.
+            let name_index = match name {
+                Some(name) => match slice.find_string(name) {
+                    Some(index) => Some(index),
+                    None => continue,
+                },
+                None => None,
+            };
             // Each reference's edges, so the call-edge check below reads only
             // the reference's own.
-            let mut edges_by_ref = HashMap::<&str, Vec<&SliceEdge>>::new();
-            for edge in slice.edges.values() {
-                edges_by_ref
-                    .entry(edge.ref_id.as_str())
-                    .or_default()
-                    .push(edge);
+            let mut edges_by_ref = HashMap::<u32, Vec<EdgeView<'_>>>::new();
+            for edge in slice.edges() {
+                if let Some(reference) = edge.reference_index() {
+                    edges_by_ref.entry(reference).or_default().push(edge);
+                }
             }
-            let mut groups = BTreeMap::<(u64, u64), Vec<SliceRef>>::new();
-            for reference in slice.refs.values() {
-                if !matches!(reference.kind, "call" | "construction") || reference.resolved {
+            let mut groups = BTreeMap::<(u64, u64), Vec<u32>>::new();
+            for reference in slice.references() {
+                if !matches!(reference.kind(), "call" | "construction") || reference.resolved() {
                     continue;
                 }
-                if let Some(name) = name {
-                    if reference.short_name.as_deref() != Some(name) {
+                if name_index.is_some() {
+                    if reference.short_name_index() != name_index {
                         continue;
                     }
-                    if member_call
-                        && !reference
-                            .full_ref
-                            .as_deref()
-                            .is_some_and(|full| full.contains('.'))
-                    {
+                    if member_call && !reference.full_ref().is_some_and(|full| full.contains('.')) {
                         continue;
                     }
                 }
                 let has_call_edge = edges_by_ref
-                    .get(reference.ref_id.as_str())
-                    .is_some_and(|edges| edges.iter().any(|edge| self.edge_kind(edge) == "call"));
+                    .get(&reference.index())
+                    .is_some_and(|edges| edges.iter().any(|edge| self.edge_kind(*edge) == "call"));
                 if has_call_edge {
                     continue;
                 }
                 groups
-                    .entry((reference.byte_start, reference.byte_end))
+                    .entry((reference.byte_start(), reference.byte_end()))
                     .or_default()
-                    .push(reference.clone());
+                    .push(reference.index());
             }
             for (span, references) in groups {
                 if visit(&file, span, &references, &slice).is_break() {
@@ -738,17 +774,17 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
-            for edge in slice.edges.values() {
-                let Some(source) = slice.node(&edge.source_node) else {
+            for edge in slice.edges() {
+                let Some(source) = slice.node(edge.source()) else {
                     continue;
                 };
                 edges.insert(StoredEdge {
                     source_file: file.clone(),
-                    source_symbol: source.scoped_name.clone(),
-                    target_file: edge.target_file.clone(),
-                    target_symbol: edge.target_symbol.clone(),
+                    source_symbol: source.scoped_name().to_string(),
+                    target_file: edge.target_file().to_string(),
+                    target_symbol: edge.target_symbol().to_string(),
                     kind: self.edge_kind(edge).to_string(),
-                    line: edge.line,
+                    line: edge.line(),
                 });
             }
         }
@@ -793,7 +829,7 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         Ok(self
             .source
             .slice(file)
-            .map(|slice| slice.record_key.clone()))
+            .map(|slice| slice.record_key().to_string()))
     }
 
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
@@ -897,31 +933,26 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         let Some(slice) = self.source.slice(&node.file) else {
             return Ok(Vec::new());
         };
+        // No reference has a caller the slice does not hold.
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
         let mut calls = Vec::new();
-        for reference in slice.refs.values() {
+        for reference in slice.references() {
             let targets_itself = reference
-                .target
-                .as_ref()
-                .is_some_and(|(file, symbol)| *file == node.file && *symbol == node.symbol);
-            if reference.caller_node.as_deref() != Some(node.node_id())
-                || reference.kind != "call"
-                || !reference.resolved
+                .target()
+                .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol);
+            if reference.caller() != Some(caller)
+                || reference.kind() != "call"
+                || !reference.resolved()
                 || !targets_itself
-                || self.has_call_edge(&slice, &reference.ref_id)
+                || self.has_call_edge(&slice, reference.index())
             {
                 continue;
             }
-            let (_, target) = self.target_of(
-                &node.file,
-                &node.symbol,
-                super::slice::TargetLookup::Ordinary,
-            );
+            let (_, target) = self.target_of(&node.file, &node.symbol, TargetLookup::Ordinary);
             calls.push((
-                (
-                    reference.byte_start,
-                    reference.line,
-                    reference.ref_id.clone(),
-                ),
+                (reference.byte_start(), reference.line(), reference.ref_id()),
                 StoreCallSite {
                     kind: "call".to_string(),
                     caller_is_test: None,
@@ -929,9 +960,9 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
                     target_file: node.file.clone(),
                     target_symbol: node.symbol.clone(),
                     target,
-                    line: reference.line,
-                    byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
-                    byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
+                    line: reference.line(),
+                    byte_start: usize::try_from(reference.byte_start()).unwrap_or(usize::MAX),
+                    byte_end: usize::try_from(reference.byte_end()).unwrap_or(usize::MAX),
                     resolved: true,
                     provenance: crate::callgraph_store::PROVENANCE_TREESITTER.to_string(),
                 },
@@ -945,34 +976,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         let Some(slice) = self.source.slice(&node.file) else {
             return Ok(Vec::new());
         };
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
         let mut calls = slice
-            .refs
-            .values()
+            .references()
             .filter(|reference| {
-                reference.caller_node.as_deref() == Some(node.node_id())
-                    && reference.kind == "call"
-                    && !reference.resolved
-                    && !self.has_call_edge(&slice, &reference.ref_id)
+                reference.caller() == Some(caller)
+                    && reference.kind() == "call"
+                    && !reference.resolved()
+                    && !self.has_call_edge(&slice, reference.index())
             })
             .map(|reference| {
                 (
-                    (
-                        reference.byte_start,
-                        reference.line,
-                        reference.ref_id.clone(),
-                    ),
-                    StoreUnresolvedCall {
-                        caller: node.clone(),
-                        symbol: reference
-                            .short_name
-                            .clone()
-                            .or_else(|| reference.full_ref.clone())
-                            .unwrap_or_default(),
-                        full_ref: reference.full_ref.clone(),
-                        line: reference.line,
-                        byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
-                        byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
-                    },
+                    (reference.byte_start(), reference.line(), reference.ref_id()),
+                    unresolved_call(node, reference),
                 )
             })
             .collect::<Vec<_>>();
@@ -984,32 +1002,19 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         let Some(slice) = self.source.slice(&node.file) else {
             return Ok(Vec::new());
         };
+        let Some(caller) = slice.handle_of(node.node_id()) else {
+            return Ok(Vec::new());
+        };
         let mut calls = slice
-            .refs
-            .values()
+            .references()
             .filter(|reference| {
-                reference.caller_node.as_deref() == Some(node.node_id())
-                    && reference.kind == crate::callgraph_store::MACRO_BODY_CALL_REF_KIND
+                reference.caller() == Some(caller)
+                    && reference.kind() == crate::callgraph_store::MACRO_BODY_CALL_REF_KIND
             })
             .map(|reference| {
                 (
-                    (
-                        reference.byte_start,
-                        reference.line,
-                        reference.ref_id.clone(),
-                    ),
-                    StoreUnresolvedCall {
-                        caller: node.clone(),
-                        symbol: reference
-                            .short_name
-                            .clone()
-                            .or_else(|| reference.full_ref.clone())
-                            .unwrap_or_default(),
-                        full_ref: reference.full_ref.clone(),
-                        line: reference.line,
-                        byte_start: usize::try_from(reference.byte_start).unwrap_or(usize::MAX),
-                        byte_end: usize::try_from(reference.byte_end).unwrap_or(usize::MAX),
-                    },
+                    (reference.byte_start(), reference.line(), reference.ref_id()),
+                    unresolved_call(node, reference),
                 )
             })
             .collect::<Vec<_>>();
@@ -1028,22 +1033,23 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
-            for reference in slice.refs.values() {
-                if reference.short_name.as_deref() != Some(short_name) || reference.kind != kind {
+            // A slice without the name has no reference of it.
+            let Some(name) = slice.find_string(short_name) else {
+                continue;
+            };
+            for reference in slice.references() {
+                if reference.short_name_index() != Some(name) || reference.kind() != kind {
                     continue;
                 }
-                let caller = reference
-                    .caller_node
-                    .as_deref()
-                    .and_then(|id| slice.node(id));
+                let caller = reference.caller().and_then(|handle| slice.node(handle));
                 sites.push((
-                    (file.clone(), reference.line, reference.ref_id.clone()),
+                    (file.clone(), reference.line(), reference.ref_id()),
                     StoreRefSite {
-                        is_test: caller.and_then(|node| node.is_test),
+                        is_test: caller.and_then(|node| node.is_test()),
                         file: file.clone(),
-                        caller_symbol: caller.map(|node| node.scoped_name.clone()),
-                        line: reference.line,
-                        local_name: reference.local_name.clone(),
+                        caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                        line: reference.line(),
+                        local_name: reference.local_name().map(str::to_string),
                     },
                 ));
             }
@@ -1070,14 +1076,15 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
                 // order.
                 let first = references
                     .iter()
-                    .min_by_key(|reference| reference.ordinal)
+                    .map(|index| slice.reference(*index as usize))
+                    .min_by_key(|reference| reference.ordinal())
                     .expect("a span has a reference");
-                let caller = first.caller_node.as_deref().and_then(|id| slice.node(id));
+                let caller = first.caller().and_then(|handle| slice.node(handle));
                 StoreRefSite {
-                    is_test: caller.and_then(|node| node.is_test),
+                    is_test: caller.and_then(|node| node.is_test()),
                     file,
-                    caller_symbol: caller.map(|node| node.scoped_name.clone()),
-                    line: first.line,
+                    caller_symbol: caller.map(|node| node.scoped_name().to_string()),
+                    line: first.line(),
                     local_name: None,
                 }
             })
@@ -1142,12 +1149,12 @@ impl<S: SliceSource> SliceReader<S> {
             false,
             |file, _, references, slice| {
                 let counted = include_tests
-                    || references.iter().any(|reference| {
-                        let caller_is_test = reference
-                            .caller_node
-                            .as_deref()
-                            .and_then(|id| slice.node(id))
-                            .and_then(|node| node.is_test)
+                    || references.iter().any(|index| {
+                        let caller_is_test = slice
+                            .reference(*index as usize)
+                            .caller()
+                            .and_then(|handle| slice.node(handle))
+                            .and_then(|node| node.is_test())
                             .unwrap_or(false);
                         !caller_is_test && !crate::inspect::job::is_test_file(file)
                     });

@@ -1,12 +1,15 @@
 //! A checkout's call graph stored in a segment and read back as slices.
 //!
 //! The segment holds the content record of every parsed file and one
-//! fragment per file: the file's resolution, keyed by its record and path.
+//! fragment per file: the file's resolution, keyed by its record and path,
+//! stored with the file's slice as a record ([`FileSlice::encode`]).
 //! Each fragment carries the terms queries find fragments by (the targets
 //! its calls reach, its reference and symbol names, its language), so a
 //! query reads only the fragments that can hold its answer. A reader maps the
-//! checkout's paths to their record and fragment once, and assembles a
-//! file's slice the first time a query reads it.
+//! checkout's paths to their record and fragment once, and decodes a file's
+//! slice record the first time a query reads it; a segment written without
+//! slice records has each slice assembled from the content record and the
+//! fragment instead.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -29,6 +32,7 @@ pub(crate) fn known_sections() -> Vec<KnownSection> {
     aft_store::content::KNOWN
         .into_iter()
         .chain(aft_store::graph::KNOWN)
+        .chain(aft_store::graph::KNOWN_OPTIONAL)
         .collect()
 }
 
@@ -65,15 +69,15 @@ pub(crate) fn fragment_key(
 
 /// The terms queries find a slice's fragment by.
 fn slice_terms(slice: &FileSlice) -> Vec<(TermKind, Vec<u8>)> {
-    let mut terms = vec![(TermKind::Language, slice.language.as_bytes().to_vec())];
-    for edge in slice.edges.values() {
+    let mut terms = vec![(TermKind::Language, slice.language().as_bytes().to_vec())];
+    for edge in slice.edges() {
         terms.push((
             TermKind::CallTarget,
-            call_target(&edge.target_file, &edge.target_symbol),
+            call_target(edge.target_file(), edge.target_symbol()),
         ));
     }
-    for reference in slice.refs.values() {
-        if let Some(name) = &reference.short_name {
+    for reference in slice.references() {
+        if let Some(name) = reference.short_name() {
             terms.push((TermKind::ReferenceName, name.as_bytes().to_vec()));
         }
     }
@@ -223,6 +227,8 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
 struct BuiltFragment {
     fragment: FragmentKey,
     bytes: Vec<u8>,
+    /// The file's slice as a record ([`FileSlice::encode`]).
+    slice: Vec<u8>,
     terms: Vec<(TermKind, Vec<u8>)>,
 }
 
@@ -359,6 +365,7 @@ impl<'i> SectionsWriter<'i> {
         BuiltFragment {
             fragment,
             bytes,
+            slice: slice.encode(),
             terms,
         }
     }
@@ -385,9 +392,10 @@ impl<'i> SectionsWriter<'i> {
             None => {}
         }
         self.keys.insert(file.clone(), built.fragment);
-        self.graph.add(
+        self.graph.add_with_slice(
             built.fragment,
             built.bytes,
+            built.slice,
             built
                 .terms
                 .iter()
@@ -639,6 +647,16 @@ impl StoredSlices {
     }
 
     fn load(&self, file: &str, located: &Located) -> Result<FileSlice, String> {
+        let graph = self.graph(located.fragment.0)?;
+        // The slice stored with the fragment, when its segment has one.
+        if let Some(bytes) = graph
+            .slice(located.fragment.1)
+            .map_err(|error| error.to_string())?
+        {
+            return FileSlice::decode(file, &located.record_key, &bytes)
+                .map_err(|error| error.to_string());
+        }
+        // Otherwise assembled from the content record and the fragment.
         let record = self
             .content(located.record.0)?
             .record(located.record.1)
@@ -648,8 +666,7 @@ impl StoredSlices {
         else {
             return Err(format!("{file}: its stored record is not a parse"));
         };
-        let bytes = self
-            .graph(located.fragment.0)?
+        let bytes = graph
             .fragment(located.fragment.1)
             .map_err(|error| error.to_string())?;
         let resolution = super::fragment::decode(&located.record_key, file, &bytes)

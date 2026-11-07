@@ -1064,7 +1064,14 @@ fn no_two_planes_share_a_section_kind() {
     let planes: [(&str, Vec<KnownSection>); 4] = [
         ("text", crate::text::KNOWN.to_vec()),
         ("content", crate::content::KNOWN.to_vec()),
-        ("graph", crate::graph::KNOWN.to_vec()),
+        (
+            "graph",
+            crate::graph::KNOWN
+                .iter()
+                .chain(&crate::graph::KNOWN_OPTIONAL)
+                .copied()
+                .collect(),
+        ),
         ("vector", KNOWN.to_vec()),
     ];
     let mut owner = HashMap::new();

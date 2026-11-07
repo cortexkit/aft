@@ -187,13 +187,13 @@ impl Samples {
 
 /// A checkout's call graph as the data layer builds it: every file scanned
 /// and extracted to a content record, and every parsed file resolved.
-struct Built {
-    inputs: CheckoutInputs,
-    resolved: BTreeMap<String, super::callgraph::FileResolution>,
-    records: HashMap<RecordKey, Arc<ContentRecord>>,
+pub(crate) struct Built {
+    pub(crate) inputs: CheckoutInputs,
+    pub(crate) resolved: BTreeMap<String, super::callgraph::FileResolution>,
+    pub(crate) records: HashMap<RecordKey, Arc<ContentRecord>>,
 }
 
-fn build(root: &Path, threads: usize) -> Result<Built, String> {
+pub(crate) fn build(root: &Path, threads: usize) -> Result<Built, String> {
     let records = Records::default();
     let scanned = scan(root, &super::content::scan_policy(), None, &records)
         .map_err(|error| error.to_string())?;

@@ -41,8 +41,10 @@ use crate::parser::LangId;
 /// resolution record each config file it found by its path rather than one
 /// key for every config file; 8 stopped parsing minified bundles, and made
 /// a JavaScript workspace package lookup record the looked-up name's key
-/// rather than every member's manifest.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-8";
+/// rather than every member's manifest; 9 stored each file's call-graph
+/// slice as a record with its fragment, so publications written before it
+/// are built again with those records.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-9";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
