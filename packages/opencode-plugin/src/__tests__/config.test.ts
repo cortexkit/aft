@@ -437,7 +437,9 @@ describe("loadAftConfig", () => {
     });
     const config = JSON.parse(result.stdout);
     expect(config.experimental).toEqual({ lsp_ty: true });
-    expect(config.bash).toEqual({ rewrite: false, compress: false, background: true });
+    // The active legacy feature block materializes omitted flags as false
+    // before merging, so its background=false also overrides the base true.
+    expect(config.bash).toEqual({ rewrite: false, compress: false, background: false });
     for (const key of [
       "experimental_lsp_ty",
       "experimental_bash_rewrite",
