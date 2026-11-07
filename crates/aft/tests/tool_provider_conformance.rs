@@ -37,10 +37,12 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
+fn legacy_fixtures_path() -> std::path::PathBuf {
+    crate::test_helpers::manifest_dir().join("tests/fixtures/tool_provider_legacy_replies.json")
+}
+
 fn legacy_fixtures() -> Value {
-    let path = crate::test_helpers::manifest_dir()
-        .join("tests/fixtures/tool_provider_legacy_replies.json");
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    serde_json::from_slice(&std::fs::read(legacy_fixtures_path()).unwrap()).unwrap()
 }
 
 /// PowerShell is optional; every other row remains mandatory for its preset.
@@ -3778,7 +3780,7 @@ async fn regenerate_pre_flip_legacy_replies() {
         "presets":{}
     });
     std::fs::write(
-        LEGACY_FIXTURES,
+        legacy_fixtures_path(),
         format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
     )
     .unwrap();
@@ -3826,7 +3828,7 @@ async fn regenerate_pre_flip_legacy_replies() {
         fixtures["presets"][preset] = json!(rows);
     }
     std::fs::write(
-        LEGACY_FIXTURES,
+        legacy_fixtures_path(),
         format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
     )
     .unwrap();
@@ -3908,7 +3910,7 @@ async fn regenerate_pre_flip_powershell_legacy_replies() {
         "capture":"real pre-flip tool.call powershell; production wait:true/pty:true validation refusal"
     });
     std::fs::write(
-        LEGACY_FIXTURES,
+        legacy_fixtures_path(),
         format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
     )
     .unwrap();
@@ -3966,7 +3968,7 @@ async fn regenerate_pre_flip_windows_native_error_replies() {
         "capture":"native Windows write to an existing directory; original-main renderer with declaration=false and authorized input hooks"
     });
     std::fs::write(
-        LEGACY_FIXTURES,
+        legacy_fixtures_path(),
         format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
     )
     .unwrap();

@@ -67,8 +67,7 @@ mod status_counts_inspect_seams;
 #[path = "../synapse_live_test.rs"]
 mod synapse_live_test;
 #[cfg(unix)]
-#[path = "../../src/test_support.rs"]
-mod test_support;
+use test_helpers as test_support;
 #[path = "../tool_provider_conformance.rs"]
 mod tool_provider_conformance;
 #[path = "../tool_provider_subc_e2e.rs"]

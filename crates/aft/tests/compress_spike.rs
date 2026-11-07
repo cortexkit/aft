@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::fs;
 
 use aft::compress::{builtin_filters, compress_with_registry, toml_filter};
 use serde::{Deserialize, Serialize};

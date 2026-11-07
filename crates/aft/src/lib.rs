@@ -241,6 +241,9 @@ pub(crate) mod test_allocations;
 pub(crate) mod test_env;
 #[cfg(test)]
 pub(crate) mod test_support;
+// The fake LSP builder also compiles in integration tests under this helper name.
+#[cfg(test)]
+use test_support as test_helpers;
 
 #[cfg(test)]
 mod tests {
