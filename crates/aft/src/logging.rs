@@ -87,7 +87,6 @@ pub(crate) enum IndexEventKind {
     BuildSuspended,
     BreakerAdmitted,
     BreakerReset,
-    ArtifactLoaded,
     FirstQuery,
 }
 
@@ -103,7 +102,6 @@ impl IndexEventKind {
             Self::BuildSuspended => "build_suspended",
             Self::BreakerAdmitted => "breaker_admitted",
             Self::BreakerReset => "breaker_reset",
-            Self::ArtifactLoaded => "artifact_loaded",
             Self::FirstQuery => "first_query",
         }
     }

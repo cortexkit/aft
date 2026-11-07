@@ -1210,51 +1210,6 @@ pub fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
     )
 }
 
-struct SearchRebuildPublishGate {
-    root: Option<PathBuf>,
-    reached_tx: crossbeam_channel::Sender<()>,
-    release_rx: crossbeam_channel::Receiver<()>,
-}
-
-static SEARCH_REBUILD_PUBLISH_GATE: OnceLock<Mutex<Option<SearchRebuildPublishGate>>> =
-    OnceLock::new();
-static SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL: OnceLock<Mutex<Option<crossbeam_channel::Sender<()>>>> =
-    OnceLock::new();
-
-#[doc(hidden)]
-pub fn install_search_rebuild_publish_gate_for_test() -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    install_search_rebuild_publish_gate(None)
-}
-
-fn install_search_rebuild_publish_gate(
-    root: Option<PathBuf>,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (shutdown_waiting_tx, shutdown_waiting_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *SEARCH_REBUILD_PUBLISH_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("search rebuild publish gate mutex poisoned") = Some(SearchRebuildPublishGate {
-        root,
-        reached_tx,
-        release_rx,
-    });
-    *SEARCH_REBUILD_SHUTDOWN_WAIT_SIGNAL
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("search rebuild shutdown wait signal mutex poisoned") = Some(shutdown_waiting_tx);
-    (reached_rx, shutdown_waiting_rx, release_tx)
-}
-
 pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
@@ -1692,7 +1647,6 @@ pub(crate) struct FileMutationGuard<'a> {
 struct MutationRefreshBudget {
     started: Instant,
     examined: usize,
-    refreshed: usize,
     skipped_ignored: usize,
 }
 
@@ -1701,7 +1655,6 @@ impl MutationRefreshBudget {
         Self {
             started: watcher_drain_now(),
             examined: 0,
-            refreshed: 0,
             skipped_ignored: 0,
         }
     }

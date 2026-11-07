@@ -384,9 +384,6 @@ static INDEX_ORDER_TIMEOUT_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 #[cfg(test)]
 static INDEX_ORDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Clone)]
-struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
-
 #[cfg(test)]
 static CONFIGURE_REPLAY_SESSION_CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -848,24 +845,6 @@ static SEMANTIC_BLOB_OPEN_OBSERVERS: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<(PathBuf, bool)>>>,
 > = std::sync::OnceLock::new();
 
-/// Tracks one worker's private index without retaining the index in the census.
-/// Each worker owns its contribution: a retiring generation cannot erase a
-/// replacement worker's bytes. Shared bases contribute zero here and are counted
-/// once by the process-wide semantic base registry. Estimates are refreshed at
-/// completed mutation boundaries; transient embedding/refresh buffers are excluded.
-struct SemanticWorkerMemory {
-    total: Arc<AtomicU64>,
-    bytes: u64,
-}
-
-impl SemanticWorkerMemory {}
-
-impl Drop for SemanticWorkerMemory {
-    fn drop(&mut self) {
-        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
-
 #[cfg(any(test, feature = "test-timing-hooks"))]
 fn semantic_quiet_gate_path() -> Option<PathBuf> {
     std::env::var_os("AFT_TEST_SEMANTIC_QUIET_GATE").map(PathBuf::from)
@@ -881,14 +860,6 @@ fn semantic_quiet_gate_held() -> bool {
     std::fs::write(path.with_extension("waiting"), b"waiting").expect("quiet gate observation");
     true
 }
-
-struct SemanticRefreshDebounce {
-    quiet_window: Duration,
-    quiet_deadline: Instant,
-    batch_deadline: Instant,
-}
-
-impl SemanticRefreshDebounce {}
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -2016,48 +1987,11 @@ fn audit01_warning_current_generation_publishes() {
     assert_eq!(rx.try_recv().unwrap().0, 2);
 }
 
-/// When a symbol-cache prewarm should give up before visiting every file.
-/// The prewarm can run for a long time on a large root, so it stops between
-/// files when its configuration is replaced or its root has been unbound past
-/// the abandon grace. Idle eviction resets the symbol cache to a new
-/// generation, which the prewarm checks on every file as well.
-#[derive(Clone)]
-struct SymbolPrewarmStop {
-    lifecycle: crate::context::SubcLifecycleAdmission,
-    content_generation_flag: Arc<AtomicU64>,
-    content_generation: u64,
-}
-
-impl SymbolPrewarmStop {
-    #[cfg(test)]
-    fn never() -> Self {
-        Self {
-            lifecycle: crate::context::SubcLifecycleAdmission::default(),
-            content_generation_flag: Arc::new(AtomicU64::new(0)),
-            content_generation: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     /// Called with the number of files visited so far, after each prewarm file.
     static SYMBOL_PREWARM_AFTER_FILE: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
         std::cell::RefCell::new(None);
-}
-
-/// What one views-routed symbol prewarm did with the files it was given.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SymbolViewPrewarm {
-    /// Already in the symbol cache for the file's current modification time.
-    cached: u64,
-    /// Served from rows the family's v3 symbol plane already held.
-    reused: u64,
-    /// Parsed here and stored into the v3 symbol plane.
-    stored: u64,
-    /// Left for an ordinary on-demand parse: unreadable, changed since the
-    /// lexical view verified it, or not parseable.
-    skipped: u64,
 }
 
 #[cfg(test)]
@@ -2970,12 +2904,8 @@ fn handle_configure_inner(
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
                     canonical_cache_root: canonical_root.clone(),
-                    project_key: ctx
-                        .cached_artifact_cache_key(canonical_root)
-                        .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
-                    artifact_root: crate::root_cache::cache_root(&next_config),
                     harness_dir: storage_root.join(harness.storage_segment()),
                     session_id: req.session().to_string(),
                     root_too_broad: ctx.root_too_broad(),
@@ -3220,12 +3150,8 @@ fn handle_configure_inner(
                 generation,
                 root_path: root_path.clone(),
                 canonical_cache_root: canonical_cache_root.clone(),
-                project_key: ctx
-                    .cached_artifact_cache_key(&canonical_cache_root)
-                    .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
-                artifact_root: crate::root_cache::cache_root(&next_config),
                 harness_dir: storage_root.join(harness.storage_segment()),
                 session_id: req.session().to_string(),
                 root_too_broad,
@@ -3781,10 +3707,8 @@ fn handle_configure_inner(
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
-        project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root: storage_root.clone(),
-        artifact_root: crate::root_cache::cache_root(&next_config),
         harness_dir: storage_root.join(harness.storage_segment()),
         session_id: req.session().to_string(),
         root_too_broad,
@@ -3865,12 +3789,6 @@ fn handle_configure_inner(
         }),
     );
     response
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ArtifactLoadNeeds {
-    search: bool,
-    semantic: bool,
 }
 
 fn release_callgraph_start_waiters_for_generation_change(
@@ -4236,7 +4154,6 @@ struct ConfigureMaintenanceContinuation {
     stage: ConfigureMaintenanceStage,
     replay_retry_at: Option<Instant>,
     lexical_bind_retry_at: Option<Instant>,
-    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -4248,7 +4165,6 @@ impl ConfigureMaintenanceContinuation {
             stage: ConfigureMaintenanceStage::Admission,
             replay_retry_at: None,
             lexical_bind_retry_at: None,
-            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
@@ -5013,18 +4929,6 @@ fn run_configure_maintenance_unit_inner(
 #[cfg(test)]
 thread_local! {
     static VIEW_WORKING_TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-struct ConfigureViewInput {
-    family: String,
-    git_common_dir: Option<PathBuf>,
-    callgraph: bool,
-    /// A linked worktree that has not needed its call graph yet; see
-    /// `AppContext::defer_callgraph_build`.
-    defer_callgraph: bool,
-    read_only: bool,
-    semantic: SemanticBackendConfig,
-    limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
 }
 
 #[cfg(test)]

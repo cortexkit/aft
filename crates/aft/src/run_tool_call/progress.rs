@@ -113,15 +113,6 @@ impl Drop for FileProgressGuard {
     }
 }
 
-/// A request may wait for a shared builder on another thread. Observe its
-/// completed-work counters, not elapsed time or repeated readiness probes.
-pub(crate) struct BuildProgress {
-    root: std::path::PathBuf,
-    last: Vec<(u64, &'static str, u64, Option<u64>)>,
-}
-
-impl BuildProgress {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

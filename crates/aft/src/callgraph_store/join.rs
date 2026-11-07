@@ -133,51 +133,6 @@ pub trait ManifestBlobReader {
     }
 }
 
-/// Shares a decoded object while a consumer owns it, without retaining an
-/// all decoded blobs after emission has finished.
-#[derive(Default)]
-pub(crate) struct DecodedBlobCache(
-    std::cell::RefCell<HashMap<String, std::sync::Weak<CallgraphBlob>>>,
-);
-
-impl DecodedBlobCache {
-    pub(crate) fn read(
-        &self,
-        key: &str,
-        read: impl FnOnce() -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError>,
-    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
-        if let Some(blob) = self.0.borrow().get(key).and_then(std::sync::Weak::upgrade) {
-            return Ok(Some(blob));
-        }
-        let blob = read()?;
-        if let Some(blob) = &blob {
-            self.0
-                .borrow_mut()
-                .insert(key.to_string(), Arc::downgrade(blob));
-        }
-        Ok(blob)
-    }
-}
-
-pub(crate) struct SharedBlobReader<'a, R> {
-    pub(crate) inner: &'a R,
-    pub(crate) decoded: DecodedBlobCache,
-}
-
-impl<R: ManifestBlobReader> ManifestBlobReader for SharedBlobReader<'_, R> {
-    fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
-        self.inner.read_callgraph_blob(key)
-    }
-
-    fn read_callgraph_blob_decoded(
-        &self,
-        key: &str,
-    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
-        self.decoded
-            .read(key, || self.inner.read_callgraph_blob_decoded(key))
-    }
-}
-
 /// Tree-sitter node position in canonical pre-order traversal order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AstPreorderNode {
@@ -2165,26 +2120,6 @@ impl ViewResolutionBinding {
             },
         }
     }
-}
-
-pub(crate) struct SelectedManifestJoin {
-    pub result: JoinResult,
-    pub bindings: BTreeMap<String, ViewBindingDependencies>,
-    pub resolved_callers: BTreeSet<String>,
-    pub rebuilt_surface_entries: usize,
-    pub rebuilt_surface_paths: BTreeSet<String>,
-    pub decoded_caller_blobs: usize,
-    pub resolved_bindings: usize,
-    /// Receiver type targets of the Rust files the join's
-    /// [`DispatchTypeTargetPlan`] resolved; other files keep their previous ones.
-    pub dispatch_type_targets: BTreeMap<String, DispatchTypeTargets>,
-    /// Parse blobs decoded only to resolve receiver type targets.
-    pub dispatch_type_target_decoded_blobs: usize,
-    /// Previous traces of other files checked against the new index.
-    pub dispatch_type_target_traces: usize,
-    /// Checked traces whose only dependency among the seeds was the module
-    /// domain.
-    pub module_domain_traces: usize,
 }
 
 /// Compact, deterministic snapshot of one file's resolver index. It deliberately

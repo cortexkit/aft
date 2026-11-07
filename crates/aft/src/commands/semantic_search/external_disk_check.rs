@@ -21,9 +21,8 @@
 //! reflects every file on disk or only part of the project.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::external_exact::classify_file;
@@ -34,18 +33,12 @@ use crate::semantic_index::SemanticIndex;
 const WALK_BUDGET: Duration = Duration::from_secs(2);
 /// Time allowed, after the walk, for reading changed and new files.
 const REREAD_BUDGET: Duration = Duration::from_secs(1);
-/// How long a finished check keeps answering later queries for the same
-/// saved index before the project is walked again. Agents often send several
-/// queries to another project in a row; each reply that reuses a check says
-/// how old it is.
-const REUSE_WINDOW: Duration = Duration::from_secs(12);
 
 /// Walk budget, re-read budget and reuse window.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Budgets {
     pub walk: Duration,
     pub reread: Duration,
-    pub reuse_window: Duration,
 }
 
 thread_local! {
@@ -62,7 +55,6 @@ pub(super) fn budgets() -> Budgets {
     BUDGETS_FOR_TEST.with(Cell::get).unwrap_or(Budgets {
         walk: WALK_BUDGET,
         reread: REREAD_BUDGET,
-        reuse_window: REUSE_WINDOW,
     })
 }
 
@@ -74,14 +66,7 @@ pub(crate) fn with_budgets_for_test<R>(
     reread: Duration,
     run: impl FnOnce() -> R,
 ) -> R {
-    with_all_budgets_for_test(
-        Budgets {
-            walk,
-            reread,
-            reuse_window: Duration::ZERO,
-        },
-        run,
-    )
+    with_all_budgets_for_test(Budgets { walk, reread }, run)
 }
 
 #[cfg(test)]
@@ -167,40 +152,6 @@ pub(crate) struct CheckedIndex {
     /// were. Two queries over the same unchanged files get the same digest, so
     /// caches keyed by index generation stay usable without mixing versions.
     pub applied_digest: Option<String>,
-    /// Time spent walking the project and comparing metadata.
-    pub walk_time: Duration,
-    /// Time spent reading changed and new files.
-    pub reread_time: Duration,
-}
-
-/// One project's checked index, kept for [`REUSE_WINDOW`].
-#[derive(Debug)]
-struct CheckedOverlay {
-    root: PathBuf,
-    /// Generation of the saved index the check started from.
-    generation: String,
-    /// The saved index and semantic index the check compared; a later query
-    /// reuses the check only while it is answered from these same indexes.
-    saved: Weak<SearchIndex>,
-    semantic: Option<Weak<SemanticIndex>>,
-    checked: CheckedIndex,
-    checked_at: Instant,
-}
-
-/// Recently checked indexes of other projects, at most one per project and
-/// [`MAX_CHECKED_ROOTS`] projects, least recently used dropped first. The
-/// owner drops a project's entry whenever it drops or replaces that project's
-/// borrowed index, so a kept copy never outlives the index it was made from.
-#[derive(Debug, Default)]
-pub(crate) struct CheckedOverlays {
-    entries: VecDeque<CheckedOverlay>,
-}
-
-impl CheckedOverlays {
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 /// Changed files whose size still matches are hashed this many at a time, so
@@ -278,8 +229,7 @@ pub(super) fn check_against_disk(
     WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
     let base = previous.unwrap_or(saved);
     let base_is_saved = Arc::ptr_eq(base, saved);
-    let walk_started = Instant::now();
-    let walk_deadline = walk_started + budgets.walk;
+    let walk_deadline = Instant::now() + budgets.walk;
     let stop_requested =
         |deadline: Instant| Instant::now() >= deadline || crate::executor::current_job_cancelled();
 
@@ -367,10 +317,8 @@ pub(super) fn check_against_disk(
     } else {
         (unseen(base, &seen_base), unseen(saved, &seen_saved))
     };
-    let walk_time = walk_started.elapsed();
 
     let mut work: Vec<usize> = (0..walked.len()).filter(|&i| walked[i].differs).collect();
-    let reread_started = Instant::now();
     let mut copy = None;
     if !work.is_empty() || !removed_from_base.is_empty() {
         let mut overlay = SearchIndex::clone(base);
@@ -380,7 +328,6 @@ pub(super) fn check_against_disk(
         resolve_differences(&mut overlay, &mut walked, &mut work, budgets.reread);
         copy = Some(overlay);
     }
-    let reread_time = reread_started.elapsed();
 
     // Describe the final copy against the saved index.
     let current: &SearchIndex = copy.as_ref().unwrap_or(base.as_ref());
@@ -448,8 +395,6 @@ pub(super) fn check_against_disk(
         index: copy.map(Arc::new).unwrap_or_else(|| Arc::clone(base)),
         check,
         applied_digest,
-        walk_time,
-        reread_time,
     }
 }
 

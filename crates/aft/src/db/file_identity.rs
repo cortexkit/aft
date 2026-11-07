@@ -200,12 +200,6 @@ fn live_files() -> &'static RwLock<LiveFiles> {
     FILES.get_or_init(RwLock::default)
 }
 
-/// Identity-admission caches must be revoked when an external database opens or
-/// changes identity. Ignore the publisher's storage, whose transient connections
-/// reopen on every publication; its paths are excluded by name instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AdmissionSnapshot(BTreeMap<PathBuf, HashSet<LiveFileIdentity>>);
-
 fn database_files(key: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix| {
         let mut path = key.as_os_str().to_os_string();
@@ -323,46 +317,6 @@ fn filesystem_gate() -> &'static parking_lot::ReentrantMutex<()> {
 
 pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
     filesystem_gate().lock()
-}
-
-/// Identity-only accounting for connections that retain SQLite's native WAL policy.
-/// Kept after the raw connection in `IdentityConnection`, so close completes before
-/// the registry forgets the handle, including on early returns and worker moves.
-#[derive(Debug)]
-pub(crate) struct OpenRecord {
-    key: Option<PathBuf>,
-    store: SqliteStore,
-}
-
-impl Drop for OpenRecord {
-    fn drop(&mut self) {
-        if let Some(key) = &self.key {
-            note_close(key, self.store);
-        }
-    }
-}
-
-/// Own the raw handle and its identity record together without installing a WAL hook.
-/// Field order matters: Rust drops the connection before its registration.
-#[derive(Debug)]
-pub(crate) struct IdentityConnection {
-    connection: rusqlite::Connection,
-    _record: OpenRecord,
-}
-
-impl IdentityConnection {}
-
-impl std::ops::Deref for IdentityConnection {
-    type Target = rusqlite::Connection;
-    fn deref(&self) -> &Self::Target {
-        &self.connection
-    }
-}
-
-impl std::ops::DerefMut for IdentityConnection {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.connection
-    }
 }
 
 /// Record that a tracked connection has opened `path`, and return the key the

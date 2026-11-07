@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
-use crate::native_stat::NativeStat;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};
@@ -216,26 +215,6 @@ pub(crate) enum BorrowedIndexLoadStop {
     /// The snapshot was written for a different part of the checkout than the
     /// loading root covers (see `checkout_position`).
     CoverageMismatch,
-}
-
-/// What reconciling a borrowed snapshot against this checkout's files found.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BorrowedReconcileSummary {
-    /// Files the ignore-aware walk found on disk.
-    pub(crate) walked: usize,
-    /// Snapshot records whose bytes still match disk (kept on shared postings).
-    pub(crate) unchanged: usize,
-    /// The subset of `unchanged` that needed a content hash to prove it.
-    pub(crate) hashed_unchanged: usize,
-    /// Snapshot records whose content differs and were re-indexed in RAM.
-    pub(crate) reindexed: usize,
-    /// Files on disk that the snapshot does not contain.
-    pub(crate) added: usize,
-    /// Snapshot records with no file on disk any more.
-    pub(crate) removed: usize,
-    pub(crate) walk: Duration,
-    pub(crate) verify: Duration,
-    pub(crate) apply: Duration,
 }
 
 struct BorrowedIndexLoadBudget<'a> {
@@ -439,17 +418,6 @@ thread_local! {
     static LEGACY_SEARCH_PUBLICATION: std::cell::RefCell<Option<Arc<LegacySearchPublicationGate>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct LegacySearchPublicationScope {
-    previous: Option<Arc<LegacySearchPublicationGate>>,
-    _not_send: std::marker::PhantomData<*const ()>,
-}
-
-impl Drop for LegacySearchPublicationScope {
-    fn drop(&mut self) {
-        LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(self.previous.take()));
-    }
-}
-
 impl LegacySearchPublicationGate {
     pub(crate) fn allowed(&self) -> bool {
         self.allowed.load(std::sync::atomic::Ordering::Acquire)
@@ -510,44 +478,6 @@ pub struct SearchIndex {
     base_file_count: u32,
     delta_packed_bytes: usize,
     compaction_state: Arc<Mutex<CompactionState>>,
-    /// The `cache.bin` this index last wrote itself, and the header values it
-    /// wrote there. `None` for an index read from disk or built in memory.
-    published_cache: Option<PublishedCache>,
-}
-
-/// Where an index wrote its own cache, and the header fields that a rewrite
-/// from the index would take from mutable index state.
-#[derive(Clone, Debug)]
-struct PublishedCache {
-    cache_dir: PathBuf,
-    /// Stored the way the header stores it: no head is an empty string.
-    git_head: String,
-    ignore_fingerprint: String,
-    max_file_size: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct VerifiedFile {
-    stat: NativeStat,
-    observed_ns: u128,
-    content_hash: [u8; 32],
-}
-
-/// Content proofs collected during verification, not a later metadata sweep.
-#[derive(Default, Deserialize, Serialize)]
-pub(crate) struct WarmVerification {
-    files: BTreeMap<PathBuf, VerifiedFile>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct WarmVerifyRecord {
-    index_version: u32,
-    cache_generation: NativeStat,
-    root: PathBuf,
-    git_head: Option<String>,
-    ignore_fingerprint: String,
-    max_file_size: u64,
-    verification: WarmVerification,
 }
 
 // A query must observe postings and superseded base files from one version;
@@ -1859,7 +1789,6 @@ enum SearchMatcher {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum IgnoreRulesLoadPolicy {
     Strict,
-    BorrowTolerant,
 }
 
 impl SearchIndex {
@@ -1882,7 +1811,6 @@ impl SearchIndex {
             base_file_count: 0,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            published_cache: None,
         }
     }
 
@@ -2480,12 +2408,6 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
-                self.published_cache = Some(PublishedCache {
-                    cache_dir: cache_dir.to_path_buf(),
-                    git_head: self.git_head.clone().unwrap_or_default(),
-                    ignore_fingerprint: self.ignore_rules_fingerprint.clone(),
-                    max_file_size: self.max_file_size,
-                });
                 true
             }
             Err(error) => {
@@ -2837,7 +2759,6 @@ impl SearchIndex {
             base_file_count: u32::try_from(file_count).ok()?,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            published_cache: None,
         };
 
         if migrated_counts && allow_legacy_repair {
@@ -4912,12 +4833,6 @@ fn build_streaming_index(
     let base = build_result?;
     let base_file_count =
         u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
-    let published_cache = Some(PublishedCache {
-        cache_dir: cache_dir.to_path_buf(),
-        git_head: git_head.clone().unwrap_or_default(),
-        ignore_fingerprint: ignore_fingerprint.clone(),
-        max_file_size,
-    });
     let index = SearchIndex {
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
@@ -4936,7 +4851,6 @@ fn build_streaming_index(
         base_file_count,
         delta_packed_bytes: 0,
         compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-        published_cache,
     };
     Ok((index, indexed))
 }
@@ -6424,17 +6338,6 @@ fn project_walk_admits_entry(
         );
     }
     !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-}
-
-/// What `project_walk_lists` found: the files the walk lists, and the places
-/// it could not look.
-#[derive(Debug, Default)]
-pub(crate) struct ProjectWalkListing {
-    pub listed: BTreeSet<PathBuf>,
-    /// Paths the walk could not read (a directory it could not list, an
-    /// ignore file it could not read), with the error. Whether a file at or
-    /// under one of them is listed is unknown, not "no".
-    pub gaps: Vec<(PathBuf, String)>,
 }
 
 /// `project_walk_lists` answers per file with the project walk's own rules,
@@ -9933,14 +9836,6 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let value = String::from_utf8(stdout).ok()?;
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
-}
-
-/// One record of `git diff --name-status -z` output, borrowing its raw bytes.
-struct GitNameStatusRecord<'a> {
-    /// Status letters, such as `M`, `A`, `D` or `R100` for a rename.
-    status: &'a [u8],
-    /// One path, or the old path then the new path for a rename or copy.
-    paths: Vec<&'a [u8]>,
 }
 
 #[cfg(not(unix))]

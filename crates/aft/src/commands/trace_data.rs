@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
     note_callgraph_served, serialized_value, store_error_response, trace_data_result,
 };
@@ -29,15 +28,7 @@ use crate::protocol::{RawRequest, Response};
 /// - call graph not initialized (configure not called)
 /// - symbol not found in the file
 pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_trace_data(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Checkout,
-        BorrowedOp::TraceData,
-    );
-    response
+    answer_trace_data(req, ctx)
 }
 
 fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {

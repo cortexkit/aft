@@ -1119,12 +1119,13 @@ mod rust_bindings;
 mod rust_manifest;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
-    project_dead_code_snapshot_from_view, project_dead_code_snapshot_with_revision,
-    ProjectionCostEstimates, ProjectionKind, ProjectionVerdict, MAX_DELTA_BYTES,
+    project_dead_code_snapshot_from_view, ProjectionCostEstimates, ProjectionKind,
+    ProjectionVerdict, MAX_DELTA_BYTES,
 };
 #[cfg(test)]
 pub(crate) use dead_code_projection::{
-    project_dead_code_snapshot_incremental, take_projection_work,
+    project_dead_code_snapshot_incremental, project_dead_code_snapshot_with_revision,
+    take_projection_work,
 };
 
 #[doc(hidden)]
@@ -1200,27 +1201,6 @@ pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
     MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow_mut() = bytes);
 }
 
-/// Carry only the initiating test's hooks across the context's worker boundary.
-/// Keeping them thread-local prevents unrelated parallel roots from inheriting
-/// another test's simulated disk floor or cold-build observer.
-pub(crate) struct CallgraphBackgroundTestHooks {
-    available_disk: Option<u64>,
-    swap_observer: Option<Arc<ColdBuildSwapObserver>>,
-    #[cfg(test)]
-    extract_observer: Option<Arc<ColdBuildExtractObserver>>,
-}
-
-impl CallgraphBackgroundTestHooks {}
-
-pub(crate) struct CallgraphBackgroundTestHooksGuard(CallgraphBackgroundTestHooks);
-
-impl Drop for CallgraphBackgroundTestHooksGuard {
-    fn drop(&mut self) {
-        set_legacy_migration_available_disk_for_test(self.0.available_disk);
-        set_cold_build_swap_observer(self.0.swap_observer.take());
-    }
-}
-
 #[doc(hidden)]
 pub fn set_legacy_migration_fail_after_temp_copy_for_test(enabled: bool) {
     MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.set(enabled));
@@ -1251,18 +1231,6 @@ pub(crate) fn with_publish_epoch<R>(
     let previous = PUBLISH_ADMISSION.with(|slot| slot.replace(Some((epoch, expected))));
     let _guard = PublishAdmissionGuard { previous };
     run()
-}
-
-struct ColdBuildAbandonmentGuard {
-    previous: Option<SubcLifecycleAdmission>,
-}
-
-impl Drop for ColdBuildAbandonmentGuard {
-    fn drop(&mut self) {
-        COLD_BUILD_ABANDONMENT.with(|slot| {
-            *slot.borrow_mut() = self.previous.take();
-        });
-    }
 }
 
 fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
@@ -4245,36 +4213,6 @@ enum WriterConnectionRole {
     Generation,
     Refresh,
     Build,
-}
-
-#[derive(Clone, Debug)]
-struct LegacyCallgraphPartition {
-    harness: String,
-    dir: PathBuf,
-    key: String,
-    bytes: u64,
-    freshness: Option<SystemTime>,
-}
-
-#[derive(Clone, Debug)]
-struct LegacyCallgraphTarget {
-    partition: LegacyCallgraphPartition,
-    sqlite_path: PathBuf,
-    generation: Option<String>,
-    source_bytes: u64,
-    source_blake3: String,
-}
-
-#[derive(Clone, Debug)]
-struct SourceFingerprint {
-    bytes: u64,
-    blake3: String,
-}
-
-#[derive(Clone, Debug)]
-struct PublishedLegacyMigration {
-    generation: String,
-    migrated_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -9681,243 +9619,6 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
         max_depth: usize,
     ) -> Result<callgraph::TraceToSymbolResult> {
         (**self).trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
-    }
-}
-
-/// One of two call-graph readers, chosen per request: today's store, or the
-/// data layer's view of the same checkout while it is built beside it.
-pub(crate) enum EitherGraph<A, B> {
-    Store(A),
-    Data(B),
-}
-
-impl<A: CallGraphRead, B: CallGraphRead> CallGraphRead for EitherGraph<A, B> {
-    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
-        match self {
-            Self::Store(store) => store.stored_content_hash(file),
-            Self::Data(data) => data.stored_content_hash(file),
-        }
-    }
-    fn project_root(&self) -> &Path {
-        match self {
-            Self::Store(store) => store.project_root(),
-            Self::Data(data) => data.project_root(),
-        }
-    }
-    fn project_key(&self) -> &str {
-        match self {
-            Self::Store(store) => store.project_key(),
-            Self::Data(data) => data.project_key(),
-        }
-    }
-    fn sqlite_path(&self) -> &Path {
-        match self {
-            Self::Store(store) => store.sqlite_path(),
-            Self::Data(data) => data.sqlite_path(),
-        }
-    }
-    fn is_current(&self) -> bool {
-        match self {
-            Self::Store(store) => store.is_current(),
-            Self::Data(data) => data.is_current(),
-        }
-    }
-    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
-        match self {
-            Self::Store(store) => store.edge_snapshot(),
-            Self::Data(data) => data.edge_snapshot(),
-        }
-    }
-    fn indexed_file_count(&self) -> Result<usize> {
-        match self {
-            Self::Store(store) => store.indexed_file_count(),
-            Self::Data(data) => data.indexed_file_count(),
-        }
-    }
-    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
-        match self {
-            Self::Store(store) => store.node_for(file_rel, symbol),
-            Self::Data(data) => data.node_for(file_rel, symbol),
-        }
-    }
-    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
-        match self {
-            Self::Store(store) => store.nodes_for(file_rel, symbol),
-            Self::Data(data) => data.nodes_for(file_rel, symbol),
-        }
-    }
-    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
-        match self {
-            Self::Store(store) => store.nodes_for_stored(file, symbol),
-            Self::Data(data) => data.nodes_for_stored(file, symbol),
-        }
-    }
-    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
-        match self {
-            Self::Store(store) => store.nodes_matching(symbol),
-            Self::Data(data) => data.nodes_matching(symbol),
-        }
-    }
-    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
-        match self {
-            Self::Store(store) => store.direct_callers_of(file_rel, symbol),
-            Self::Data(data) => data.direct_callers_of(file_rel, symbol),
-        }
-    }
-    fn direct_callers_for_symbols(
-        &self,
-        targets: &[(String, String)],
-    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
-        match self {
-            Self::Store(store) => store.direct_callers_for_symbols(targets),
-            Self::Data(data) => data.direct_callers_for_symbols(targets),
-        }
-    }
-    fn direct_caller_counts_of(
-        &self,
-        targets: &[(String, String)],
-    ) -> Result<HashMap<(String, String), usize>> {
-        match self {
-            Self::Store(store) => store.direct_caller_counts_of(targets),
-            Self::Data(data) => data.direct_caller_counts_of(targets),
-        }
-    }
-    fn callers_of(
-        &self,
-        file_rel: &Path,
-        symbol: &str,
-        depth: usize,
-    ) -> Result<StoreCallersResult> {
-        match self {
-            Self::Store(store) => store.callers_of(file_rel, symbol, depth),
-            Self::Data(data) => data.callers_of(file_rel, symbol, depth),
-        }
-    }
-    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult> {
-        match self {
-            Self::Store(store) => store.impact_of(file_rel, symbol, depth),
-            Self::Data(data) => data.impact_of(file_rel, symbol, depth),
-        }
-    }
-    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
-        match self {
-            Self::Store(store) => store.outgoing_calls_of(node),
-            Self::Data(data) => data.outgoing_calls_of(node),
-        }
-    }
-    fn outgoing_calls_for_symbols(
-        &self,
-        sources: &[(String, String)],
-    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
-        match self {
-            Self::Store(store) => store.outgoing_calls_for_symbols(sources),
-            Self::Data(data) => data.outgoing_calls_for_symbols(sources),
-        }
-    }
-    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
-        match self {
-            Self::Store(store) => store.resolved_self_calls_of(node),
-            Self::Data(data) => data.resolved_self_calls_of(node),
-        }
-    }
-    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
-        match self {
-            Self::Store(store) => store.unresolved_calls_of(node),
-            Self::Data(data) => data.unresolved_calls_of(node),
-        }
-    }
-    fn ref_sites_named(
-        &self,
-        kind: &str,
-        short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        match self {
-            Self::Store(store) => store.ref_sites_named(kind, short_name, limit),
-            Self::Data(data) => data.ref_sites_named(kind, short_name, limit),
-        }
-    }
-    fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
-        match self {
-            Self::Store(store) => store.macro_template_calls_of(node),
-            Self::Data(data) => data.macro_template_calls_of(node),
-        }
-    }
-    fn unresolved_method_sites_named(
-        &self,
-        name: &str,
-        language: LangId,
-    ) -> Result<Vec<StoreRefSite>> {
-        match self {
-            Self::Store(store) => store.unresolved_method_sites_named(name, language),
-            Self::Data(data) => data.unresolved_method_sites_named(name, language),
-        }
-    }
-    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
-        match self {
-            Self::Store(store) => store.unresolved_call_site_count(language, include_tests),
-            Self::Data(data) => data.unresolved_call_site_count(language, include_tests),
-        }
-    }
-    fn unresolved_call_site_count_named(
-        &self,
-        name: &str,
-        language: LangId,
-        include_tests: bool,
-    ) -> Result<usize> {
-        match self {
-            Self::Store(store) => {
-                store.unresolved_call_site_count_named(name, language, include_tests)
-            }
-            Self::Data(data) => {
-                data.unresolved_call_site_count_named(name, language, include_tests)
-            }
-        }
-    }
-    fn call_tree(
-        &self,
-        file_rel: &Path,
-        symbol: &str,
-        depth: usize,
-    ) -> Result<callgraph::CallTreeNode> {
-        match self {
-            Self::Store(store) => store.call_tree(file_rel, symbol, depth),
-            Self::Data(data) => data.call_tree(file_rel, symbol, depth),
-        }
-    }
-    fn trace_to(
-        &self,
-        file_rel: &Path,
-        symbol: &str,
-        max_depth: usize,
-    ) -> Result<callgraph::TraceToResult> {
-        match self {
-            Self::Store(store) => store.trace_to(file_rel, symbol, max_depth),
-            Self::Data(data) => data.trace_to(file_rel, symbol, max_depth),
-        }
-    }
-    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
-        match self {
-            Self::Store(store) => store.trace_to_symbol_candidates(to_symbol),
-            Self::Data(data) => data.trace_to_symbol_candidates(to_symbol),
-        }
-    }
-    fn trace_to_symbol(
-        &self,
-        file_rel: &Path,
-        symbol: &str,
-        to_symbol: &str,
-        to_file: Option<&Path>,
-        max_depth: usize,
-    ) -> Result<callgraph::TraceToSymbolResult> {
-        match self {
-            Self::Store(store) => {
-                store.trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
-            }
-            Self::Data(data) => {
-                data.trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
-            }
-        }
     }
 }
 

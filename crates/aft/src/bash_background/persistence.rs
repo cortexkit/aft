@@ -3872,29 +3872,6 @@ impl std::fmt::Display for NonRegularEntryRetained {
 
 impl std::error::Error for NonRegularEntryRetained {}
 
-/// What a no-follow stat says about one entry.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RepairEntryStatus {
-    pub(crate) is_dir: bool,
-    pub(crate) is_file: bool,
-    /// Owned by the current user, and neither its group nor other users may
-    /// write it. Windows storage directories are per-user, so there this only
-    /// requires the entry not to be a reparse point.
-    pub(crate) private: bool,
-}
-
-impl RepairEntryStatus {
-    #[cfg(windows)]
-    fn windows(metadata: &fs::Metadata) -> Self {
-        let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-        Self {
-            is_dir: !reparse && metadata.is_dir(),
-            is_file: !reparse && metadata.is_file(),
-            private: !reparse,
-        }
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn repair_errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }

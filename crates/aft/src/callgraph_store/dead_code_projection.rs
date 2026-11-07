@@ -35,6 +35,7 @@ pub(crate) enum ProjectionKind {
     Full,
     /// The cached snapshot for the current revision was handed back without
     /// touching the store: no projection work at all.
+    #[cfg(test)]
     Reused,
 }
 
@@ -88,7 +89,9 @@ impl ProjectionCostEstimates {
                 let per_file = elapsed_ns / verdict.changed_files as u64;
                 update_running_estimate(&mut self.splice_ns_per_file, per_file.max(1));
             }
-            ProjectionKind::Spliced | ProjectionKind::Reused => {}
+            ProjectionKind::Spliced => {}
+            #[cfg(test)]
+            ProjectionKind::Reused => {}
         }
     }
 }

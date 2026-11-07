@@ -865,12 +865,6 @@ fn handle_inspect_payload(
         return inspect_interrupted_response(&req.id);
     }
 
-    // Wait while the request's config/query guard is alive. The result is pinned
-    // once and handed into workers; they must not open another generation.
-    let tier2_enabled = InspectCategory::active()
-        .iter()
-        .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
-    start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
     // The graph-backed categories read the index store's checkout (below);
     // no other call-graph store is pinned for the request.
     let v3_routed = false;
@@ -1310,19 +1304,6 @@ fn scoped_in_root_file_count(
     )
 }
 
-/// A linked worktree builds its call graph when a query first needs it, and
-/// the Tier-2 categories (dead code and the like) need it. Route one call-graph
-/// access so the main checkout's graph answers or that build starts; the
-/// scans themselves still read the published view.
-fn start_on_demand_callgraph_for_inspect(ctx: &AppContext, config: &crate::config::Config) {
-    let tier2_enabled = InspectCategory::active()
-        .iter()
-        .any(|category| category.is_tier2() && config.inspect.category_enabled(*category));
-    if tier2_enabled && ctx.callgraph_build_on_demand() {
-        let _ = ctx.callgraph_store_for_query_without_wait();
-    }
-}
-
 fn scoped_runtime_notes(
     ctx: &AppContext,
     producer_keys: impl FnOnce() -> std::collections::HashSet<ServerKey>,
@@ -1524,7 +1505,6 @@ pub(crate) fn handle_inspect_deferred_with_clock(
     // Start any on-demand call-graph build here, while this request still runs
     // under its root actor. The body below runs on a detached thread without
     // one, where starting the build would leave it to a later query instead.
-    start_on_demand_callgraph_for_inspect(&ctx, &snapshot.config);
     let completion_request_id = request_id.clone();
     let shutdown_log = phase_log.clone();
     let cancellation = crate::executor::current_job_cancellation()
@@ -8435,7 +8415,6 @@ mod deferred_terminal_tests {
             crate::inspect::job::canonicalize_normalized(&root)
         );
         assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
-        start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
         let _ = ctx.callgraph_store_for_query_without_wait();
         let scope = JobScope::for_project(root.clone());
         for category in InspectCategory::active().iter().copied() {

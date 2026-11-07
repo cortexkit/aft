@@ -267,8 +267,6 @@ pub(crate) fn progress_origin_guard(
 }
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
-/// `view_disk_limits_next_ms` while views are disabled: never due.
-const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 
 thread_local! {
     /// Config snapshots pinned by the requests running on this thread, keyed
@@ -1047,22 +1045,6 @@ pub struct ViewLoadFailure {
     /// All view load failures since this process started.
     pub total: u64,
     pub last_at_ms: u64,
-}
-
-/// A checkout over `views.callgraph_copies` reading another checkout's
-/// published call graph (see `views::callgraph_copies`).
-struct CallgraphBorrow {
-    /// The borrowed checkout's call-graph member scope and root.
-    scope: String,
-    target_root: PathBuf,
-    /// When admission decided to borrow. It decides again after
-    /// [`CALLGRAPH_READMIT_AFTER`], so a borrower takes a free slot.
-    decided_at: Instant,
-    /// The open reader and the generation it reads.
-    reader: Option<(String, Arc<ReadonlyCallGraphStore>)>,
-    /// When the borrowed checkout's published generation was last compared
-    /// with the open reader's.
-    checked_at: Instant,
 }
 
 /// Per-project checkout view load health. Counts every load attempt the
@@ -2661,32 +2643,13 @@ pub enum CallGraphStoreBuildEvent {
     Settled,
 }
 
-struct CallGraphStoreBuildSettlement {
-    tx: crossbeam_channel::Sender<CallGraphStoreBuildEvent>,
-    sent: bool,
-    force_token: Option<u64>,
-    publication_epoch: u64,
-}
-
-impl CallGraphStoreBuildSettlement {}
-
-impl Drop for CallGraphStoreBuildSettlement {
-    fn drop(&mut self) {
-        if !self.sent {
-            let _ = self.tx.send(CallGraphStoreBuildEvent::Settled);
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
     pub(crate) root_path: PathBuf,
     pub(crate) canonical_cache_root: PathBuf,
-    pub(crate) project_key: String,
     pub(crate) harness: Harness,
     pub(crate) storage_root: PathBuf,
-    pub(crate) artifact_root: PathBuf,
     pub(crate) harness_dir: PathBuf,
     pub(crate) session_id: String,
     pub(crate) root_too_broad: bool,
@@ -3282,17 +3245,6 @@ pub enum SemanticRefreshEvent {
         paths: Vec<PathBuf>,
         error: String,
     },
-}
-
-pub(crate) struct ReceiverTerminalGuard {
-    terminal_epoch: Arc<AtomicU64>,
-    epoch: u64,
-}
-
-impl Drop for ReceiverTerminalGuard {
-    fn drop(&mut self) {
-        self.terminal_epoch.fetch_max(self.epoch, Ordering::SeqCst);
-    }
 }
 
 pub type SemanticRefreshWorkerSlot = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
@@ -4215,30 +4167,6 @@ struct WatcherRuntimeIdentity {
     thread_id: Option<std::thread::ThreadId>,
 }
 
-/// A linked worktree builds its call graph on first use, not when it binds.
-///
-/// Until a query needs the graph, the worktree publishes view generations
-/// without a derived call-graph database. While its published files match the
-/// main checkout's, queries read main's published graph instead. The first
-/// query that main's graph cannot answer sets `demanded`; from then on every
-/// publication builds the worktree's own graph and keeps it current.
-#[derive(Default)]
-struct LazyCallgraph {
-    /// A query needed this worktree's own graph.
-    demanded: AtomicBool,
-    /// Serializes "is a publication queued or running? if not, start one"
-    /// across query threads, so concurrent first queries start one build.
-    schedule: parking_lot::Mutex<()>,
-    /// Which source last answered a query, logged only when it changes.
-    source: parking_lot::Mutex<Option<&'static str>>,
-    /// Some thread has published for this context under a root actor or the
-    /// standalone scope, so a query outside one leaves the build to such a
-    /// caller instead of publishing inline.
-    publication_scoped: AtomicBool,
-    #[cfg(test)]
-    builds_scheduled: AtomicUsize,
-}
-
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, and configuration.
@@ -4327,7 +4255,6 @@ pub struct AppContext {
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
-    lazy_callgraph: LazyCallgraph,
     /// This root's checkout in the data layer that replaces the views and
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
     /// `data_layer::runtime`).
@@ -4383,7 +4310,6 @@ pub struct AppContext {
     callgraph_store_build_suspension:
         parking_lot::Mutex<Option<(u64, crate::build_breaker::BuildSuspension)>>,
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
-    callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
     search_exact_memo: Arc<crate::commands::semantic_search::memo::ExactMemoStore>,
     symbol_cache: SharedSymbolCache,
@@ -4398,7 +4324,6 @@ pub struct AppContext {
     /// Size of a finished semantic-index load waiting in `semantic_index_rx`.
     semantic_pending_install: Arc<PendingInstallSlot>,
     semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
-    semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
     semantic_index_status: Arc<RwLock<SemanticIndexStatus>>,
     /// Present only while a cold semantic build is running. Its counters are
     /// read by status and health without taking the worker's batch-loop locks.
@@ -4406,9 +4331,6 @@ pub struct AppContext {
     /// Advances when the inputs that determine a semantic corpus build change.
     /// Unrelated configure changes adopt the existing worker instead.
     semantic_build_epoch: Arc<AtomicU64>,
-    /// Serializes missing-artifact checks with receiver installation so
-    /// concurrent fallback queries cannot start duplicate reload workers.
-    artifact_reload_lock: parking_lot::Mutex<()>,
     /// True while this context has a cold semantic seed scheduled or actively
     /// collecting/embedding/persisting the full project corpus. The semantic
     /// worker clears it as soon as it proves the cached/incremental path is in use.
@@ -4662,12 +4584,6 @@ impl Drop for AppContext {
     }
 }
 
-struct CallgraphPublicationFence {
-    lifecycle: SubcLifecycleAdmission,
-    generation: Arc<AtomicU64>,
-    expected: u64,
-}
-
 /// Result of requesting the persisted callgraph store for a store-backed op.
 ///
 /// Cold builds run in the background. Checkout-view acquisitions also run
@@ -4698,48 +4614,6 @@ pub struct CallgraphViewReadDiagnostics {
     pub last_attempt_ms: u64,
     pub total_attempt_ms: u64,
     pub last_error: Option<String>,
-}
-
-#[derive(Clone)]
-struct CallgraphViewInstallTestGate {
-    reached: crossbeam_channel::Sender<String>,
-    release: crossbeam_channel::Receiver<()>,
-    installed: crossbeam_channel::Sender<String>,
-}
-
-static CALLGRAPH_VIEW_INSTALL_TEST_GATES: std::sync::OnceLock<
-    parking_lot::Mutex<BTreeMap<PathBuf, CallgraphViewInstallTestGate>>,
-> = std::sync::OnceLock::new();
-
-/// Hold this root between callgraph preparation and runtime installation.
-/// Integration tests observe both sides of that boundary without delaying other roots.
-#[doc(hidden)]
-pub fn install_callgraph_view_install_test_gate(
-    root: PathBuf,
-) -> (
-    crossbeam_channel::Receiver<String>,
-    crossbeam_channel::Sender<()>,
-    crossbeam_channel::Receiver<String>,
-) {
-    let (reached, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release) = crossbeam_channel::bounded(1);
-    let (installed, installed_rx) = crossbeam_channel::bounded(1);
-    let previous = CALLGRAPH_VIEW_INSTALL_TEST_GATES
-        .get_or_init(Default::default)
-        .lock()
-        .insert(
-            root,
-            CallgraphViewInstallTestGate {
-                reached,
-                release,
-                installed,
-            },
-        );
-    assert!(
-        previous.is_none(),
-        "callgraph view install gate already registered"
-    );
-    (reached_rx, release_tx, installed_rx)
 }
 
 #[cfg(test)]
@@ -5073,7 +4947,6 @@ impl AppContext {
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
-            lazy_callgraph: LazyCallgraph::default(),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
             data_layer_followed_configure: AtomicU64::new(0),
@@ -5101,7 +4974,6 @@ impl AppContext {
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
             callgraph_store_build_suspension: parking_lot::Mutex::new(None),
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
-            callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             search_exact_memo: Arc::new(
                 crate::commands::semantic_search::memo::ExactMemoStore::new(),
@@ -5117,11 +4989,9 @@ impl AppContext {
             semantic_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
             semantic_pending_install: Arc::default(),
             semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
-            semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
             semantic_index_status: Arc::new(RwLock::new(SemanticIndexStatus::Disabled)),
             semantic_build_progress: RwLock::new(None),
             semantic_build_epoch: Arc::new(AtomicU64::new(0)),
-            artifact_reload_lock: parking_lot::Mutex::new(()),
             semantic_cold_seed_active,
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
@@ -9514,15 +9384,6 @@ impl AppContext {
     /// worktree's on-demand build.
     pub(crate) fn callgraph_store_for_query_without_wait(&self) -> CallgraphStoreAccess {
         self.callgraph_store_for_ops_with_wait(Duration::ZERO, true, None)
-    }
-
-    /// True when this root builds its call graph only on first use: a linked
-    /// worktree, as git reported it at configure, with views on. Main
-    /// checkouts keep building eagerly, and so does a root whose topology
-    /// probe failed: it is only presumed to be a worktree and has no known
-    /// main checkout whose graph could answer for it.
-    pub(crate) fn callgraph_build_on_demand(&self) -> bool {
-        false
     }
 
     fn callgraph_store_for_ops_with_wait(

@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::{
     impact_result, note_callgraph_served, store_error_response,
@@ -10,15 +9,7 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle an `impact` request.
 pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_impact(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::Impact,
-    );
-    response
+    answer_impact(req, ctx)
 }
 
 fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {

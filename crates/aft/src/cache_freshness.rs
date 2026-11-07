@@ -33,6 +33,7 @@ static VERIFY_MEMO: OnceLock<Mutex<VerifyMemo>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerifyArtifact {
     Search,
+    #[cfg(test)]
     Semantic,
 }
 

@@ -557,10 +557,8 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        let connection = crate::db::write_accounting::open_connection(
-            &sqlite_open_path(path),
-            OpenFlags::default(),
-        )?;
+        let connection =
+            rusqlite::Connection::open_with_flags(&sqlite_open_path(path), OpenFlags::default())?;
         Self::from_connection_attributed(connection, store, root_id)
     }
 
@@ -580,13 +578,11 @@ impl TrackedConnection {
         // store's `sqlite_readonly_uri`).
         let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
         {
-            let connection = crate::db::write_accounting::open_connection(Path::new(path), flags)?;
+            let connection = rusqlite::Connection::open_with_flags(Path::new(path), flags)?;
             connection
         } else {
-            let connection = crate::db::write_accounting::open_connection(
-                &sqlite_open_path(Path::new(path)),
-                flags,
-            )?;
+            let connection =
+                rusqlite::Connection::open_with_flags(&sqlite_open_path(Path::new(path)), flags)?;
             connection
         };
         Self::from_connection_attributed(connection, store, path.to_owned())
@@ -602,8 +598,7 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
-        let connection =
-            crate::db::write_accounting::open_connection(&sqlite_open_path(path), flags)?;
+        let connection = rusqlite::Connection::open_with_flags(&sqlite_open_path(path), flags)?;
         Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 

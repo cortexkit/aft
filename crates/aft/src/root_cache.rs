@@ -1076,28 +1076,6 @@ pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarke
     read_marker_protection(cache_dir, generation_label, true)
 }
 
-/// A sweep may retain a positive census across its epoch bump: an extra mark
-/// only postpones garbage collection. Never cache a negative result, because a
-/// reader can register before the deleting mark. Removal checks must bypass
-/// this cache entirely and inspect protection again under the registry barrier.
-#[derive(Default)]
-pub(crate) struct ReadMarkerProtectionCache {
-    protected: std::collections::BTreeMap<(PathBuf, String), bool>,
-}
-
-/// Marker inputs a storage sweep re-reads for every generation it visits:
-/// the process hostname and each live pid's start time. The hostname cannot
-/// change mid-pass and a cached start time only ever over-retains (pids are
-/// reused with ever newer start times), so one pass keeps one copy of each
-/// instead of re-reading them once per generation or once per marker.
-/// Liveness itself is still probed per marker and never cached.
-pub(crate) struct ReadMarkerSweepContext {
-    hostname: String,
-    started: HashMap<u32, Option<u64>>,
-}
-
-impl ReadMarkerSweepContext {}
-
 // Test hook counting hostname resolutions on this thread. Reset before a
 // marker pass and read after it to prove the pass resolved the hostname
 // once instead of once per generation.

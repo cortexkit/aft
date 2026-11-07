@@ -34,9 +34,6 @@ pub(crate) struct ProjectWatcher {
 }
 
 impl ProjectWatcher {
-    pub(crate) fn initial_coverage(&self) -> super::InitialCoverage {
-        self.initial_coverage.clone()
-    }
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,

@@ -5,7 +5,6 @@ pub mod lifecycle;
 pub(crate) mod sealed_database;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod shm_diagnostics;
-pub(crate) mod write_accounting;
 pub mod write_ledger;
 pub use lifecycle::{
     connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,

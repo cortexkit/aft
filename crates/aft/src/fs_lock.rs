@@ -179,19 +179,12 @@ fn is_transient_create_contention(error: &io::Error) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum MalformedOwnerPolicy {
-    RecoverAfterGrace,
-    FailClosed,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
     heartbeat_refresh_interval_ms: u64,
     stale_heartbeat_ms: u64,
     live_owner_warn_ms: u64,
     poll_interval_ms: u64,
-    malformed_owner: MalformedOwnerPolicy,
 }
 
 impl LockConfig {
@@ -217,7 +210,6 @@ impl Default for LockConfig {
             stale_heartbeat_ms: STALE_HEARTBEAT_MS,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: POLL_INTERVAL_MS,
-            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 }
@@ -661,10 +653,6 @@ fn acquire_with_deadline(
                     }
                     Err(ReadLockError::Io(error)) => return Err(error.into()),
                     Err(ReadLockError::Malformed(_)) => {}
-                }
-                if matches!(config.malformed_owner, MalformedOwnerPolicy::FailClosed) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        format!("filesystem lease owner metadata is malformed; cannot prove the owner exited: {error}")).into());
                 }
                 slog_warn!(
                     "removing malformed filesystem lock at {}: {}",
@@ -2997,7 +2985,6 @@ mod tests {
             stale_heartbeat_ms: 2_000,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: 10,
-            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 

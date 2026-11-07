@@ -733,7 +733,6 @@ pub struct Child {
     pub root: PathBuf,
     /// Path relative to the parent folder, used as the answer's path prefix.
     pub relative: PathBuf,
-    scope: String,
     /// Read-only handle on the child's persisted inspect aggregates, holding
     /// a read marker on the inspect generation it reads.
     pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
@@ -748,11 +747,9 @@ impl Child {
             .strip_prefix(parent)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| root.clone());
-        let scope = crate::path_identity::project_scope_key(&root);
         Self {
             root,
             relative,
-            scope,
             inspect: RwLock::new(None),
             engine: Mutex::new(None),
         }

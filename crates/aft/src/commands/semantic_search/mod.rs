@@ -144,10 +144,6 @@ pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
-/// Fresh borrowed trigram bases were measured ready 1.1–2.5 seconds after root
-/// bind. Waiting through that observed window prevents a healthy first search
-/// from returning an empty loading response while keeping a stuck load bounded.
-const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
     "trigram index building; results from a bounded walk";
@@ -156,32 +152,6 @@ const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
 thread_local! {
     static FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
-}
-
-fn first_search_index_load_wait_budget() -> Duration {
-    #[cfg(test)]
-    if let Some(budget) = FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
-        return budget;
-    }
-    FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET
-}
-
-#[cfg(test)]
-fn with_first_search_index_load_wait_budget_for_test<T>(
-    budget: Duration,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset(Option<Duration>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.set(self.0));
-        }
-    }
-
-    let previous =
-        FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.replace(Some(budget)));
-    let _reset = Reset(previous);
-    action()
 }
 
 #[cfg(test)]
@@ -291,12 +261,6 @@ enum SearchMode {
     Literal,
     Semantic,
     Hybrid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchIndexWaitError {
-    Cancelled,
-    Contended,
 }
 
 struct RuntimeReadinessSource<'a> {
@@ -442,10 +406,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         {
             return extensions::ReadinessWait::Completed;
         }
-        match search_index_ready_with_budget(self.ctx, first_search_index_load_wait_budget()) {
-            Err(SearchIndexWaitError::Cancelled) => extensions::ReadinessWait::Cancelled,
-            Ok(_) | Err(SearchIndexWaitError::Contended) => extensions::ReadinessWait::Completed,
-        }
+        extensions::ReadinessWait::Completed
     }
 }
 
@@ -1434,11 +1395,7 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET) {
-            Ok(ready) => ready,
-            Err(SearchIndexWaitError::Cancelled) => return (plan, cancelled_search_response(req)),
-            Err(SearchIndexWaitError::Contended) => false,
-        }
+        search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
     };
     let patterns = match external {
         Some(corpus) => match corpus.collect(compiled, include_tests) {
@@ -2273,22 +2230,7 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
-    {
-        Ok(ready) => ready,
-        Err(SearchIndexWaitError::Cancelled) => return cancelled_search_response(req),
-        Err(SearchIndexWaitError::Contended) => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                &project_root,
-                top_k,
-                "search index remained busy",
-            );
-        }
-    };
+    let lexical_ready = search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET);
     // Ordinary roots retain the index-lane refusal policy. Parent children
     // may still be warming their first indexes, so their reader engines use
     // the existing bounded exact/lexical fallback instead.
@@ -6897,15 +6839,12 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn search_index_ready_with_budget(
-    ctx: &AppContext,
-    _wait_budget: Duration,
-) -> Result<bool, SearchIndexWaitError> {
+fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
     if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
-        return Ok(true);
+        return true;
     }
 
-    Ok(false)
+    false
 }
 
 /// Ranks every semantic chunk against `query_vector` with no enumeration
@@ -7005,7 +6944,7 @@ fn data_meaning_search(
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET).unwrap_or(false)
+    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {

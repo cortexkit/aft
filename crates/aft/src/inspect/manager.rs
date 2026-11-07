@@ -38,36 +38,6 @@ use crate::callgraph_store::{
 use crate::cold_build_limiter;
 use crate::config::Config;
 
-// A checkout view's refusal reasons were recorded only by tests of the
-// retired views store; the reads below return None on the same branches.
-macro_rules! note_checkout_view_refusal {
-    ($($arg:tt)*) => {};
-}
-
-macro_rules! checkout_view_some {
-    ($value:expr, $($reason:tt)*) => {
-        match $value {
-            Some(value) => value,
-            None => {
-                note_checkout_view_refusal!($($reason)*);
-                return None;
-            }
-        }
-    };
-}
-
-macro_rules! checkout_view_ok {
-    ($value:expr, $($reason:tt)*) => {
-        match $value {
-            Ok(value) => value,
-            Err(_error) => {
-                note_checkout_view_refusal!("{}: {_error}", format!($($reason)*));
-                return None;
-            }
-        }
-    };
-}
-
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
 fn inspect_category_is_off(
@@ -190,7 +160,6 @@ type ProjectionSlot = Mutex<Option<CachedCallgraphProjection>>;
 struct ProjectionFleetEntry {
     slot: Weak<ProjectionSlot>,
     bytes: u64,
-    touched: u64,
 }
 
 #[derive(Default)]
@@ -198,7 +167,6 @@ struct ProjectionFleet {
     entries: HashMap<PathBuf, ProjectionFleetEntry>,
     bytes: u64,
     drops: u64,
-    clock: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +282,7 @@ pub(crate) enum InspectBuilderState {
     WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
+    #[cfg(test)]
     Suspended,
     BuildDenied,
     Absent,
@@ -326,6 +295,7 @@ impl InspectBuilderState {
             Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
+            #[cfg(test)]
             Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
@@ -1755,14 +1725,6 @@ impl InspectManager {
         }
         payload["gaps"] = serde_json::json!([{"kind": kind, "reason": reason}]);
         payload
-    }
-
-    fn view_publication_epoch(&self, root: &Path) -> u64 {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&deferred_view_key(root))
-            .map_or(0, |state| state.publication_epoch)
     }
 
     pub(crate) fn deferred_view_refresh_ready(&self, root: &Path) -> bool {
@@ -4964,6 +4926,7 @@ fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
         ProjectionKind::Spliced => "spliced",
         ProjectionKind::Full => "full",
+        #[cfg(test)]
         ProjectionKind::Reused => "reused",
     };
     let reason = match verdict.reason {
@@ -5283,9 +5246,7 @@ fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallG
 
 #[derive(Debug)]
 pub(crate) enum CheckoutViewUnavailable {
-    Pending,
     Busy,
-    Unverified,
     Failed(String),
 }
 
@@ -5298,9 +5259,7 @@ impl From<String> for CheckoutViewUnavailable {
 impl CheckoutViewUnavailable {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
-            Self::Pending => "view_pending",
             Self::Busy => "callgraph_building",
-            Self::Unverified => "view_unverified",
             Self::Failed(_) => "view_unavailable",
         }
     }
@@ -5313,9 +5272,7 @@ impl CheckoutViewUnavailable {
 
     pub(crate) fn reason(&self) -> String {
         match self {
-            Self::Pending => "dead code waits for this checkout's index view to publish; publication schedules a Tier-2 refresh automatically".into(),
             Self::Busy => "checkout call graph view is temporarily locked; waiting for the published graph reader; retry aft_inspect".into(),
-            Self::Unverified => "checkout call graph view freshness could not be verified; retry aft_inspect after indexing settles".into(),
             Self::Failed(error) => format!("checkout call graph view could not be read: {error}; retry aft_inspect after indexing recovers"),
         }
     }
