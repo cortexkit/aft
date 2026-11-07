@@ -23,7 +23,7 @@ fn restart_placeholder_preview(command: &str, legacy: bool) -> BgCompletion {
             .remove("completion_has_secret_placeholders");
     }
     std::fs::write(&task.paths.json, serde_json::to_vec(&record).unwrap()).unwrap();
-    let metadata = persistence::read_task(&task.paths.json).unwrap();
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
     drop(original);
     let restarted = BgTaskRegistry::default();
     restarted
