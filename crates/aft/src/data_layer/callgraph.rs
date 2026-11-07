@@ -456,6 +456,13 @@ impl EncodedResolution {
     pub(crate) fn record_key(&self) -> &str {
         &self.record_key
     }
+
+    /// The encoded bytes: exactly what [`super::fragment::encode`] writes for
+    /// this resolution.
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl Resolutions {

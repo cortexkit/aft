@@ -31,7 +31,7 @@ use aft_store::text::{
     TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
-use super::callgraph::{CheckoutInputs, EncodedResolution};
+use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
@@ -329,9 +329,9 @@ struct Refreshed {
     removed: BTreeSet<String>,
     /// The content record of each file whose content changed since the
     /// publication, which dead code reads its stored facts from: the
-    /// publication holds the file's old record. Shared with the changes
-    /// that hold them.
-    records: BTreeMap<String, Arc<ContentRecord>>,
+    /// publication holds the file's old record. Kept encoded and shared
+    /// with the changes that hold them.
+    records: BTreeMap<String, Arc<aft_store::content::EncodedRecord>>,
     /// The dead-code snapshot of this call graph, built on first use.
     dead_code: DeadCodeMemo,
 }
@@ -3230,12 +3230,12 @@ impl ViewGraphFiles<'_> {
             if refreshed.removed.contains(path) {
                 return None;
             }
-            if let Some((key, _, resolution)) = refreshed.replaced.get(path) {
+            if let Some(file) = refreshed.replaced.get(path) {
                 return Some(GraphIdentity {
-                    record: key.clone(),
+                    record: file.resolution.record_key().to_string(),
                     fragment: None,
                     digest: Some(
-                        blake3::hash(&super::fragment::encode(resolution))
+                        blake3::hash(file.resolution.bytes())
                             .to_hex()
                             .to_string(),
                     ),
@@ -3299,9 +3299,11 @@ impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
     }
 
     fn parse(&self, path: &str) -> Result<Arc<ParseBlob>, String> {
-        if let Some((_, parse, _)) = self
+        // A refreshed file without its own parse uses the publication's.
+        if let Some(parse) = self
             .refreshed
             .and_then(|refreshed| refreshed.replaced.get(path))
+            .and_then(|file| file.parse.as_ref())
         {
             return Ok(Arc::clone(parse));
         }
@@ -3312,11 +3314,11 @@ impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
     }
 
     fn resolution(&self, path: &str) -> Result<Arc<FileResolution>, String> {
-        if let Some((_, _, resolution)) = self
+        if let Some(file) = self
             .refreshed
             .and_then(|refreshed| refreshed.replaced.get(path))
         {
-            return Ok(Arc::clone(resolution));
+            return Ok(Arc::new(file.resolution.decode(path)));
         }
         self.published
             .resolution_of(path)
@@ -3325,10 +3327,13 @@ impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
     }
 
     fn dead_code_facts(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
-        if let Some(record) = self
+        if let Some(encoded) = self
             .refreshed
             .and_then(|refreshed| refreshed.records.get(path))
         {
+            let record = encoded
+                .decode()
+                .map_err(|error| format!("{path}: changed content record: {error:?}"))?;
             return Ok(match &record.data {
                 RecordBody::Parsed { body, .. } => body.dead_code.clone(),
                 RecordBody::Config { .. } => None,
