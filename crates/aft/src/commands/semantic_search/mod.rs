@@ -108,7 +108,6 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::commands::callgraph_store_adapter::callers_result;
 use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, render_symbol_within_budget,
     BudgetedSymbolRenderStatus,
@@ -2039,13 +2038,6 @@ fn disclose_skipped_chunks(
 /// callgraph cannot serve it, the enrichment is explicitly omitted with the
 /// callgraph index status and the analysis code, never silently absent.
 fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
-    if warm_callgraph_store(ctx).is_some() {
-        return serde_json::json!({
-            "status": "applied",
-            "code": serde_json::Value::Null,
-            "index": IndexObservation::ready().consumer_json(),
-        });
-    }
     let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
         // Resident but mid-refresh: enrichment waits for the refresh.
         observation if observation.is_ready() => IndexObservation::building(),
@@ -7373,7 +7365,6 @@ fn format_lexical_unavailable_text_counted(
     let (mut sections, shown) = format_result_sections_counted(
         results,
         project_root,
-        None,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -7865,7 +7856,6 @@ fn format_ranked_text_counted(
     let (mut text, shown) = format_result_sections_counted(
         results,
         display_root,
-        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         if literal_absent.is_some() {
             TextualHits::Similar
@@ -8497,7 +8487,7 @@ fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root:
 
 #[cfg(test)]
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
-    format_result_sections_with_context(results, project_root, None)
+    format_result_sections_with_context(results, project_root)
 }
 
 /// Whether textual (lexical) hits may be called matches. They may not when
@@ -8523,25 +8513,20 @@ fn absent_literal_line(literal: &str) -> String {
 }
 
 #[cfg(test)]
-fn format_result_sections_with_context(
-    results: &[HybridResult],
-    project_root: &Path,
-    ctx: Option<&AppContext>,
-) -> String {
-    format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
+fn format_result_sections_with_context(results: &[HybridResult], project_root: &Path) -> String {
+    format_result_sections_labelled(results, project_root, TextualHits::Matches)
 }
 
 #[cfg(test)]
 fn format_result_sections_labelled(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     textual_hits: TextualHits,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
-        ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
         textual_hits,
     )
@@ -8555,13 +8540,12 @@ fn format_result_sections_labelled(
 fn format_result_sections_within_budget(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
 ) -> String {
     format_result_sections_within_budget_labelled(
         results,
         project_root,
-        ctx,
         max_bytes,
         TextualHits::Matches,
     )
@@ -8573,33 +8557,24 @@ fn format_result_sections_within_budget(
 fn format_result_sections_within_budget_labelled(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> String {
-    format_result_sections_counted(results, project_root, ctx, max_bytes, textual_hits).0
+    format_result_sections_counted(results, project_root, max_bytes, textual_hits).0
 }
 
 fn format_result_sections_counted(
     results: &[HybridResult],
     project_root: &Path,
-    ctx: Option<&AppContext>,
+
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> (String, usize) {
-    // Results arrive sorted by fused score desc. Group by file preserving
-    // first-appearance order so the most relevant file's group renders first.
-    // A BTreeMap would re-sort groups alphabetically by path and scramble the
-    // ranking the agent relies on to read most-relevant-first. Snippet line
-    // counts are budgeted by enrich_snippets_from_source; here each line is
-    // capped in length and the whole reply is held to `max_bytes`.
-    let annotations = ctx
-        .map(|ctx| blast_radius_annotations(ctx, results))
-        .unwrap_or_else(|| vec![None; results.len()]);
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<(usize, &HybridResult)>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<&HybridResult>> = HashMap::new();
 
-    for (index, result) in results.iter().enumerate() {
+    for result in results {
         let display_path = result
             .file
             .strip_prefix(project_root)
@@ -8609,16 +8584,13 @@ fn format_result_sections_counted(
         if !groups.contains_key(&display_path) {
             group_order.push(display_path.clone());
         }
-        groups
-            .entry(display_path)
-            .or_default()
-            .push((index, result));
+        groups.entry(display_path).or_default().push(result);
     }
 
     let mut out = snippet_bounds::BudgetedText::new(max_bytes);
     let mut shown = 0usize;
     'groups: for file in &group_order {
-        let matching_line = groups[file].iter().find(|(_, result)| {
+        let matching_line = groups[file].iter().find(|result| {
             matches!(result.kind, SymbolKind::FileSummary)
                 && (result.exact || result.source == "lexical")
                 && !result.snippet.trim().is_empty()
@@ -8629,16 +8601,14 @@ fn format_result_sections_counted(
             "\n\n".to_string()
         };
         match matching_line {
-            Some((_, result)) => header.push_str(&format!(
+            Some(result) => header.push_str(&format!(
                 "{file}:{}",
                 display_line_number(result.start_line)
             )),
             None => header.push_str(file),
         }
-        let exact = groups[file].iter().any(|(_, result)| result.exact);
-        let lexical = groups[file]
-            .iter()
-            .any(|(_, result)| result.source == "lexical");
+        let exact = groups[file].iter().any(|result| result.exact);
+        let lexical = groups[file].iter().any(|result| result.source == "lexical");
         match textual_hits {
             TextualHits::Matches => {
                 if exact {
@@ -8659,7 +8629,7 @@ fn format_result_sections_counted(
         if !out.push(&header) {
             break;
         }
-        if let Some((_, result)) = matching_line {
+        if let Some(result) = matching_line {
             shown += 1;
             if !push_snippet_lines(&mut out, &result.snippet) {
                 break;
@@ -8671,8 +8641,8 @@ fn format_result_sections_counted(
         // extension), symbol header at 2 spaces, snippet body at 6. Without
         // this, file paths and symbol headers were both at col 0 and could
         // only be told apart by parsing the "[kind] lines X-Y" suffix.
-        for (index, result) in &groups[file] {
-            if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
+        for result in &groups[file] {
+            if matching_line.is_some_and(|matching| std::ptr::eq(*matching, *result)) {
                 continue;
             }
             if result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary) {
@@ -8684,15 +8654,11 @@ fn format_result_sections_counted(
                 format!("\n  {} [file summary]", result.name)
             } else {
                 format!(
-                    "\n  {} [{}] lines {}-{}{}",
+                    "\n  {} [{}] lines {}-{}",
                     result.name,
                     symbol_kind_label(&result.kind),
                     display_line_number(result.start_line),
-                    display_line_number(result.end_line),
-                    annotations
-                        .get(*index)
-                        .and_then(|annotation| annotation.as_deref())
-                        .unwrap_or("")
+                    display_line_number(result.end_line)
                 )
             };
             if !out.push(&symbol_header) {
@@ -8723,85 +8689,6 @@ fn push_snippet_lines(out: &mut snippet_bounds::BudgetedText, snippet: &str) -> 
         let line = snippet_bounds::cap_snippet_line(line);
         out.push(&format!("\n      {line}"))
     })
-}
-
-fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
-    let Some(store) = warm_callgraph_store(ctx) else {
-        return vec![None; results.len()];
-    };
-
-    results
-        .iter()
-        .map(|result| blast_radius_annotation_for_result(&store, result))
-        .collect()
-}
-
-fn warm_callgraph_store(
-    ctx: &AppContext,
-) -> Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> {
-    let receiver = ctx.callgraph_store_rx().try_lock()?;
-    if receiver.is_some() {
-        return None;
-    }
-    drop(receiver);
-    try_read_with_budget(ctx.callgraph_store(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        .and_then(|store| store.as_ref().map(std::sync::Arc::clone))
-}
-
-fn blast_radius_annotation_for_result(
-    store: &crate::callgraph_store::ReadonlyCallGraphStore,
-    result: &HybridResult,
-) -> Option<String> {
-    if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
-        return None;
-    }
-    if result.name.trim().is_empty() {
-        return None;
-    }
-
-    let callers = callers_result(store, &result.file, &result.name, 1, true).ok()?;
-    let mut caller_basenames = Vec::new();
-    let mut seen_files = HashSet::new();
-    for group in &callers.callers {
-        if seen_files.insert(group.file.clone()) {
-            caller_basenames.push(compact_caller_basename(&group.file));
-        }
-    }
-
-    let mut suffix = format!("  ↩{}", callers.total_callers);
-    if !caller_basenames.is_empty() {
-        let more = caller_basenames.len() > 2;
-        let names = caller_basenames
-            .iter()
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(",");
-        suffix.push(' ');
-        suffix.push_str(&names);
-        if more {
-            suffix.push_str(",…");
-        }
-    }
-    Some(suffix)
-}
-
-fn compact_caller_basename(file: &str) -> String {
-    let basename = Path::new(file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(file);
-    truncate_chars(basename, 18)
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
 }
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
@@ -12291,7 +12178,7 @@ mod tests {
             .map(|index| long_line_result(index, format!("line of result {index:03}")))
             .collect::<Vec<_>>();
 
-        let text = format_result_sections_within_budget(&results, Path::new("/project"), None, 200);
+        let text = format_result_sections_within_budget(&results, Path::new("/project"), 200);
 
         assert!(
             text.contains("data/census_000.json:1 [lexical match]"),
@@ -12309,7 +12196,7 @@ mod tests {
         );
 
         let uncut =
-            format_result_sections_within_budget(&results, Path::new("/project"), None, usize::MAX);
+            format_result_sections_within_budget(&results, Path::new("/project"), usize::MAX);
         assert!(uncut.contains("census_019"));
         assert!(!uncut.contains("Output reached"));
     }

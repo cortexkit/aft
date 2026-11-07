@@ -829,10 +829,6 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
     };
     if root_path.exists() {
         install_project_watcher(ctx, &root_path);
-        // With the watcher attached again, edits from here on are observed, so
-        // this is the point to compare the callgraph store with the disk for
-        // the edits made while nothing was watching.
-        ctx.start_pending_callgraph_reconcile();
         // Config edits made while nothing watched the files are picked up
         // now; the reload compares file contents, so it is a no-op otherwise.
         crate::config_live::sync_config_watches(ctx);
@@ -1050,14 +1046,7 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let callgraph_ready = !config.indexes.callgraph
-        || ctx
-            .callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx.callgraph_store_rx().lock().is_some();
-    callgraph_ready
+    !config.indexes.callgraph
 }
 
 #[cfg(test)]
@@ -1068,49 +1057,6 @@ fn reset_workspace_manifest_fingerprint_scans_for_test() {
 #[cfg(test)]
 fn workspace_manifest_fingerprint_scans_for_test() -> usize {
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(std::cell::Cell::get)
-}
-
-/// Resolution fields of the workspace manifests configure watches, keyed by
-/// path; None marks a watched file that does not exist.
-type WorkspaceResolutionManifests = std::collections::BTreeMap<PathBuf, Option<String>>;
-
-/// Read what module resolution uses from the workspace manifests (see
-/// `callgraph_store::resolution_config`). A `version` bump or a new dependency
-/// leaves this unchanged; an `exports`, `main`, `name` or `workspaces` change
-/// does not.
-fn workspace_manifest_fingerprint(project_root: &Path) -> WorkspaceResolutionManifests {
-    #[cfg(test)]
-    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(count.get() + 1));
-    crate::callgraph_store::resolution_config::workspace_resolution_manifest_paths(project_root)
-        .into_iter()
-        .map(|path| {
-            let fields = crate::callgraph_store::resolution_config::resolution_fields(&path);
-            (path, fields)
-        })
-        .collect()
-}
-
-/// Hand workspace manifests whose resolution fields changed since this root's
-/// previous configure to the incremental callgraph refresh. The refresh
-/// compares each with the fields the store recorded and re-resolves only the
-/// files importing through it, so a manifest change never rebuilds the store.
-fn refresh_changed_workspace_manifests(
-    ctx: &AppContext,
-    canonical_root: &Path,
-    manifests: Option<WorkspaceResolutionManifests>,
-) {
-    let Some(manifests) = manifests else {
-        return;
-    };
-    let changed = ctx.note_workspace_resolution_manifests(canonical_root, manifests);
-    if changed.is_empty() || !ctx.callgraph_writer() {
-        return;
-    }
-    slog_info!(
-        "workspace manifest resolution fields changed in {} file(s); refreshing their importers in the callgraph store",
-        changed.len()
-    );
-    ctx.enqueue_callgraph_store_refresh_before_queries(changed);
 }
 
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
@@ -2142,27 +2088,6 @@ fn configure_warm_key(
     )
 }
 
-/// What selects the callgraph store itself. Workspace manifests are not part
-/// of it: a manifest change moves only the imports that resolve through it,
-/// which `refresh_changed_workspace_manifests` refreshes incrementally.
-fn configure_callgraph_build_key(
-    canonical_root: &Path,
-    config: &Config,
-    root_too_broad: bool,
-    is_worktree_bridge: bool,
-    shared_artifacts_read_only: bool,
-) -> String {
-    format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
-        canonical_root,
-        (config.cache_storage_dir(), config.cache_epoch),
-        root_too_broad,
-        is_worktree_bridge,
-        shared_artifacts_read_only,
-        config.indexes.callgraph,
-    )
-}
-
 /// Cooperative cancellation checkpoint for foreground configure phases.
 ///
 /// A cancelled RouteBind (route Goodbye or bind-deadline expiry) signals the
@@ -2916,9 +2841,7 @@ fn handle_configure_inner(
                     sync_bash_compress_flag: false,
                     reset_filter_registry: false,
                     clear_failed_spawns: false,
-                    warm_callgraph_store: false,
                     supersede_search_artifact_persistence: false,
-                    supersede_callgraph_artifact_persistence: false,
                     supersede_semantic_artifact_persistence: false,
                 });
                 if enqueue_result.is_err() {
@@ -3066,13 +2989,6 @@ fn handle_configure_inner(
             )
         });
     let effective_configure_changed = current_fingerprint.as_ref() != Some(&requested_fingerprint);
-    // Workspace manifests only matter to the callgraph store. Read them once
-    // when that lane is enabled; disabled roots should not read every package
-    // manifest on every equivalent bind.
-    let workspace_manifests = next_config
-        .indexes
-        .callgraph
-        .then(|| workspace_manifest_fingerprint(&canonical_cache_root));
     let preflight_warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
@@ -3127,7 +3043,6 @@ fn handle_configure_inner(
                 );
             }
         }
-        refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
         register_hashline_for_configure(
             ctx,
             &canonical_cache_root,
@@ -3162,9 +3077,7 @@ fn handle_configure_inner(
                 sync_bash_compress_flag: false,
                 reset_filter_registry: false,
                 clear_failed_spawns: false,
-                warm_callgraph_store: false,
                 supersede_search_artifact_persistence: false,
-                supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
             });
             if enqueue_result.is_err() {
@@ -3504,16 +3417,7 @@ fn handle_configure_inner(
         &canonical_cache_root,
         equivalent_warm_config,
     );
-    let callgraph_build_key = configure_callgraph_build_key(
-        &canonical_cache_root,
-        &next_config,
-        root_too_broad,
-        is_worktree_bridge,
-        ctx.shared_artifacts_read_only(),
-    );
-    let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
     ctx.begin_configure_ack_step("build_state");
-    let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_build_adopted = cache_available
         && !equivalent_warm_config
@@ -3583,12 +3487,6 @@ fn handle_configure_inner(
                 configure_generation
             );
         }
-        if callgraph_build_in_progress {
-            slog_info!(
-                "callgraph store warm build adopted by equivalent reconfigure (generation {})",
-                configure_generation
-            );
-        }
     } else {
         // Semantic and callgraph workers keep their receiver and dedicated
         // build epoch when that lane's inputs are unchanged. Changed lane inputs
@@ -3602,19 +3500,6 @@ fn handle_configure_inner(
             } else {
                 slog_warn!(
                     "semantic index build cancelled (semantic build inputs changed at generation {})",
-                    configure_generation
-                );
-            }
-        }
-        if callgraph_build_in_progress {
-            if equivalent_callgraph_build {
-                slog_info!(
-                    "callgraph store warm build adopted by matching root and corpus configuration (generation {})",
-                    configure_generation
-                );
-            } else {
-                slog_warn!(
-                    "callgraph store warm build cancelled (callgraph inputs changed at generation {})",
                     configure_generation
                 );
             }
@@ -3642,29 +3527,6 @@ fn handle_configure_inner(
             );
             ctx.set_semantic_build_progress(None);
         }
-        if equivalent_callgraph_build {
-            if callgraph_build_in_progress {
-                let adopted = ctx.adopt_callgraph_store_rx_generation(configure_generation);
-                debug_assert!(
-                    adopted,
-                    "callgraph build receiver disappeared before adoption"
-                );
-            }
-        } else {
-            *ctx.callgraph_store()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            ctx.retire_callgraph_store_rx();
-            // Only a callgraph writer can fulfil a force token. A read-only
-            // root (linked worktree, borrowed index family) follows the
-            // owner's published store; a token here would never be fulfilled
-            // and would keep every later callgraph query Unavailable.
-            if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
-                ctx.mark_callgraph_store_force_rebuild(
-                    "callgraph build inputs changed (storage, enablement, or worktree topology)",
-                );
-            }
-        }
         if !semantic_build_adopted {
             if !retain_semantic {
                 *ctx.semantic_index_status()
@@ -3675,11 +3537,7 @@ fn handle_configure_inner(
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
         }
-        if equivalent_callgraph_build {
-            ctx.clear_pending_index_updates_preserving_callgraph();
-        } else {
-            ctx.clear_pending_index_updates();
-        }
+        ctx.clear_pending_index_updates();
 
         // Reconfigure can point AFT at a different root; reset that root's
         // entries before warming the callgraph store for it.
@@ -3687,7 +3545,6 @@ fn handle_configure_inner(
             crate::callgraph::clear_workspace_package_cache_under(root);
         }
     }
-    refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
 
     let refresh_project_runtime =
         project_root_changed || watcher_topology_changed || !ctx.watcher_runtime_active();
@@ -3719,12 +3576,7 @@ fn handle_configure_inner(
         sync_bash_compress_flag,
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
-        warm_callgraph_store: next_config.indexes.callgraph
-            && !root_too_broad
-            && (!equivalent_warm_config || ctx.configure_callgraph_upgrade_pending())
-            && (!equivalent_callgraph_build || !callgraph_build_in_progress),
         supersede_search_artifact_persistence: !equivalent_warm_config,
-        supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
         supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
     });
     if enqueue_result.is_err() {
@@ -4186,12 +4038,6 @@ pub(crate) struct ConfigureMaintenanceState {
 }
 
 impl ConfigureMaintenanceState {
-    pub(crate) fn callgraph_upgrade_pending(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|continuation| continuation.callgraph_upgrade_retry_at.is_some())
-    }
-
     pub(crate) fn jobs_is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
@@ -4703,8 +4549,7 @@ fn run_configure_maintenance_unit_inner(
                 && !job.refresh_project_runtime
                 && !job.sync_bash_compress_flag
                 && !job.reset_filter_registry
-                && !job.clear_failed_spawns
-                && !job.warm_callgraph_store;
+                && !job.clear_failed_spawns;
             if session_only {
                 if ctx
                     .database_runtime_refusal("configure-session-replay", "bash_drain_completions")
@@ -4736,9 +4581,6 @@ fn run_configure_maintenance_unit_inner(
                         && job.supersede_semantic_artifact_persistence
                     {
                         ctx.next_semantic_persist_epoch();
-                    }
-                    if job.supersede_callgraph_artifact_persistence {
-                        ctx.next_callgraph_persist_epoch();
                     }
                 })
                 .is_none()

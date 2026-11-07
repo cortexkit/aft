@@ -322,27 +322,6 @@ fn recursive_delete_refuses_ancestor_of_storage_floor() {
     assert!(f.neighbor.exists());
 }
 
-struct SqliteAliases {
-    _connection: crate::db::file_identity::IdentityConnection,
-    fixture: Fixture,
-    aliases: Vec<PathBuf>,
-    history: crate::backup::BackupStore,
-}
-
-impl SqliteAliases {
-    fn assert_refused(&self, path: &Path, call: impl FnOnce() -> Response) {
-        let before = crate::file_identity::metadata(path).unwrap();
-        let response = call();
-        assert_eq!(
-            response.data["code"], "denied_floor",
-            "{path:?}: {response:?}"
-        );
-        let after = crate::file_identity::metadata(path).unwrap();
-        assert_eq!(before.1, after.1);
-        assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
-    }
-}
-
 #[test]
 fn storage_floor_ordinary_project_hard_links_still_work() {
     let f = Fixture::new();

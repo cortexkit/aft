@@ -991,7 +991,6 @@ fn main() {
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();
     for runtime in registry.iter() {
-        runtime.shutdown_callgraph_acquisition();
         clients.extend(runtime.lsp().take_all_clients());
         runtime.bash_background().detach();
     }

@@ -4542,24 +4542,6 @@ fn run_subc_mode_on_runtime_thread(
     let exit_started = Instant::now();
     let actor_contexts = executor.actor_contexts();
     log::info!("subc exit phase=drain_done elapsed_ms=0");
-    // Index persistence and language-server teardown are independent. Starting
-    // both now keeps their separate deadlines from adding to the restart gap.
-    let flush_contexts = actor_contexts.clone();
-    let flush_indexes = matches!(
-        loop_result,
-        Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
-    );
-    let index_flush = std::thread::spawn(move || {
-        record_exit_phase_event("index_flush", "start");
-        if flush_indexes {
-            flush_actor_indexes_on_graceful_shutdown(&flush_contexts, exit_started);
-        }
-        record_exit_phase_event("index_flush", "end");
-        log::info!(
-            "subc exit phase=index_flush_done elapsed_ms={}",
-            exit_started.elapsed().as_millis()
-        );
-    });
     let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
         // Connection teardown left every root's running servers in its
@@ -4587,7 +4569,6 @@ fn run_subc_mode_on_runtime_thread(
         exit_started.elapsed().as_millis()
     );
 
-    let _ = index_flush.join();
     log::info!(
         "subc exit phase=runtime_shutdown_start budget_ms={} elapsed_ms={}",
         EXIT_RUNTIME_SHUTDOWN_WAIT.as_millis(),
@@ -4705,62 +4686,6 @@ fn note_fatal_panic_response(response: &Response) -> bool {
         );
     }
     fatal
-}
-
-/// Flush every root's search index and the queued call-graph refreshes on a
-/// graceful exit. `drained_at` is when the module loop ended; both flushes
-/// finish by [`crate::callgraph_store::exit_index_flush_deadline`] while LSP
-/// shutdown runs independently. Returns the logged summary line.
-fn flush_actor_indexes_on_graceful_shutdown(
-    actor_contexts: &[Arc<AppContext>],
-    drained_at: Instant,
-) -> String {
-    flush_actor_indexes_on_graceful_shutdown_with(actor_contexts, drained_at, || {
-        // The opt-in timing hook lets process regressions exercise a busy
-        // persistence worker without relying on cache size or disk speed.
-        #[cfg(any(test, feature = "test-timing-hooks"))]
-        if let Ok(delay) = std::env::var("AFT_TEST_EXIT_INDEX_DELAY_MS") {
-            if let Ok(ms) = delay.parse::<u64>() {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
-        }
-        crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown()
-    })
-}
-
-fn flush_actor_indexes_on_graceful_shutdown_with(
-    actor_contexts: &[Arc<AppContext>],
-    drained_at: Instant,
-    callgraph_flush: impl FnOnce() -> bool + Send + 'static,
-) -> String {
-    log::info!(
-        "subc exit phase=index_flush_start roots={} budget_ms={} elapsed_ms={}",
-        actor_contexts.len(),
-        crate::callgraph_store::exit_index_flush_deadline(drained_at)
-            .saturating_duration_since(Instant::now())
-            .as_millis(),
-        drained_at.elapsed().as_millis()
-    );
-    let started = Instant::now();
-    let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
-    // Refreshes are reconstructible, so exit waits for them only until the
-    // flush deadline and otherwise leaves them to the next start.
-    let refreshed =
-        crate::callgraph_store::run_exit_callgraph_flush_before(flush_deadline, callgraph_flush);
-    let line = format!(
-        "subc exit phase=index_flush roots={} callgraph={} elapsed_ms={}",
-        actor_contexts.len(),
-        refreshed.as_str(),
-        started.elapsed().as_millis()
-    );
-    if refreshed == crate::callgraph_store::ExitCallgraphFlush::Abandoned {
-        log::warn!(
-            "{line}: abandoned an unfinished call-graph refresh to exit on time; the next start refreshes the call graph"
-        );
-    } else {
-        log::info!("{line}");
-    }
-    line
 }
 
 /// Record phase boundaries for process-level shutdown tests without relying on
@@ -12702,7 +12627,6 @@ fn submit_maintenance_job(
             }
             MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
-                runtime_drain::drain_callgraph_store_events(ctx);
                 runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()

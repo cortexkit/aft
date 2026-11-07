@@ -578,8 +578,7 @@ enum BuilderAttemptTerminal {
 fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
     match outcome {
         JobOutcome::Fresh { payload }
-            if payload["status"] == "pending"
-                && payload["code"] == CheckoutViewUnavailable::Busy.kind() =>
+            if payload["status"] == "pending" && payload["code"] == "callgraph_building" =>
         {
             BuilderAttemptTerminal::ViewBusyWait
         }
@@ -3045,94 +3044,6 @@ impl InspectManager {
         }
     }
 
-    /// Run against the request's already waited, pinned view reader. This path
-    /// bypasses background reuse so a previous generation cannot answer a newer
-    /// request. An unavailable reader never falls back to a legacy database.
-    pub fn tier2_run_with_pinned_view(
-        self: &Arc<Self>,
-        mut snapshot: InspectSnapshot,
-        category: InspectCategory,
-        scope: JobScope,
-        store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
-    ) -> JobOutcome {
-        if inspect_category_is_off(&snapshot.config.inspect, category) {
-            return JobOutcome::off();
-        }
-        if let Err(outcome) = validate_tier2_read_category(category) {
-            return outcome;
-        }
-        if !self.heavy_root_work_allowed() {
-            return JobOutcome::Failed {
-                message: Self::heavy_root_work_block_message(category),
-            };
-        }
-        let projected = store
-            .as_ref()
-            .filter(|_| category == InspectCategory::DeadCode)
-            .and_then(|store| {
-                // The data layer's view stands in for the pinned store's
-                // projection while its call graph is ready.
-                match self.data_layer_dead_code.snapshot(&snapshot.project_root) {
-                    crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
-                        Some(snapshot)
-                    }
-                    _ => None,
-                }
-                .or_else(|| {
-                        let started = Instant::now();
-                        let projected =
-                            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                                .ok()
-                                .map(|(_, snapshot, _, _)| Arc::new(snapshot))?;
-                        crate::slog_info!(
-                            "perf tier2_callgraph_snapshot: source=pinned_view files={} exports={} edges={} entry_points={} ms={}",
-                            projected.files.len(),
-                            projected.exported_symbols.len(),
-                            projected.outbound_calls.len()
-                                + projected
-                                    .go_initializers
-                                    .iter()
-                                    .map(|group| group.edge_count())
-                                    .sum::<usize>(),
-                            projected.entry_points.len(),
-                            started.elapsed().as_millis()
-                        );
-                        Some(projected)
-                    })
-            });
-        let mut config = (*snapshot.config).clone();
-        config.indexes.callgraph = false;
-        snapshot.config = Arc::new(config);
-        let mut job = self.tier2_reuse_job(snapshot, category, projected);
-        job.scope_files = scope_files(
-            &job.project_root,
-            &JobScope::for_project(job.project_root.clone()),
-        );
-        let oxc = match self.oxc_result_for_scan(&job, &job.scope_files, &[]) {
-            Ok(oxc) => oxc,
-            Err(message) => return JobOutcome::Failed { message },
-        };
-        let result = self.scan_with_file_progress(&job, oxc.as_ref());
-        // A view projection needs no inspect writer either. Persisting with the
-        // temporary no-legacy-fallback config would also poison cache identity.
-        let outcome = match result.outcome {
-            Ok(success) => JobOutcome::Fresh {
-                // Scope full contributions before capping rows, just like the
-                // persisted read path. Otherwise out-of-scope rows can exhaust
-                // the project-wide cap and hide all of this scope's findings.
-                payload: if scope.is_project_wide() {
-                    success.aggregate
-                } else {
-                    let full =
-                        roll_up_tier2_contributions_with_limit(&job, &success.contributions, None);
-                    filter_payload_for_scope(full, &scope)
-                },
-            },
-            Err(message) => JobOutcome::Failed { message },
-        };
-        filter_outcome_for_scope(outcome, &scope)
-    }
-
     /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
     ///
     /// The blocking inspect path must not turn an unfinished reuse job into a
@@ -4924,6 +4835,7 @@ fn render_no_projection_suffix(reason: &'static str) -> String {
 /// projections.
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
+        #[cfg(test)]
         ProjectionKind::Spliced => "spliced",
         ProjectionKind::Full => "full",
         #[cfg(test)]
@@ -5242,40 +5154,6 @@ fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallG
     // Today's call-graph store is retired, so it records no path identity.
     let _ = job;
     Ok(None)
-}
-
-#[derive(Debug)]
-pub(crate) enum CheckoutViewUnavailable {
-    Busy,
-    Failed(String),
-}
-
-impl From<String> for CheckoutViewUnavailable {
-    fn from(error: String) -> Self {
-        Self::Failed(error)
-    }
-}
-
-impl CheckoutViewUnavailable {
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::Busy => "callgraph_building",
-            Self::Failed(_) => "view_unavailable",
-        }
-    }
-
-    /// True when the view's graph exists but its database was locked: a
-    /// moment of contention to retry, not a missing or broken graph.
-    pub(crate) fn is_busy(&self) -> bool {
-        matches!(self, Self::Busy)
-    }
-
-    pub(crate) fn reason(&self) -> String {
-        match self {
-            Self::Busy => "checkout call graph view is temporarily locked; waiting for the published graph reader; retry aft_inspect".into(),
-            Self::Failed(error) => format!("checkout call graph view could not be read: {error}; retry aft_inspect after indexing recovers"),
-        }
-    }
 }
 
 /// The verdict a dead-code snapshot from the data layer reports: a whole

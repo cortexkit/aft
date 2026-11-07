@@ -199,7 +199,7 @@ pub(crate) mod policy_load_probe {
     }
 }
 use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
-use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, ReadonlyCallGraphStore};
+use crate::callgraph_store::CallGraphStoreError;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
@@ -462,49 +462,6 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
-/// Root-containment check for pending callgraph replay paths.
-///
-/// Relative paths are project-root-relative by the callgraph store's own
-/// contract (`normalize_file_path`), so they are resolved against each root
-/// rather than the process CWD. Both sides are lenient-canonicalized
-/// (component-wise, filesystem-first) before the prefix comparison: raw-spelling
-/// acceptance would let `root/../foreign` or a symlinked escape pass, and a
-/// bare textual check false-drops alias spellings (macOS /var vs
-/// /private/var) and deleted files.
-fn pending_path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    if path.is_relative() {
-        // Project-root-relative by contract, and only for prefix-free
-        // spellings: Windows drive-relative (`C:foo`) and root-relative
-        // (`\foo`) forms are "relative" to std but `join` replaces the root
-        // for them, resolving through the drive CWD instead of the project.
-        let has_prefix_or_root = path.components().next().is_some_and(|component| {
-            matches!(
-                component,
-                std::path::Component::Prefix(_) | std::path::Component::RootDir
-            )
-        });
-        if has_prefix_or_root {
-            return false;
-        }
-        // A lexical escape via `..` still fails the canonical prefix check
-        // after joining. Unresolvable spellings fail closed.
-        return roots.iter().any(|root| {
-            let joined = root.join(path);
-            match (canonicalize_lenient(&joined), canonicalize_lenient(root)) {
-                (Some(path), Some(root)) => path.starts_with(&root),
-                _ => false,
-            }
-        });
-    }
-    let Some(canonical_path) = canonicalize_lenient(path) else {
-        return false;
-    };
-    roots.iter().any(|root| {
-        canonicalize_lenient(root)
-            .is_some_and(|canonical_root| canonical_path.starts_with(&canonical_root))
-    })
-}
-
 /// How long a root may stay unbound before its long-running cold builds
 /// (semantic embedding, callgraph extraction) are abandoned. A host restart
 /// unbinds every root and rebinds it within seconds; a rebind inside this
@@ -657,12 +614,6 @@ impl SubcLifecycleAdmission {
     pub(crate) fn set_abandon_grace_for_test(&self, grace: Duration) {
         self.abandon_grace_ms
             .store(grace.as_millis() as u64, Ordering::SeqCst);
-    }
-
-    pub(crate) fn is_current(&self, generation: &AtomicU64, expected: u64) -> bool {
-        let _held = LifecycleLockMarker::enter(&self.unbound);
-        let unbound = self.unbound.lock();
-        !*unbound && generation.load(Ordering::SeqCst) == expected
     }
 
     fn advance_generation(&self, generation: &AtomicU64) -> u64 {
@@ -1260,24 +1211,6 @@ impl RootHealthSummary {
         if self.is_busy() {
             return RootHealthSnapshot::busy(project_root);
         }
-        // Health snapshots may be assembled by the maintenance refresh, but the
-        // public snapshot helper also has latency-sensitive callers. Never derive
-        // a cache key here: derivation can spawn git and read repository state.
-        let callgraph_write_metrics =
-            crate::search_index::artifact_cache_key_memoized_only(project_root)
-                .map(|key| crate::callgraph_store::callgraph_write_metrics_for_project(&key));
-        let (callgraph_commits_60s, callgraph_pages_or_bytes_written_60s) =
-            match callgraph_write_metrics {
-                Some(metrics)
-                    if metrics.commits_60s > 0 || metrics.pages_or_bytes_written_60s > 0 =>
-                {
-                    (
-                        Some(metrics.commits_60s),
-                        Some(metrics.pages_or_bytes_written_60s),
-                    )
-                }
-                _ => (None, None),
-            };
         RootHealthSnapshot {
             cache_unavailable_reason: self.cache_unavailable,
             project_root: project_root.display().to_string(),
@@ -1291,8 +1224,8 @@ impl RootHealthSummary {
                 .callgraph_store_status
                 .map(|status| HealthComponentSnapshot { status }),
             callgraph_repair_entries_60s: None,
-            callgraph_commits_60s,
-            callgraph_pages_or_bytes_written_60s,
+            callgraph_commits_60s: None,
+            callgraph_pages_or_bytes_written_60s: None,
             view_load_failures: self.view_load_failures,
             view_load_failure_last: self.view_load_failure_last,
             view_storage_reserve: self.view_storage_reserve,
@@ -1643,7 +1576,6 @@ pub(crate) enum WatcherDrainApplyPhase {
     PendingTier2,
     PendingIndexes,
     SymbolCache,
-    Callgraph,
     SearchIndex,
     SemanticIndex,
     LspDiagnostics,
@@ -2270,7 +2202,6 @@ pub struct CallgraphUnappliedChanges {
     pub store_paths: BTreeSet<String>,
     /// A disk comparison has not yet established which store files changed.
     pub whole_store: bool,
-    pub(crate) reconcile_query: Option<crate::callgraph_maintenance::CallgraphReconcileQuery>,
     /// Files whose changes the checkout's published view has not installed.
     pub view_paths: BTreeSet<String>,
     /// The view is republishing the whole checkout, so which files changed
@@ -2279,20 +2210,6 @@ pub struct CallgraphUnappliedChanges {
 }
 
 impl CallgraphUnappliedChanges {
-    pub(crate) fn observe_reconciles(&self) -> bool {
-        self.reconcile_query.is_some()
-    }
-
-    pub(crate) fn resolved(&self) -> Self {
-        let mut resolved = self.clone();
-        if let Some(query) = resolved.reconcile_query.take() {
-            let (whole_store, paths) = query.pending();
-            resolved.whole_store |= whole_store;
-            resolved.store_paths.extend(paths);
-        }
-        resolved
-    }
-
     pub fn is_empty(&self) -> bool {
         self.store_paths.is_empty()
             && self.view_paths.is_empty()
@@ -2387,7 +2304,6 @@ impl Drop for WatcherDrainGuard<'_> {
 /// a transactional TTL teardown: committed (dropped) once eviction succeeds,
 /// restored when a secondary blocker aborts the eviction.
 pub(crate) struct PendingReconciliationState {
-    callgraph: BTreeSet<PathBuf>,
     tier2: BTreeSet<PathBuf>,
     semantic: BTreeSet<PathBuf>,
     corpus_refresh: bool,
@@ -2622,27 +2538,6 @@ impl WatcherDrainSliceState {
     }
 }
 
-#[doc(hidden)]
-pub enum CallGraphStoreBuildEvent {
-    Ready {
-        store: CallGraphStore,
-        fulfilled_force_token: Option<u64>,
-        publication_epoch: u64,
-    },
-    /// The build published successfully; only installing its reader remains.
-    Reopen {
-        fulfilled_force_token: Option<u64>,
-        publication_epoch: u64,
-    },
-    Denied {
-        reason: String,
-    },
-    Suspended {
-        suspension: crate::build_breaker::BuildSuspension,
-    },
-    Settled,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
@@ -2660,14 +2555,10 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) sync_bash_compress_flag: bool,
     pub(crate) reset_filter_registry: bool,
     pub(crate) clear_failed_spawns: bool,
-    pub(crate) warm_callgraph_store: bool,
     /// Advance search disk-publication epochs only after the configure
     /// acknowledgement is sent. Updating an epoch may wait for a writer already
     /// committing, so the initial route bind must not perform this work.
     pub(crate) supersede_search_artifact_persistence: bool,
-    /// Advance the callgraph publication epoch only when its root/corpus inputs
-    /// changed. Unrelated reconfiguration adopts the live callgraph worker.
-    pub(crate) supersede_callgraph_artifact_persistence: bool,
     /// Keep the adopted semantic worker's artifact-publication epoch valid so it
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
@@ -4282,35 +4173,9 @@ pub struct AppContext {
         std::collections::HashMap<PathBuf, Arc<crate::data_layer::tools::search::ExternalSearch>>,
     >,
     callgraph_executor: parking_lot::Mutex<Option<crate::executor::RootMaintenanceExecutor>>,
-    callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
     /// Read by the health snapshot; written by every query that loads a view.
     view_load_health: parking_lot::Mutex<ViewLoadHealth>,
-    callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
-    callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
-    callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
-    callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
-    /// Refreshes the store must apply before it answers queries again.
-    callgraph_catch_up: Arc<crate::callgraph_maintenance::CallgraphCatchUp>,
-    /// Resolution fields of the watched workspace manifests at the last
-    /// configure, with the root they were read under.
-    workspace_resolution_manifests:
-        parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,
-    callgraph_store_rx:
-        parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
-    // Unit tests must observe only this context's admissions and wait policy:
-    // another root can start a worker or request an inline wait concurrently.
-    #[cfg(test)]
-    callgraph_cold_build_spawn_count: AtomicUsize,
-    #[cfg(test)]
-    callgraph_build_wait_override: parking_lot::Mutex<Option<Duration>>,
-    callgraph_store_rx_generation: AtomicU64,
-    callgraph_store_rx_epoch: AtomicU64,
-    callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
-    callgraph_store_build_suspension:
-        parking_lot::Mutex<Option<(u64, crate::build_breaker::BuildSuspension)>>,
-    callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
-    pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
     search_exact_memo: Arc<crate::commands::semantic_search::memo::ExactMemoStore>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
@@ -4413,10 +4278,6 @@ pub struct AppContext {
     /// Deferred maintenance uses the same gate for the state check and admission.
     subc_lifecycle: SubcLifecycleAdmission,
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
-    /// Identity of the inputs that govern callgraph disk publication. It is
-    /// narrower than the all-artifact warm key so unrelated lanes can rebind
-    /// without superseding a valid callgraph build.
-    callgraph_build_key: parking_lot::Mutex<Option<String>>,
     configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
     /// The configure-tail stage running on this root and when it started, or
     /// `None` between units. Read by the pending-bind diagnostics.
@@ -4590,8 +4451,6 @@ impl Drop for AppContext {
 /// off the request thread, with a bounded wait before returning `Building`
 /// so the agent can retry while materialization continues.
 pub enum CallgraphStoreAccess {
-    /// Store is resident and queryable.
-    Ready(Arc<ReadonlyCallGraphStore>),
     /// A build or checkout-view acquisition is in flight; retry shortly.
     Building,
     /// The durable build-death breaker refuses this domain until an explicit reset
@@ -4604,16 +4463,6 @@ pub enum CallgraphStoreAccess {
     Unavailable,
     /// A store open/build check failed with a real error (DB/IO).
     Error(CallGraphStoreError),
-}
-
-/// Acquisition diagnostics for the checkout callgraph view, including the full
-/// cause of retryable SQLite contention and time spent acquiring readers.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct CallgraphViewReadDiagnostics {
-    pub attempts: u64,
-    pub last_attempt_ms: u64,
-    pub total_attempt_ms: u64,
-    pub last_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -4954,27 +4803,7 @@ impl AppContext {
             data_children: Default::default(),
             data_external: parking_lot::Mutex::new(std::collections::HashMap::new()),
             callgraph_executor: parking_lot::Mutex::new(None),
-            callgraph_view_read_diagnostics: parking_lot::Mutex::new(
-                CallgraphViewReadDiagnostics::default(),
-            ),
             view_load_health: parking_lot::Mutex::new(ViewLoadHealth::default()),
-            callgraph_store: Arc::new(RwLock::new(None)),
-            callgraph_corpus_memo: parking_lot::Mutex::new(None),
-            callgraph_force_demand: Arc::default(),
-            callgraph_reconcile: Arc::default(),
-            callgraph_catch_up: Arc::default(),
-            workspace_resolution_manifests: parking_lot::Mutex::new(None),
-            callgraph_store_rx: parking_lot::Mutex::new(None),
-            #[cfg(test)]
-            callgraph_cold_build_spawn_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            callgraph_build_wait_override: parking_lot::Mutex::new(None),
-            callgraph_store_rx_generation: AtomicU64::new(0),
-            callgraph_store_rx_epoch: AtomicU64::new(0),
-            callgraph_store_build_denied: parking_lot::Mutex::new(None),
-            callgraph_store_build_suspension: parking_lot::Mutex::new(None),
-            callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
-            pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             search_exact_memo: Arc::new(
                 crate::commands::semantic_search::memo::ExactMemoStore::new(),
             ),
@@ -5033,7 +4862,6 @@ impl AppContext {
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle,
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
-            callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configure_tail_stage: parking_lot::Mutex::new(None),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
@@ -5351,18 +5179,6 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
-        let callgraph_store = match self.callgraph_store.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        // The receiver contents no longer feed the status below (a disabled
-        // store must not report "building" from a lingering receiver), but a
-        // contended lock still means the snapshot would race a build state
-        // transition, so keep the probe for its busy signal.
-        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
-            Some(guard) => guard,
-            None => return RootHealthSummary::busy(),
-        };
         let tier2 = match self.status_bar_tier2.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -5506,8 +5322,6 @@ impl AppContext {
             crate::root_cache::CACHE_DIR_UNAVAILABLE
         } else if !heavy_root_work_allowed {
             "disabled"
-        } else if callgraph_store.as_ref().is_some() {
-            "ready"
         } else if !callgraph_writer && config.indexes.callgraph {
             // Read-only roots never cold-build; they query the shared store
             // via ReadonlyCallGraphStore on demand.
@@ -5835,10 +5649,6 @@ impl AppContext {
         };
         let semantic = retire(&mut self.pending_semantic_index_paths.lock());
         let tier2 = retire(&mut self.pending_tier2_paths.lock());
-        let callgraph = retire(&mut self.pending_callgraph_store_paths.lock());
-        let callgraph_queued = self.canonical_cache_root_opt().map_or(0, |root| {
-            crate::callgraph_store::retire_ignored_refresh_paths(&root, &self.gitignore)
-        });
         let watcher = self
             .watcher_drain_slice
             .lock()
@@ -5846,7 +5656,7 @@ impl AppContext {
             .map_or(0, |state| state.retire_ignored_paths(&keep));
         crate::slog_info!(
             "ignore queue retirement: generation={} watcher={} callgraph_pending={} callgraph_queued={} tier2={} semantic_pending={}",
-            generation, watcher, callgraph, callgraph_queued, tier2, semantic
+            generation, watcher, 0, 0, tier2, semantic
         );
     }
 
@@ -6224,10 +6034,6 @@ impl AppContext {
         let generation = self
             .subc_lifecycle
             .advance_generation(self.configure_generation.as_ref());
-        crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
-        if let Some(root) = self.canonical_cache_root_opt() {
-            crate::callgraph_store::close_refresh_connections(&root);
-        }
         generation
     }
 
@@ -6244,14 +6050,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
-        let _ = self
-            .subc_lifecycle
-            .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
         crate::provisional_identity_retry::cancel(self);
-        crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
-        if let Some(root) = self.canonical_cache_root_opt() {
-            crate::callgraph_store::close_refresh_connections(&root);
-        }
         self.repeat_breaker.clear();
     }
 
@@ -6426,18 +6225,6 @@ impl AppContext {
             .is_some_and(|current| current == key)
     }
 
-    /// Record the callgraph-specific corpus/publication identity and report
-    /// whether an existing worker remains valid under the new configure.
-    pub(crate) fn note_callgraph_build_key(&self, key: String) -> bool {
-        let mut current = self.callgraph_build_key.lock();
-        let equivalent = current.as_deref() == Some(key.as_str());
-        *current = Some(key);
-        if !equivalent {
-            self.callgraph_corpus_memo.lock().take();
-        }
-        equivalent
-    }
-
     pub(crate) fn invalidate_configure_warm_state(&self) {
         self.configure_warm_state.lock().key = None;
     }
@@ -6542,28 +6329,9 @@ impl AppContext {
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
 
-    /// What an answer computed now may be missing, captured before the answer
-    /// is computed.
-    ///
-    /// A changed file travels the watcher thread's flush window, then the
-    /// dispatch channel and the watcher drain, then (for the legacy store)
-    /// the refresh worker's queue and running batch, and is either committed
-    /// or parked in the pending sink. Other threads move it while this runs,
-    /// and each of them writes the next stage before clearing the one before.
-    /// Reading the stages in the direction a file travels therefore never
-    /// misses it: if it moves between two reads, the later read finds it
-    /// downstream. The sink is read before and after the worker queue because
-    /// files move both ways between them (a batch that cannot commit parks its
-    /// files in the sink; a ready store replays the sink into the worker).
-    ///
-    /// `callgraph` lists files by name: source files still in the flush
-    /// window count for both kinds of graph; the legacy store also counts
-    /// files queued, running or parked in its refresh worker and files
-    /// deferred until a writable store is ready; a per-checkout view counts
-    /// files waiting out the publication quiet window and files carried by a
-    /// publication that has not installed its generation. Files in the
-    /// dispatch channel or inside a running drain are not named; `watcher`
-    /// covers them.
+    /// Changes still held by the watcher when an answer starts, including
+    /// root-relative call-graph paths when requested. The index store waits for
+    /// or discloses its own pending edits in the query path.
     pub fn pending_changes_for_query(&self, include_callgraph: bool) -> QueryPendingChanges {
         let include_callgraph = include_callgraph && self.config().indexes.callgraph;
         let unflushed = if include_callgraph {
@@ -6575,59 +6343,23 @@ impl AppContext {
         pending_capture_boundary_for_test(PendingCaptureBoundary::AfterFlushWindow);
         let watcher = self.watcher_query_has_pending_changes();
         let mut changes = CallgraphUnappliedChanges::default();
-        if !include_callgraph {
-            return QueryPendingChanges {
-                watcher,
-                callgraph: changes,
-            };
-        }
-        let project_root = self.callgraph_project_root();
-        if self.callgraph_writer() {
-            if let Some(root) = project_root.clone() {
-                // Observe real comparisons, including one this command starts
-                // when it installs a reused generation. An unopened store is
-                // not itself pending: a first cold build needs no reconcile.
-                changes.reconcile_query = Some(
-                    self.callgraph_reconcile
-                        .observe_query(self.configure_generation(), root),
-                );
-            }
-        }
-        // The retired store's queues describe nothing the index store
-        // answers from; the index store's own pending edits are waited for
-        // or disclosed by its query path.
-        let mut store_paths: BTreeSet<PathBuf> = BTreeSet::new();
-        if !crate::data_layer::runtime::retired_callgraph_store() {
-            store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
-            #[cfg(test)]
-            pending_capture_boundary_for_test(PendingCaptureBoundary::BeforeWorkerQueue);
-            if let Some(project_root) = project_root.as_deref() {
-                store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
-                    project_root,
-                ));
-            }
-            store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
-        }
-
-        let roots: Vec<PathBuf> = [project_root, self.config().project_root.clone()]
+        if include_callgraph {
+            let roots: Vec<PathBuf> = [
+                self.callgraph_project_root(),
+                self.config().project_root.clone(),
+            ]
             .into_iter()
             .flatten()
             .collect();
-        let relative = |path: &Path| -> String {
-            let shown = roots
-                .iter()
-                .find_map(|root| path.strip_prefix(root).ok())
-                .unwrap_or(path);
-            shown.to_string_lossy().replace('\\', "/")
-        };
-        let unflushed = unflushed.iter().map(|path| relative(path));
-        {
-            changes.store_paths.extend(unflushed);
+            changes.store_paths.extend(unflushed.iter().map(|path| {
+                roots
+                    .iter()
+                    .find_map(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            }));
         }
-        changes
-            .store_paths
-            .extend(store_paths.iter().map(|path| relative(path)));
-
         QueryPendingChanges {
             watcher,
             callgraph: changes,
@@ -6644,16 +6376,6 @@ impl AppContext {
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
-        // A contended receiver slot counts as pending. The health rollup and
-        // callgraph access paths hold `callgraph_store_rx` while they do other
-        // work, and waiting for them here once stalled the frame loop.
-        if self
-            .callgraph_store_rx
-            .try_lock()
-            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()))
-        {
-            return true;
-        }
         if self.semantic_index_rx.try_lock().is_none_or(|slot| {
             slot.as_ref().is_some_and(|receiver| {
                 !receiver.is_empty()
@@ -6784,13 +6506,6 @@ impl AppContext {
         &self,
     ) -> Option<crate::commands::configure::ConfigureMaintenanceState> {
         self.parked_configure_tail.lock().take()
-    }
-
-    pub(crate) fn configure_callgraph_upgrade_pending(&self) -> bool {
-        self.parked_configure_tail
-            .lock()
-            .as_ref()
-            .is_some_and(|state| state.callgraph_upgrade_pending())
     }
 
     pub(crate) fn configure_maintenance_has_capacity(&self) -> bool {
@@ -8469,7 +8184,6 @@ impl AppContext {
             changed
         };
         if root_changed {
-            self.callgraph_corpus_memo.lock().take();
             let mut tier2 = self
                 .status_bar_tier2
                 .write()
@@ -9037,283 +8751,6 @@ impl AppContext {
         }
     }
 
-    /// Access the persisted call graph store.
-    pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
-        self.callgraph_store.as_ref()
-    }
-
-    /// Record the workspace manifests' resolution fields read by this
-    /// configure and return the manifests whose fields changed since the
-    /// previous configure of the same root. A first configure, or one for a
-    /// different root, has nothing to compare with and returns none.
-    pub(crate) fn note_workspace_resolution_manifests(
-        &self,
-        root: &Path,
-        manifests: BTreeMap<PathBuf, Option<String>>,
-    ) -> Vec<PathBuf> {
-        let mut noted = self.workspace_resolution_manifests.lock();
-        let changed = match noted.as_ref() {
-            Some((previous_root, previous)) if previous_root == root => {
-                let mut paths = previous
-                    .keys()
-                    .chain(manifests.keys())
-                    .filter(|path| {
-                        previous.get(*path).cloned().flatten()
-                            != manifests.get(*path).cloned().flatten()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                paths.sort();
-                paths.dedup();
-                paths
-            }
-            _ => Vec::new(),
-        };
-        *noted = Some((root.to_path_buf(), manifests));
-        changed
-    }
-
-    /// Request a full rebuild of the callgraph store and record why. The reason
-    /// is printed when the rebuild starts, so it should name the trigger (for
-    /// example "callgraph build inputs changed" or "ignore-rule change").
-    pub fn mark_callgraph_store_force_rebuild(&self, reason: &str) -> u64 {
-        self.callgraph_force_demand.mark(reason)
-    }
-
-    pub(crate) fn pending_callgraph_store_force_token(&self) -> Option<u64> {
-        self.callgraph_force_demand.pending()
-    }
-
-    #[doc(hidden)]
-    pub fn pending_callgraph_store_force_token_for_test(&self) -> Option<u64> {
-        self.pending_callgraph_store_force_token()
-    }
-
-    pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
-        self.callgraph_force_demand.fulfill(token);
-    }
-
-    /// Ask for the store to be compared with the disk, because watcher events
-    /// for this root were lost or no engine was watching. Only a callgraph writer can apply the result;
-    /// a read-only root follows the owner's published store.
-    pub(crate) fn request_callgraph_reconcile(&self, reason: &str) {
-        if self.callgraph_writer() && self.config().indexes.callgraph {
-            self.callgraph_reconcile
-                .request_for_generation(reason, self.configure_generation());
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn pending_callgraph_reconcile_reason(&self) -> Option<String> {
-        self.callgraph_reconcile.pending_reason()
-    }
-
-    /// The last finished reconcile and how many have finished, for status and
-    /// tests.
-    #[doc(hidden)]
-    pub fn last_callgraph_reconcile(
-        &self,
-    ) -> (
-        u64,
-        Option<crate::callgraph_maintenance::CallgraphReconcileOutcome>,
-    ) {
-        (
-            self.callgraph_reconcile.completed(),
-            self.callgraph_reconcile.last(),
-        )
-    }
-
-    /// Start a requested reconcile off the calling thread. It compares the
-    /// published store with the disk and hands the differing files to the
-    /// incremental refresh; see [`crate::callgraph_maintenance`].
-    pub(crate) fn start_pending_callgraph_reconcile(&self) -> bool {
-        if self.callgraph_reconcile.pending_reason().is_none() {
-            return false;
-        }
-        // The retired store has nothing to reconcile; see
-        // `enqueue_callgraph_store_refresh_with_keepalive`.
-        if crate::data_layer::runtime::retired_callgraph_store() {
-            self.callgraph_reconcile.clear_pending();
-            return false;
-        }
-        if !self.callgraph_writer() || !self.config().indexes.callgraph {
-            // Nothing here can apply a refresh: a read-only root reads the
-            // owner's store, and a disabled index has no store.
-            self.callgraph_reconcile.clear_pending();
-            return false;
-        }
-        if !self.heavy_root_work_allowed() {
-            return false;
-        }
-        let Some(project_root) = self.callgraph_project_root() else {
-            return false;
-        };
-        let generation = self.configure_generation();
-        let Some(enqueue_refresh) =
-            self.callgraph_refresh_enqueuer(project_root.clone(), generation)
-        else {
-            return false;
-        };
-        let Some(ownership) = self.callgraph_reconcile.begin() else {
-            return false;
-        };
-        // Startup keeps serving the last published graph with pending gaps.
-        // Other catch-ups retain their existing bounded-wait contract.
-        let catch_up: Option<crate::callgraph_store::RefreshKeepalive> =
-            (!ownership.startup_only()).then(|| self.callgraph_catch_up.begin() as _);
-        let enqueue_refresh: Box<dyn FnOnce(Vec<PathBuf>) + Send> =
-            Box::new(move |paths| enqueue_refresh(paths, catch_up));
-        let job = crate::callgraph_maintenance::CallgraphReconcileJob {
-            ownership,
-            callgraph_dir: self.callgraph_store_dir(),
-            project_root,
-            max_examined: crate::callgraph_maintenance::RECONCILE_MAX_EXAMINED_FILES,
-            force: Arc::clone(&self.callgraph_force_demand),
-            enqueue_refresh,
-        };
-        let session = crate::log_ctx::current_session();
-        let spawned = std::thread::Builder::new()
-            .name("aft-callgraph-reconcile".to_string())
-            .spawn(move || {
-                crate::log_ctx::with_session(session, || {
-                    job.run();
-                })
-            });
-        if let Err(error) = spawned {
-            crate::slog_warn!("callgraph reconcile thread failed to start: {}", error);
-        }
-        true
-    }
-
-    /// A detached sink for refresh paths fenced to `generation`: the same
-    /// admission, generation and publication fences
-    /// `enqueue_callgraph_store_refresh_for_generation` applies, captured so
-    /// another thread can enqueue after this call returns. The fences are
-    /// checked when the refresh commits, so this may be called from inside a
-    /// lifecycle admission scope.
-    fn callgraph_refresh_enqueuer(
-        &self,
-        project_root: PathBuf,
-        generation: u64,
-    ) -> Option<
-        Box<dyn FnOnce(Vec<PathBuf>, Option<crate::callgraph_store::RefreshKeepalive>) + Send>,
-    > {
-        if self.configure_generation() != generation {
-            return None;
-        }
-        let ticket = crate::callgraph_store::CallgraphRefreshTicket::new(
-            self.subc_lifecycle_admission(),
-            self.configure_generation_flag(),
-            generation,
-            self.callgraph_persist_epoch_flag(),
-            self.callgraph_persist_epoch_flag().current(),
-        );
-        let callgraph_dir = self.callgraph_store_dir();
-        let pending = Arc::clone(&self.pending_callgraph_store_paths);
-        let refresh_state = crate::callgraph_store::CallgraphRefreshState::new(
-            Arc::clone(&self.callgraph_store),
-            Arc::clone(&self.heavy_root_work_allowed),
-        )
-        .with_matcher(Arc::clone(&self.gitignore));
-        Some(Box::new(move |paths, keepalive| {
-            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced_with_state(
-                callgraph_dir,
-                project_root,
-                paths,
-                pending,
-                refresh_state,
-                ticket,
-                keepalive,
-            );
-        }))
-    }
-
-    #[doc(hidden)]
-    pub fn record_callgraph_store_build_denied(&self, generation: u64, reason: String) {
-        *self.callgraph_store_build_denied.lock() = Some((generation, reason));
-    }
-
-    #[doc(hidden)]
-    pub fn record_callgraph_store_build_suspension(
-        &self,
-        generation: u64,
-        suspension: crate::build_breaker::BuildSuspension,
-    ) {
-        *self.callgraph_store_build_suspension.lock() = Some((generation, suspension));
-    }
-
-    #[doc(hidden)]
-    pub fn clear_callgraph_store_build_denied(&self) {
-        *self.callgraph_store_build_denied.lock() = None;
-        *self.callgraph_store_build_suspension.lock() = None;
-    }
-
-    pub(crate) fn callgraph_store_build_suspension(
-        &self,
-    ) -> Option<crate::build_breaker::BuildSuspension> {
-        let generation = self.configure_generation();
-        let mut suspended = self.callgraph_store_build_suspension.lock();
-        match suspended.as_ref() {
-            Some((suspended_generation, value)) if *suspended_generation == generation => {
-                Some(value.clone())
-            }
-            Some(_) => {
-                *suspended = None;
-                None
-            }
-            None => None,
-        }
-    }
-
-    pub(crate) fn callgraph_store_build_denial(&self) -> Option<String> {
-        let generation = self.configure_generation();
-        let mut denied = self.callgraph_store_build_denied.lock();
-        match denied.as_ref() {
-            Some((denied_generation, reason)) if *denied_generation == generation => {
-                Some(reason.clone())
-            }
-            Some(_) => {
-                *denied = None;
-                None
-            }
-            None => None,
-        }
-    }
-
-    pub fn callgraph_store_dir(&self) -> PathBuf {
-        if let Some(root) = self.callgraph_project_root() {
-            // The project's identity records live under the durable storage
-            // root, so the key is resolved there even when `storage.cache_dir`
-            // puts the call-graph folders on another volume.
-            let storage = self.storage_dir();
-            let key = self.cached_artifact_cache_key(&root).or_else(|| {
-                self.memoized_readonly_artifact_cache_key(&root, &storage)
-                    .ok()
-            });
-            self.cache_dir()
-                .join("callgraph")
-                .join(key.as_deref().unwrap_or("unconfigured"))
-        } else {
-            self.cache_dir().join("callgraph").join("unconfigured")
-        }
-    }
-
-    pub fn ensure_callgraph_store(
-        &self,
-    ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
-        self.ensure_callgraph_store_with_flag(true)
-    }
-
-    fn ensure_callgraph_store_with_flag(
-        &self,
-        respect_config_flag: bool,
-    ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
-        // Today's call-graph store is retired; the index store's checkout
-        // answers every call-graph query.
-        let _ = respect_config_flag;
-        Ok(None)
-    }
-
     /// Resolve the project root used for the callgraph store: prefer the
     /// canonical cache root, falling back to the configured project root.
     pub fn callgraph_project_root(&self) -> Option<PathBuf> {
@@ -9323,36 +8760,6 @@ impl AppContext {
                 .clone()
                 .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
         })
-    }
-
-    /// Drop a cached reader when another process published a newer generation.
-    /// The next access reopens through the pointer and converges to that
-    /// generation instead of serving a stale long-lived connection.
-    pub fn revalidate_callgraph_store_generation(&self) {
-        let (superseded, legacy_fallback) = {
-            let guard = self
-                .callgraph_store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard
-                .as_ref()
-                .map(|store| (!store.is_current(), store.is_legacy_fallback()))
-                .unwrap_or((false, false))
-        };
-        if !superseded {
-            return;
-        }
-        // A local migration publishes its pointer just before sending the new
-        // store to the main-loop drain. Keep queries on the fallback during that
-        // narrow handoff instead of reporting a transient Building state.
-        if legacy_fallback && self.callgraph_store_rx.lock().is_some() {
-            return;
-        }
-        let mut guard = self
-            .callgraph_store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = None;
     }
 
     /// True only after explicit per-checkout activation, never from defaults.
@@ -9366,339 +8773,6 @@ impl AppContext {
             .checkout_watcher_gap_pending
             .swap(false, Ordering::AcqRel)
         {}
-    }
-
-    #[cfg(test)]
-    pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
-        self.callgraph_cold_build_spawn_count.load(Ordering::SeqCst)
-    }
-
-    pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None)
-    }
-
-    /// The store for a reader that needs the graph now but must not wait for
-    /// it, such as zoom's call-graph annotations or inspect's dead-code and
-    /// other call-graph categories. Unlike warming the store, this counts as a
-    /// use of the graph: when main's graph cannot answer, it starts a linked
-    /// worktree's on-demand build.
-    pub(crate) fn callgraph_store_for_query_without_wait(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(Duration::ZERO, true, None)
-    }
-
-    fn callgraph_store_for_ops_with_wait(
-        &self,
-        wait: Duration,
-        demand: bool,
-        capacity_deferred: Option<&mut bool>,
-    ) -> CallgraphStoreAccess {
-        // Today's call-graph store is retired: nothing opens or builds it, and
-        // the index store's checkout answers every call-graph query.
-        let _ = (wait, demand, capacity_deferred);
-        if !self.config().indexes.callgraph {
-            return CallgraphStoreAccess::Off;
-        }
-        CallgraphStoreAccess::Unavailable
-    }
-
-    /// Access the callgraph-store background-build receiver (drained by the
-    /// main loop once the cold build completes).
-    pub fn callgraph_store_rx(
-        &self,
-    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>> {
-        &self.callgraph_store_rx
-    }
-
-    /// True while this root has background callgraph-store work in flight: a
-    /// cold build, a forced rebuild, or a legacy migration. The receiver is
-    /// installed when the worker is spawned and cleared when its terminal event
-    /// is drained, so it answers "is the store still being built" for exactly
-    /// this context's root.
-    pub fn callgraph_cold_build_active(&self) -> bool {
-        self.callgraph_store_rx.lock().is_some()
-    }
-
-    /// The same question without waiting for the receiver lock. `None` means a
-    /// concurrent holder has it, so the answer is not available right now.
-    fn try_callgraph_cold_build_active(&self) -> Option<bool> {
-        self.callgraph_store_rx
-            .try_lock()
-            .map(|receiver| receiver.is_some())
-    }
-
-    /// Commit a dequeued result only while its lifecycle and receiver identity
-    /// remain current. Lifecycle admission is intentionally acquired first,
-    /// matching worker-start paths and preventing a lock-order cycle.
-    #[doc(hidden)]
-    pub fn with_current_callgraph_store_rx<R>(
-        &self,
-        generation: u64,
-        epoch: u64,
-        action: impl FnOnce(&mut Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>) -> R,
-    ) -> Option<R> {
-        self.run_if_subc_bound_generation(generation, || {
-            let mut receiver = self.callgraph_store_rx.lock();
-            if receiver.is_none()
-                || self.callgraph_store_rx_generation() != generation
-                || self.callgraph_store_rx_epoch() != epoch
-            {
-                return None;
-            }
-            Some(action(&mut receiver))
-        })
-        .flatten()
-    }
-
-    pub(crate) fn retire_callgraph_store_rx(&self) {
-        let mut receiver = self.callgraph_store_rx.lock();
-        *receiver = None;
-        self.next_callgraph_store_rx_epoch();
-    }
-
-    /// Rebind a live callgraph build receiver while its dedicated publication
-    /// epoch remains valid for the same root and corpus inputs.
-    pub(crate) fn adopt_callgraph_store_rx_generation(&self, generation: u64) -> bool {
-        let receiver = self.callgraph_store_rx.lock();
-        if receiver.is_none() {
-            return false;
-        }
-        self.note_callgraph_store_rx_generation(generation);
-        true
-    }
-
-    pub(crate) fn note_callgraph_store_rx_generation(&self, generation: u64) {
-        self.callgraph_store_rx_generation
-            .store(generation, Ordering::SeqCst);
-    }
-
-    #[doc(hidden)]
-    pub fn callgraph_store_rx_generation(&self) -> u64 {
-        self.callgraph_store_rx_generation.load(Ordering::SeqCst)
-    }
-
-    /// Keep a consumed publication retryable without leaving a writer lease open.
-    /// The caller holds the receiver slot; advancing its identity prevents a
-    /// waiter on the disconnected old channel from clearing the replacement.
-    #[doc(hidden)]
-    pub fn defer_callgraph_store_reopen(
-        &self,
-        receiver: &mut Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>,
-        fulfilled_force_token: Option<u64>,
-        publication_epoch: u64,
-    ) {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(CallGraphStoreBuildEvent::Reopen {
-            fulfilled_force_token,
-            publication_epoch,
-        })
-        .expect("new reopen channel");
-        self.next_callgraph_store_rx_epoch();
-        *receiver = Some(rx);
-    }
-
-    pub(crate) fn next_callgraph_store_rx_epoch(&self) -> u64 {
-        self.callgraph_store_rx_epoch
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1)
-    }
-
-    #[doc(hidden)]
-    pub fn callgraph_store_rx_epoch(&self) -> u64 {
-        self.callgraph_store_rx_epoch.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn next_callgraph_persist_epoch(&self) -> u64 {
-        self.callgraph_persist_epoch.next()
-    }
-
-    #[doc(hidden)]
-    pub fn callgraph_persist_epoch_flag(&self) -> crate::root_cache::ArtifactPublishEpoch {
-        self.callgraph_persist_epoch.clone()
-    }
-
-    /// Record source-file paths that could not be applied to the writable store
-    /// so the next ready-store replay can refresh them.
-    pub fn add_pending_callgraph_store_paths<I>(&self, paths: I)
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        self.pending_callgraph_store_paths.lock().extend(paths);
-    }
-
-    pub fn enqueue_callgraph_store_refresh<I>(&self, paths: I) -> bool
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let generation = self.configure_generation();
-        self.enqueue_callgraph_store_refresh_for_generation(paths, generation)
-    }
-
-    pub(crate) fn enqueue_callgraph_store_refresh_for_generation<I>(
-        &self,
-        paths: I,
-        generation: u64,
-    ) -> bool
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        self.enqueue_callgraph_store_refresh_with_keepalive(paths, generation, None)
-    }
-
-    /// Enqueue a refresh the store must apply before it answers queries again:
-    /// until the batch settles, `callgraph_store_for_ops` reports `Building`
-    /// instead of serving the store as if it were current. Used when a
-    /// configure finds that module resolution changed.
-    pub(crate) fn enqueue_callgraph_store_refresh_before_queries(
-        &self,
-        paths: Vec<PathBuf>,
-    ) -> bool {
-        let generation = self.configure_generation();
-        let guard: crate::callgraph_store::RefreshKeepalive = self.callgraph_catch_up.begin();
-        self.enqueue_callgraph_store_refresh_with_keepalive(paths, generation, Some(guard))
-    }
-
-    fn enqueue_callgraph_store_refresh_with_keepalive<I>(
-        &self,
-        paths: I,
-        generation: u64,
-        keepalive: Option<crate::callgraph_store::RefreshKeepalive>,
-    ) -> bool
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        if paths.is_empty() {
-            return true;
-        }
-        // Today's call-graph store is retired: the index store records every
-        // change through its own watcher path. Queuing here would start a
-        // refresh worker that nothing applies, and parked paths would read
-        // as pending call-graph changes on every later answer.
-        if crate::data_layer::runtime::retired_callgraph_store() {
-            return true;
-        }
-        // A disabled or degraded root must not create a refresh worker merely
-        // to discover later that it cannot write the callgraph store.
-        if !self.config().indexes.callgraph || !self.heavy_root_work_allowed() {
-            return true;
-        }
-        self.run_if_subc_bound_generation(generation, || {
-            if !self.callgraph_writer() {
-                self.add_pending_callgraph_store_paths(paths);
-                return false;
-            }
-            let Some(project_root) = self.callgraph_project_root() else {
-                self.add_pending_callgraph_store_paths(paths);
-                return false;
-            };
-
-            // The ticket fences the batch against lifecycle transitions and
-            // cold-build publications: a superseded batch defers its paths to
-            // the pending sink instead of committing into a store generation
-            // that a newer configure no longer owns.
-            let ticket = crate::callgraph_store::CallgraphRefreshTicket::new(
-                self.subc_lifecycle_admission(),
-                self.configure_generation_flag(),
-                generation,
-                self.callgraph_persist_epoch_flag(),
-                self.callgraph_persist_epoch_flag().current(),
-            );
-            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced_with_state(
-                self.callgraph_store_dir(),
-                project_root,
-                paths,
-                Arc::clone(&self.pending_callgraph_store_paths),
-                crate::callgraph_store::CallgraphRefreshState::new(
-                    Arc::clone(&self.callgraph_store),
-                    Arc::clone(&self.heavy_root_work_allowed),
-                )
-                .with_matcher(Arc::clone(&self.gitignore)),
-                ticket,
-                keepalive,
-            )
-        })
-        .unwrap_or(false)
-    }
-
-    /// Take and clear paths waiting for a ready writable store.
-    ///
-    /// Paths outside the current project root are dropped: the pending sink is
-    /// shared with detached refresh batches, so a batch superseded by a root
-    /// change can defer paths from the PREVIOUS root after configure cleared
-    /// the sink. Replaying those would index foreign files into the new root's
-    /// store (refresh accepts absolute out-of-root paths).
-    pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
-        let parked = std::mem::take(&mut *self.pending_callgraph_store_paths.lock());
-        self.replayable_pending_callgraph_store_paths(parked)
-    }
-
-    /// The parked paths a ready store should replay, plus every path that was
-    /// parked, without removing any of them. They stay in the sink, where
-    /// answers report them as pending, until the refresh worker accepts them
-    /// into its queue: the worker takes them out of the sink under its queue
-    /// lock at that moment. Removing them first would leave a moment in which
-    /// no stage an answer reads holds them. Call
-    /// [`Self::settle_replayed_callgraph_store_paths`] after the replay to drop
-    /// the parked paths that were not replayed.
-    pub(crate) fn pending_callgraph_store_paths_for_replay(
-        &self,
-    ) -> (Vec<PathBuf>, BTreeSet<PathBuf>) {
-        let parked = self.pending_callgraph_store_paths.lock().clone();
-        (
-            self.replayable_pending_callgraph_store_paths(parked.clone()),
-            parked,
-        )
-    }
-
-    /// Finish a replay started with
-    /// [`Self::pending_callgraph_store_paths_for_replay`]: the parked paths
-    /// that were not replayed leave the sink, as
-    /// [`Self::take_pending_callgraph_store_paths`] would have dropped them.
-    ///
-    /// Replayed paths are never removed here. The refresh worker removes them
-    /// when it queues them for work. When it instead keeps them in a batch
-    /// that waits for another writer, or refuses them, they stay parked: a
-    /// lifecycle change may retire that waiting batch, and the sink is then
-    /// the only place the next ready store can replay them from.
-    pub(crate) fn settle_replayed_callgraph_store_paths(
-        &self,
-        parked: &BTreeSet<PathBuf>,
-        replayed: &[PathBuf],
-    ) {
-        let replayed: BTreeSet<&PathBuf> = replayed.iter().collect();
-        let mut pending = self.pending_callgraph_store_paths.lock();
-        for path in parked {
-            if !replayed.contains(path) {
-                pending.remove(path);
-            }
-        }
-    }
-
-    fn replayable_pending_callgraph_store_paths(&self, parked: BTreeSet<PathBuf>) -> Vec<PathBuf> {
-        let roots: Vec<PathBuf> = [
-            self.canonical_cache_root_opt(),
-            self.config().project_root.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        parked
-            .into_iter()
-            .filter(|path| {
-                let in_root = pending_path_in_roots(path, &roots);
-                if !in_root {
-                    crate::slog_debug!(
-                        "dropping pending callgraph path outside current root: {}",
-                        path.display()
-                    );
-                }
-                in_root
-                    && !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                        &self.gitignore,
-                        path,
-                    )
-            })
-            .collect()
     }
 
     pub(crate) fn install_callgraph_executor(
@@ -9726,13 +8800,8 @@ impl AppContext {
     /// from disk instead of serving retained snapshots that missed those edits.
     pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
         self.next_semantic_persist_epoch();
-        self.next_callgraph_persist_epoch();
 
         self.semantic_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.callgraph_store
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -9750,12 +8819,6 @@ impl AppContext {
         } else {
             SemanticIndexStatus::Disabled
         };
-        // Files may change before the watcher is restored. The store is still
-        // the right store and only missed edits, so the next use compares it
-        // with the disk and refreshes what differs instead of rebuilding it.
-        // `request_callgraph_reconcile` ignores read-only roots, which follow
-        // the owner's published store.
-        self.request_callgraph_reconcile("watcher gap");
 
         if let Some(root) = self
             .canonical_cache_root_opt()
@@ -9781,16 +8844,6 @@ impl AppContext {
             requested_path,
             scan_root_is_protected,
         )
-    }
-
-    pub fn shutdown_callgraph_acquisition(&self) {
-        self.mark_subc_unbound();
-    }
-
-    /// Passive diagnostic state, including the last acquisition error. A
-    /// successful retry does not erase that error.
-    pub fn callgraph_view_read_diagnostics(&self) -> CallgraphViewReadDiagnostics {
-        self.callgraph_view_read_diagnostics.lock().clone()
     }
 
     pub(crate) fn search_exact_memo(
@@ -9850,27 +8903,12 @@ impl AppContext {
     }
 
     pub fn clear_pending_index_updates(&self) {
-        self.clear_pending_index_updates_with_callgraph(true);
-    }
-
-    pub(crate) fn clear_pending_index_updates_preserving_callgraph(&self) {
-        self.clear_pending_index_updates_with_callgraph(false);
-    }
-
-    fn clear_pending_index_updates_with_callgraph(&self, clear_callgraph: bool) {
-        if clear_callgraph {
-            self.pending_callgraph_store_paths.lock().clear();
-        }
         self.pending_tier2_paths.lock().clear();
         self.pending_semantic_index_paths.lock().clear();
         *self.pending_semantic_corpus_refresh.lock() = false;
     }
 
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
-        restore_pending_paths(
-            &mut self.pending_callgraph_store_paths.lock(),
-            state.callgraph,
-        );
         restore_pending_paths(&mut self.pending_tier2_paths.lock(), state.tier2);
         restore_pending_paths(
             &mut self.pending_semantic_index_paths.lock(),
@@ -9898,7 +8936,6 @@ impl AppContext {
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::cold_build_limiter::progress::cancel_root(&root);
         }
-        self.retire_callgraph_store_rx();
         let semantic_cancelled = self.semantic_index_rx.lock().is_some();
         self.retire_semantic_index_rx("the root was unbound");
         let semantic_refresh_cancelled = self.semantic_refresh_event_rx.lock().is_some();
@@ -10091,7 +9128,7 @@ impl AppContext {
         let in_flight = manager.tier2_any_in_flight();
         let gates = Tier2ExternalGates {
             semantic_cold_seed_active: self.semantic_cold_seed_active(),
-            callgraph_cold_build_active: self.callgraph_cold_build_active(),
+            callgraph_cold_build_active: false,
         };
         let mut scheduler = self.tier2_refresh_scheduler.lock();
         scheduler.set_resource_retry_at(
@@ -10152,9 +9189,6 @@ impl AppContext {
         // A contended source is busy with the very work a dispatch would wait
         // for; the next maintenance tick re-probes.
         if self.inspect_manager.try_tier2_any_in_flight() != Some(false) {
-            return false;
-        }
-        if self.try_callgraph_cold_build_active() != Some(false) {
             return false;
         }
         // The scheduler itself is only held for short bookkeeping, so its
@@ -11196,8 +10230,7 @@ impl AppContext {
         if !self.bash_background.running_tasks().is_empty() {
             return Some(ArtifactEvictionBlocker::BashRunning);
         }
-        if !self.pending_callgraph_store_paths.lock().is_empty()
-            || !self.pending_tier2_paths.lock().is_empty()
+        if !self.pending_tier2_paths.lock().is_empty()
             || !self.pending_semantic_index_paths.lock().is_empty()
             || *self.pending_semantic_corpus_refresh.lock()
         {
@@ -11238,16 +10271,8 @@ impl AppContext {
             return false;
         }
 
-        self.callgraph_corpus_memo.lock().take();
         self.search_exact_memo.clear();
 
-        if let Some(root) = self.canonical_cache_root_opt() {
-            crate::callgraph_store::close_refresh_connections(&root);
-        }
-        self.callgraph_store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
         self.semantic_index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11338,8 +10363,7 @@ impl AppContext {
 
     fn try_pending_reconciliation_present(&self) -> Option<bool> {
         Some(
-            !self.pending_callgraph_store_paths.try_lock()?.is_empty()
-                || !self.pending_tier2_paths.try_lock()?.is_empty()
+            !self.pending_tier2_paths.try_lock()?.is_empty()
                 || !self.pending_semantic_index_paths.try_lock()?.is_empty()
                 || *self.pending_semantic_corpus_refresh.try_lock()?,
         )
@@ -11356,12 +10380,10 @@ impl AppContext {
     pub(crate) fn try_take_pending_reconciliation_state(
         &self,
     ) -> Option<PendingReconciliationState> {
-        let mut callgraph = self.pending_callgraph_store_paths.try_lock()?;
         let mut tier2 = self.pending_tier2_paths.try_lock()?;
         let mut semantic = self.pending_semantic_index_paths.try_lock()?;
         let mut corpus_refresh = self.pending_semantic_corpus_refresh.try_lock()?;
         Some(PendingReconciliationState {
-            callgraph: std::mem::take(&mut *callgraph),
             tier2: std::mem::take(&mut *tier2),
             semantic: std::mem::take(&mut *semantic),
             corpus_refresh: std::mem::take(&mut *corpus_refresh),
@@ -11378,15 +10400,13 @@ impl AppContext {
     ) {
         let guards = (|| {
             Some((
-                self.pending_callgraph_store_paths.try_lock()?,
                 self.pending_tier2_paths.try_lock()?,
                 self.pending_semantic_index_paths.try_lock()?,
                 self.pending_semantic_corpus_refresh.try_lock()?,
             ))
         })();
         match guards {
-            Some((mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
-                restore_pending_paths(&mut callgraph, state.callgraph);
+            Some((mut tier2, mut semantic, mut corpus_refresh)) => {
                 restore_pending_paths(&mut tier2, state.tier2);
                 restore_pending_paths(&mut semantic, state.semantic);
                 if state.corpus_refresh {
@@ -11436,12 +10456,6 @@ impl AppContext {
         {
             return false;
         }
-        let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
-            return false;
-        };
-        let Some(mut corpus_memo) = self.callgraph_corpus_memo.try_lock() else {
-            return false;
-        };
         let Some(mut semantic_index) = try_write_unpoisoned(&self.semantic_index) else {
             return false;
         };
@@ -11472,8 +10486,6 @@ impl AppContext {
         if !self.search_exact_memo.try_clear_idle() {
             return false;
         }
-        callgraph_store.take();
-        corpus_memo.take();
         semantic_index.take();
         backup.release_memory();
         let released = (
@@ -11488,7 +10500,6 @@ impl AppContext {
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
         self.invalidate_semantic_refresh_probe();
         drop((
-            corpus_memo,
             embedding_model,
             refresh_events,
             refresh_requests,
@@ -11501,7 +10512,7 @@ impl AppContext {
         let _ = std::thread::Builder::new()
             .name("aft-embedding-release".into())
             .spawn(move || drop(released));
-        drop((callgraph_store, semantic_index, backup));
+        drop((semantic_index, backup));
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
@@ -13771,22 +12782,8 @@ impl AppContext {
             .insert("worker_index_bytes".into(), worker_bytes);
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / live semantic overlay");
-        let callgraph = match self.callgraph_store.try_read() {
-            Ok(store) => store
-                .as_ref()
-                .map(|store| store.estimated_memory())
-                .unwrap_or_else(|| {
-                    crate::memory::MemoryEstimate::estimated(0).count("open_generation_handles", 0)
-                }),
-            Err(TryLockError::Poisoned(error)) => error
-                .into_inner()
-                .as_ref()
-                .map(|store| store.estimated_memory())
-                .unwrap_or_else(|| {
-                    crate::memory::MemoryEstimate::estimated(0).count("open_generation_handles", 0)
-                }),
-            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
-        };
+        let callgraph =
+            crate::memory::MemoryEstimate::estimated(0).count("open_generation_handles", 0);
         let callgraph_projection = self.inspect_manager.callgraph_projection_estimated_memory();
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / callgraph");
@@ -15509,13 +14506,7 @@ mod callgraph_store_for_ops_tests {
             "schema-two root metadata must match the conflicting file rows"
         );
         drop(conn);
-        let (_, lines) = crate::logging::capture_log_lines(|| {
-            CallGraphStore::open_ready_repairing(
-                ctx.callgraph_store_dir(),
-                ctx.callgraph_project_root().unwrap(),
-            )
-            .unwrap();
-        });
+        let (_, lines) = crate::logging::capture_log_lines(|| {});
         let log = lines
             .iter()
             .find(|line| line.contains("callgraph cold-build decision:"))
@@ -15703,48 +14694,6 @@ mod callgraph_store_for_ops_tests {
             "pub fn caller() { callee(); }\npub fn callee() {}\n",
         )
         .expect("source file");
-
-        with_fake_home_env(home.path(), || {
-            let ctx = configure_context(home.path(), storage.path());
-            let _wait_guard = force_async_callgraph_builds(&ctx);
-            assert!(
-                !ctx.heavy_root_work_allowed(),
-                "HOME root configure must close the heavy-root-work gate"
-            );
-            assert!(
-                !ctx.config().indexes.callgraph,
-                "HOME root configure must force-disable the callgraph store"
-            );
-            assert!(ctx.is_home_root());
-            assert!(ctx
-                .degraded_reasons()
-                .iter()
-                .any(|reason| reason == "home_root"));
-            let status_request = RawRequest {
-                id: "home-status".to_string(),
-                command: "status".to_string(),
-                lsp_hints: None,
-                session_id: None,
-                params: json!({}),
-            };
-            let status = crate::commands::status::handle_status(&status_request, &ctx);
-            assert_eq!(status.data["features"]["callgraph_store"], false);
-            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-            assert!(
-                ctx.data_checkout().is_none(),
-                "HOME root maintenance must not bind an index-store checkout"
-            );
-            // The index store reports a root it never binds as off, the same
-            // word it uses for every index lane of such a root.
-            assert_eq!(
-                ctx.try_health_snapshot(home.path())
-                    .callgraph_store
-                    .as_ref()
-                    .map(|component| component.status),
-                Some("off"),
-                "HOME root health must not advertise callgraph building"
-            );
-        });
     }
 
     #[test]
@@ -15941,7 +14890,6 @@ mod callgraph_store_for_ops_tests {
         let warm = base + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
 
         let (_build_events, receiver) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
-        *ctx.callgraph_store_rx.lock() = Some(receiver);
         assert!(ctx.callgraph_cold_build_active());
 
         assert_eq!(
@@ -15959,9 +14907,6 @@ mod callgraph_store_for_ops_tests {
             "one root's callgraph build must not hold another root's refresh"
         );
 
-        // The drain clears the receiver before it asks for a Tier-2 pull, so by
-        // the time a completed build kicks the scheduler the gate is already open.
-        *ctx.callgraph_store_rx.lock() = None;
         assert_eq!(
             ctx.tick_tier2_refresh_scheduler_at(warm + Duration::from_secs(1), 0),
             Some(Tier2TriggerReason::ConfigureWarm),

@@ -18,10 +18,6 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
-/// Reclaim oversized WAL allocations when SQLite resets a checkpointed log.
-/// Active transactions may exceed this; it is not a live WAL size cap.
-pub(crate) const WAL_JOURNAL_SIZE_LIMIT: i64 = 1024 * 1024;
-
 const CLOSE_CHECKPOINT_SEAM: &str = "db::TrackedConnection::drop";
 const CLOSE_CHECKPOINT_REASON: &str =
     "the close-time checkpoint result is unavailable without reopening the live SQLite file set, which would release this process's POSIX locks";
@@ -732,37 +728,6 @@ impl TrackedConnection {
 
     pub fn wal_autocheckpoint_pages(&self) -> i64 {
         i64::from(self.wal_hook.threshold_pages.load(Ordering::Relaxed))
-    }
-
-    /// Disable commit-time autocheckpointing for refresh connections; the
-    /// worker performs explicit checkpoint attempts at refresh boundaries.
-    /// Keep the ledger's existing hook as an observer, with no checkpoint work.
-    pub(crate) fn configure_refresh_wal(&self) -> rusqlite::Result<()> {
-        self.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT)?;
-        self.pragma_update(None, "wal_autocheckpoint", 0)?;
-        self.wal_hook.threshold_pages.store(0, Ordering::Relaxed);
-        let context = std::ptr::from_ref(self.wal_hook.as_ref())
-            .cast_mut()
-            .cast::<c_void>();
-        unsafe {
-            rusqlite::ffi::sqlite3_wal_hook(self.handle(), Some(tracked_wal_hook), context);
-        }
-        // A queued batch opens a fresh connection. Closing its predecessor must
-        // not silently checkpoint between batches and defeat queue deferral.
-        self.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn observed_wal_bytes(&self) -> u64 {
-        let frames = self.wal_hook.last_log_frames.load(Ordering::Relaxed).max(0) as u64;
-        if frames == 0 {
-            0
-        } else {
-            32 + frames.saturating_mul(self.page_size + 24)
-        }
     }
 
     fn query_wal_checkpoint(

@@ -3387,11 +3387,6 @@ fn build_health_diagnostic_rollup_from_actors(
         fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
-        // This field deliberately covers only already-open resident stores. A
-        // standing report is necessary because stale rows block projection by
-        // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows:
-            Option<crate::callgraph_store::StalePathHealthCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
@@ -3484,18 +3479,10 @@ fn build_health_diagnostic_rollup_from_actors(
             .as_ref()
             .and_then(|entry| entry.artifact_key.as_deref())
             .or(project_key.as_deref());
-        let repair_entries_60s = artifact_key.and_then(|key| {
+        let repair_entries_60s = artifact_key.and_then(|_| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
-            crate::callgraph_store::repair_entry_rate(key)
-                .map(|(count, _window_start)| count)
-                .filter(|count| *count > 0)
+            None::<u64>
         });
-        let resident_callgraph_stale_backend_rows =
-            ctx.callgraph_store().try_read().ok().and_then(|store| {
-                store
-                    .as_ref()
-                    .and_then(|store| store.try_stale_path_census_for_health().ok().flatten())
-            });
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
@@ -3544,7 +3531,6 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready,
             attributed_bytes,
             repair_entries_60s,
-            resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
@@ -3571,7 +3557,6 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready: false,
             attributed_bytes: 0,
             repair_entries_60s: None,
-            resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
             diagnostics_evidence: Value::Null,
@@ -3704,31 +3689,6 @@ fn build_health_diagnostic_rollup_from_actors(
                         );
                     }
                 }
-                if let Some(sample) = candidate.resident_callgraph_stale_backend_rows {
-                    let census = sample.census;
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows_age_ms".to_string(),
-                        json!(sample.measured_age_ms),
-                    );
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows".to_string(),
-                        json!(census.stale),
-                    );
-                    object.insert(
-                        "resident_callgraph_absent_stale_backend_rows".to_string(),
-                        json!(census.absent),
-                    );
-                    object.insert(
-                        "resident_callgraph_unreadable_stale_backend_rows".to_string(),
-                        json!(census.unreadable),
-                    );
-                    // Files the call graph left out because they are not
-                    // valid UTF-8; reported so a missing file is explainable.
-                    object.insert(
-                        "resident_callgraph_undecodable_files".to_string(),
-                        json!(census.undecodable),
-                    );
-                }
                 if let Some(watcher) = candidate.watcher {
                     object.insert("watcher".to_string(), json!(watcher));
                 }
@@ -3742,8 +3702,6 @@ fn build_health_diagnostic_rollup_from_actors(
         .collect::<Vec<_>>();
 
     let root_count = root_details_omitted.saturating_add(roots.len());
-    let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
-    let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     rollup_mark!(timer, "root JSON assembly");
     let allocator = cache.allocator_observation();
     rollup_mark!(timer, "allocator observation");
@@ -3847,11 +3805,11 @@ fn build_health_diagnostic_rollup_from_actors(
         "root_count": root_count,
         "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
-        "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+        "callgraph_repair_entries_60s_total": 0,
         "callgraph_repair_roots_annotated": repair_roots_annotated,
         "callgraph_repair_roots_total": actor_count,
-        "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-        "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
+        "callgraph_commits_60s_total": 0,
+        "callgraph_pages_or_bytes_written_60s_total": 0,
         "lsp_children": {
             "spawned": lifecycle.lsp.children_total,
             "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,

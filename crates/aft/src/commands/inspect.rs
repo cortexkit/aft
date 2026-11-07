@@ -865,12 +865,6 @@ fn handle_inspect_payload(
         return inspect_interrupted_response(&req.id);
     }
 
-    // The graph-backed categories read the index store's checkout (below);
-    // no other call-graph store is pinned for the request.
-    let v3_routed = false;
-    let checkout_store: Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> =
-        None;
-    let routed_observation: Option<(crate::feature_status::IndexObservation, bool)> = None;
     let manager = ctx.inspect_manager();
     // Dead code reads its call graph from the root's checkout (see
     // `data_layer::tools::inspect`).
@@ -886,16 +880,6 @@ fn handle_inspect_payload(
             manager.read_dead_code_from_data_layer(&snapshot.project_root, &checkout);
         }
     }
-    let view_callgraph_observation = if checkout_store.is_none() {
-        routed_observation
-    } else {
-        None
-    };
-    // A v3-routed request scans only with a reader in hand; without one its
-    // graph-backed categories report the gap below rather than running the
-    // legacy reuse scanner.
-    let use_checkout_view = false;
-    let checkout_view_unavailability: Option<crate::inspect::CheckoutViewUnavailable> = None;
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -910,7 +894,7 @@ fn handle_inspect_payload(
         } else if scope_was_provided
             && !sections.detail_categories.is_empty()
             && !sections.includes(category)
-            && (!category.is_tier2() || use_checkout_view)
+            && !category.is_tier2()
         {
             // Explicit scoped sections must not start unrequested producers.
             // Legacy Tier-2 cache reads can still disclose existing results
@@ -952,7 +936,7 @@ fn handle_inspect_payload(
         if outcomes.contains_key(&category) {
             continue;
         }
-        if (scope_was_provided || !ctx.inspect_writer() || v3_routed) && !use_checkout_view {
+        if scope_was_provided || !ctx.inspect_writer() {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
@@ -967,7 +951,6 @@ fn handle_inspect_payload(
             continue;
         }
         let manager = manager.clone();
-        let checkout_store = checkout_store.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
         let callgraph_phase = phase_log.and_then(|phase_log| {
@@ -1004,9 +987,7 @@ fn handle_inspect_payload(
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if use_checkout_view {
-                manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
-            } else if force_root_diagnostics {
+            let outcome = if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
             } else {
                 manager.tier2_run_with_reuse_blocking(snapshot, category, scope)
@@ -1138,71 +1119,19 @@ fn handle_inspect_payload(
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
-                let reserve_reason = view_callgraph_observation
-                    .as_ref()
-                    .and_then(|(observation, _)| observation.unavailable_reason.as_ref())
-                    .filter(|reason| crate::view_storage_reserve::is_message(reason));
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
                     JobOutcome::Stale { .. } => "cached analysis freshness could not be verified".into(),
-                    _ if reserve_reason.is_some() => reserve_reason.unwrap().clone(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                // A locked call-graph database is contention, not absence: both
-                // the query observation and the view reader's own open can see
-                // the lock, and either one makes the answer "pending, retry".
-                let callgraph_contended = view_callgraph_observation
-                    .as_ref()
-                    .is_some_and(|(_, transient_lock_contention)| *transient_lock_contention);
-                let callgraph_pending = (callgraph_contended
-                    || checkout_view_unavailability
-                        .as_ref()
-                        .is_some_and(|unavailability| unavailability.is_busy()))
-                    && matches!(
-                        *category,
-                        InspectCategory::DeadCode | InspectCategory::UnusedExports
-                    );
-                let mut payload = if let Some(unavailability) = checkout_view_unavailability
-                    .as_ref()
-                    .filter(|_| *category == InspectCategory::DeadCode && !callgraph_pending)
-                {
-                    let mut payload = manager.tier2_incomplete_payload(
-                        &snapshot,
-                        *category,
-                        &scope,
-                        unavailability.kind(),
-                        unavailability.reason(),
-                    );
-                    payload["code"] = serde_json::json!(unavailability.kind());
-                    payload
-                } else if callgraph_pending {
-                    // The observation may have opened the store after the lock
-                    // cleared; the reader's busy verdict still means building.
-                    let index = view_callgraph_observation
-                        .as_ref()
-                        .filter(|(_, contended)| *contended)
-                        .map_or_else(
-                            || crate::feature_status::IndexObservation::building().consumer_json(),
-                            |(observation, _)| observation.consumer_json(),
-                        );
-                    serde_json::json!({
-                        "status": "pending",
-                        "code": "callgraph_building",
-                        "index": index,
-                        "building": { "state": "building" },
-                        "reason": "waiting for or projecting the checkout call graph",
-                        "complete": false,
-                    })
-                } else {
-                    manager.tier2_incomplete_payload(
-                        &snapshot,
-                        *category,
-                        &scope,
-                        "tier2_unavailable",
-                        reason,
-                    )
-                };
+                let mut payload = manager.tier2_incomplete_payload(
+                    &snapshot,
+                    *category,
+                    &scope,
+                    "tier2_unavailable",
+                    reason,
+                );
                 // Enabling checkout views requests real scoped Tier-2 analysis.
                 // A missing or stale view is a gap, not an intentional skip.
                 {

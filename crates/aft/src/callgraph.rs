@@ -18,7 +18,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-use crate::callgraph_store::disk_facts::{CanonicalProbeMemo, DiskFacts};
+use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
 use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(test)]
@@ -234,7 +234,6 @@ impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
-    canonical_probes: Arc<CanonicalProbeMemo>,
     module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
     json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
@@ -254,7 +253,6 @@ impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
-            canonical_probes: Arc::default(),
             module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
@@ -285,14 +283,6 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
-    pub(crate) fn disk_facts(&self, root: &Path) -> DiskFacts {
-        if self.enabled {
-            DiskFacts::with_probe_memo(root, Arc::clone(&self.canonical_probes))
-        } else {
-            DiskFacts::new(root)
-        }
-    }
-
     fn resolve_module_path(
         &self,
         from_dir: &Path,
@@ -541,56 +531,6 @@ fn symbol_unqualified_name(symbol: &str) -> &str {
 
 pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
     full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
-}
-
-fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    let qualified_query = symbol_name.contains("::");
-
-    let mut consider = |candidate: &str| {
-        let matches = if qualified_query {
-            candidate == symbol_name
-        } else {
-            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
-        };
-
-        if matches && seen.insert(candidate.to_string()) {
-            candidates.push(candidate.to_string());
-        }
-    };
-
-    for candidate in file_data.symbol_metadata.keys() {
-        consider(candidate);
-    }
-    for candidate in file_data.calls_by_symbol.keys() {
-        consider(candidate);
-    }
-    for candidate in &file_data.exported_symbols {
-        consider(candidate);
-    }
-
-    candidates.sort();
-    candidates
-}
-
-pub(crate) fn resolve_symbol_query_in_data(
-    file_data: &FileCallData,
-    file: &Path,
-    symbol_name: &str,
-) -> Result<String, AftError> {
-    let candidates = symbol_query_candidates(file_data, symbol_name);
-    match candidates.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        [] => Err(AftError::SymbolNotFound {
-            name: symbol_name.to_string(),
-            file: file.display().to_string(),
-        }),
-        _ => Err(AftError::AmbiguousSymbol {
-            name: symbol_name.to_string(),
-            candidates,
-        }),
-    }
 }
 
 /// A call or function-value dependency site owned by a symbol.
@@ -1467,28 +1407,6 @@ pub(crate) fn build_file_data_from_source(
             message: format!("unsupported file for call graph: {}", path.display()),
         })?;
     build_file_data_from_source_with_lang(path, source, lang)
-}
-
-pub(crate) fn build_file_data_with_typescript_objects(
-    path: &Path,
-    source: &str,
-) -> Result<
-    (
-        FileCallData,
-        Option<crate::callgraph_store::join::ParseBlob>,
-    ),
-    AftError,
-> {
-    let lang =
-        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
-            message: format!("unsupported file for call graph: {}", path.display()),
-        })?;
-    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
-        return build_file_data_from_source_with_lang(path, source, lang).map(|data| (data, None));
-    }
-    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
-    let lines = SourceLineIndex::new(source);
-    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true, Direct, None)
 }
 
 #[derive(Debug)]
@@ -3462,40 +3380,6 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
         current = dir.parent();
     }
     None
-}
-
-/// The `compilerOptions.paths` of `tsconfig_dir/tsconfig.json` as
-/// `resolve_tsconfig_path` reads them: the directory targets are relative to
-/// (`baseUrl`, default the tsconfig's directory) and each alias with its
-/// targets. None when the file is missing, unparsable or has no `paths`.
-pub(crate) fn tsconfig_path_aliases(
-    tsconfig_dir: &Path,
-    facts: &FactPaths<'_>,
-) -> Option<(PathBuf, Vec<(String, Vec<String>)>)> {
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), None, facts)?;
-    let compiler_options = tsconfig.get("compilerOptions")?;
-    let paths = compiler_options.get("paths")?.as_object()?;
-    let base_url = compiler_options
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let aliases = paths
-        .iter()
-        .map(|(alias, targets)| {
-            let targets = targets
-                .as_array()
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            (alias.clone(), targets)
-        })
-        .collect();
-    Some((tsconfig_dir.join(base_url), aliases))
 }
 
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {

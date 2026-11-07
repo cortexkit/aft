@@ -1556,6 +1556,11 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
+        Self::from_config(config, dimension)
+    }
+
     fn matches_expected(&self, expected: &str) -> bool {
         let Ok(current) = serde_json::from_str::<Self>(expected) else {
             return false;

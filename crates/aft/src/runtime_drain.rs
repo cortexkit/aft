@@ -1,10 +1,9 @@
 use crate as aft;
-use crate::callgraph_store::invalidates_workspace_crate_prefix_cache;
 #[cfg(test)]
 use crate::callgraph_store::CallGraphStore;
 use crate::context::{
-    AppContext, CallGraphStoreBuildEvent, SemanticIndexStatus, SemanticRefreshRequest,
-    WatcherDrainApplyPhase, WatcherDrainPhase, WatcherDrainSliceState,
+    AppContext, SemanticIndexStatus, SemanticRefreshRequest, WatcherDrainApplyPhase,
+    WatcherDrainPhase, WatcherDrainSliceState,
 };
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
@@ -14,7 +13,7 @@ use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip_under, WatcherDispatchEvent};
 #[cfg(any(test, feature = "test-timing-hooks"))]
 use std::collections::HashMap;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -35,7 +34,6 @@ pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
 // semantic embedder's human-edit debounce before publishing callgraph data.
 const IGNORE_RULE_REFRESH_QUIET_WINDOW: Duration = Duration::from_secs(5);
 const IGNORE_RULE_CHANGED_PATHS_RETAINED: usize = 8;
-const IGNORE_RULE_CHANGED_PATHS_LOGGED: usize = 3;
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
@@ -100,14 +98,6 @@ pub(crate) fn reset_legacy_watcher_refreshes_for_test() {
 pub(crate) fn legacy_watcher_refreshes_for_test() -> usize {
     LEGACY_WATCHER_REFRESHES.with(std::cell::Cell::get)
 }
-
-#[cfg(test)]
-fn note_legacy_watcher_refresh_for_test() {
-    LEGACY_WATCHER_REFRESHES.with(|count| count.set(count.get() + 1));
-}
-
-#[cfg(not(test))]
-fn note_legacy_watcher_refresh_for_test() {}
 
 #[cfg(test)]
 fn reset_ignore_rule_refreshes_for_test() {
@@ -314,29 +304,6 @@ fn install_artifact_drain_commit_gate_for_test(
 }
 
 #[cfg(test)]
-fn wait_on_artifact_drain_commit_gate_for_test(ctx: &AppContext) {
-    let mut slot = ARTIFACT_DRAIN_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("artifact drain commit gate mutex poisoned");
-    if !slot
-        .as_ref()
-        .is_some_and(|gate| gate.context_id == ctx as *const AppContext as usize)
-    {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
-    if let Some(gate) = gate {
-        let _ = gate.reached_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
-    }
-}
-
-#[cfg(not(test))]
-fn wait_on_artifact_drain_commit_gate_for_test(_ctx: &AppContext) {}
-
-#[cfg(test)]
 fn install_semantic_refresh_recovery_gate_for_test(
     ctx: &AppContext,
 ) -> (
@@ -390,15 +357,6 @@ impl<'a> WatcherDrainUnitGuard<'a> {
             phase: watcher_drain_phase_name(phase),
             path,
             batch_len: 1,
-            started: Instant::now(),
-        }
-    }
-
-    fn start_batch(phase: WatcherDrainApplyPhase, path: &'a Path, batch_len: usize) -> Self {
-        Self {
-            phase: watcher_drain_phase_name(phase),
-            path,
-            batch_len,
             started: Instant::now(),
         }
     }
@@ -707,24 +665,11 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
     }
 }
 
-/// Drain all background build-completion receivers in standalone order:
-/// the call-graph store's, then the semantic index's.
-pub fn drain_build_completions(ctx: &AppContext) {
-    drain_callgraph_store_events(ctx);
-}
-
 /// Return true when any background build-completion receiver is currently set.
 ///
 /// Each receiver is checked under its own short lock; no lock is held while
 /// checking the next subsystem.
 pub fn any_build_in_flight(ctx: &AppContext) -> bool {
-    {
-        let rx = ctx.callgraph_store_rx().lock();
-        if rx.is_some() {
-            return true;
-        }
-    }
-
     {
         let rx = ctx.semantic_index_rx().lock();
         rx.is_some()
@@ -734,10 +679,7 @@ pub fn any_build_in_flight(ctx: &AppContext) -> bool {
 /// [`any_build_in_flight`] without waiting: `None` when one of the receiver
 /// slots is locked by another thread right now.
 pub fn try_any_build_in_flight(ctx: &AppContext) -> Option<bool> {
-    Some(
-        ctx.callgraph_store_rx().try_lock()?.is_some()
-            || ctx.semantic_index_rx().try_lock()?.is_some(),
-    )
+    Some(ctx.semantic_index_rx().try_lock()?.is_some())
 }
 
 pub fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &Path) -> bool {
@@ -795,208 +737,6 @@ fn semantic_paths_with_recorded_freshness(
 pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
     ctx.clear_all_semantic_refresh_retry_attempts();
     ctx.reset_semantic_refresh_circuit_after_success();
-}
-
-pub fn drain_callgraph_store_events(ctx: &AppContext) {
-    let (
-        latest,
-        denied,
-        suspended,
-        settled,
-        disconnected,
-        fulfilled_force_token,
-        receiver_generation,
-        receiver_epoch,
-        reopen_epoch,
-    ) = {
-        let rx_ref = ctx.callgraph_store_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-
-        let mut latest = None;
-        let mut denied = None;
-        let mut suspended = None;
-        let mut settled = false;
-        let mut fulfilled_force_token = None;
-        let mut disconnected = false;
-        let mut reopen_epoch = None;
-        loop {
-            match rx.try_recv() {
-                Ok(CallGraphStoreBuildEvent::Ready {
-                    store,
-                    fulfilled_force_token: token,
-                    publication_epoch,
-                }) => {
-                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
-                        latest = Some(store);
-                        fulfilled_force_token = token;
-                        reopen_epoch = Some(publication_epoch);
-                    } else {
-                        // A newer configure advanced the persist epoch after this
-                        // build published; its generation is already superseded on
-                        // disk, so treat the event as settled instead of installing
-                        // the stale handle in RAM.
-                        drop(store);
-                        settled = true;
-                    }
-                }
-                Ok(CallGraphStoreBuildEvent::Reopen {
-                    fulfilled_force_token: token,
-                    publication_epoch,
-                }) => {
-                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
-                        reopen_epoch = Some(publication_epoch);
-                        fulfilled_force_token = token;
-                    } else {
-                        settled = true;
-                    }
-                }
-                Ok(CallGraphStoreBuildEvent::Denied { reason }) => denied = Some(reason),
-                Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
-                    suspended = Some(suspension)
-                }
-                Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (
-            latest,
-            denied,
-            suspended,
-            settled,
-            disconnected,
-            fulfilled_force_token,
-            ctx.callgraph_store_rx_generation(),
-            ctx.callgraph_store_rx_epoch(),
-            reopen_epoch,
-        )
-    };
-
-    let ready_received = reopen_epoch.is_some();
-    let terminal =
-        ready_received || denied.is_some() || suspended.is_some() || settled || disconnected;
-    if !terminal {
-        return;
-    }
-    if let Some(project_root) = ctx.callgraph_project_root() {
-        crate::logging::release_index_build_start_waiters(
-            crate::logging::IndexPlane::Callgraph,
-            &project_root,
-        );
-    }
-    wait_on_artifact_drain_commit_gate_for_test(ctx);
-
-    let mut reopened = None;
-    let mut busy_reopen = false;
-    if ready_received {
-        // Release the cold-build writer lease before opening the published
-        // generation through its read-only pointer.
-        drop(latest);
-        if let Some(project_root) = ctx.callgraph_project_root() {
-            // Today's call-graph store is retired: no build publishes one.
-            let _ = project_root;
-            match Ok::<
-                Option<crate::callgraph_store::ReadonlyCallGraphStore>,
-                crate::callgraph_store::CallGraphStoreError,
-            >(None)
-            {
-                Ok(Some(store)) => reopened = Some(Arc::new(store)),
-                Ok(None) => {
-                    crate::slog_warn!(
-                        "callgraph store build completed without a readable published generation"
-                    );
-                }
-                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
-                Err(error) => {
-                    crate::slog_warn!("failed to install read-only callgraph store: {}", error);
-                }
-            }
-        }
-    }
-
-    let mut pending = Vec::new();
-    let mut replay_parked = BTreeSet::new();
-    let installed =
-        ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
-            let installed = if let Some(store) = reopened {
-                ctx.clear_callgraph_store_build_denied();
-                let mut resident = ctx
-                    .callgraph_store()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // A query may already have installed this generation while the
-                // build was still settling. Keep that handle rather than swap in
-                // a second one for the same generation, so callers holding the
-                // resident store see it stay current.
-                let same_generation = resident
-                    .as_ref()
-                    .is_some_and(|current| current.sqlite_path() == store.sqlite_path());
-                if !same_generation {
-                    *resident = Some(store);
-                }
-                drop(resident);
-                // This take and the refresh worker's post-defer re-check form a
-                // check-then-act handoff: one site sees parked paths with a
-                // ready current store, so neither site needs to poll alone.
-                // The paths stay parked until the worker has them (see below).
-                let (paths, parked) = ctx.pending_callgraph_store_paths_for_replay();
-                pending = paths
-                    .into_iter()
-                    .filter(|path| {
-                        invalidates_workspace_crate_prefix_cache(path)
-                            || !watcher_path_is_generated_for_callgraph(ctx, path)
-                    })
-                    .collect();
-                replay_parked = parked;
-                true
-            } else {
-                false
-            };
-            if let Some(reason) = denied {
-                ctx.record_callgraph_store_build_denied(receiver_generation, reason);
-            }
-            if let Some(suspension) = suspended {
-                ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
-            }
-            if terminal {
-                *receiver = None;
-            }
-            if busy_reopen {
-                ctx.defer_callgraph_store_reopen(
-                    receiver,
-                    fulfilled_force_token,
-                    reopen_epoch.expect("completed publication"),
-                );
-            }
-            if installed {
-                if let Some(force_token) = fulfilled_force_token {
-                    ctx.fulfill_callgraph_store_force_token(force_token);
-                }
-            }
-            installed
-        });
-    let Some(installed) = installed else {
-        return;
-    };
-
-    if installed {
-        // The worker moves the paths from the sink into its queue under its
-        // queue lock, so they are never in neither place while an answer
-        // reads both.
-        if !pending.is_empty() {
-            ctx.enqueue_callgraph_store_refresh(pending.clone());
-        }
-        ctx.settle_replayed_callgraph_store_paths(&replay_parked, &pending);
-        let _ = ctx.request_tier2_refresh_pull();
-    }
-    if terminal {
-        ctx.signal_status_changed();
-    }
 }
 
 pub const MAX_RETRY_ATTEMPTS: usize = 6;
@@ -1210,7 +950,7 @@ pub fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
     )
 }
 
-pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
+pub fn refresh_project_corpus(ctx: &AppContext) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
         let Some(_root) = ctx.canonical_cache_root_opt() else {
@@ -1218,48 +958,6 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
         };
         let config = ctx.config();
         let mut status_changed = false;
-
-        // Lost watcher events leave the callgraph store the right store with
-        // some edits missing; the rescan path reconciles it against the disk.
-        // Only an ignore-rule change alters which files belong in the store,
-        // which the reconcile does not model, so only that forces a rebuild.
-        if ignore_rules_changed && ctx.callgraph_writer() {
-            // Do NOT cold-build the callgraph store synchronously here. This function
-            // runs on the single-threaded dispatch loop from `drain_watcher_events`,
-            // which fires before EVERY request (and on idle ticks). A full O(repo)
-            // `cold_build` (parse all files + resolve refs +
-            // rewrite SQLite) blocks ALL queued requests — including `configure` and
-            // `bash` — for its entire duration, which exceeds the 30s transport
-            // timeout on a large repo.
-            //
-            // Instead, drop the resident store and force a BACKGROUND rebuild: the
-            // next `callgraph_store_for_ops()` spawns the cold build off-thread and
-            // returns `Building` (callgraph ops + dead_code projection already handle
-            // `Building`/unavailable gracefully). This mirrors the search/semantic
-            // refreshes below, which are already async. A build already in flight
-            // keeps running; the resident drop + force flag make the next op converge
-            // to a fresh full rebuild.
-            // Mirror the original "act only when the callgraph is actually loaded or
-            // building" guard, but reschedule instead of inline-building.
-            let callgraph_store_resident = {
-                let guard = ctx
-                    .callgraph_store()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.is_some()
-            };
-            if callgraph_store_resident || ctx.callgraph_store_rx().lock().is_some() {
-                *ctx.callgraph_store()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                ctx.mark_callgraph_store_force_rebuild(reason);
-                status_changed = true;
-                aft::slog_info!(
-                    "callgraph store scheduled for background rebuild after {}",
-                    reason
-                );
-            }
-        }
 
         if config.indexes.semantic && !ctx.shared_artifacts_read_only() {
             if let Some(sender) = ctx.semantic_refresh_sender() {
@@ -1298,12 +996,7 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
 
 pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     note_ignore_rule_refresh_for_test();
-    refresh_project_corpus(ctx, "ignore-rule change", true)
-}
-
-fn refresh_corpus_after_named_ignore_change(ctx: &AppContext, reason: &str) -> bool {
-    note_ignore_rule_refresh_for_test();
-    refresh_project_corpus(ctx, reason, true)
+    refresh_project_corpus(ctx)
 }
 
 fn arm_ignore_rule_refresh(state: &mut WatcherDrainSliceState, paths: Vec<PathBuf>) {
@@ -1318,30 +1011,6 @@ fn arm_ignore_rule_refresh(state: &mut WatcherDrainSliceState, paths: Vec<PathBu
             state.ignore_changed_paths.push(path);
         }
     }
-}
-
-fn ignore_rule_change_reason(
-    root: Option<&Path>,
-    paths: &[PathBuf],
-    observed_path_count: usize,
-) -> String {
-    let mut rendered = paths
-        .iter()
-        .map(|path| {
-            root.and_then(|root| path.strip_prefix(root).ok())
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect::<Vec<_>>();
-    rendered.sort_unstable();
-    rendered.dedup();
-    rendered.truncate(IGNORE_RULE_CHANGED_PATHS_LOGGED);
-    let hidden = observed_path_count.saturating_sub(rendered.len());
-    let tail = (hidden > 0)
-        .then(|| format!(" (+{hidden})"))
-        .unwrap_or_default();
-    format!("ignore-rule change: paths=[{}]{tail}", rendered.join(", "))
 }
 
 fn watcher_rescan_rss_bytes() -> Option<u64> {
@@ -1376,7 +1045,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         return false;
     };
 
-    status_changed |= refresh_project_corpus(ctx, "watcher overflow", false);
+    status_changed |= refresh_project_corpus(ctx);
 
     // The shared corpus refresh only reconciles what is resident or has a live
     // worker. After lost events that is not enough: nothing may be resident
@@ -1385,14 +1054,6 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     // each lane regardless of residency.
     let hardened = ctx.run_if_subc_bound_generation(generation, || {
         let config = ctx.config();
-        if ctx.callgraph_writer() && config.indexes.callgraph {
-            // Compare the store with the disk and refresh only what differs,
-            // off this dispatch thread (started below, outside this admission
-            // scope). The resident store keeps serving in the meantime; the
-            // reconcile falls back to a forced rebuild only when it cannot
-            // finish within its bound.
-            ctx.request_callgraph_reconcile("watcher overflow");
-        }
         if ctx.shared_artifacts_read_only() {
             // Read-only roots reconcile by re-opening the shared artifacts:
             // drop the resident snapshots so the evicted-reload path fires on
@@ -1417,70 +1078,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         }
     });
     status_changed |= hardened.is_some();
-    if hardened.is_some() {
-        ctx.start_pending_callgraph_reconcile();
-    }
     status_changed
-}
-
-fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> bool {
-    ctx.callgraph_project_root()
-        .is_some_and(|project_root| crate::inspect::is_generated_file(&project_root, path))
-}
-
-fn published_view_owns_callgraph_writes(_ctx: &AppContext) -> bool {
-    // A views-routed root reads its call graph from its v3 view only, so no
-    // legacy store refresh runs for it.
-    false
-}
-
-fn enqueue_legacy_callgraph_refresh_for_watcher(
-    ctx: &AppContext,
-    paths: impl IntoIterator<Item = PathBuf>,
-    generation: u64,
-) -> bool {
-    if published_view_owns_callgraph_writes(ctx) {
-        let root = ctx
-            .canonical_cache_root_opt()
-            .or_else(|| ctx.config().project_root.clone())
-            .unwrap_or_default();
-        log::debug!(
-            "legacy callgraph refresh skipped root={} reason=views_owner",
-            root.display()
-        );
-        return true;
-    }
-    note_legacy_watcher_refresh_for_test();
-    ctx.enqueue_callgraph_store_refresh_for_generation(paths, generation)
-}
-
-pub fn refresh_callgraph_store_for_watcher(
-    ctx: &AppContext,
-    changed: &HashSet<std::path::PathBuf>,
-) {
-    if !ctx.heavy_root_work_allowed() {
-        return;
-    }
-    let refresh_paths = changed
-        .iter()
-        .filter(|path| {
-            invalidates_workspace_crate_prefix_cache(path)
-                || (watcher_path_is_callgraph_indexed(path)
-                    && !watcher_path_is_generated_for_callgraph(ctx, path))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if refresh_paths.is_empty() {
-        return;
-    }
-    // This is intentionally the only watcher call-site action. Opening and
-    // mutating SQLite belongs to the process-wide store worker, outside every
-    // executor lane and its epoch gate.
-    let _ = enqueue_legacy_callgraph_refresh_for_watcher(
-        ctx,
-        refresh_paths,
-        ctx.configure_generation(),
-    );
 }
 
 /// Drain pre-filtered watcher events and apply cache invalidations on the
@@ -1499,7 +1097,6 @@ fn watcher_drain_phase_name(stage: WatcherDrainApplyPhase) -> &'static str {
         WatcherDrainApplyPhase::PendingTier2 => "pending_tier2",
         WatcherDrainApplyPhase::PendingIndexes => "pending_indexes",
         WatcherDrainApplyPhase::SymbolCache => "symbol_cache",
-        WatcherDrainApplyPhase::Callgraph => "callgraph",
         WatcherDrainApplyPhase::SearchIndex => "search_index",
         WatcherDrainApplyPhase::SemanticIndex => "semantic_index",
         WatcherDrainApplyPhase::LspDiagnostics => "lsp_diagnostics",
@@ -1554,77 +1151,11 @@ fn try_apply_watcher_path_phase(
     true
 }
 
-fn apply_callgraph_watcher_phase(
-    ctx: &AppContext,
-    paths: &mut VecDeque<PathBuf>,
-    remaining: &mut usize,
-    started: Instant,
-    budget: Duration,
-    enabled: bool,
-    mut refresh: impl FnMut(&AppContext, &HashSet<PathBuf>),
-) -> bool {
-    let mut changed = HashSet::new();
-    if enabled {
-        // Include manifest invalidation before the budgeted path loop. If this
-        // phase yields before reaching Cargo.toml, an earlier source sub-batch
-        // must still discard the root's old workspace map before resolving refs.
-        changed.extend(
-            paths
-                .iter()
-                .filter(|path| invalidates_workspace_crate_prefix_cache(path))
-                .cloned(),
-        );
-    }
-    let mut generated_skipped = 0usize;
-    let completed = apply_watcher_path_phase(
-        WatcherDrainApplyPhase::Callgraph,
-        paths,
-        remaining,
-        started,
-        budget,
-        |path| {
-            if !enabled {
-                return;
-            }
-            if invalidates_workspace_crate_prefix_cache(path) {
-                changed.insert(path.to_path_buf());
-            } else if watcher_path_is_callgraph_indexed(path) {
-                if watcher_path_is_generated_for_callgraph(ctx, path) {
-                    generated_skipped += 1;
-                } else {
-                    changed.insert(path.to_path_buf());
-                }
-            }
-        },
-    );
-    if generated_skipped > 0 {
-        log::debug!(
-            "callgraph refresh skipped {} generated file(s)",
-            generated_skipped
-        );
-    }
-    if !changed.is_empty() {
-        let first = changed
-            .iter()
-            .min()
-            .expect("non-empty callgraph watcher batch has a first path");
-        let _watchdog = WatcherDrainUnitGuard::start_batch(
-            WatcherDrainApplyPhase::Callgraph,
-            first,
-            changed.len(),
-        );
-        delay_watcher_unit_for_test();
-        refresh(ctx, &changed);
-    }
-    completed
-}
-
 fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyPhase {
     match stage {
         WatcherDrainApplyPhase::PendingTier2 => WatcherDrainApplyPhase::PendingIndexes,
         WatcherDrainApplyPhase::PendingIndexes => WatcherDrainApplyPhase::SymbolCache,
-        WatcherDrainApplyPhase::SymbolCache => WatcherDrainApplyPhase::Callgraph,
-        WatcherDrainApplyPhase::Callgraph => WatcherDrainApplyPhase::SearchIndex,
+        WatcherDrainApplyPhase::SymbolCache => WatcherDrainApplyPhase::SearchIndex,
         WatcherDrainApplyPhase::SearchIndex => WatcherDrainApplyPhase::SemanticIndex,
         WatcherDrainApplyPhase::SemanticIndex => WatcherDrainApplyPhase::LspDiagnostics,
         WatcherDrainApplyPhase::LspDiagnostics => WatcherDrainApplyPhase::Complete,
@@ -1874,21 +1405,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             }
                         });
                     }
-                },
-            ),
-            WatcherDrainApplyPhase::Callgraph => apply_callgraph_watcher_phase(
-                ctx,
-                &mut paths,
-                &mut remaining,
-                started,
-                WATCHER_DRAIN_SLICE_BUDGET,
-                heavy_root_work_allowed,
-                |ctx, changed| {
-                    let _ = enqueue_legacy_callgraph_refresh_for_watcher(
-                        ctx,
-                        changed.iter().cloned(),
-                        lifecycle_generation,
-                    );
                 },
             ),
             WatcherDrainApplyPhase::SearchIndex => apply_watcher_path_phase(
@@ -2525,13 +2041,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
         let ignore_changed = state.ignore_changed;
         if ignore_changed {
-            let root = ctx.canonical_cache_root_opt();
-            let reason = ignore_rule_change_reason(
-                root.as_deref(),
-                &state.ignore_changed_paths,
-                state.ignore_changed_path_count,
-            );
-            state.status_changed |= refresh_corpus_after_named_ignore_change(ctx, &reason);
+            state.status_changed |= refresh_project_corpus(ctx);
             // Same partial-sequence rule as the rescan path: acknowledge only
             // when the refresh ran fully under this lifecycle generation.
             if ctx

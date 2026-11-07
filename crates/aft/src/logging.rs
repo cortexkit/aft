@@ -84,9 +84,6 @@ pub(crate) enum IndexEventKind {
     #[allow(dead_code)]
     BuildCancelled,
     BuildFailed,
-    BuildSuspended,
-    BreakerAdmitted,
-    BreakerReset,
     FirstQuery,
 }
 
@@ -99,9 +96,6 @@ impl IndexEventKind {
             Self::BuildSuperseded => "build_superseded",
             Self::BuildCancelled => "build_cancelled",
             Self::BuildFailed => "build_failed",
-            Self::BuildSuspended => "build_suspended",
-            Self::BreakerAdmitted => "breaker_admitted",
-            Self::BreakerReset => "breaker_reset",
             Self::FirstQuery => "first_query",
         }
     }
@@ -109,11 +103,7 @@ impl IndexEventKind {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::BuildReady
-                | Self::BuildSuperseded
-                | Self::BuildCancelled
-                | Self::BuildFailed
-                | Self::BuildSuspended
+            Self::BuildReady | Self::BuildSuperseded | Self::BuildCancelled | Self::BuildFailed
         )
     }
 }

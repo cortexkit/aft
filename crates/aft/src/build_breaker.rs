@@ -361,26 +361,6 @@ impl BuildDeathBreaker {
         })
     }
 
-    /// Retire an attempt that returned normally without publishing. Cancellation
-    /// preserves all prior death history and prevents a late attribution from
-    /// treating an ordinary corpus edit as a process death.
-    pub(crate) fn cancel_attempt(&self, key: &BreakerKey, attempt_id: &str) -> Result<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "DELETE FROM breaker_attempts
-                 WHERE root_id = ?1 AND domain = ?2 AND corpus_fingerprint = ?3
-                   AND attempt_id = ?4 AND death_charged = 0",
-                params![
-                    key.root_id,
-                    key.domain.as_str(),
-                    key.corpus_fingerprint,
-                    attempt_id
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
     /// A ready pointer flip is the only automatic full reset. Staged commits do
     /// not call this method and therefore cannot launder a death loop.
     pub fn record_ready_publication(&self, key: &BreakerKey) -> Result<()> {

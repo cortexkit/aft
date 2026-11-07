@@ -2447,28 +2447,6 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
 }
 
-/// Do not turn missing coverage into a claim that a source symbol is absent.
-/// Check the generation's file inventory before any graph or parser lookup.
-pub fn ensure_target_indexed(
-    req_id: &str,
-    operation: &str,
-    ctx: &AppContext,
-    store: &crate::callgraph_store::ReadonlyCallGraphStore,
-    file: &Path,
-) -> Result<(), Response> {
-    match store.is_file_indexed(file) {
-        Ok(true) => return Ok(()),
-        Err(error) => return Err(store_error_response(req_id, operation, error)),
-        Ok(false) => {}
-    }
-    Err(not_indexed_response(
-        req_id,
-        operation,
-        ctx,
-        &absolute_file(store, file),
-    ))
-}
-
 /// The refusal for a target file the call graph does not cover, naming
 /// whether the project's ignore rules exclude it.
 pub fn not_indexed_response(
@@ -2604,9 +2582,9 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Suspended(suspension) => {
             suspended_response(req_id, operation, suspension)
         }
-        CallgraphStoreAccess::Unavailable
-        | CallgraphStoreAccess::Ready(_)
-        | CallgraphStoreAccess::Error(_) => unavailable_for(req_id, operation, ctx),
+        CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
+            unavailable_for(req_id, operation, ctx)
+        }
     }
 }
 

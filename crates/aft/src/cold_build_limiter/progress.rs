@@ -357,19 +357,21 @@ pub(crate) struct Scope {
 #[derive(Clone, Copy)]
 pub(crate) enum StartLog {
     Info,
+    #[cfg(test)]
     Quiet,
 }
 
 fn start_message(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Option<String> {
-    if matches!(log, StartLog::Quiet) {
-        return None;
+    match log {
+        #[cfg(test)]
+        StartLog::Quiet => None,
+        StartLog::Info => Some(format!(
+            "indexing start root={} kind={} total={:?}",
+            root.display(),
+            kind,
+            total
+        )),
     }
-    Some(format!(
-        "indexing start root={} kind={} total={:?}",
-        root.display(),
-        kind,
-        total
-    ))
 }
 
 pub(crate) fn start(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Scope {
@@ -425,14 +427,6 @@ pub(crate) fn remaining(files: usize) {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
             entry.total = Some(entry.done.saturating_add(files as u64));
-        }
-    });
-}
-
-pub(crate) fn completed(files: usize) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            lock(entry).advance(files as u64, Instant::now());
         }
     });
 }

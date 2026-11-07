@@ -32,7 +32,6 @@ pub use job::{
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
 pub(crate) use manager::scope_files as tier2_scope_files;
-pub(crate) use manager::CheckoutViewUnavailable;
 #[cfg(test)]
 pub(crate) use manager::{filter_payload_for_scope_for_test, InspectBuilderState};
 pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
