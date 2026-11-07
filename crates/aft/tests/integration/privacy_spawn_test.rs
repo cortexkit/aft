@@ -174,6 +174,10 @@ fn timeout_group_snapshot(group: i32) -> String {
 /// One process the kernel still files under a process group.
 #[derive(Debug)]
 struct GroupMember {
+    /// Read only through `Debug`: the timeout reason lists each member with
+    /// its pid, which the never-reaped test checks for.
+    #[allow(dead_code)]
+    pid: i32,
     /// `proc_pidinfo(PROC_PIDTBSDINFO)` result: the `pbi_status` run state, or
     /// the errno when the kernel would not describe the process.
     state: Result<u32, i32>,
@@ -226,7 +230,7 @@ fn group_members(group: i32) -> Vec<GroupMember> {
             } else {
                 Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
             };
-            GroupMember { state }
+            GroupMember { pid, state }
         })
         .collect()
 }
