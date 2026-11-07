@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/data_layer/tools/search.rs",
+    "crates/aft/src/data_layer/tools/search/meaning.rs"
+  ],
+  "slices": [
+    "index-store-cutover"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/, crates/aft/src/search_b2/, crates/aft/src/search_index.rs (deleted), crates/aft/src/semantic_index.rs and crates/aft/src/lib.rs. The index store becomes the only source for aft_search's text and meaning lanes, and the old trigram index, semantic snapshot and views are deleted. Both lanes already read through data_layer::tools::search (TextIndex, MeaningIndex), and earlier slices replayed the concept, exact and real-query families through the index store with identical replies. Routing, candidates, scores and truncation are unchanged, so ranked rows must stay byte-identical to the committed reference."
+}
