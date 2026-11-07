@@ -16,9 +16,9 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
-    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, GrepScanOrder, IndexStatus,
-    PathFilters, RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, GrepMatch, GrepPathExclusion,
+    GrepQueryPhaseTimings, GrepResult, GrepScanOrder, IndexStatus, PathFilters, RegexQuery,
+    WalkBound,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -873,7 +873,7 @@ fn execute_root_profiled(
         IndexStatus::Fallback
     };
     let mut counts = ScopeFileCounts::default();
-    let mut result = fallback_grep_counted(
+    let result = fallback_grep_counted(
         project_root,
         &root.search_root,
         &root.filter_root,

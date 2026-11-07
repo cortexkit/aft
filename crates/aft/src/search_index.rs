@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
-use crate::native_stat::{now_ns, NativeStat};
+use crate::native_stat::NativeStat;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};

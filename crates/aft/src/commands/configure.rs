@@ -1,36 +1,26 @@
+#[cfg(test)]
 use std::fs;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 #[cfg(test)]
-use std::sync::{Condvar, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::unbounded;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
-use crate::context::{
-    AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticBuildProgress,
-    SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
-    SemanticRefreshWorkerSlot, SubcLifecycleAdmission,
-};
+use crate::context::{AppContext, ConfigureMaintenanceJob, SemanticIndexStatus};
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
     resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
     ServerKind,
 };
-use crate::parser::{detect_language, LangId, SharedSymbolCache};
+use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{
-    build_path_filters, current_git_head, resolve_cache_dir_with_key, CacheLock, SearchIndex,
-};
-use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
@@ -3400,7 +3390,6 @@ fn handle_configure_inner(
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
     }
-    let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     drop(cache_key_profile);
     let project_key = project_key.unwrap_or_default();
     ctx.begin_configure_ack_phase("storage_capability_probe");
@@ -3652,8 +3641,6 @@ fn handle_configure_inner(
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
     // The data layer's text plane serves search; today's index is not built.
-    let search_index = false;
-    let semantic_search = ctx.config().indexes.semantic;
 
     // Reconfigure is still the signal that this root's workspace package
     // metadata may have changed, even when the warm-maintenance key is

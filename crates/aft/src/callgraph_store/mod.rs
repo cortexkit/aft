@@ -1119,9 +1119,8 @@ mod rust_bindings;
 mod rust_manifest;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
-    project_dead_code_snapshot_from_view, project_dead_code_snapshot_incremental_with_costs,
-    project_dead_code_snapshot_with_revision, ProjectionCostEstimates, ProjectionKind,
-    ProjectionVerdict, MAX_DELTA_BYTES,
+    project_dead_code_snapshot_from_view, project_dead_code_snapshot_with_revision,
+    ProjectionCostEstimates, ProjectionKind, ProjectionVerdict, MAX_DELTA_BYTES,
 };
 #[cfg(test)]
 pub(crate) use dead_code_projection::{

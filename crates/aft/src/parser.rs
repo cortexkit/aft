@@ -11,7 +11,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::Parser;
 use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
-use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::cache_freshness::{self};
 use crate::callgraph::resolve_module_path;
 use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::error::AftError;

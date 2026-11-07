@@ -28,10 +28,11 @@ use super::oxc_engine::{
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 #[cfg(test)]
-use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
-    project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError,
-    ProjectionCostEstimates, ProjectionKind, ProjectionVerdict, ReadonlyCallGraphStore,
+    project_dead_code_snapshot, project_dead_code_snapshot_with_revision, CallGraphStore,
+};
+use crate::callgraph_store::{
+    CallGraphStoreError, ProjectionCostEstimates, ProjectionKind, ProjectionVerdict,
     MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
@@ -3958,7 +3959,6 @@ impl InspectManager {
         cache: &InspectCache,
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, Tier2RunError> {
-        let view_epoch = self.view_publication_epoch(&job.project_root);
         let mut phases = Tier2PhaseTimings::default();
         self.record_build_progress(
             &job.key,
@@ -4122,7 +4122,7 @@ impl InspectManager {
                         phases.projection = Some(verdict);
                         phases.projection_cost += projection_cost;
                     }
-                    None => phases.projection_skip_reason = Some({ "no_callgraph" }),
+                    None => phases.projection_skip_reason = Some("no_callgraph"),
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -4254,7 +4254,7 @@ impl InspectManager {
                             phases.projection = Some(verdict);
                             phases.projection_cost += projection_cost;
                         }
-                        None => phases.projection_skip_reason = Some({ "no_callgraph" }),
+                        None => phases.projection_skip_reason = Some("no_callgraph"),
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -4337,7 +4337,7 @@ impl InspectManager {
                     phases.projection = Some(verdict);
                     phases.projection_cost += projection_cost;
                 }
-                None => phases.projection_skip_reason = Some({ "no_callgraph" }),
+                None => phases.projection_skip_reason = Some("no_callgraph"),
             }
             phases.snapshot += snapshot_started.elapsed();
         }

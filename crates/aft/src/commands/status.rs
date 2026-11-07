@@ -303,7 +303,7 @@ impl AppContext {
         } else {
             search_index_info
         };
-        let mut semantic_index_info = if self.root_too_broad() {
+        let semantic_index_info = if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)

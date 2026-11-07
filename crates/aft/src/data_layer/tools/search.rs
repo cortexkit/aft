@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod meaning;
 
-pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex, DATA_LAYER_BUILD_STAGE};
+pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex};
 
 use aft_store::text::{plan_pattern, PathText, Query, Scope};
 

@@ -29,7 +29,7 @@ mod worker;
 pub use query::route;
 pub(crate) use query::{attach_gaps, glob_fan_out, grep_fan_out};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};

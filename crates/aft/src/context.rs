@@ -214,7 +214,6 @@ use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
-use crate::views::Manifest;
 use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
@@ -2944,7 +2943,6 @@ fn emit_pending_status(state: &StatusEmitterState) {
     )));
 }
 use crate::cache_freshness::FileFreshness;
-use crate::search_index::SearchIndex;
 use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
 
 // `SemanticIndexStatus::Ready` exposes a unique `refreshing` path list. Keep
@@ -5035,7 +5033,6 @@ impl AppContext {
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
         let compression_aggregates = bash_background.compression_aggregate_cache();
-        let view_disk_limits_next_ms = AtomicU64::new({ VIEW_DISK_LIMITS_OFF });
         let checkpoint_store = CheckpointStore::new();
         let checkpoint_namespace_request = checkpoint_store.namespace_request();
         let cache_leases = config.cache_lease.clone().into_iter().collect();
@@ -5461,7 +5458,7 @@ impl AppContext {
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
-        let (mut view_load_failures, mut view_load_failure_last, mut view_storage_reserve): (
+        let (view_load_failures, view_load_failure_last, view_storage_reserve): (
             BTreeMap<String, u64>,
             _,
             _,
@@ -7958,7 +7955,6 @@ impl AppContext {
 
     pub fn note_request(&self) {
         *self.last_request_at.lock() = Instant::now();
-        let config = self.config();
     }
 
     pub fn last_request_at(&self) -> Instant {
@@ -9526,7 +9522,6 @@ impl AppContext {
     /// probe failed: it is only presumed to be a worktree and has no known
     /// main checkout whose graph could answer for it.
     pub(crate) fn callgraph_build_on_demand(&self) -> bool {
-        let config = self.config();
         false
     }
 

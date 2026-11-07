@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::callgraph_store::{CallGraphStore, DiskReconcileReport};
+use crate::callgraph_store::DiskReconcileReport;
 
 /// Walked files a single reconcile compares before giving up. A reconcile
 /// hashes every size-matching file it visits, so the bound keeps a pathological

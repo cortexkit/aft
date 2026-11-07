@@ -1,9 +1,10 @@
 use crate as aft;
-use crate::callgraph_store::{invalidates_workspace_crate_prefix_cache, CallGraphStore};
+use crate::callgraph_store::invalidates_workspace_crate_prefix_cache;
+#[cfg(test)]
+use crate::callgraph_store::CallGraphStore;
 use crate::context::{
-    AppContext, CallGraphStoreBuildEvent, SemanticIndexEvent, SemanticIndexStatus,
-    SemanticRefreshEvent, SemanticRefreshRequest, WatcherDrainApplyPhase, WatcherDrainPhase,
-    WatcherDrainSliceState,
+    AppContext, CallGraphStoreBuildEvent, SemanticIndexStatus, SemanticRefreshRequest,
+    WatcherDrainApplyPhase, WatcherDrainPhase, WatcherDrainSliceState,
 };
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
@@ -1257,7 +1258,7 @@ fn install_search_rebuild_publish_gate(
 pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
-        let Some(root) = ctx.canonical_cache_root_opt() else {
+        let Some(_root) = ctx.canonical_cache_root_opt() else {
             return false;
         };
         let config = ctx.config();
@@ -1472,7 +1473,7 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
         .is_some_and(|project_root| crate::inspect::is_generated_file(&project_root, path))
 }
 
-fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
+fn published_view_owns_callgraph_writes(_ctx: &AppContext) -> bool {
     // A views-routed root reads its call graph from its v3 view only, so no
     // legacy store refresh runs for it.
     false
@@ -2326,14 +2327,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.semantic_refresh_paths.clear();
                     state.scheduler_changed_path_count = 0;
                 }
-                Ok(WatcherDispatchEvent::CookieObserved(path)) => {
+                Ok(WatcherDispatchEvent::CookieObserved(_)) => {
                     dispatch_events_received += 1;
-                    // Earlier batches may still await sliced Tier-2 work. Record
-                    // their intents now so the cookie cannot overtake them.
-                    for pending in &state.pending_paths {}
-                    if let WatcherDrainPhase::Apply { paths, .. } = &state.phase {
-                        for pending in paths {}
-                    }
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     dispatch_events_received += 1;

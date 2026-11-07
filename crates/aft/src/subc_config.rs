@@ -485,7 +485,12 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
             assert_eq!(tiers[0].doc, text);
             // A project file's long-retired names load with a notice.
             let resolved = crate::config_resolve::resolve_config(&tiers);
-            assert!(resolved.errors.is_empty(), "{}: {:?}", fixture["name"], resolved.errors);
+            assert!(
+                resolved.errors.is_empty(),
+                "{}: {:?}",
+                fixture["name"],
+                resolved.errors
+            );
         }
         for file in files {
             assert_eq!(

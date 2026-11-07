@@ -6836,7 +6836,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         progress: &mut P,
         verify_strategy: cache_freshness::VerifyStrategy,
-        reuse_blob: &mut R,
+        _reuse_blob: &mut R,
         mut recovery_paths: Option<&mut Vec<PathBuf>>,
     ) -> Result<RefreshSummary, String>
     where
@@ -7001,7 +7001,7 @@ impl SemanticIndex {
             });
         }
 
-        let mut reuse_map = self.build_chunk_reuse_map(&changed);
+        let reuse_map = self.build_chunk_reuse_map(&changed);
         let embed_text_caps = self
             .fingerprint
             .as_ref()
@@ -7201,7 +7201,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         max_files: usize,
         progress: &mut P,
-        reuse_blob: &mut R,
+        _reuse_blob: &mut R,
     ) -> Result<InvalidatedFilesRefresh, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -7239,7 +7239,7 @@ impl SemanticIndex {
         // The watcher path has already invalidated these files in the request
         // thread's live index. Move reusable payloads out while mirroring that
         // removal, so parse/read failures do not resurrect stale entries.
-        let mut reuse_map = self.take_chunk_reuse_map(&requested_paths);
+        let reuse_map = self.take_chunk_reuse_map(&requested_paths);
 
         let existing_paths = requested_paths
             .iter()

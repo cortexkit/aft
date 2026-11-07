@@ -102,7 +102,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -133,7 +133,7 @@ use crate::search_index::{
 use crate::semantic_index::{
     query_embedding_is_busy, query_embedding_timeout_budget, strip_query_embedding_busy_marker,
     strip_query_embedding_timeout_marker, EmbeddingModel, QueryBudget, SemanticIndex,
-    SemanticIndexFingerprint, SemanticResult,
+    SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 
@@ -803,7 +803,6 @@ fn handle_semantic_search_with_disk_fallback(
         text: raw_query.original_query(),
     });
     let runtime_source = RuntimeReadinessSource { ctx };
-    let storage_dir = ctx.config().cache_storage_dir();
     let readiness_source: &dyn extensions::ReadinessSource = &runtime_source;
     let root = Root::new(
         external_root.as_deref().unwrap_or(&project_root),
@@ -2512,7 +2511,6 @@ fn handle_external_bounded_lexical_fallback(
     }
 
     let result_source = if literal { "literal" } else { "regex" };
-    let interpreted_as = if literal { "literal" } else { "regex" };
     let result_values = result
         .matches
         .iter()
@@ -2520,35 +2518,9 @@ fn handle_external_bounded_lexical_fallback(
         .collect::<Vec<_>>();
     let more_available =
         result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
-    {
-        // No index exists, so nothing could rank this query; say so plainly,
-        // with how much of the project the scan for its literal text covered.
-        let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
-        let envelope = fallback_search_envelope(
-            result_values.len(),
-            more_available,
-            result.engine_capped,
-            result.walk_truncated || result.skipped_foreign_mounts > 0,
-        );
-        return external_fallback_response(
-            req,
-            params,
-            shape,
-            external_root,
-            ExternalFallbackBody {
-                results: result_values,
-                text,
-                walk_truncated: result.walk_truncated,
-                more_available,
-                engine_capped: result.engine_capped,
-                // The reply text states the scan's coverage in plain words.
-                fully_degraded: false,
-                envelope,
-                exact_sweep: None,
-            },
-        );
-    }
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+    // No index exists, so nothing could rank this query; say so plainly,
+    // with how much of the project the scan for its literal text covered.
+    let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
     let envelope = fallback_search_envelope(
         result_values.len(),
         more_available,
@@ -2566,7 +2538,8 @@ fn handle_external_bounded_lexical_fallback(
             walk_truncated: result.walk_truncated,
             more_available,
             engine_capped: result.engine_capped,
-            fully_degraded: true,
+            // The reply text states the scan's coverage in plain words.
+            fully_degraded: false,
             envelope,
             exact_sweep: None,
         },
@@ -7605,7 +7578,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
 
 /// The gap for a ready index that is not loaded in memory. Starts a reload
 /// when the index was evicted, and says so.
-fn semantic_not_loaded_gap(ctx: &AppContext) -> SemanticLaneGap {
+fn semantic_not_loaded_gap(_ctx: &AppContext) -> SemanticLaneGap {
     let reloading = false;
     SemanticLaneGap {
         semantic_status: "unavailable",

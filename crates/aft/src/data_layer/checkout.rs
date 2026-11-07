@@ -3234,11 +3234,7 @@ impl ViewGraphFiles<'_> {
                 return Some(GraphIdentity {
                     record: file.resolution.record_key().to_string(),
                     fragment: None,
-                    digest: Some(
-                        blake3::hash(file.resolution.bytes())
-                            .to_hex()
-                            .to_string(),
-                    ),
+                    digest: Some(blake3::hash(file.resolution.bytes()).to_hex().to_string()),
                 });
             }
         }

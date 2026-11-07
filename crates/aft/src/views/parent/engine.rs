@@ -20,7 +20,7 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 use super::query::{attach_gaps, Gaps};
-use super::{display_relative, lock, read, Child, ParentSession, Plane};
+use super::{display_relative, lock, read, Child, ParentSession};
 
 /// One child's search engine context and what is installed in it.
 pub(crate) struct ChildEngine {

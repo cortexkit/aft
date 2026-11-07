@@ -24,16 +24,14 @@
 //! still empty names the files the graph does not reflect and suggests grep
 //! rather than reading as "nothing calls this".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::cache_freshness;
 use crate::context::AppContext;
 use crate::inspect::job::is_test_file;
 use crate::language::LanguageProvider;

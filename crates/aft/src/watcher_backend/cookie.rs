@@ -1,8 +1,7 @@
 //! In-band views delivery acknowledgments, distinct from command-report flushes.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicU64, atomic::Ordering, mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// Whether the watcher can vouch for disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

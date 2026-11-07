@@ -16,7 +16,7 @@ use crate::pattern_compile::CompiledPattern;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
-use super::{display_relative, read, Child, ParentSession, Plane};
+use super::{display_relative, Child, ParentSession, Plane};
 
 /// Commands a parent session answers itself from its children.
 const ROUTED_COMMANDS: &[&str] = &[

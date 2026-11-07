@@ -727,10 +727,7 @@ pub fn resolve_config_for_harness(
                 .ok()
                 .and_then(|value| {
                     value.as_object().map(|map| {
-                        feature_config::removed_config_key_errors_for_file(
-                            map,
-                            tier.tier == "user",
-                        )
+                        feature_config::removed_config_key_errors_for_file(map, tier.tier == "user")
                     })
                 })
                 .unwrap_or_default()
