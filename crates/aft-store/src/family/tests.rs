@@ -90,6 +90,49 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Every checkout of a repository reads the same segment files, so a
+/// process opens each once: two snapshots naming the same segment share
+/// its open file while either holds it, and the file closes when the last
+/// holder drops it.
+#[test]
+fn a_segment_file_is_opened_once_for_every_snapshot_that_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"shared bytes", b"state");
+    let shared = cache();
+    let first = family.snapshot().unwrap();
+    let second = family.snapshot().unwrap();
+    let id = first.manifest().segments()[0].id;
+    let a = first.open_shared_segment(id, &known(), &shared).unwrap();
+    let b = second.open_shared_segment(id, &known(), &shared).unwrap();
+    assert!(Arc::ptr_eq(&a, &b), "both snapshots read one open file");
+
+    // A segment cached in another cache is opened on its own: its blocks
+    // would otherwise land in a cache its caller does not read.
+    let elsewhere = first.open_shared_segment(id, &known(), &cache()).unwrap();
+    assert!(!Arc::ptr_eq(&a, &elsewhere));
+
+    // Once every holder drops it, the registry does not keep it open.
+    let weak = Arc::downgrade(&a);
+    drop((a, b, elsewhere));
+    assert!(
+        weak.upgrade().is_none(),
+        "the file closed with its last holder"
+    );
+    let again = second.open_shared_segment(id, &known(), &shared).unwrap();
+    assert_eq!(again.id(), id);
+
+    // A segment the snapshot does not name is refused, as unshared.
+    publish(&family, b"newer bytes", b"state");
+    let newer = family.snapshot().unwrap();
+    let newer_id = newer.manifest().segments()[0].id;
+    assert!(
+        first
+            .open_shared_segment(newer_id, &known(), &shared)
+            .is_err()
+    );
+}
+
 #[test]
 fn an_empty_family_reads_as_the_empty_generation() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,7 +1,8 @@
 //! Reading one generation of a family.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::lease::LeaseFile;
 use super::manifest::Manifest;
@@ -11,6 +12,26 @@ use crate::cache::BlockCache;
 use crate::checkout::CheckoutState;
 use crate::ids::{CheckoutId, Digest128, FamilyId, Generation, SegmentId};
 use crate::segment::{KnownSection, Segment};
+
+/// One open segment per file, sections list and cache, for
+/// [`Snapshot::open_shared_segment`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SharedKey {
+    path: PathBuf,
+    /// The cache's address: a segment caches its blocks in the cache it was
+    /// opened with, so only callers sharing that cache share the segment.
+    cache: usize,
+    known: Vec<KnownSection>,
+}
+
+fn shared_segments() -> &'static Mutex<HashMap<SharedKey, Weak<Segment>>> {
+    static SHARED: OnceLock<Mutex<HashMap<SharedKey, Weak<Segment>>>> = OnceLock::new();
+    SHARED.get_or_init(Mutex::default)
+}
+
+/// The registry's size after its last sweep: the next sweep runs once it
+/// has doubled.
+static SWEEP_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
 /// How many times a reader starts again when the generation it read is
 /// reclaimed before its lease takes hold. Each retry reads a newer
@@ -131,6 +152,69 @@ impl Snapshot {
             });
         }
         Ok(segment)
+    }
+
+    /// [`Self::open_segment`], shared by every caller in this process that
+    /// reads the same segment file with the same sections and cache: the file
+    /// is opened once and stays open while any of them holds it.
+    ///
+    /// Every checkout of a repository reads the same segment files. Opened
+    /// once per checkout, a busy daemon held one descriptor per checkout per
+    /// segment (10,966 descriptors with about 90 checkouts bound); past
+    /// macOS's OPEN_MAX of 10,240, new pipes for shell commands got numbers
+    /// `posix_spawn` refuses, and spawns failed with EBADF. Shared, the
+    /// process holds one descriptor per segment file, and one copy of each
+    /// cached block.
+    ///
+    /// A shared segment was checked when it was first opened; its file never
+    /// changes. The manifest must still name it, and each caller's own
+    /// snapshot keeps the file on disk, as for an unshared segment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_segment`].
+    pub fn open_shared_segment(
+        &self,
+        id: SegmentId,
+        known: &[KnownSection],
+        cache: &Arc<BlockCache>,
+    ) -> Result<Arc<Segment>, FamilyError> {
+        if self.manifest.segment(id).is_none() {
+            return Err(FamilyError::Misuse(
+                "the snapshot's manifest does not name this segment",
+            ));
+        }
+        let key = SharedKey {
+            path: self.layout.segment(id),
+            cache: Arc::as_ptr(cache) as usize,
+            known: known.to_vec(),
+        };
+        if let Some(segment) = shared_segments()
+            .lock()
+            .expect("shared segment registry poisoned")
+            .get(&key)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(segment);
+        }
+        // Opened without the registry's lock held: opening reads the file.
+        // Two threads opening the same segment at once both open it, and the
+        // second keeps the first one's.
+        let opened = Arc::new(self.open_segment(id, known, Arc::clone(cache))?);
+        let mut registry = shared_segments()
+            .lock()
+            .expect("shared segment registry poisoned");
+        if let Some(segment) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(segment);
+        }
+        // Entries whose segments every holder dropped are cleared here, so
+        // the registry holds about as many entries as there are open files.
+        if registry.len() >= 2 * SWEEP_AT.load(std::sync::atomic::Ordering::Relaxed) {
+            registry.retain(|_, segment| segment.strong_count() > 0);
+            SWEEP_AT.store(registry.len().max(64), std::sync::atomic::Ordering::Relaxed);
+        }
+        registry.insert(key, Arc::downgrade(&opened));
+        Ok(opened)
     }
 
     /// The payload of a checkout's state at this generation, or `None` when

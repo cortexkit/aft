@@ -369,11 +369,9 @@ impl Loaded {
             }
             let segment = match previous.open.get(&entry.id) {
                 Some(segment) => Arc::clone(segment),
-                None => Arc::new(
-                    snapshot
-                        .open_segment(entry.id, &parts.known, Arc::clone(parts.cache))
-                        .map_err(store_error)?,
-                ),
+                None => snapshot
+                    .open_shared_segment(entry.id, &parts.known, parts.cache)
+                    .map_err(store_error)?,
             };
             segments.push(segment);
         }

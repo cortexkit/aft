@@ -1507,7 +1507,7 @@ impl Checkout {
             .iter()
             .map(|&index| {
                 read.opened[index]
-                    .as_ref()
+                    .as_deref()
                     .expect("usable segments are open")
             })
             .collect::<Vec<_>>();
@@ -1549,7 +1549,7 @@ impl Checkout {
         // `None` for one it cannot.
         let mut opened = Vec::with_capacity(entries.len());
         for entry in &entries {
-            match snapshot.open_segment(entry.id, &known, Arc::clone(&self.layer.cache)) {
+            match snapshot.open_shared_segment(entry.id, &known, &self.layer.cache) {
                 Ok(segment) => opened.push(Some(segment)),
                 Err(error) if error.is_unusable_file() => opened.push(None),
                 Err(error) => return Err(DataError::store(error)),
@@ -1684,7 +1684,7 @@ impl Checkout {
             .filter(|&&index| read.needed[index])
             .map(|&index| {
                 read.opened[index]
-                    .as_ref()
+                    .as_deref()
                     .expect("usable segments are open")
             })
             .collect::<Vec<_>>();
@@ -2470,8 +2470,8 @@ impl Checkout {
         let mut segments = Vec::new();
         let mut unusable = Vec::new();
         for entry in snapshot.manifest().segments() {
-            match snapshot.open_segment(entry.id, &known, Arc::clone(&self.layer.cache)) {
-                Ok(segment) => segments.push(Arc::new(segment)),
+            match snapshot.open_shared_segment(entry.id, &known, &self.layer.cache) {
+                Ok(segment) => segments.push(segment),
                 Err(error) if error.is_unusable_file() => unusable.push(error.to_string()),
                 Err(error) => return Err(DataError::store(error)),
             }
@@ -3157,7 +3157,7 @@ struct SegmentsRead {
     entries: Vec<aft_store::family::SegmentEntry>,
     /// Each segment by its place in the manifest; `None` when this build
     /// cannot use it.
-    opened: Vec<Option<Segment>>,
+    opened: Vec<Option<Arc<Segment>>>,
     /// The places of the segments in `opened` that are open.
     usable: Vec<usize>,
     /// By place in the manifest: some given state reads from it.
