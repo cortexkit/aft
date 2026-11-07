@@ -9026,7 +9026,7 @@ export function bannerUnused() {}
     /// The folders and index-store checkout an edge-case fixture keeps alive
     /// for the test; the checkout is dropped before its storage folder.
     struct EdgeCaseFixture {
-        _checkout: Arc<crate::data_layer::runtime::DataCheckout>,
+        checkout: Arc<crate::data_layer::runtime::DataCheckout>,
         _storage: tempfile::TempDir,
         _project: tempfile::TempDir,
     }
@@ -9082,7 +9082,7 @@ export function bannerUnused() {}
             Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
         );
         let fixture = EdgeCaseFixture {
-            _checkout: checkout,
+            checkout,
             _storage: storage,
             _project: dir,
         };
@@ -9469,18 +9469,18 @@ export function bannerUnused() {}
     /// pass completes instead of failing until some later pass.
     #[test]
     fn missing_dead_code_facts_are_filled_before_rollup() {
-        let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[("src/empty.rs", "")]);
+        let (fixture, root, manager, snapshot) =
+            dead_code_edge_case_fixture(&[("src/empty.rs", "")]);
         let mut job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
         job.scope_files = scope_files(&root, &JobScope::for_project(root.clone()));
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&snapshot.inspect_dir, &root).expect("store dir");
-        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
-            .expect("open store")
-            .expect("store is ready");
         job.callgraph_snapshot = Some(Arc::new(
-            project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot"),
+            fixture
+                .checkout
+                .view()
+                .expect("published call graph")
+                .dead_code_snapshot()
+                .expect("project snapshot"),
         ));
-        drop(store);
         let cache = manager
             .cache_for_snapshot(&snapshot)
             .expect("inspect cache");
