@@ -134,7 +134,24 @@ if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
   TRAIN_PUSH_EXEC_COPY="$train_push_copy" \
     exec bash "$train_push_copy" "$@"
 fi
-trap 'rm -f "$TRAIN_PUSH_EXEC_COPY"' EXIT
+# Every EXIT goes through train_push_on_exit. macOS /bin/bash 3.2 exits 0 when
+# `set -eu` aborts on an unbound name while an EXIT trap is set, and `$?` reads
+# 0 inside the trap too, so a train could report success having landed
+# nothing. The handler removes the files in train_push_cleanup, keeps a
+# nonzero status, and turns a 0 into exit 1 unless train_push_finished was set
+# just before one of the two intended successful exits.
+train_push_finished=0
+train_push_cleanup=("$TRAIN_PUSH_EXEC_COPY")
+train_push_on_exit() {
+  local status=$?
+  rm -f "${train_push_cleanup[@]}"
+  if [ "$status" -eq 0 ] && [ "$train_push_finished" != 1 ]; then
+    printf 'train-push: exited before finishing; treating it as a failure\n' >&2
+    status=1
+  fi
+  exit "$status"
+}
+trap train_push_on_exit EXIT
 
 repo_slug_override="${REPO:-}"
 REPO="$(git rev-parse --show-toplevel)" || {
@@ -1254,7 +1271,7 @@ land_verified_sha() {
 
 watch_log="$(mktemp "${TMPDIR:-/tmp}/train-push-watch.XXXXXX")"
 push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
-trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"' EXIT
+train_push_cleanup+=("$watch_log" "$push_log")
 
 fetch_remote -q --prune "$remote" || refuse "git fetch $remote failed"
 if default_branch="$(resolve_default_branch)"; then
@@ -1350,6 +1367,7 @@ if [ "$recover_existing" -eq 1 ]; then
     say "$heartbeat_dead_note; landing its verified sha $verified_sha"
   fi
   land_verified_sha "$verified_sha" "$run_url"
+  train_push_finished=1
   exit 0
 fi
 
@@ -1997,3 +2015,4 @@ if ! git -C "$REPO" push -q "$remote" --delete "$train_ref"; then
 fi
 rm -f "$watch_heartbeat"
 say "done"
+train_push_finished=1
