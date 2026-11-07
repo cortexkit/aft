@@ -102,7 +102,7 @@ fn update_checked(
     super::incremental::UpdateStats,
     BTreeMap<String, super::callgraph::FileResolution>,
 ) {
-    let mut live = LiveCheckout::cold(before, 1).unwrap();
+    let mut live = LiveCheckout::cold(before).unwrap();
     let changed = changed
         .iter()
         .map(|path| (*path).to_string())
@@ -147,7 +147,7 @@ fn what_an_update_resolves_is_encoded_and_reads_back_the_same() {
         ],
         &[],
     );
-    let mut live = LiveCheckout::cold(before, 1).unwrap();
+    let mut live = LiveCheckout::cold(before).unwrap();
     // Built in memory by a cold build, nothing can be let go.
     assert_eq!(live.resolved.decoded_count(), 0);
     let stats = live
@@ -164,6 +164,19 @@ fn what_an_update_resolves_is_encoded_and_reads_back_the_same() {
     live.resolved.get_mut("lib.ts").unwrap().sites.clear();
     live.resolved.release_decoded();
     assert!(live.resolved.get("lib.ts").unwrap().sites.is_empty());
+}
+
+/// Every engine resolves on the process's one engine pool, instead of
+/// starting a pool of its own whose threads live as long as it does: with
+/// dozens of edited worktrees, those were hundreds of idle threads.
+#[test]
+fn every_engine_resolves_on_the_one_shared_pool() {
+    let files = [("lib.ts", "export function run() { return 1; }\n")];
+    let first = LiveCheckout::cold(checkout(&files, &[])).unwrap();
+    let second = LiveCheckout::cold(checkout(&files, &[])).unwrap();
+    assert!(first.shares_pool_with(&second));
+    let cores = std::thread::available_parallelism().map_or(4, usize::from);
+    assert_eq!(first.install(rayon::current_num_threads), cores);
 }
 
 #[test]

@@ -1117,6 +1117,34 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinErro
         .map_err(|error| ManifestJoinError::Parse(error.to_string()))
 }
 
+/// The thread pool every live call-graph engine (`LiveCheckout`) resolves
+/// on: one for the whole process, started the first time an engine needs
+/// it, with a thread per available core. A pool per engine kept a full set
+/// of resolver threads alive for as long as each edited checkout's engine
+/// lived: with dozens of worktrees, hundreds of idle threads.
+///
+/// Engines run their parallel work through `ThreadPool::install`, so the
+/// parallel iterators nested inside stay in this pool. Refreshes of
+/// different checkouts share its threads; the runtime runs at most four of
+/// them at once. Cold builds keep pools of their own ([`pool`]).
+///
+/// # Errors
+///
+/// When the pool's threads cannot start.
+pub(crate) fn engine_pool() -> Result<Arc<rayon::ThreadPool>, ManifestJoinError> {
+    static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
+    let mut slot = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pool) = slot.as_ref() {
+        return Ok(Arc::clone(pool));
+    }
+    let threads = std::thread::available_parallelism().map_or(4, usize::from);
+    let shared = Arc::new(pool(threads)?);
+    *slot = Some(Arc::clone(&shared));
+    Ok(shared)
+}
+
 /// The facts one resolver thread reads, recording every checkout read with
 /// its answer so a stored resolution can be validated elsewhere.
 pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {

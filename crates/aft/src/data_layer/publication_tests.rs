@@ -213,7 +213,6 @@ impl Engine {
             inputs,
             Resolutions::stored(&stored),
             Arc::clone(&stored),
-            2,
             &mut Vec::new(),
         )
         .unwrap();
@@ -227,7 +226,7 @@ impl Engine {
     fn cold(fixture: &Fixture) -> Self {
         Self {
             label: "cold start",
-            live: LiveCheckout::cold(fixture.inputs.clone(), 2).unwrap(),
+            live: LiveCheckout::cold(fixture.inputs.clone()).unwrap(),
             stored: None,
         }
     }

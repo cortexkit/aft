@@ -1,0 +1,1 @@
+- AFT's index store resolves every edited worktree's call graph on one shared set of threads instead of a set per worktree, so a daemon with dozens of edited worktrees runs a few dozen resolver threads instead of hundreds.

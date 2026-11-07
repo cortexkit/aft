@@ -427,8 +427,7 @@ pub fn run(
     let extract_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = Instant::now();
     let base_inputs = files.inputs();
-    let mut live =
-        LiveCheckout::cold(files.inputs(), threads).map_err(|error| error.to_string())?;
+    let mut live = LiveCheckout::cold(files.inputs()).map_err(|error| error.to_string())?;
     let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     // The base segment the overlay is checked over: the cold resolution,
@@ -482,6 +481,15 @@ pub fn run(
         if value["type"] == "edit" {
             edits.push(value);
         }
+    }
+    // `EDIT_GATE_EDITS=N` replays only the pack's first N edits: a short run
+    // for checking a change before the whole pack. Its last edit counts as
+    // the end of a commit, so the run ends with a full check.
+    if let Some(limit) = std::env::var("EDIT_GATE_EDITS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        edits.truncate(limit);
     }
     let mut failures = 0;
     let mut checked = 0;

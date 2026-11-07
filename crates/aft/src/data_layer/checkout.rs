@@ -2475,7 +2475,6 @@ impl Checkout {
             inputs,
             resolved,
             Arc::clone(&published.graph),
-            self.layer.threads,
             timings,
         )
         .map_err(|error| DataError::Resolve(error.to_string()))?;

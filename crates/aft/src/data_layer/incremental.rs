@@ -539,8 +539,8 @@ impl LiveCheckout {
     /// # Errors
     ///
     /// When resolution fails on a file.
-    pub(crate) fn cold(inputs: CheckoutInputs, threads: usize) -> Result<Self, ManifestJoinError> {
-        let pool = Arc::new(super::callgraph::pool(threads)?);
+    pub(crate) fn cold(inputs: CheckoutInputs) -> Result<Self, ManifestJoinError> {
+        let pool = super::callgraph::engine_pool()?;
         let bound = BindCache::default();
         let (resolved, calls) = pool.install(|| {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
@@ -581,16 +581,15 @@ impl LiveCheckout {
     ///
     /// # Errors
     ///
-    /// When the thread pool cannot start.
+    /// When the process's engine pool cannot start.
     pub(crate) fn from_resolved_timed(
         inputs: CheckoutInputs,
         resolved: Resolutions,
         stored: Arc<StoredSlices>,
-        threads: usize,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<Self, ManifestJoinError> {
         let started = Instant::now();
-        let pool = Arc::new(super::callgraph::pool(threads)?);
+        let pool = super::callgraph::engine_pool()?;
         timings.push(("thread pool", started.elapsed().as_secs_f64() * 1000.0));
         let calls = MethodCallInputs::stored(Arc::clone(&stored));
         let reverse = ReverseInputs::new(Some(stored));
@@ -629,9 +628,16 @@ impl LiveCheckout {
         Ok(stats)
     }
 
-    /// Runs `op` on the engine's thread pool.
+    /// Runs `op` on the engine's thread pool, which every engine of the
+    /// process shares (see `callgraph::engine_pool`).
     pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
         self.pool.install(op)
+    }
+
+    /// Whether this engine and `other` resolve on the same thread pool.
+    #[cfg(test)]
+    pub(crate) fn shares_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pool, &other.pool)
     }
 
     #[expect(

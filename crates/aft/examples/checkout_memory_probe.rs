@@ -24,6 +24,12 @@
 //! says how many bytes recording the edit and refreshing the call graph
 //! allocated.
 //!
+//! With PROBE_ENGINES=N, N more checkouts of two small files each are
+//! bound, built, edited and refreshed before the pack is replayed, so N + 1
+//! call-graph engines are alive at once. Every edit's line says how many
+//! threads the process runs (`threads`) and how many of them are resolver
+//! threads (`resolver_threads`, named `aft-resolve-N`; Linux only).
+//!
 //! ```text
 //! cargo run --profile ci-storm -p agent-file-tools --example checkout_memory_probe -- <pack.jsonl.gz> [threads]
 //! ```
@@ -104,6 +110,49 @@ fn rss_mib() -> u64 {
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kib| kib.parse::<u64>().ok())
         .map_or(0, |kib| kib / 1024)
+}
+
+/// The process's threads, and how many of them are resolver threads
+/// (named `aft-resolve-N`), from `/proc/self/task`; zeros elsewhere.
+fn thread_counts() -> (usize, usize) {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return (0, 0);
+    };
+    let names = tasks
+        .flatten()
+        .map(|task| std::fs::read_to_string(task.path().join("comm")).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let resolvers = names
+        .iter()
+        .filter(|name| name.starts_with("aft-resolve"))
+        .count();
+    (names.len(), resolvers)
+}
+
+/// Binds, builds, edits and refreshes a checkout of two small files under
+/// `folder`, so it holds a call-graph engine, and returns it.
+fn small_engine(layer: &Arc<DataLayer>, folder: &Path, index: usize) -> Checkout {
+    let root = folder.join("files");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(folder.join("store")).unwrap();
+    let lib = "export function run() { return 1; }\n";
+    let main = "import { run } from './lib';\nexport function main() { run(); }\n";
+    std::fs::write(root.join("lib.ts"), lib).unwrap();
+    std::fs::write(root.join("main.ts"), main).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let family = FamilyId::from_digest(Digest128::of(
+        format!("checkout memory probe engine {index}").as_bytes(),
+    ));
+    let checkout = Checkout::bind(Arc::clone(layer), &folder.join("store"), family, &root).unwrap();
+    checkout.build().unwrap();
+    std::fs::write(
+        root.join("lib.ts"),
+        "export function run() { return 2; }\nexport function stop() {}\n",
+    )
+    .unwrap();
+    checkout.record_paths(&[b"lib.ts".to_vec()]).unwrap();
+    checkout.refresh_callgraph().unwrap();
+    checkout
 }
 
 /// The bytes glibc's allocator hands out now and holds from the system, in
@@ -300,6 +349,21 @@ fn main() {
     let loaded_rss = rss_mib();
 
     let layer = Arc::new(DataLayer::new(256 << 20, threads));
+    // PROBE_ENGINES=N: N more checkouts, each holding a call-graph engine
+    // while the pack is replayed.
+    let engines = std::env::var("PROBE_ENGINES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let others = (0..engines)
+        .map(|index| small_engine(&layer, &work.join(format!("engine-{index}")), index))
+        .collect::<Vec<_>>();
+    if engines > 0 {
+        let (threads, resolvers) = thread_counts();
+        eprintln!(
+            "{engines} small checkouts hold engines: {threads} threads, {resolvers} resolver threads"
+        );
+    }
     let family = FamilyId::from_digest(Digest128::of(b"checkout memory probe"));
     let checkout = Checkout::bind(Arc::clone(&layer), Path::new(&store), family, &root).unwrap();
     peaks.take();
@@ -380,6 +444,10 @@ fn main() {
         }
         line["refresh_ms"] = serde_json::json!((refresh_ms * 10.0).round() / 10.0);
         line["record_ms"] = serde_json::json!((record_ms * 100.0).round() / 100.0);
+        let (threads, resolver_threads) = thread_counts();
+        line["threads"] = serde_json::json!(threads);
+        line["resolver_threads"] = serde_json::json!(resolver_threads);
+        line["engines"] = serde_json::json!(others.len() + 1);
         if COUNTING.load(Ordering::Relaxed) {
             line["record_alloc_kib"] = serde_json::json!(record_allocated >> 10);
             line["refresh_alloc_kib"] = serde_json::json!(refresh_allocated >> 10);
@@ -450,5 +518,6 @@ fn main() {
         most_after_relief
     );
     drop(checkout);
+    drop(others);
     let _ = std::fs::remove_dir_all(&work);
 }
