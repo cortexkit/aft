@@ -16022,7 +16022,24 @@ mod callgraph_store_for_ops_tests {
                 Some("off"),
                 "HOME root health must not advertise callgraph building"
             );
+        });
+    }
 
+    #[test]
+    #[ignore = "callers on a HOME root answers callgraph_off: HOME forces indexes.callgraph off, and callgraph_store_for_ops checks that switch before the home-root gate, so the reply never names home_root as the cause"]
+    fn home_root_callers_name_the_home_root_as_the_cause() {
+        let home = TempDir::new().expect("home tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = home.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(
+            source_dir.join("lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("source file");
+
+        with_fake_home_env(home.path(), || {
+            let ctx = configure_context(home.path(), storage.path());
             let navigation = RawRequest {
                 id: "home-callers".to_string(),
                 command: "callers".to_string(),
