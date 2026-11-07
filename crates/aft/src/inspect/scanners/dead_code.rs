@@ -3914,9 +3914,12 @@ fn rust_raw_import_contributions(
 /// code.
 fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestRange> {
     let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let in_function_body = node.parent().is_some_and(|parent| parent.kind() == "block")
+    // Each node with whether its parent is a block. The walk carries this
+    // down rather than asking `Node::parent`, which searches from the root
+    // and is quadratic over a file of many top-level nodes.
+    let mut stack = vec![(root, false)];
+    while let Some((node, parent_is_block)) = stack.pop() {
+        let in_function_body = parent_is_block
             && !matches!(
                 node.kind(),
                 "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
@@ -3946,8 +3949,9 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
 
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
+            let is_block = node.kind() == "block";
             loop {
-                stack.push(cursor.node());
+                stack.push((cursor.node(), is_block));
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -4119,15 +4123,7 @@ fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -
     while let Some(attribute) = previous {
         match attribute.kind() {
             "attribute_item" => {
-                let compact = source[attribute.byte_range()]
-                    .chars()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect::<String>();
-                if compact
-                    .strip_prefix("#[cfg(")
-                    .and_then(|inner| inner.strip_suffix(")]"))
-                    .is_some_and(cfg_predicate_requires_test)
-                {
+                if rust_attribute_requires_test(source, attribute) {
                     return true;
                 }
                 previous = attribute.prev_sibling();
@@ -4137,6 +4133,47 @@ fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -
         }
     }
     false
+}
+
+/// `parent`'s named children, each with whether
+/// [`rust_node_has_cfg_test_attribute`] holds for it, worked out in one pass
+/// over the children. Asking each child separately walks back over every
+/// comment before it, which is quadratic in a file of many comment lines.
+fn rust_children_cfg_test_gated<'t>(
+    source: &str,
+    parent: tree_sitter::Node<'t>,
+) -> Vec<(tree_sitter::Node<'t>, bool)> {
+    let mut children = Vec::new();
+    // Whether an attribute requiring `test` is in the run of attributes and
+    // comments right before the current child.
+    let mut run_requires_test = false;
+    let mut cursor = parent.walk();
+    for node in parent.children(&mut cursor) {
+        if node.is_named() {
+            children.push((node, run_requires_test));
+        }
+        match node.kind() {
+            "attribute_item" => {
+                run_requires_test =
+                    run_requires_test || rust_attribute_requires_test(source, node);
+            }
+            "line_comment" | "block_comment" => {}
+            _ => run_requires_test = false,
+        }
+    }
+    children
+}
+
+/// Whether `attribute` is `#[cfg(...)]` with a predicate requiring `test`.
+fn rust_attribute_requires_test(source: &str, attribute: tree_sitter::Node<'_>) -> bool {
+    let compact = source[attribute.byte_range()]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    compact
+        .strip_prefix("#[cfg(")
+        .and_then(|inner| inner.strip_suffix(")]"))
+        .is_some_and(cfg_predicate_requires_test)
 }
 
 fn cfg_predicate_requires_test(predicate: &str) -> bool {
@@ -5271,9 +5308,9 @@ fn rust_collect_api_facts(
     scope: &[String],
     facts: &mut RustApiFacts,
 ) {
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        if rust_node_has_cfg_test_attribute(source, node) {
+    let gated = rust_children_cfg_test_gated(source, root);
+    for (node, gated) in gated {
+        if gated {
             continue;
         }
         // An impl header names its own receiver even when nothing uses it.
