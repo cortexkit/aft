@@ -155,16 +155,19 @@ impl Snapshot {
     }
 
     /// [`Self::open_segment`], shared by every caller in this process that
-    /// reads the same segment file with the same sections and cache: the file
-    /// is opened once and stays open while any of them holds it.
+    /// reads the same segment file with the same sections and cache: the
+    /// segment is opened once and stays open while any of them holds it.
     ///
     /// Every checkout of a repository reads the same segment files. Opened
     /// once per checkout, a busy daemon held one descriptor per checkout per
     /// segment (10,966 descriptors with about 90 checkouts bound); past
     /// macOS's OPEN_MAX of 10,240, new pipes for shell commands got numbers
     /// `posix_spawn` refuses, and spawns failed with EBADF. Shared, the
-    /// process holds one descriptor per segment file, and one copy of each
-    /// cached block.
+    /// process holds at most one descriptor per segment file, and one copy
+    /// of each cached block. Descriptors are capped as well
+    /// ([`crate::segment::MAX_OPEN_SEGMENT_FILES`]): past the cap, a segment
+    /// nobody read lately has its file closed, and opened again on its next
+    /// read.
     ///
     /// A shared segment was checked when it was first opened; its file never
     /// changes. The manifest must still name it, and each caller's own

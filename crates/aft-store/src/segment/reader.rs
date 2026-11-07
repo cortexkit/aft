@@ -11,6 +11,7 @@ use super::format::{
     Alignment, BLOCK_LEN, HEADER_LEN, Header, MAX_SECTIONS, MAX_SEGMENT_LEN, ROW_LEN, Requirement,
     Row, SectionId, SectionKind,
 };
+use super::open_files::OpenFiles;
 use crate::cache::{BlockCache, BlockKey, FileToken};
 use crate::ids::{Digest128, FamilyId, SegmentId, WriterIncarnation};
 
@@ -44,10 +45,21 @@ pub struct SectionHandle {
 
 /// An open, verified segment. Its bytes are read through the shared
 /// [`BlockCache`]; dropping the segment releases its cached blocks.
+///
+/// Its file is held open in the process's table of open segment files
+/// ([`super::MAX_OPEN_SEGMENT_FILES`] at most), which may close it while
+/// the segment is unused; the next read opens it again, and refuses it as
+/// damaged unless it has the length and header the segment was opened
+/// with. Each block read is checked against the checksums read then, so
+/// another file never answers as this segment.
 #[derive(Debug)]
 pub struct Segment {
     path: PathBuf,
-    file: File,
+    /// The file's length and header as opened, which a reopened file must
+    /// match.
+    len: u64,
+    header_bytes: [u8; HEADER_LEN],
+    files: Arc<OpenFiles>,
     token: FileToken,
     cache: Arc<BlockCache>,
     header: Header,
@@ -77,6 +89,17 @@ impl Segment {
         family: FamilyId,
         known: &[KnownSection],
         cache: Arc<BlockCache>,
+    ) -> Result<Self, SegmentError> {
+        Self::open_in(path, family, known, cache, OpenFiles::process())
+    }
+
+    /// [`Self::open`], holding the file open in `files`.
+    pub(crate) fn open_in(
+        path: &Path,
+        family: FamilyId,
+        known: &[KnownSection],
+        cache: Arc<BlockCache>,
+        files: &Arc<OpenFiles>,
     ) -> Result<Self, SegmentError> {
         let fail = |kind| SegmentError::new(path, kind);
         let file = crate::fs::open_read(path).map_err(|error| fail(error.into()))?;
@@ -173,9 +196,12 @@ impl Segment {
                 block_digests,
             });
         }
+        files.insert(token, file);
         Ok(Self {
             path: path.to_path_buf(),
-            file,
+            len: file_len,
+            header_bytes,
+            files: Arc::clone(files),
             token,
             cache,
             header,
@@ -393,9 +419,35 @@ impl Segment {
         let len = usize::try_from(block_len.min(section.info.len - start))
             .expect("a block length fits in usize");
         let bytes = &mut buf[..len];
-        crate::fs::read_exact_at(&self.file, bytes, section.offset + start)
+        let file = self.files.get(self.token, || self.reopen())?;
+        crate::fs::read_exact_at(&file, bytes, section.offset + start)
             .map_err(|error| self.error(error.into()))?;
         Ok(bytes)
+    }
+
+    /// Opens the segment's file again after the table of open files closed
+    /// it. The path must still hold the file this segment opened: one of
+    /// another length, or with another header, is refused as damaged.
+    /// Block checksums catch any other change, as they do for a file held
+    /// open.
+    fn reopen(&self) -> Result<File, SegmentError> {
+        let file = crate::fs::open_read(&self.path).map_err(|error| self.error(error.into()))?;
+        let len = file
+            .metadata()
+            .map_err(|error| self.error(error.into()))?
+            .len();
+        if len != self.len {
+            return Err(self.error(ErrorKind::Malformed(
+                "the file's length changed since the segment was opened",
+            )));
+        }
+        let mut header = [0; HEADER_LEN];
+        crate::fs::read_exact_at(&file, &mut header, 0)
+            .map_err(|error| self.error(error.into()))?;
+        if header != self.header_bytes {
+            return Err(self.error(ErrorKind::Corrupt(Region::Header)));
+        }
+        Ok(file)
     }
 
     fn error(&self, kind: ErrorKind) -> SegmentError {
@@ -405,6 +457,7 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        self.files.forget(self.token);
         self.cache.forget(self.token);
     }
 }
@@ -468,14 +521,16 @@ crate::heap_bytes_of_fields!(OpenSection {
 });
 
 /// What an open segment holds in memory: its path and its section table
-/// with each section's block checksums. The file handle owns no heap, and
-/// the block cache its reads go through is shared by every segment, so it
-/// is counted once for the process, never here.
+/// with each section's block checksums. The table of open files and the
+/// block cache its reads go through are shared by every segment, so they
+/// are counted once for the process, never here.
 impl crate::heap::HeapBytes for Segment {
     fn heap_bytes(&self, seen: &mut crate::heap::Seen) -> usize {
         let Self {
             path,
-            file: _,
+            len: _,
+            header_bytes: _,
+            files: _,
             token: _,
             cache: _,
             header: _,

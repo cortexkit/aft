@@ -311,6 +311,105 @@ fn closing_a_segment_releases_its_cached_blocks() {
     assert_eq!(shared.stats().resident_bytes, 0);
 }
 
+/// Writes segment `n` of the family at `dir/n.seg`, with one section of
+/// `bytes`.
+fn write_numbered(dir: &Path, n: u64, bytes: &[u8]) -> (PathBuf, SectionId) {
+    let path = dir.join(format!("{n}.seg"));
+    let section = spec(KIND_A, 0, Alignment::Word);
+    let mut writer = SegmentWriter::create(
+        &path,
+        SegmentMeta {
+            segment: SegmentId::new(n),
+            ..meta()
+        },
+    )
+    .unwrap();
+    writer.begin_section(section).unwrap();
+    writer.write(bytes).unwrap();
+    writer.end_section(1).unwrap();
+    writer.finish().unwrap();
+    (path, section.id)
+}
+
+/// A process holds only so many segment files open. With room for three,
+/// six segments read back every byte as written, closing and opening their
+/// files again in turn, and never more than three are open. A file
+/// replaced while its segment's file was closed fails the next read as
+/// damage, never answering with the other file's bytes; one removed fails
+/// it as missing.
+#[test]
+fn past_the_cap_on_open_files_segments_reopen_their_own_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = Arc::new(open_files::OpenFiles::new(3));
+    let mut rng = TestRng::new(7);
+    let written = (1..=6)
+        .map(|n| {
+            let bytes = rng.bytes(2 * BLOCK_LEN + 5);
+            let (path, id) = write_numbered(dir.path(), n, &bytes);
+            (path, id, bytes)
+        })
+        .collect::<Vec<_>>();
+    // A cache of one block, so reads keep going to the files.
+    let cache = Arc::new(BlockCache::new(BLOCK_LEN));
+    let segments = written
+        .iter()
+        .map(|(path, _, _)| {
+            Segment::open_in(path, family("repo"), &known(), Arc::clone(&cache), &files).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(files.open_count(), 3);
+    for round in 0..3 {
+        for (segment, (_, id, bytes)) in segments.iter().zip(&written) {
+            let handle = segment.section(*id).unwrap();
+            assert_eq!(
+                segment.read_range(handle, 0..bytes.len() as u64).unwrap(),
+                *bytes,
+                "round {round}, segment {}",
+                segment.id().get()
+            );
+            assert!(files.open_count() <= 3, "{}", files.open_count());
+        }
+    }
+    segments[5].verify().unwrap();
+    assert_eq!(files.open_count(), 3);
+
+    // Segments 4 to 6 were read last, so the files of 1 to 3 are closed.
+    // Another segment's file now stands at 1's path, and 2's is gone.
+    std::fs::copy(&written[3].0, &written[0].0).unwrap();
+    std::fs::remove_file(&written[1].0).unwrap();
+    let first = segments[0].section(written[0].1).unwrap();
+    let error = segments[0].read_range(first, 0..10).unwrap_err();
+    assert!(error.is_corruption(), "{error}");
+    let second = segments[1].section(written[1].1).unwrap();
+    let error = segments[1].read_range(second, 0..10).unwrap_err();
+    assert!(
+        matches!(error.kind(), ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "{error}"
+    );
+    // A file of another length is refused too.
+    std::fs::write(&written[2].0, b"short").unwrap();
+    let third = segments[2].section(written[2].1).unwrap();
+    assert!(
+        segments[2]
+            .read_range(third, 0..10)
+            .unwrap_err()
+            .is_corruption()
+    );
+    // The files still open read on, and none of the failures opened one.
+    assert_eq!(files.open_count(), 3);
+    let (_, id, bytes) = &written[4];
+    let handle = segments[4].section(*id).unwrap();
+    assert_eq!(
+        segments[4]
+            .read_range(handle, 0..bytes.len() as u64)
+            .unwrap(),
+        *bytes
+    );
+    // A dropped segment closes its file.
+    drop(segments);
+    assert_eq!(files.open_count(), 0);
+}
+
 /// Damage anywhere in a segment must never panic, and must never let a read
 /// return bytes other than the ones written: either the read fails or the
 /// damage was in bytes no read uses, such as alignment padding.

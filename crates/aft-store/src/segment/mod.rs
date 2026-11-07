@@ -32,6 +32,7 @@
 
 mod error;
 mod format;
+mod open_files;
 mod reader;
 mod writer;
 
@@ -40,6 +41,7 @@ pub use format::{
     Alignment, BLOCK_LEN, FORMAT_VERSION, KeySpace, MAX_SEGMENT_LEN, Requirement, SectionId,
     SectionKind,
 };
+pub use open_files::{MAX_OPEN_SEGMENT_FILES, open_segment_files};
 pub use reader::{KnownSection, SectionHandle, SectionInfo, Segment};
 pub use writer::{SectionSpec, SegmentMeta, SegmentSummary, SegmentWriter};
 
