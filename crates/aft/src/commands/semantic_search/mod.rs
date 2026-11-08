@@ -4110,6 +4110,96 @@ fn take_windows_semantic_preview(
     metadata.remove(&semantic_path)
 }
 
+/// The path-lookup lane's files: those under `project_root` that
+/// `candidate_filter` admits and whose name, or `/`-separated path relative
+/// to the root, ends with one of `tokens`, newest first.
+///
+/// With the data layer's view of the root, while this context's file
+/// watcher keeps that view current, the files come from the view's path
+/// list, which holds every path the project walk would reach; otherwise (no
+/// view yet, no watcher, or a view that cannot stand in for the walk) from
+/// that walk. Both apply the same test to each file and the same order, so
+/// the lane's answer does not depend on which one ran.
+fn path_lookup_paths(
+    ctx: &AppContext,
+    data_text: Option<&crate::data_layer::tools::search::DataText>,
+    project_root: &Path,
+    tokens: &[&str],
+    candidate_filter: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let tokens = tokens
+        .iter()
+        .map(|token| token.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    let matches = |path: &Path| {
+        if !candidate_filter(path) {
+            return false;
+        }
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        tokens.iter().any(|normalized| {
+            file_name == Some(normalized.as_str()) || relative.ends_with(normalized.as_str())
+        })
+    };
+    if let Some(text) = data_text.filter(|_| watcher_keeps_view_current(ctx)) {
+        // A file `matches` keeps has a relative path ending with a token (a
+        // file name equal to the token ends it too), so only those members
+        // need spelling out.
+        let ends_with_token = |relative: &[u8]| {
+            tokens
+                .iter()
+                .any(|token| relative.ends_with(token.as_bytes()))
+        };
+        if let Some(files) = waits::timed(waits::SearchWait::TextSearch, || {
+            text.files_matching(project_root, ends_with_token, matches)
+        }) {
+            return files;
+        }
+    }
+    // Reject unrelated filenames before the walker builds metadata and
+    // canonical display keys for sorting; the surviving order is unchanged.
+    let _walk = waits::time(waits::SearchWait::Walk);
+    walk_project_files_from_matching(project_root, project_root, &PathFilters::default(), matches)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for [`AppContext::watcher_runtime_active`] on this thread.
+    static WATCHER_LIVE_FOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with this thread's path lookups treating the file watcher as
+/// running (`live`) or not, whatever the context's watcher does.
+#[cfg(test)]
+fn with_watcher_live_for_test<R>(live: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCHER_LIVE_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(WATCHER_LIVE_FOR_TEST.with(|slot| slot.replace(Some(live))));
+    run()
+}
+
+/// Whether this context's file watcher is running. Only then does the data
+/// layer's view learn of a file created outside AFT soon after it appears
+/// (a change still in the watcher's hands is disclosed on the reply as a
+/// pending-change gap); without a watcher the view keeps missing it, and a
+/// lookup by file name must walk the folder to find it.
+fn watcher_keeps_view_current(ctx: &AppContext) -> bool {
+    #[cfg(test)]
+    if let Some(live) = WATCHER_LIVE_FOR_TEST.with(std::cell::Cell::get) {
+        return live;
+    }
+    ctx.watcher_runtime_active()
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -4498,28 +4588,12 @@ fn run_engine_ranking(
             })
             .filter(|token| token.contains('.'))
             .collect::<Vec<_>>();
-        // Reject unrelated filenames before the walker builds metadata and
-        // canonical display keys for sorting; the surviving order is unchanged.
-        let _walk = waits::time(waits::SearchWait::Walk);
-        walk_project_files_from_matching(
+        path_lookup_paths(
+            ctx,
+            data_text.as_ref(),
             project_root,
-            project_root,
-            &PathFilters::default(),
-            |path| {
-                if !candidate_filter(path) {
-                    return false;
-                }
-                let relative = path
-                    .strip_prefix(project_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let file_name = path.file_name().and_then(|name| name.to_str());
-                query_path_tokens.iter().any(|token| {
-                    let normalized = token.replace('\\', "/");
-                    file_name == Some(normalized.as_str()) || relative.ends_with(&normalized)
-                })
-            },
+            &query_path_tokens,
+            &candidate_filter,
         )
         .into_iter()
         .map(|path| {
@@ -9941,6 +10015,146 @@ mod tests {
         let first = first.expect("first query vector");
         assert_eq!(second.expect("second query vector"), first);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A folder for the path-lookup lane: files a token names at several
+    /// depths, beside copies the project walk never lists (ignored by
+    /// `.gitignore` or `.aftignore`, in skipped folders, OS metadata files,
+    /// symlinks), test files, and hidden folders the walk does list. Returns
+    /// the folder and a context whose index-store checkout of it serves text.
+    fn path_lookup_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
+        let project = tempfile::tempdir().expect("create project dir");
+        let root = std::fs::canonicalize(project.path()).expect("canonical root");
+        let files = [
+            (".gitignore", "ignored/\n*.log\n"),
+            (".aftignore", "secret/\n"),
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("notes.md", "# notes\n"),
+            ("subc_format.rs", "pub fn top() {}\n"),
+            ("src/a/subc_format.rs", "pub fn a() {}\n"),
+            ("src/b/subc_format.rs", "pub fn b() {}\n"),
+            ("src/b/deep/nested/subc_format.rs", "pub fn nested() {}\n"),
+            ("src/b/my_subc_format.rs", "pub fn suffix() {}\n"),
+            ("src/subc_format_test.rs", "#[test] fn t() {}\n"),
+            ("tests/subc_format.rs", "#[test] fn t() {}\n"),
+            (".config/subc_format.rs", "pub fn hidden() {}\n"),
+            ("ignored/subc_format.rs", "pub fn ignored() {}\n"),
+            ("secret/subc_format.rs", "pub fn secret() {}\n"),
+            ("node_modules/pkg/subc_format.rs", "pub fn dep() {}\n"),
+            ("target/debug/subc_format.rs", "pub fn built() {}\n"),
+            ("dist/subc_format.rs", "pub fn dist() {}\n"),
+            ("src/._subc_format.rs", "resource fork\n"),
+            ("src/ehthumbs.db", "thumbs\n"),
+            ("build.log", "log line\n"),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write fixture file");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("src/a/subc_format.rs"),
+            root.join("src/linked_subc_format.rs"),
+        )
+        .expect("symlink fixture file");
+        let ctx = test_context(&root);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        (project, root, ctx)
+    }
+
+    /// The path-lookup lane answered from the index store's path list lists
+    /// the same files, in the same order, as the project walk it replaces:
+    /// names and suffixes at any depth, with the walk's ignore rules, skipped
+    /// folders, exclusions and the test-file filter applied.
+    #[test]
+    fn path_lookup_from_the_view_matches_the_project_walk() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let token_sets: [&[&str]; 9] = [
+            &["subc_format.rs"],
+            &["b/subc_format.rs"],
+            &["format.rs"],
+            &["subc_format_test.rs"],
+            &["build.log"],
+            &["._subc_format.rs", "ehthumbs.db"],
+            &["linked_subc_format.rs"],
+            &["Cargo.toml", "notes.md", ".gitignore"],
+            &["src\\b\\deep\\nested\\subc_format.rs"],
+        ];
+        for include_tests in [false, true] {
+            let filter = |path: &Path| path_allowed_by_include_tests(path, &root, include_tests);
+            for tokens in token_sets {
+                let walked = path_lookup_paths(&ctx, None, &root, tokens, &filter);
+                let listed = with_watcher_live_for_test(true, || {
+                    path_lookup_paths(&ctx, Some(&text), &root, tokens, &filter)
+                });
+                assert_eq!(
+                    listed, walked,
+                    "tokens {tokens:?}, include_tests {include_tests}"
+                );
+            }
+        }
+        // The comparison above is not vacuous: the walk found nested files
+        // and left out every ignored, skipped and excluded copy.
+        let all = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let mut found = with_watcher_live_for_test(true, || {
+            path_lookup_paths(&ctx, Some(&text), &root, &["subc_format.rs"], &all)
+        })
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .expect("under the root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ".config/subc_format.rs",
+                "src/a/subc_format.rs",
+                "src/b/deep/nested/subc_format.rs",
+                "src/b/my_subc_format.rs",
+                "src/b/subc_format.rs",
+                "subc_format.rs",
+                "tests/subc_format.rs",
+            ]
+        );
+    }
+
+    /// With a current view of the root (its file watcher running), the
+    /// path-lookup lane reads the view's path list and walks no folder.
+    /// Without a watcher, or without a view, it walks.
+    #[test]
+    fn path_lookup_walks_no_folder_when_a_current_view_exists() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let filter = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let lookup = |live: bool, text: Option<&crate::data_layer::tools::search::DataText>| {
+            crate::search_hot_path_measurements::reset();
+            let found = with_watcher_live_for_test(live, || {
+                path_lookup_paths(&ctx, text, &root, &["subc_format.rs"], &filter)
+            });
+            (
+                found,
+                crate::search_hot_path_measurements::counts().project_walks,
+            )
+        };
+
+        let (listed, walks) = lookup(true, Some(&text));
+        assert_eq!(walks, 0);
+        assert!(!listed.is_empty());
+        let (without_watcher, walks) = lookup(false, Some(&text));
+        assert_eq!(walks, 1);
+        assert_eq!(without_watcher, listed);
+        let (without_view, walks) = lookup(true, None);
+        assert_eq!(walks, 1);
+        assert_eq!(without_view, listed);
     }
 
     #[test]

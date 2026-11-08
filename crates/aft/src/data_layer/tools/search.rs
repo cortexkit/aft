@@ -130,6 +130,54 @@ impl DataText {
         self.candidates_for(&Query::All)
     }
 
+    /// The files the project walk over `root` would list and keep with
+    /// `matches`, newest first as that walk orders them, read from this
+    /// view's path list instead of the folder. `admit_relative` is a cheap
+    /// test of a member's `/`-separated relative path that every path
+    /// `matches` keeps must pass; only those members are spelled out and
+    /// tested with `matches`.
+    ///
+    /// The index store's scan applies the walk's ignore files, skipped
+    /// folders, hidden-path and nested-worktree rules; the walk's other
+    /// exclusions (AFT's storage, watcher markers, OS metadata files,
+    /// database files) are applied here per path, and a member that is not
+    /// a regular file on disk now is left out, as the walk would not reach
+    /// it. Symlinks are never listed, as the walk does not follow them.
+    ///
+    /// `None` when the view cannot stand in for the walk: it is of another
+    /// folder, a rescan against the disk is still pending, or the walk at
+    /// `root` uses other ignore settings than the store's scan.
+    pub(crate) fn files_matching(
+        &self,
+        root: &Path,
+        admit_relative: impl Fn(&[u8]) -> bool,
+        matches: impl Fn(&Path) -> bool,
+    ) -> Option<Vec<PathBuf>> {
+        use crate::inspect::job::canonicalize_normalized;
+        if self.view.rescanning()
+            || canonicalize_normalized(&self.root) != canonicalize_normalized(root)
+            || walk_uses_other_ignore_settings(root)
+        {
+            return None;
+        }
+        let mut files = self
+            .view
+            .current_state()
+            .paths()
+            .iter()
+            .filter(|record| record.kind != aft_store::checkout::PathKind::Symlink)
+            .filter(|record| admit_relative(&record.path))
+            .map(|record| absolute(root, &record.path))
+            .filter(|path| {
+                !crate::project_content::is_excluded_file_by_path(path)
+                    && matches(path)
+                    && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+            })
+            .collect::<Vec<_>>();
+        crate::search_index::sort_paths_by_mtime_desc(&mut files, root);
+        Some(files)
+    }
+
     /// The paths whose indexed content holds each of `trigrams`, read once
     /// per distinct trigram.
     fn postings(&self, trigrams: &[u32]) -> io::Result<HashMap<u32, Holders>> {
@@ -298,6 +346,17 @@ fn merge_in_path_order<'a>(
 
 fn store_error(error: DataError) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+/// Whether the project walk at `root` reads ignore files differently from
+/// the index store's scan, so the view's members cannot stand in for the
+/// walk's files: under confinement the walk reads no ignore file, and in a
+/// Jujutsu-only repository it applies Git's rules where the scan does not.
+/// The source inventory makes the same check before it lists a checkout.
+fn walk_uses_other_ignore_settings(root: &Path) -> bool {
+    crate::context::confinement::active()
+        || (root.ancestors().any(|path| path.join(".jj").exists())
+            && !root.ancestors().any(|path| path.join(".git").exists()))
 }
 
 /// The absolute path of the view's `relative` path under `root`.
