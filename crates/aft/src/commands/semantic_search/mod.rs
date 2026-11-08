@@ -9522,9 +9522,14 @@ mod tests {
     /// once made; it is made without loading the model, since the fake
     /// serves one session and the query must have it. Returns the project,
     /// its storage and the context.
+    /// The project, its storage, the context, and the guard that keeps
+    /// meaning-search fills off the fake backend: hold the guard for the
+    /// whole test. A fill round the query starts after it dropped would send
+    /// its own embedding request, which the tests count and which can pause
+    /// the lane before the query sees it.
     fn served_over_fake_synapse(
         mut semantic: SemanticBackendConfig,
-    ) -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+    ) -> (tempfile::TempDir, tempfile::TempDir, AppContext, impl Drop) {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(project.path()).unwrap();
@@ -9541,11 +9546,11 @@ mod tests {
         });
         ctx.set_canonical_cache_root(root.clone());
         crate::semantic_admission::note_opened("data-layer-synapse-test", &root);
-        let _model_free = crate::data_layer::meaning::fill_without_model_for_test(&root, 2);
+        let model_free = crate::data_layer::meaning::fill_without_model_for_test(&root, 2);
         wait_for_data_semantic(&ctx, |data| {
             data.serving().is_some_and(|meaning| meaning.complete())
         });
-        (project, storage, ctx)
+        (project, storage, ctx, model_free)
     }
 
     #[test]
@@ -9553,7 +9558,7 @@ mod tests {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
             with_fake_synapse(clock.clone(), None, |semantic, requests| {
-                let (_project, _storage, ctx) = served_over_fake_synapse(semantic);
+                let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
                 let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
@@ -9594,7 +9599,7 @@ mod tests {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
             with_compiling_synapse(clock.clone(), 90_000, |semantic, requests| {
-                let (_project, _storage, ctx) = served_over_fake_synapse(semantic);
+                let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
                 let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
