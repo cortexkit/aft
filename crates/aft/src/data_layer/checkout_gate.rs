@@ -1310,8 +1310,9 @@ pub struct Summary {
     pub failed: usize,
     /// Times A's changes were published on their own.
     pub publications: usize,
-    /// Folds of A's segments once it read from too many, and the times a
-    /// fold could not run and A was built again whole instead.
+    /// Folds of the segments of checkout A (the one driven through its
+    /// handle) once it read from too many, and the times a fold could not
+    /// run and A was built again whole instead.
     pub compactions: usize,
     pub compaction_builds: usize,
     /// The most segments only A read from after a publication of its

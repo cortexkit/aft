@@ -211,8 +211,8 @@ pub enum TextCopy {
     /// The unit at `ordinal` of the source segment at `source`, with its
     /// postings.
     Stored { source: usize, ordinal: u32 },
-    /// A content whose trigrams are not indexed: its unit alone, as the
-    /// locator found it.
+    /// A content whose trigrams are not indexed: its unit alone, with the
+    /// length and status a segment holding it records.
     Unindexed { len: u64, status: TextStatus },
 }
 

@@ -13,7 +13,8 @@
 //! default); `CHECKOUT_GATE_MEMORY_EVERY=N` writes a `memory {json}` line
 //! to stderr every N edits and around each build and comparison. Exits
 //! nonzero when any comparison differs, when nothing was compared, or when
-//! checkout A's segments were never folded.
+//! the segments of checkout A (the one driven through its handle) were
+//! never folded.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
