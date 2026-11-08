@@ -242,7 +242,8 @@ fn frame_location(_ip: usize) -> Option<FrameLocation> {
 }
 
 /// The running binary's build id: the Mach-O UUID on macOS, the GNU build
-/// id on Linux, as the debug files are keyed.
+/// id on Linux, as uppercase hex without separators. That is how
+/// `aft profile` names the folder it keeps a binary's debug symbols in.
 pub(super) fn build_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| read_build_id().unwrap_or_else(|| "unknown".to_string()))
@@ -281,15 +282,7 @@ fn read_build_id() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn format_uuid(bytes: &[u8]) -> String {
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -342,7 +335,7 @@ fn gnu_build_id(mut notes: &[u8]) -> Option<String> {
         }
         if kind == NT_GNU_BUILD_ID && &notes[12..12 + name_size] == b"GNU\0" {
             let desc = &notes[name_end..name_end + desc_size];
-            return Some(desc.iter().map(|byte| format!("{byte:02x}")).collect());
+            return Some(desc.iter().map(|byte| format!("{byte:02X}")).collect());
         }
         notes = &notes[desc_end..];
     }
