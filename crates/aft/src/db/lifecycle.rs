@@ -437,6 +437,7 @@ unsafe extern "C" fn tracked_wal_hook(
         return rusqlite::ffi::SQLITE_OK;
     }
 
+    let started = std::time::Instant::now();
     let mut log_frames = 0;
     let mut checkpointed_frames = 0;
     // This is the same threshold check and PASSIVE checkpoint used by SQLite's
@@ -456,9 +457,22 @@ unsafe extern "C" fn tracked_wal_hook(
             .checkpoint_counter
             .credit(0, state.bytes_for_frames(frames));
     }
+    INLINE_CHECKPOINT_TIME.with(|total| total.set(total.get() + started.elapsed()));
     // SQLite's built-in autocheckpoint hook deliberately does not fail the
     // already-committed transaction when a PASSIVE checkpoint is busy.
     rusqlite::ffi::SQLITE_OK
+}
+
+thread_local! {
+    /// Time this thread spent in WAL checkpoints run inside its own commits.
+    static INLINE_CHECKPOINT_TIME: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Total time this thread has spent in WAL checkpoints that ran inside its
+/// own commits. Callers difference two readings to split a commit's time.
+pub(crate) fn inline_checkpoint_time_on_this_thread() -> std::time::Duration {
+    INLINE_CHECKPOINT_TIME.with(std::cell::Cell::get)
 }
 
 /// A `rusqlite::Connection` whose lifetime contributes to the process-wide

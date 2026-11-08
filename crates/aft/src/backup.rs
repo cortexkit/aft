@@ -13,6 +13,7 @@ use crate::error::AftError;
 use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
+pub mod latency;
 #[cfg(test)]
 #[path = "agent_data/ordinary_backup_format_tests.rs"]
 mod ordinary_format_tests;
@@ -1606,15 +1607,16 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        // Hydrate any prior on-disk history before appending, so a snapshot
-        // taken on a fresh store (post-restart) extends the existing stack and
-        // advances the id counter instead of overwriting history with a single
+        // Hydrating prior on-disk history before appending lets a snapshot
+        // taken on a fresh store (post-restart) extend the existing stack and
+        // advance the id counter instead of overwriting history with a single
         // entry and reusing backup-0.
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
-        let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
+        let entry = {
+            let _capture = latency::time(latency::Part::Capture);
+            backup_entry_from_path(path, id.clone(), order, description, op_id)?
+        };
 
         self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
@@ -1636,9 +1638,7 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
         let entry = backup_entry_from_capture(capture, id.clone(), order, description, op_id);
 
@@ -1661,9 +1661,7 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
@@ -1753,6 +1751,28 @@ impl BackupStore {
         })
     }
 
+    /// The steps every snapshot runs before it builds its entry: snapshot
+    /// maintenance, the stack's disk lock, and re-reading the stack from disk
+    /// under that lock. Returns the lock, which the caller holds until the
+    /// entry is persisted.
+    fn begin_snapshot(
+        &mut self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
+        {
+            let _maintenance = latency::time(latency::Part::Maintenance);
+            self.run_snapshot_maintenance(session, key)?;
+        }
+        let disk_lock = {
+            let _stack_lock = latency::time(latency::Part::StackLock);
+            self.acquire_stack_disk_lock(session, key)?
+        };
+        let _hydrate = latency::time(latency::Part::Hydrate);
+        self.ensure_stack_hydrated_locked(session, key)?;
+        Ok(disk_lock)
+    }
+
     /// Shared body of the snapshot methods: apply the skip policy, hydrate the
     /// stack under its disk lock, then persist the entry `build` produces.
     fn snapshot_built_entry(
@@ -1766,11 +1786,12 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
-        let entry = build(id.clone(), order)?;
+        let entry = {
+            let _capture = latency::time(latency::Part::Capture);
+            build(id.clone(), order)?
+        };
         self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
         Ok(Some(id))
@@ -5297,6 +5318,7 @@ impl BackupStore {
                 if final_path.exists() {
                     continue;
                 }
+                let _content_file = latency::time(latency::Part::ContentFile);
                 let bytes = content_bytes_for_disk(entry).map_err(|error| AftError::IoError {
                     path: final_path.display().to_string(),
                     message: error.to_string(),
@@ -5327,6 +5349,7 @@ impl BackupStore {
             "count": retained.len(),
             "entries": entries,
         });
+        let meta_file = latency::time(latency::Part::MetaFile);
         let meta_content =
             serde_json::to_string_pretty(&meta).map_err(|error| AftError::IoError {
                 path: dir.join("meta.json").display().to_string(),
@@ -5338,27 +5361,34 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
+        drop(meta_file);
         ledger_bytes = ledger_bytes.saturating_add(meta_content.len() as u64);
         // One directory flush commits both content and metadata renames.
+        let dir_sync = latency::time(latency::Part::DirSync);
         fsync_dir(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
         })?;
+        drop(dir_sync);
         // Rewriting from retained entries prunes stale sidecar rows. Failure
         // loses only annotations; the stack has already committed durably.
+        let post_state = latency::time(latency::Part::PostState);
         if let Err(error) = self.write_post_states(session, key, retained) {
             crate::slog_warn!(
                 "backup fingerprints not recorded for {}: {error}",
                 key.display()
             );
         }
+        drop(post_state);
 
+        let prune = latency::time(latency::Part::Prune);
         prune_unreferenced_backup_files(&dir, &referenced_content).map_err(|error| {
             AftError::IoError {
                 path: dir.display().to_string(),
                 message: error.to_string(),
             }
         })?;
+        drop(prune);
         crate::write_ledger::credit(
             crate::write_ledger::Domain::Backups,
             key.display().to_string(),
@@ -5414,6 +5444,7 @@ impl BackupStore {
             return;
         };
 
+        let lock_wait = latency::time(latency::Part::DbLock);
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => {
@@ -5425,6 +5456,9 @@ impl BackupStore {
                 return;
             }
         };
+        drop(lock_wait);
+        let write_started = Instant::now();
+        let checkpoint_before = crate::db::lifecycle::inline_checkpoint_time_on_this_thread();
         let path_hash = Self::path_hash(key);
         let file_path = key.display().to_string();
 
@@ -5459,6 +5493,14 @@ impl BackupStore {
             ),
         };
         self.set_db_mirror_synced(session, key, write_result.is_ok());
+        drop(conn);
+        let checkpoint = crate::db::lifecycle::inline_checkpoint_time_on_this_thread()
+            .saturating_sub(checkpoint_before);
+        latency::add(latency::Part::WalCheckpoint, checkpoint);
+        latency::add(
+            latency::Part::DbWrite,
+            write_started.elapsed().saturating_sub(checkpoint),
+        );
         if let Err(error) = write_result {
             crate::slog_warn!(
                 "dual-write backup {} to DB failed for {} (rolled back, prior stack kept): {}",
