@@ -5349,6 +5349,16 @@ impl BackupStore {
             "count": retained.len(),
             "entries": entries,
         });
+        // Each content file above was flushed to the device on its own, so
+        // meta.json can never name content that has not reached the disk.
+        // meta.json and the directory sync then share one device flush, which
+        // completes before this returns and before anything is pruned. On
+        // macOS a flush is an F_FULLFSYNC that waits for the drive's whole
+        // write cache, so this saves one per snapshot. Power loss before that
+        // flush leaves either the previous meta.json, without the new entry,
+        // or a new one whose content file is missing, which loading refuses
+        // (see `validate_v2_content_reference`).
+        let syncs = crate::durability::SyncGroup::new();
         let meta_file = latency::time(latency::Part::MetaFile);
         let meta_content =
             serde_json::to_string_pretty(&meta).map_err(|error| AftError::IoError {
@@ -5370,6 +5380,12 @@ impl BackupStore {
             message: error.to_string(),
         })?;
         drop(dir_sync);
+        let device_flush = latency::time(latency::Part::DeviceFlush);
+        syncs.finish().map_err(|error| AftError::IoError {
+            path: dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        drop(device_flush);
         // Rewriting from retained entries prunes stale sidecar rows. Failure
         // loses only annotations; the stack has already committed durably.
         let post_state = latency::time(latency::Part::PostState);
@@ -5469,29 +5485,32 @@ impl BackupStore {
             file_path: &file_path,
             path_hash: &path_hash,
         };
-        let (write_result, operation) = match plan {
-            DbMirrorPlan::Append {
-                evicted_orders,
-                new_entry,
-                restamped,
-            } if self.db_mirror_is_synced(session, key) => (
-                apply_backup_append_delta_in_db(
-                    &conn,
-                    &context,
+        // A tool call waits on this write, so a WAL checkpoint its commit
+        // triggers runs on the background worker instead of here.
+        let (write_result, operation) =
+            crate::db::lifecycle::defer_wal_checkpoints(|| match plan {
+                DbMirrorPlan::Append {
                     evicted_orders,
                     new_entry,
                     restamped,
+                } if self.db_mirror_is_synced(session, key) => (
+                    apply_backup_append_delta_in_db(
+                        &conn,
+                        &context,
+                        evicted_orders,
+                        new_entry,
+                        restamped,
+                    ),
+                    "append delta",
                 ),
-                "append delta",
-            ),
-            // A newly configured or previously failed mirror has no trusted DB
-            // baseline. Repair it once from the authoritative disk stack before
-            // later appends switch to constant-work deltas.
-            DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
-                replace_backup_stack_in_db(&conn, &context, stack),
-                "full stack",
-            ),
-        };
+                // A newly configured or previously failed mirror has no trusted DB
+                // baseline. Repair it once from the authoritative disk stack before
+                // later appends switch to constant-work deltas.
+                DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
+                    replace_backup_stack_in_db(&conn, &context, stack),
+                    "full stack",
+                ),
+            });
         self.set_db_mirror_synced(session, key, write_result.is_ok());
         drop(conn);
         let checkpoint = crate::db::lifecycle::inline_checkpoint_time_on_this_thread()
@@ -12341,5 +12360,137 @@ mod tests {
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
             .filter(|name| name.starts_with("bak_") && name.ends_with(".bak"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod edit_latency_tests {
+    use super::*;
+    use crate::durability::EventKind;
+    use crate::harness::Harness;
+    use std::fs;
+
+    fn stack_dir(store: &BackupStore, session: &str, path: &Path) -> PathBuf {
+        store
+            .session_dir(session)
+            .unwrap()
+            .join(BackupStore::path_hash(&canonicalize_key(path)))
+    }
+
+    /// A snapshot flushes its content file to the device on its own, then
+    /// meta.json and the stack directory with one shared flush. meta.json can
+    /// therefore never name content that has not reached the disk.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_flushes_content_alone_before_meta_rename_then_meta_and_dir_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("user.txt");
+        fs::write(&path, "original").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        // The first snapshot also publishes the new store directories.
+        store.snapshot("flush-order", &path, "first").unwrap();
+        fs::write(&path, "edited").unwrap();
+        crate::durability::take();
+        crate::durability::take_full_syncs();
+
+        store.snapshot("flush-order", &path, "second").unwrap();
+        let events = crate::durability::take();
+        let flushes = crate::durability::take_full_syncs();
+
+        let dir = stack_dir(&store, "flush-order", &path);
+        let meta = dir.join("meta.json");
+        assert_eq!(flushes.len(), 2, "device flushes per snapshot: {flushes:?}");
+        let content = &flushes[0];
+        assert_eq!(content.parent(), Some(dir.as_path()), "{flushes:?}");
+        assert!(
+            content
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("bak_")),
+            "the first flush is the content file's own: {flushes:?}"
+        );
+        assert_eq!(flushes[1], meta, "{flushes:?}");
+        // The content file's sync event is recorded once its flush returned,
+        // so it must come before meta.json is renamed into place.
+        let content_synced = events
+            .iter()
+            .position(|event| event.0 == EventKind::FileSync && &event.1 == content)
+            .expect("content file synced");
+        let meta_renamed = events
+            .iter()
+            .position(|event| *event == (EventKind::AtomicReplace, meta.clone()))
+            .expect("meta.json renamed");
+        assert!(content_synced < meta_renamed, "{events:?}");
+        // The stack is still complete and undoable.
+        assert_eq!(store.history("flush-order", &path).len(), 2);
+        store.restore_latest("flush-order", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
+    }
+
+    /// Opens the deferred-checkpoint gate when dropped, so a failing
+    /// assertion cannot leave other tests' checkpoints held.
+    struct GateGuard;
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            crate::db::deferred_checkpoint::test_hooks::open_gate();
+        }
+    }
+
+    /// The aft.db mirror commit of an undo snapshot must not run the WAL
+    /// checkpoint SQLite triggers past the autocheckpoint threshold: that
+    /// copies the WAL into the database and syncs both files while the edit
+    /// waits. The background worker runs it instead.
+    #[test]
+    fn snapshot_mirror_commit_leaves_its_wal_checkpoint_to_the_background_worker() {
+        use crate::db::deferred_checkpoint::test_hooks;
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        // Every commit passes the threshold, so the mirror commit would
+        // checkpoint inline.
+        conn.set_wal_autocheckpoint(1).unwrap();
+        let db_file = PathBuf::from(conn.path().unwrap());
+        let pool = Arc::new(Mutex::new(conn));
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_pool(Arc::clone(&pool));
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+
+        let finished_before = test_hooks::finished(&db_file);
+        let inline_before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
+        test_hooks::close_gate();
+        let gate = GateGuard;
+        store
+            .snapshot_with_op("deferred", &path, "edit", Some("op-1"))
+            .unwrap();
+        assert_eq!(
+            crate::db::lifecycle::inline_checkpoints_on_this_thread() - inline_before,
+            0,
+            "the snapshot's own aft.db commit ran a WAL checkpoint"
+        );
+        // The snapshot returned while its checkpoint is still held.
+        assert!(
+            test_hooks::wait_until_held(Duration::from_secs(10)),
+            "no checkpoint was handed to the background worker"
+        );
+        let rows = crate::db::backups::list_backups(
+            &pool.lock().unwrap(),
+            "opencode",
+            "deferred",
+            &BackupStore::path_hash(&canonicalize_key(&path)),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "the mirror row was committed");
+        drop(gate);
+        assert!(
+            test_hooks::wait_finished_after(&db_file, finished_before, Duration::from_secs(10)),
+            "the background checkpoint never finished"
+        );
     }
 }

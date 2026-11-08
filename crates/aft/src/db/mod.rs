@@ -23,6 +23,7 @@ pub mod catalog_edit_modes;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
+pub(crate) mod deferred_checkpoint;
 pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;

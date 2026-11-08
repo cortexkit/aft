@@ -1,0 +1,1 @@
+- Edits, writes and patches on macOS return sooner, most of all while the disk is busy. Their undo snapshot now does one device-cache flush fewer, and an undo-history write no longer waits for an aft.db WAL checkpoint.

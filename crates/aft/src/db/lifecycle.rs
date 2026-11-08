@@ -338,6 +338,10 @@ struct WalHookState {
     page_size: u64,
     checkpoint_counter: WriteCounter,
     residual_counter: WriteCounter,
+    /// The `aft.db` file this connection is attached to, so a commit inside
+    /// [`defer_wal_checkpoints`] can hand its checkpoint to the background
+    /// worker. `None` for other stores, which always checkpoint inline.
+    deferrable: Option<(PathBuf, crate::db::file_identity::FileIdentity)>,
 }
 
 impl WalHookState {
@@ -436,6 +440,16 @@ unsafe extern "C" fn tracked_wal_hook(
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
     }
+    if let Some((path, identity)) = state.deferrable.as_ref() {
+        // Past several thresholds the background worker is not keeping up
+        // (or cannot open the file); checkpoint here so the WAL stays bounded.
+        if DEFER_CHECKPOINTS.with(std::cell::Cell::get)
+            && frame_count < threshold.saturating_mul(DEFERRED_CHECKPOINT_LIMIT)
+        {
+            crate::db::deferred_checkpoint::request(path, *identity);
+            return rusqlite::ffi::SQLITE_OK;
+        }
+    }
 
     let started = std::time::Instant::now();
     let mut log_frames = 0;
@@ -458,15 +472,48 @@ unsafe extern "C" fn tracked_wal_hook(
             .credit(0, state.bytes_for_frames(frames));
     }
     INLINE_CHECKPOINT_TIME.with(|total| total.set(total.get() + started.elapsed()));
+    INLINE_CHECKPOINTS.with(|count| count.set(count.get() + 1));
     // SQLite's built-in autocheckpoint hook deliberately does not fail the
     // already-committed transaction when a PASSIVE checkpoint is busy.
     rusqlite::ffi::SQLITE_OK
 }
 
+/// How many autocheckpoint thresholds the WAL may pass while its checkpoints
+/// are deferred before a commit checkpoints inline anyway.
+const DEFERRED_CHECKPOINT_LIMIT: i32 = 8;
+
 thread_local! {
     /// Time this thread spent in WAL checkpoints run inside its own commits.
     static INLINE_CHECKPOINT_TIME: std::cell::Cell<std::time::Duration> =
         const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// WAL checkpoints run inside this thread's own commits.
+    static INLINE_CHECKPOINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Set while this thread's `aft.db` commits hand their checkpoints to the
+    /// background worker; see [`defer_wal_checkpoints`].
+    static DEFER_CHECKPOINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `work` with the WAL checkpoint that any `aft.db` commit in it would
+/// run inline handed to a background worker instead, so a caller waiting on
+/// `work` never waits for the checkpoint's file copy and syncs. Use it for
+/// writes a tool call waits on; commits elsewhere keep SQLite's inline
+/// autocheckpoint. Durability is unchanged: a checkpoint only moves already
+/// committed pages from the WAL into the database file.
+pub(crate) fn defer_wal_checkpoints<R>(work: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEFER_CHECKPOINTS.with(|defer| defer.set(self.0));
+        }
+    }
+    let _restore = Restore(DEFER_CHECKPOINTS.with(|defer| defer.replace(true)));
+    work()
+}
+
+/// WAL checkpoints that ran inside this thread's own commits so far.
+#[cfg(test)]
+pub(crate) fn inline_checkpoints_on_this_thread() -> u64 {
+    INLINE_CHECKPOINTS.with(std::cell::Cell::get)
 }
 
 /// Total time this thread has spent in WAL checkpoints that ran inside its
@@ -652,6 +699,15 @@ impl TrackedConnection {
             root_id.clone(),
         );
         let residual_counter = crate::write_ledger::register(WriteDomain::Other, root_id);
+        let deferrable = (store == SqliteStore::AftDb)
+            .then(|| connection.path())
+            .flatten()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .and_then(|path| {
+                let path = PathBuf::from(path);
+                let identity = crate::db::file_identity::identity_of(&path)?;
+                Some((path, identity))
+            });
         let wal_hook = Box::new(WalHookState {
             threshold_pages: AtomicI32::new(DEFAULT_WAL_AUTOCHECKPOINT_PAGES as i32),
             last_log_frames: AtomicI32::new(0),
@@ -661,6 +717,7 @@ impl TrackedConnection {
             page_size,
             checkpoint_counter,
             residual_counter,
+            deferrable,
         });
         let context = std::ptr::from_ref(wal_hook.as_ref())
             .cast_mut()
