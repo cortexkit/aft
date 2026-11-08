@@ -5506,8 +5506,13 @@ impl BackupStore {
             file_path: &file_path,
             path_hash: &path_hash,
         };
-        // A tool call waits on this write, so a WAL checkpoint its commit
-        // triggers runs on the background worker instead of here.
+        // A tool call waits on this write. It waits at most
+        // `MIRROR_BUSY_WAIT` for another connection's write transaction; past
+        // that the write fails, the stack is marked out of sync below, and
+        // the next mirror write for it rewrites the whole stack from disk.
+        // Undo and history read the disk stack, so they are unaffected. A
+        // WAL checkpoint the commit triggers runs on the background worker.
+        let _ = conn.busy_timeout(MIRROR_BUSY_WAIT);
         let (write_result, operation) =
             crate::db::lifecycle::defer_wal_checkpoints(|| match plan {
                 DbMirrorPlan::Append {
@@ -5532,6 +5537,7 @@ impl BackupStore {
                     "full stack",
                 ),
             });
+        let _ = conn.busy_timeout(crate::db::STEADY_BUSY_TIMEOUT);
         self.set_db_mirror_synced(session, key, write_result.is_ok());
         drop(conn);
         let checkpoint = crate::db::lifecycle::inline_checkpoint_time_on_this_thread()
@@ -5708,6 +5714,10 @@ impl BackupStore {
         }
     }
 }
+
+/// Longest an edit's undo-mirror write waits for another aft.db connection's
+/// write transaction before leaving the stack to the out-of-sync repair.
+const MIRROR_BUSY_WAIT: Duration = Duration::from_millis(50);
 
 /// Open a connection of the undo mirror's own to the database behind
 /// `shared`, so an edit's mirror write never waits for the process-wide
@@ -12600,8 +12610,9 @@ mod edit_latency_tests {
             let _ = done.send(result);
             (store, path)
         });
-        // Generous: a snapshot takes milliseconds. Today's code waits for
-        // the held mutex for as long as this test holds it.
+        // The 20 s timeout is generous: a snapshot takes milliseconds and
+        // must finish while the shared mutex is still held. A mirror that
+        // wrote through the shared connection would wait until it is released.
         let outcome = finished.recv_timeout(Duration::from_secs(20));
         drop(held);
         let (store, path) = snapshot.join().unwrap();
@@ -12619,5 +12630,51 @@ mod edit_latency_tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(store.history("held-mutex", &path).len(), 1);
+    }
+
+    /// When another connection holds aft.db's write lock, an edit's mirror
+    /// write gives up after `MIRROR_BUSY_WAIT` instead of the 5 s steady busy
+    /// timeout, and the next mirror write for the stack restores the row.
+    #[test]
+    fn busy_mirror_write_gives_up_quickly_and_the_next_write_restores_the_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let db_path = storage.path().join("aft.db");
+        let pool = Arc::new(Mutex::new(crate::db::open(&db_path).unwrap()));
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_pool(Arc::clone(&pool));
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+        let path_hash = BackupStore::path_hash(&canonicalize_key(&path));
+        let rows = |pool: &Arc<Mutex<TrackedConnection>>| {
+            crate::db::backups::list_backups(&pool.lock().unwrap(), "opencode", "busy", &path_hash)
+                .unwrap()
+                .len()
+        };
+
+        let blocker = crate::db::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        store
+            .snapshot_with_op("busy", &path, "first", Some("op-1"))
+            .unwrap();
+        let waited = started.elapsed();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the snapshot waited {waited:?} for another connection's write lock"
+        );
+        // The row write was given up; the disk stack, which undo reads, has it.
+        assert_eq!(rows(&pool), 0);
+        assert_eq!(store.history("busy", &path).len(), 1);
+
+        fs::write(&path, "edited").unwrap();
+        store
+            .snapshot_with_op("busy", &path, "second", Some("op-2"))
+            .unwrap();
+        assert_eq!(rows(&pool), 2, "the next mirror write rewrote the stack");
     }
 }
