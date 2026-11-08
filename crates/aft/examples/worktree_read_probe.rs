@@ -112,12 +112,7 @@ fn round(value: f64) -> f64 {
 }
 
 /// Runs one scan pass on `root` and prints what it read and cost.
-fn pass(
-    label: &str,
-    delay: u64,
-    root: &Path,
-    previous: Option<&CheckoutState>,
-) -> CheckoutState {
+fn pass(label: &str, delay: u64, root: &Path, previous: Option<&CheckoutState>) -> CheckoutState {
     let policy = aft::data_layer::content::scan_policy();
     let cpu = cpu_seconds();
     let started = Instant::now();
@@ -185,7 +180,14 @@ fn main() {
         let started = Instant::now();
         git(
             &main_root,
-            &["worktree", "add", "-q", "--detach", root.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                root.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         eprintln!(
             "git worktree add {name}: {:.2} s",
