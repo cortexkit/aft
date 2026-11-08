@@ -1,6 +1,11 @@
 //! Measures what a new Git worktree's first build reads: the bytes, files,
-//! wall time and CPU time of each pass a sibling start makes over the new
-//! worktree's files.
+//! wall time and CPU time of each pass that build makes over the new
+//! worktree's files. A checkout with nothing published whose repository
+//! already has another checkout built starts from that sibling's
+//! publication instead of building cold: it scans its own files to learn
+//! which differ, publishes the sibling's state for itself, and serves it
+//! through `Checkout::bind`'s comparison of the published state with the
+//! files on disk.
 //!
 //! The tree in `<tree.tar[.gz]>` is committed into a fresh repository (the
 //! "main" checkout), which is built cold into an index store of its own;
@@ -8,18 +13,19 @@
 //! harness does, and the passes are measured on it:
 //!
 //! - `first`: a scan with no earlier state, which reads every admitted
-//!   file, as a sibling start's first scan does.
+//!   file, as the start from a sibling's first scan does.
 //! - `second`: a scan over the first one's state, which reads every record
 //!   whose stat is still racy (changed less than two seconds before it was
-//!   observed), as the bind that serves the sibling start does.
+//!   observed), as the comparison that serves the sibling's state does.
 //! - `floor`: the same scan with every record aged out of the racy window,
 //!   so nothing is read: the cost of walking and stating alone.
 //!
 //! Each pass runs on a worktree made `delay` seconds earlier: 0 is a build
 //! that starts as soon as the worktree exists, 3 one that starts after a
-//! short preparation. Finally a fourth worktree is bound and built through
-//! a checkout, as the runtime does, for the whole build's wall and CPU time.
-//! Each line of stdout is one measurement, as JSON.
+//! short preparation. Finally two more worktrees, at the same two ages, are
+//! bound and built through a checkout, as the runtime does, for the whole
+//! build's wall and CPU time. Each line of stdout is one measurement, as
+//! JSON.
 //!
 //! ```text
 //! cargo run --release -p agent-file-tools --example worktree_read_probe -- \
