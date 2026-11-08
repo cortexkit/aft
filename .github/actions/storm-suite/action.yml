@@ -15,7 +15,7 @@ runs:
 
     - name: Run all calibrated storm tests
       shell: bash
-      run: cargo nextest run --features test-hooks --no-fail-fast --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)'
+      run: cargo nextest run --no-fail-fast --features test-hooks --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)'
 
     - name: Retain storm compiler timings and inventory
       if: always()
