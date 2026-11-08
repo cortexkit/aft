@@ -1548,7 +1548,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
 
       - name: Check feature-enabled provider conformance (deny warnings)
-        run: cargo check -p agent-file-tools --features test-timing-hooks --test rest
+        run: cargo check -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
         shell: pwsh
         env:
           RUSTFLAGS: "-D warnings"
