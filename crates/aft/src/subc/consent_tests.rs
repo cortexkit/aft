@@ -1491,6 +1491,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
                 }
             },
             run_id: run_id.into(),
+            task_identity: None,
             owner_route: parent.clone(),
             owner_route_channel: RouteChannel {
                 channel: 41,
@@ -6186,6 +6187,93 @@ async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
     );
 }
 
+#[cfg(target_os = "macos")]
+struct StartupMacosWithdrawal {
+    fake: Arc<FakeCingulate>,
+    failed_id: String,
+    calls: StdMutex<Vec<Value>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ConsentTransport for StartupMacosWithdrawal {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        assert_eq!(call.method, "consent.withdraw");
+        self.calls.lock().unwrap().push(call.params.clone());
+        if call.params["elicitation_id"] == self.failed_id {
+            Box::pin(async {
+                Err(ConsentError::Unavailable(
+                    "injected withdrawal failure".into(),
+                ))
+            })
+        } else {
+            SharedFake(Arc::clone(&self.fake)).call(call)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_failed_rows() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let db = f.ctx.db().unwrap();
+    let failed = f.dir.path().join("failed");
+    let observations = [f.dir.path().join("withdrawn"), failed.clone()]
+        .into_iter()
+        .map(|folder| crate::bounded_io::PermissionObservation {
+            folder,
+            readable: false,
+        })
+        .collect();
+    macos_permissions(Arc::clone(&db), f.head.clone(), observations)
+        .await
+        .unwrap();
+    let failed_id: String = {
+        let conn = db.lock().unwrap();
+        conn.execute("INSERT INTO macos_permission_cards SELECT 'unpublished',program,call_key,'invalid unused scope',project_root,session,NULL FROM macos_permission_cards LIMIT 1", []).unwrap();
+        conn.query_row(
+            "SELECT elicitation_id FROM macos_permission_cards WHERE folder=?1",
+            [failed.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let transport = Arc::new(StartupMacosWithdrawal {
+        fake: Arc::clone(&f.fake),
+        failed_id: failed_id.clone(),
+        calls: StdMutex::default(),
+    });
+    install_test_transport(Some(transport.clone()));
+    assert_eq!(
+        withdraw_macos_permission_cards(Arc::clone(&db))
+            .await
+            .unwrap(),
+        1
+    );
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "unpublished rows must not cause a consent call"
+    );
+    assert!(calls.iter().any(|call| call["elicitation_id"] == failed_id));
+    let remaining = db
+        .lock()
+        .unwrap()
+        .prepare("SELECT folder FROM macos_permission_cards")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(remaining, vec![failed.to_string_lossy().into_owned()]);
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        2,
+        "startup does not file replacement cards"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
@@ -6217,6 +6305,102 @@ async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
     let reply = f.read(&f.worker, &target, 9).await;
     assert!(text(&reply).contains("protected bytes"), "{reply}");
     wait_for(|| f.fake.calls("consent.withdraw").len() == 1).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_walk_skips_protected_descendants_with_named_gap_and_no_card() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &f.head,
+        &f.ctx,
+    )
+    .unwrap();
+    let root = f.ctx.config().project_root.clone().unwrap();
+    let protected = root.join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    std::fs::write(root.join("readable.rs"), "fn needle() {}\n").unwrap();
+    std::fs::write(protected.join("hidden.rs"), "fn needle() {}\n").unwrap();
+    let _probe = crate::bounded_io::tests::deny_macos_directory(&protected);
+    let expected = format!(
+        "macOS did not let AFT read 1 folder under {}, so the result skips it: protected.",
+        root.display()
+    );
+    for (index, (tool, arguments, dispatch)) in [
+        (
+            "glob",
+            json!({"path":".","pattern":"**/*.rs"}),
+            glob_dispatch as DispatchFn,
+        ),
+        (
+            "grep",
+            json!({"path":root,"pattern":"needle"}),
+            grep_dispatch as DispatchFn,
+        ),
+        (
+            "search",
+            json!({"path":root,"pattern":"needle"}),
+            aft_search_dispatch as DispatchFn,
+        ),
+        (
+            "outline",
+            json!({"target":root}),
+            scope_dispatch as DispatchFn,
+        ),
+        (
+            "outline",
+            json!({"target":root,"files":true}),
+            scope_dispatch as DispatchFn,
+        ),
+        (
+            "search",
+            json!({"path":root,"query":"needle"}),
+            aft_search_dispatch as DispatchFn,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if arguments.get("query").is_some() {
+            f.ctx.update_config(|config| {
+                config.cache_unavailable = Some("injected unavailable index storage".into())
+            });
+        }
+        let expected = if index == 0 {
+            "macOS did not let AFT read 1 folder under ., so the result skips it: protected."
+                .to_string()
+        } else {
+            expected.clone()
+        };
+        let reply = f
+            .checkout_tool(&f.worker, tool, arguments, 70 + index as u64, dispatch)
+            .await;
+        assert!(code(&reply).is_empty(), "{tool}: {reply}");
+        assert!(reply.get("code").is_none(), "{tool}: {reply}");
+        assert_eq!(
+            reply["structuredContent"]["complete"], false,
+            "{tool}: {reply}"
+        );
+        let output = text(&reply);
+        assert!(output.contains("readable.rs"), "{tool}: {reply}");
+        assert!(!output.contains("hidden.rs"), "{tool}: {reply}");
+        assert_eq!(output.matches(&expected).count(), 1, "{tool}: {reply}");
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.fake.calls("consent.await").is_empty());
+    let cards: usize = f
+        .ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM macos_permission_cards", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(cards, 0);
 }
 
 #[cfg(unix)]

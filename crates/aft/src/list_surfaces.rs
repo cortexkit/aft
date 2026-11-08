@@ -1226,6 +1226,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::inspect::MAX_PARSE_FAILURE_FILES",
         reason: "an incomplete-analysis explanation previews five parse-failure paths with their parse reasons and says `+N more`; this is a coverage gap, not a findings page. The full failure count and structured parse_errors stay visible and scope can narrow the affected files; the preview never changes completeness",
     },
+    ExclusionEntry {
+        file: "bounded_io.rs",
+        enclosing_item: "walk_permission_gap",
+        location_or_primitive: ".take(3)",
+        reason: "three-folder preview inside a gap note with the full skipped count, not a pageable list",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.

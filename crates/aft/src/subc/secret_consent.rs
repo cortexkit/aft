@@ -589,6 +589,7 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
             agent_id: "secret-agent".into(),
         },
         run_id: "secret-run".into(),
+        task_identity: None,
         owner_route: head.clone(),
         owner_route_channel: super::RouteChannel {
             channel: 1,

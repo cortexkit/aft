@@ -169,6 +169,7 @@ jobs:
           bash scripts/train-push.test.sh
           bash scripts/land-pr.test.sh
           bash scripts/release-ci-gate.test.sh
+          bash scripts/lib/card-source-gate.test.sh
       - name: Validate publication shapes and release notes
         run: |
           node scripts/validate-packages.mjs

@@ -84,6 +84,7 @@ impl DatabaseWaits {
         let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
         let key = (route, decoded.frame.header.corr);
         let admission = AdmissionWait::from_decoded(&decoded, "tool.call");
+        let launches_shell_task = codemode::launches_shell_task(decoded.body().ok());
         decoded.confinement = None;
         let handle = self.tasks.spawn(async move {
             for (identity, ctx) in &candidates {
@@ -99,7 +100,7 @@ impl DatabaseWaits {
                     tokio::time::Instant::from_std(deadline),
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        codemode::SavedPolicies::read(candidates)
+                        codemode::SavedPolicies::read_for_call(candidates, launches_shell_task)
                     }),
                 )
                 .await

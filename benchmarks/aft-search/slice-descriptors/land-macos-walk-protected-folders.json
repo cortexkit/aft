@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "macos-walk-protected-folders"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/commands/semantic_search/mod.rs. Its degraded folder walk (used only when no index is available) now records the root spelling the agent wrote and probes each directory for macOS read permission, so a protected folder becomes a named gap instead of failing the call. Routing, candidates, scores, ordering and caps are unchanged, and the benchmark never takes the degraded walk, so ranked rows must stay byte-identical to the committed reference."
+}

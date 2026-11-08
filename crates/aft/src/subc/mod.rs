@@ -1628,6 +1628,13 @@ enum ManagementAdmission {
 
 impl RouteIdentity {
     fn task_identity(&self) -> crate::bash_background::TaskIdentity {
+        if let Some(identity) = self
+            .run_owner
+            .as_ref()
+            .and_then(|owner| owner.task_identity.as_ref())
+        {
+            return identity.clone();
+        }
         let principal = match &self.spawn_principal {
             AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.clone(),
             AuthenticatedPrincipal::FirstParty => None,
@@ -5370,6 +5377,22 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    // Withdraw the macOS access cards earlier builds filed. It runs beside the
+    // route loop, never before it: each withdrawal waits on Cingulate, and a
+    // slow or absent Cingulate must not delay route binds.
+    #[cfg(target_os = "macos")]
+    match shared_app.open_db(&storage_dir.join("aft.db")) {
+        Ok(db) => {
+            tokio::spawn(async move {
+                if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
+                    log::warn!("macOS permission card startup cleanup failed: {error:?}");
+                }
+            });
+        }
+        Err(error) => {
+            log::warn!("macOS permission card startup cleanup could not open database: {error}")
+        }
+    }
     rich_ui::display::start(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
@@ -6024,7 +6047,8 @@ where
                             let Some(ctx) = executor.actor_context(&identity.root) else {
                                 return Some(Err(remote_policy::policy_unavailable()));
                             };
-                            if remote_policy::key(identity, Some("worker")).is_none() || ctx.database_runtime_unconfigured() {
+                            if ctx.database_runtime_unconfigured() || (remote_policy::key(identity, Some("worker")).is_none()
+                                && !identity.scope.as_ref().is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)) {
                                 return Some(Ok(codemode::EffectiveSavedPolicy::default()));
                             }
                             match decoded.codemode_policies.as_ref()? {
@@ -10420,6 +10444,29 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            // Translation resolves tool paths before dispatch. Keep the agent's
+            // spelling for messages about folders a walk could not read, without
+            // changing the translated paths.
+            let walk_argument = match bare_name.as_str() {
+                "glob" | "grep" | "search" => arguments.get("path"),
+                "outline" => arguments.get("target"),
+                _ => None,
+            };
+            if let Some(argument) = walk_argument {
+                let names = argument.as_str().into_iter().chain(
+                    argument
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                );
+                for name in names.filter(|name| !name.contains("://") && !name.is_empty()) {
+                    let root = tool_call_context
+                        .project_root
+                        .join(crate::readonly_artifacts::expand_tilde(name));
+                    crate::bounded_io::name_walk_root(&root, Path::new(name));
+                }
+            }
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
             let _task_identity =

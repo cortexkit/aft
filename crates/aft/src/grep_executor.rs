@@ -1264,6 +1264,7 @@ fn target_walk_builder(
     // explicitly named target inside a worktree still walks, exactly like an
     // explicitly named ignored directory.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
+    let permission_root = search_root.to_path_buf();
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(!crate::context::confinement::active())
         .filter_entry(move |entry| {
@@ -1322,7 +1323,8 @@ fn target_walk_builder(
                     return false;
                 }
             }
-            !is_dir || crate::bounded_io::probe_directory(entry.path(), None).is_ok()
+            !is_dir
+                || crate::bounded_io::probe_walk_directory(&permission_root, entry.path()).is_ok()
         });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules
