@@ -3415,6 +3415,10 @@ mod prune_legacy_tests {
         // Canonical, so test hooks keyed by path match the pinned spelling
         // (macOS reaches temp folders through /var -> /private/var).
         let base = fs::canonicalize(temp.path()).unwrap();
+        // On Windows canonical paths carry the verbatim `\\?\` prefix, and
+        // the command reports and keys paths in their plain spelling.
+        #[cfg(windows)]
+        let base = crate::windows_path::normalize_windows_path(&base);
         let storage = base.join("storage");
         for relative in LEGACY.iter().chain(&PROTECTED) {
             let path = storage.join(relative);

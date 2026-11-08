@@ -244,9 +244,9 @@ fn blocking_dead_code_builds_a_cold_callgraph_snapshot() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("blocking-dead-code");
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(&root, "package.json", r#"{"main":"src/main.ts"}"#);
     write_file(
         &root,
@@ -338,9 +338,9 @@ export function privateHelper() { return 0; }
             .path()
             .join(format!("framework-route-{}", case.name));
         fs::create_dir_all(&root).expect("create project");
-        // The index store binds the canonical root; on macOS a temp folder is
-        // under /var, a link to /private/var.
-        let root = fs::canonicalize(&root).expect("canonical project root");
+        // The index store binds the canonical root without the Windows `\\?\`
+        // prefix; on macOS a temp folder is under /var, a link to /private/var.
+        let root = crate::helpers::canonicalize_like_product(&root);
         write_file(&root, "package.json", case.package_json);
         write_file(&root, case.route_file, case.route_source);
         let service_file = Path::new(case.route_file)
@@ -516,9 +516,9 @@ export function deadSibling() { return 0; }
             .path()
             .join(format!("nestjs-decorator-{}", case.name));
         fs::create_dir_all(&root).expect("create project");
-        // The index store binds the canonical root; on macOS a temp folder is
-        // under /var, a link to /private/var.
-        let root = fs::canonicalize(&root).expect("canonical project root");
+        // The index store binds the canonical root without the Windows `\\?\`
+        // prefix; on macOS a temp folder is under /var, a link to /private/var.
+        let root = crate::helpers::canonicalize_like_product(&root);
         write_file(&root, "package.json", case.package_json);
         let controller_file = "src/app.controller.ts";
         write_file(&root, controller_file, case.controller_source);
@@ -1514,9 +1514,9 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join(format!("dead-code-project-{name}"));
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     setup(&root);
 
     let warm_inspect_dir = temp_dir.path().join(format!("warm-{name}/inspect"));
@@ -2019,9 +2019,9 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-twice-cold");
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(root.as_path(), "package.json", r#"{"main":"src/main.ts"}"#);
     write_file(
         root.as_path(),
@@ -2068,9 +2068,9 @@ fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-rust-macro-twice-cold");
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         root.as_path(),
         "Cargo.toml",
@@ -2128,9 +2128,9 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-route-twice-cold");
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         &root,
         "package.json",
@@ -2181,9 +2181,9 @@ fn inspect_dead_code_nestjs_decorators_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-nestjs-twice-cold");
     fs::create_dir_all(&root).expect("create project");
-    // The index store binds the canonical root; on macOS a temp folder is
-    // under /var, a link to /private/var.
-    let root = fs::canonicalize(&root).expect("canonical project root");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         &root,
         "package.json",

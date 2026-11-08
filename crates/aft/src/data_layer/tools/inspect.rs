@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
 use crate::data_layer::runtime::DataCheckout;
-use crate::inspect::job::{canonicalize_normalized, CallgraphSnapshot};
+use crate::inspect::job::{canonicalize_normalized, normalize_path, CallgraphSnapshot};
 
 /// How long a dead-code run waits for recorded edits to reach the call
 /// graph, as the call-graph commands do.
@@ -45,7 +45,7 @@ impl DeadCodeSources {
     /// A checkout of another folder is not used: its call graph would
     /// describe different files.
     pub(crate) fn bind(&self, project_root: &Path, checkout: &Arc<DataCheckout>) {
-        if canonicalize_normalized(checkout.root()) != project_root {
+        if canonicalize_normalized(checkout.root()) != normalize_path(project_root) {
             crate::slog_info!(
                 "tier2 dead_code: data layer not used for {}: its checkout is of {}",
                 project_root.display(),
@@ -56,7 +56,19 @@ impl DeadCodeSources {
         self.checkouts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(project_root.to_path_buf(), Arc::downgrade(checkout));
+            .insert(normalize_path(project_root), Arc::downgrade(checkout));
+    }
+
+    /// The checkout bound for `project_root`. Keys are normalized, so a root
+    /// spelled with the Windows verbatim prefix (`\\?\C:\...`, what
+    /// `std::fs::canonicalize` returns there) finds the same checkout as
+    /// its plain spelling.
+    fn checkout(&self, project_root: &Path) -> Option<Arc<DataCheckout>> {
+        self.checkouts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&normalize_path(project_root))
+            .and_then(Weak::upgrade)
     }
 
     /// The inventory of `project_root` from its bound checkout's current
@@ -67,12 +79,7 @@ impl DeadCodeSources {
         &self,
         project_root: &Path,
     ) -> Option<crate::inspect::inventory::InspectInventory> {
-        let checkout = self
-            .checkouts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(project_root)
-            .and_then(Weak::upgrade)?;
+        let checkout = self.checkout(project_root)?;
         let view = checkout.view()?;
         crate::inspect::inventory::InspectInventory::from_checkout(project_root, &view)
     }
@@ -84,11 +91,7 @@ impl DeadCodeSources {
     /// in for a graph that doesn't exist yet. A published graph with edits
     /// pending is not busy: [`Self::snapshot`] brings it up to date.
     pub(crate) fn callgraph_busy(&self, project_root: &Path) -> bool {
-        self.checkouts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(project_root)
-            .and_then(Weak::upgrade)
+        self.checkout(project_root)
             .and_then(|checkout| checkout.view())
             .is_none_or(|view| !view.status().callgraph_published)
     }
@@ -97,12 +100,7 @@ impl DeadCodeSources {
     /// once the view is published and its call graph has no changes
     /// pending.
     pub(crate) fn snapshot(&self, project_root: &Path) -> DeadCodeSnapshot {
-        let Some(checkout) = self
-            .checkouts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(project_root)
-            .and_then(Weak::upgrade)
+        let Some(checkout) = self.checkout(project_root)
         else {
             return DeadCodeSnapshot::Building;
         };

@@ -383,7 +383,12 @@ mod tests {
     /// indexes and the live model cache beside them.
     fn storage() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let storage = fs::canonicalize(temp.path()).unwrap().join("storage");
+        let base = fs::canonicalize(temp.path()).unwrap();
+        // On Windows canonical paths carry the verbatim `\\?\` prefix, and
+        // the command prints the plain spelling.
+        #[cfg(windows)]
+        let base = aft::windows_path::normalize_windows_path(&base);
+        let storage = base.join("storage");
         for (relative, contents) in [
             ("aft.db", "db"),
             ("views/view-1/derived.sqlite", "old view"),
