@@ -1970,9 +1970,6 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
         && root["suspended_domains"]
             .as_array()
             .is_none_or(Vec::is_empty)
-        && root["tier2"]["retry_paused"]
-            .as_array()
-            .is_none_or(Vec::is_empty)
         && root["bash"]["project_replay_failures"]
             .as_array()
             .is_none_or(Vec::is_empty)
@@ -2602,12 +2599,6 @@ impl HealthRollupCache {
                 .unwrap_or("unknown")
                 .to_string();
             let key = (root.to_string(), plane);
-            if plane == "tier2" && status == "stale" {
-                timings.remove(&key);
-                component.remove("since_ms");
-                component.remove("last_progress_at_ms");
-                continue;
-            }
             let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
             let reported_progress_ms = component.get("last_progress_at_ms").and_then(Value::as_u64);
             let progress_signature = serde_json::to_string(component).unwrap_or_default();
@@ -4750,7 +4741,7 @@ mod tests {
             ("/search_index/status", json!("building")),
             ("/semantic_index/status", json!("degraded")),
             ("/callgraph_store/status", json!("absent")),
-            ("/tier2/status", json!("stale")),
+            ("/tier2/status", json!("building")),
             ("/views/pinned", json!(false)),
             ("/views/pending_paths", json!(1)),
             ("/views/failed_paths", json!(1)),
@@ -8408,8 +8399,6 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
-        ctx.mark_status_bar_tier2_stale();
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -9299,31 +9288,6 @@ mod plane_timing_tests {
                 .unwrap()
                 > 2_000
         );
-    }
-
-    #[test]
-    fn stale_tier2_uses_scheduler_fields_instead_of_build_timings() {
-        let cache = HealthRollupCache::new();
-        let mut stale = json!({
-            "tier2": {
-                "status": "stale",
-                "stale_since_ms": 10,
-                "next_refresh_at_ms": 20,
-                "pending_paths": 3,
-            },
-        });
-        cache.annotate_plane_timings("/tmp/root", &mut stale);
-
-        assert_eq!(stale["tier2"]["stale_since_ms"], 10);
-        assert_eq!(stale["tier2"]["next_refresh_at_ms"], 20);
-        assert_eq!(stale["tier2"]["pending_paths"], 3);
-        assert!(stale["tier2"].get("since_ms").is_none());
-        assert!(stale["tier2"].get("last_progress_at_ms").is_none());
-
-        let mut building = json!({ "tier2": { "status": "building" } });
-        cache.annotate_plane_timings("/tmp/root", &mut building);
-        assert!(building["tier2"]["since_ms"].is_u64());
-        assert!(building["tier2"]["last_progress_at_ms"].is_u64());
     }
 }
 

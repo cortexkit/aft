@@ -878,10 +878,6 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
         || before.inspect.categories != after.inspect.categories
     {
         ctx.reset_tier2_refresh_scheduler();
-    } else if before.inspect != after.inspect {
-        // Inspect settings shape Tier-2 results (for example duplicates'
-        // expected mirrors), so a failed category may now succeed.
-        ctx.inspect_manager().clear_tier2_retry_pauses();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
         let storage_root = crate::bash_background::storage_dir(after.storage_dir.as_deref());

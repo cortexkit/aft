@@ -5,21 +5,14 @@ fn truthful_count_shape_keeps_proven_values_and_omits_unproven_categories() {
     let values = StatusBarCountValues {
         errors: None,
         warnings: None,
-        dead_code: Some(7),
-        unused_exports: None,
-        duplicates: None,
-        todos: None,
-        tier2_stale: true,
+        todos: Some(7),
         disabled_categories: Default::default(),
         ..Default::default()
     };
 
-    assert_eq!(values.dead_code, Some(7));
+    assert_eq!(values.todos, Some(7));
     assert_eq!(values.errors, None);
     assert_eq!(values.warnings, None);
-    assert_eq!(values.unused_exports, None);
-    assert_eq!(values.duplicates, None);
-    assert_eq!(values.todos, None);
 }
 
 #[test]
@@ -34,7 +27,6 @@ fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seam
     assert!(context.contains("pub errors: Option<usize>"));
     assert!(context.contains("pub todos: Option<usize>"));
     assert!(!context.contains("todos: tier2.todos.unwrap_or(0)"));
-    assert!(!context.contains("match (tier2.dead_code, tier2.unused_exports, tier2.duplicates)"));
 
     // The agent-visible AFT bar renders the truthful values (a category with no
     // value shows `?`, never 0), and it does so in exactly one place: the
@@ -93,7 +85,7 @@ fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
     let response_finalize = include_str!("../src/response_finalize.rs");
 
     assert!(inspect.contains("refresh_status_bar_counts(ctx, &outcomes);"));
-    assert!(inspect.contains("ctx.update_status_bar_tier2("));
+    assert!(inspect.contains("ctx.update_status_bar_todos("));
     // The counts refresh must run on the OUTCOMES side of the freshness gate:
     // truthful fleet values update from whatever the collection proved even when
     // `fresh_payloads` refuses the payload. (During parallel campaign assembly

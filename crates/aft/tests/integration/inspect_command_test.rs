@@ -813,55 +813,6 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
 }
 
 #[test]
-fn inspect_blocking_reuse_attaches_to_in_flight_background_category() {
-    let _env_lock = env_serial_lock();
-    let (_temp_dir, root) = fixture_project();
-    let _wait_for_attach_root = EnvVarGuard::set(
-        "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT",
-        &root.to_string_lossy(),
-    );
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/bar.ts", duplicate_fixture_source());
-    let ctx = configured_context(&root);
-    let manager = ctx.inspect_manager();
-    let snapshot = InspectSnapshot::new(
-        root.clone(),
-        ctx.inspect_dir(),
-        ctx.config(),
-        ctx.symbol_cache(),
-    );
-
-    let starts_before_submit = manager.reuse_start_count_for_test();
-    manager
-        .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::Duplicates)
-        .expect("queue background duplicate scan");
-    let start_deadline = Instant::now() + Duration::from_secs(20);
-    while manager.reuse_start_count_for_test() == starts_before_submit {
-        assert!(
-            Instant::now() < start_deadline,
-            "background duplicate scan never started"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let outcome = manager.tier2_run_with_reuse_blocking(
-        snapshot,
-        InspectCategory::Duplicates,
-        aft::inspect::JobScope::for_project(root),
-    );
-
-    assert!(
-        matches!(outcome, JobOutcome::Fresh { .. }),
-        "blocking inspect should attach to and receive the background result: {outcome:?}"
-    );
-    assert_eq!(
-        manager.reuse_completion_count(),
-        1,
-        "blocking inspect must not start a competing same-category reuse scan"
-    );
-}
-
-#[test]
 fn scoped_inspect_does_not_wait_for_blocked_tier2() {
     let _env_lock = env_serial_lock();
     let (temp, owner) = fixture_project();
@@ -5532,7 +5483,7 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     })
     .unwrap();
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
-    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+    ctx.update_status_bar_todos(Some(14));
 
     for sections in [json!(["dead_code"]), json!("todos")] {
         let params = json!({
@@ -5577,11 +5528,7 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
             .unwrap()
             .iter()
             .all(|phase| !matches!(phase["id"].as_str(), Some("lsp_start" | "lsp_quiescence"))));
-        let bar = ctx.status_bar_count_values();
-        assert_eq!(
-            (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
-            (Some(11), Some(12), Some(13), Some(14))
-        );
+        assert_eq!(ctx.status_bar_count_values().todos, Some(14));
     }
 
     // Omitted sections: the scoped request reports diagnostics and waits for
@@ -5605,10 +5552,9 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
         "omitted sections must wait for diagnostics producers: {:#}",
         response.data["wait_stamp"]
     );
-    let bar = ctx.status_bar_count_values();
     assert_eq!(
-        (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
-        (Some(11), Some(12), Some(13), Some(14)),
+        ctx.status_bar_count_values().todos,
+        Some(14),
         "a scoped request must not overwrite project totals"
     );
 }
@@ -5700,20 +5646,12 @@ fn inspect_offset_pages_all_150_unused_exports() {
     };
     let first = page(0);
     assert_eq!(first["success"], true, "{first:#}");
-    let bar = ctx.status_bar_count_values();
-    for (category, count) in [
-        ("dead_code", bar.dead_code),
-        ("unused_exports", bar.unused_exports),
-        ("duplicates", bar.duplicates),
-        ("todos", bar.todos),
-    ] {
-        assert_eq!(
-            count,
-            first["summary"][category]["count"]
-                .as_u64()
-                .map(|n| n as usize)
-        );
-    }
+    assert_eq!(
+        ctx.status_bar_count_values().todos,
+        first["summary"]["todos"]["count"]
+            .as_u64()
+            .map(|n| n as usize)
+    );
     assert!(first["text"]
         .as_str()
         .unwrap()
@@ -5779,7 +5717,6 @@ fn inspect_offset_pages_all_150_unused_exports() {
         scoped["details"]["unused_exports"],
         second_details["unused_exports"]
     );
-    assert_eq!(ctx.status_bar_count_values().unused_exports, Some(150));
 }
 
 #[test]
@@ -5791,7 +5728,6 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
     // Dead code answers only once the root's call graph is published; until
     // then it reports pending, with no gaps.
     crate::helpers::wait_for_published_call_graph_in(&ctx);
-    ctx.update_status_bar_tier2(Some(99), Some(0), Some(0), Some(0), false);
     let response = inspect(
         &ctx,
         json!({"id":"python-only", "command":"inspect", "sections":["dead_code"]}),
@@ -5807,7 +5743,6 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
         .any(|gap| gap["kind"] == "language_unsupported"
             && gap["language"] == "python"
             && gap["files"] == 1));
-    assert_eq!(ctx.status_bar_count_values().dead_code, None);
 
     // Inspect lists files from the root's index store, which learns of a file
     // written outside AFT from the project watcher; this context runs none,
@@ -5827,10 +5762,6 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
     let summary = &response["summary"]["dead_code"];
     assert!(summary["count"].is_u64(), "{response:#}");
     assert_eq!(summary["complete"], false);
-    assert_eq!(
-        ctx.status_bar_count_values().dead_code,
-        summary["count"].as_u64().map(|count| count as usize)
-    );
     assert!(response["text"].as_str().unwrap().contains("python"));
 }
 
@@ -5893,7 +5824,7 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
     );
     assert!(warming.accepted_snapshots.is_empty());
     assert_eq!(warming.pending_servers.len(), expected.len());
-    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+    ctx.update_status_bar_todos(Some(14));
     assert!(ctx.lsp().has_diagnostic_report_for_file(&pre_opened));
     assert!(
         ctx.status_bar_count_values().errors.is_none(),
@@ -5933,20 +5864,7 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
     );
     assert!(response.success, "{response:?}");
     let after = ctx.status_bar_count_values();
-    assert_eq!(
-        (
-            after.dead_code,
-            after.unused_exports,
-            after.duplicates,
-            after.todos
-        ),
-        (
-            before.dead_code,
-            before.unused_exports,
-            before.duplicates,
-            before.todos
-        )
-    );
+    assert_eq!(after.todos, before.todos);
     assert_eq!(after.diagnostics, before.diagnostics);
     assert_eq!(after.diagnostics_gaps, before.diagnostics_gaps);
     assert!(
@@ -7814,4 +7732,75 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     );
     assert!(response["summary"]["diagnostics"]["errors"].is_null());
     assert_eq!(ctx.status_bar_count_values().errors, None);
+}
+
+/// Configure and edits refresh only the status bar's TODO count in the
+/// background. Dead code, unused exports, duplicates, cycles and complexity
+/// run only inside an `aft_inspect` call, so no automatic refresh starts one.
+#[test]
+fn configure_and_edits_start_no_whole_repository_analysis() {
+    use aft::inspect::tier2_scheduler::{
+        TIER2_REFRESH_COLD_CACHE_DELAY, TIER2_REFRESH_DEBOUNCE, TIER2_REFRESH_MIN_INTERVAL,
+    };
+    use aft::inspect::Tier2TriggerReason;
+
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    write_file(
+        &root,
+        "src/todo.ts",
+        "// TODO: one\nexport const todo = 1;\n",
+    );
+    let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
+    let no_whole_repository_work = |phase: &str| {
+        // A started analysis registers before it runs, so polling for a
+        // while catches one however quickly it would finish.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert_eq!(
+                manager.reuse_start_count_for_test(),
+                0,
+                "{phase} started a whole-repository analysis"
+            );
+            assert!(
+                !manager.tier2_any_in_flight(),
+                "{phase} queued a whole-repository analysis"
+            );
+            aft::runtime_drain::drain_inspect_events(&ctx);
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // The first refresh after configure: the warm-up that used to run every
+    // whole-repository analysis now refreshes the TODO count alone.
+    let configured_at = Instant::now()
+        .checked_sub(TIER2_REFRESH_COLD_CACHE_DELAY + Duration::from_secs(1))
+        .expect("monotonic clock is older than the cold-cache delay");
+    ctx.reset_tier2_refresh_scheduler_at(configured_at);
+    let now = Instant::now();
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(now, 0),
+        Some(Tier2TriggerReason::ConfigureWarm)
+    );
+    no_whole_repository_work("configure warm-up");
+    assert_eq!(ctx.status_bar_count_values().todos, Some(1));
+
+    // An edit, then the quiet window after it.
+    write_file(
+        &root,
+        "src/todo.ts",
+        "// TODO: one\n// TODO: two\nexport const todo = 1;\n",
+    );
+    ctx.add_pending_tier2_paths([root.join("src/todo.ts")]);
+    let edited_at = now + TIER2_REFRESH_MIN_INTERVAL;
+    assert_eq!(ctx.tick_tier2_refresh_scheduler_at(edited_at, 1), None);
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(edited_at + TIER2_REFRESH_DEBOUNCE, 0),
+        Some(Tier2TriggerReason::Debounce)
+    );
+    no_whole_repository_work("edit refresh");
+    assert_eq!(ctx.status_bar_count_values().todos, Some(2));
+    assert_eq!(manager.reuse_completion_count(), 0);
 }

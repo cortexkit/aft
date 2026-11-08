@@ -461,29 +461,25 @@ impl AppContext {
         // repository writes the one index store.
         let artifact_owner = serde_json::Value::Null;
 
-        // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
+        // Agent status-bar counts (the `[AFT E· W· | T·]` glance).
         // Surfaced for the TUI sidebar so users see the same code-health view
-        // agents get. `None` until the Tier-2 cache is populated at least once
-        // (so we never render fabricated zeros) — emitted as JSON null then,
-        // and the sidebar hides the section.
+        // agents get. `None` until every count has a value at least once (so
+        // we never render fabricated zeros) — emitted as JSON null then, and
+        // the sidebar hides the section.
         let status_bar = match status_bar_values.legacy_projection() {
             Some(counts) => serde_json::json!({
                 "errors": counts.errors,
                 "warnings": counts.warnings,
-                "dead_code": counts.dead_code,
-                "unused_exports": counts.unused_exports,
-                "duplicates": counts.duplicates,
                 "todos": counts.todos,
-                "tier2_stale": counts.tier2_stale,
             }),
             None => serde_json::Value::Null,
         };
         // Per-category companion to `status_bar`: always an object once a
         // snapshot exists, with each count either a number or null when its
-        // producer has not supplied a trustworthy value (for example dead-code
-        // while the callgraph store is unavailable). `status_bar` stays null in
-        // that case for consumers that need the full set; renderers use this
-        // field to show what is known instead of claiming startup forever.
+        // producer has not supplied a trustworthy value. `status_bar` stays
+        // null in that case for consumers that need the full set; renderers
+        // use this field to show what is known instead of claiming startup
+        // forever.
         // Errors and warnings only exist once a language server has reported.
         // With no server running (all disabled, none installed, or no file
         // touched that one serves) nothing will ever report, and a bare null
@@ -508,11 +504,7 @@ impl AppContext {
             "warnings": status_bar_values.warnings,
             "diagnostics": diagnostics_state,
             "diagnostics_gaps": diagnostics_gaps,
-            "dead_code": status_bar_values.dead_code,
-            "unused_exports": status_bar_values.unused_exports,
-            "duplicates": status_bar_values.duplicates,
             "todos": status_bar_values.todos,
-            "tier2_stale": status_bar_values.tier2_stale,
         });
         if !disabled_categories.is_empty() {
             status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
@@ -1040,21 +1032,21 @@ mod tests {
     fn status_status_bar_is_null_until_every_independent_producer_is_populated() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request(), &ctx);
-        // No Tier-2 scan has run yet, so the status-bar glance must be null
+        // No TODO scan has run yet, so the status-bar glance must be null
         // (never fabricated zeros). The key is always present so the TS
         // coercion can distinguish "field absent" from "not populated".
         assert!(response.data.get("status_bar").is_some());
         assert!(response.data["status_bar"].is_null());
 
-        // Tier-2 counts are only one input to the status bar. Keep `status_bar`
+        // The TODO count is only one input to the status bar. Keep `status_bar`
         // null until diagnostics and all other required inputs have reported.
-        ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
+        ctx.update_status_bar_todos(Some(5));
         let response = handle_status(&request(), &ctx);
         assert!(response.data["status_bar"].is_null());
     }
 
-    // One unavailable producer (dead-code while the callgraph store is out)
-    // keeps `status_bar` null, so renderers need the per-category values to
+    // One unavailable producer (diagnostics with no language server) keeps
+    // `status_bar` null, so renderers need the per-category values to
     // show what is known instead of reporting startup indefinitely.
     #[test]
     fn status_bar_values_report_each_category_independently() {
@@ -1063,7 +1055,7 @@ mod tests {
         // snapshot exists. This fixture runs no server discovery, so record
         // that no language server applies to the project.
         ctx.lsp().store_project_applicability(Default::default());
-        ctx.update_status_bar_tier2(None, Some(2), Some(1), Some(5), false);
+        ctx.update_status_bar_todos(Some(5));
         let response = handle_status(&request(), &ctx);
 
         assert!(response.data["status_bar"].is_null());
@@ -1074,11 +1066,7 @@ mod tests {
                 "warnings": null,
                 "diagnostics": "no_language_server",
                 "diagnostics_gaps": [],
-                "dead_code": null,
-                "unused_exports": 2,
-                "duplicates": 1,
                 "todos": 5,
-                "tier2_stale": false,
             })
         );
     }
@@ -1092,7 +1080,7 @@ mod tests {
         // Server discovery has run and found no language server for this
         // project. Before discovery has run, the counts would read "pending".
         ctx.lsp().store_project_applicability(Default::default());
-        ctx.update_status_bar_tier2(Some(1), Some(1), Some(0), Some(0), false);
+        ctx.update_status_bar_todos(Some(0));
         let response = handle_status(&request(), &ctx);
 
         let values = &response.data["status_bar_values"];

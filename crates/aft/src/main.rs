@@ -2580,7 +2580,7 @@ mod pending_response_tests {
         let storage = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(root.path());
         install_pending_completion(&ctx, storage.path(), root.path(), session_id, task_id);
-        ctx.update_status_bar_tier2(Some(3), Some(4), Some(5), Some(6), false);
+        ctx.update_status_bar_todos(Some(6));
         FinalizeFixture {
             _root: root,
             _storage: storage,
@@ -4254,7 +4254,7 @@ mod watcher_filter_tests {
         // without configure never runs discovery. Record an empty applicable
         // set so the report published below is the whole project's answer.
         ctx.lsp().store_empty_project_applicability_for_test();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
         {
             let key = ServerKey {
                 kind: ServerKind::TypeScript,
@@ -4272,17 +4272,17 @@ mod watcher_filter_tests {
         let with_text = |id: &str| Response::success(id, serde_json::json!({ "text": "body" }));
         let mut first = with_text("one");
         finalize_response(&mut first, &ctx, "session-status", "read");
-        assert_eq!(first.data["text"], "body\n\n[AFT E0 W0 | D1 U2 C3 | T4]");
+        assert_eq!(first.data["text"], "body\n\n[AFT E0 W0 | T4]");
         assert!(first.data.get("status_bar").is_none());
 
         let mut unchanged = with_text("two");
         finalize_response(&mut unchanged, &ctx, "session-status", "read");
         assert_eq!(unchanged.data["text"], "body");
 
-        ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(5));
         let mut changed = with_text("three");
         finalize_response(&mut changed, &ctx, "session-status", "read");
-        assert_eq!(changed.data["text"], "body\n\n[AFT E0 W0 | D5 U2 C3 | T4]");
+        assert_eq!(changed.data["text"], "body\n\n[AFT E0 W0 | T5]");
     }
 
     #[test]
@@ -4595,53 +4595,6 @@ mod watcher_filter_tests {
     }
 
     #[test]
-    fn watcher_stale_mark_emits_status_without_semantic_change() {
-        let tmp = TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let file = root.join("notes.txt");
-        std::fs::write(&file, "changed").unwrap();
-
-        let ctx = make_ctx_with_root(&root);
-        // Diagnostics totals count only after server discovery has recorded
-        // which language servers apply to the project; a context built
-        // without configure never runs discovery. Record an empty applicable
-        // set so the report published below is the whole project's answer.
-        ctx.lsp().store_empty_project_applicability_for_test();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
-        // The bar renders only once every producer has reported; an empty
-        // diagnostics publish is a proven zero, not a fabricated one. It is
-        // published for a different file than the one the watcher touches:
-        // a change to a diagnosed file masks that file's report as stale,
-        // which would drop the only diagnostics producer and blank the bar
-        // for a reason unrelated to what this test pins.
-        {
-            let key = ServerKey {
-                kind: ServerKind::TypeScript,
-                root: root.clone(),
-            };
-            let other = root.join("other.ts");
-            std::fs::write(&other, "").unwrap();
-            let mut lsp = ctx.lsp();
-            lsp.diagnostics_store_mut_for_test()
-                .publish(key, other.clone(), vec![]);
-            lsp.certify_diagnostic_content_for_test(&other);
-        }
-        // Every producer has now reported, so the legacy projection exists.
-        assert!(ctx.status_bar_counts().is_some());
-        let rx = status_frame_rx(&ctx);
-        let watcher_tx = install_watcher_rx(&ctx);
-        watcher_tx.send(watcher_paths_event(file)).unwrap();
-
-        drain_watcher_events(&ctx);
-
-        let snapshot = recv_status_changed(&rx);
-        assert_eq!(
-            snapshot["status_bar"]["tier2_stale"],
-            serde_json::Value::Bool(true)
-        );
-    }
-
-    #[test]
     fn watcher_diagnostics_clear_emits_status_without_semantic_change() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -4654,7 +4607,7 @@ mod watcher_filter_tests {
         // without configure never runs discovery. Record an empty applicable
         // set so the report published below is the whole project's answer.
         ctx.lsp().store_empty_project_applicability_for_test();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), true);
+        ctx.update_status_bar_todos(Some(4));
         {
             let key = ServerKey {
                 kind: ServerKind::TypeScript,

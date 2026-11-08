@@ -1,70 +1,38 @@
+//! When the status bar's TODO count is refreshed in the background.
+//!
+//! The whole-repository analyses (dead code, unused exports, duplicates,
+//! cycles and complexity) never run in the background: only an explicit
+//! `aft_inspect` computes them. The TODO count is cheap, and the status bar
+//! shows it on every change, so this scheduler keeps it current: once after
+//! configure, then after edits settle. It keeps the `Tier2` names it was
+//! introduced with, when it also refreshed those analyses.
+
 use std::time::{Duration, Instant};
 
 pub const TIER2_REFRESH_DEBOUNCE: Duration = Duration::from_secs(45);
-// Ceiling that forces a Tier-2 refresh during CONTINUOUS editing (when the
-// debounce never gets its quiet window). Set high: mid-session refreshes show
-// churning, half-applied numbers and cost a scan with no value until changes
-// land — a normal continuous-coding stretch should not trigger one.
+// Ceiling that forces a refresh during CONTINUOUS editing (when the debounce
+// never gets its quiet window). Set high: a normal continuous-coding stretch
+// should not trigger one.
 pub const TIER2_REFRESH_MAX_STALENESS: Duration = Duration::from_secs(30 * 60);
 pub const TIER2_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const TIER2_REFRESH_COLD_CACHE_DELAY: Duration = Duration::from_secs(90);
 pub const TIER2_REFRESH_STORM_DEBOUNCE: Duration = Duration::from_secs(120);
 pub const TIER2_REFRESH_STORM_PATH_THRESHOLD: usize = 200;
-// How long a dispatch that the cold-build limiter turned away waits before it
-// is retried. The maintenance tick pumps the scheduler on its own timer rather
-// than only when files change, so without this pause a root whose dispatch
-// keeps being refused would retry (and log) several times a second for as long
-// as the limiter stays full.
-pub const TIER2_REFRESH_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
-/// A foreign cache writer can release its lease without any input changing.
-/// Initial fallback delay; lease-release notifications can wake a retry sooner.
-pub const TIER2_CACHE_WRITER_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-pub const TIER2_CACHE_WRITER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
-
-pub fn tier2_cache_writer_retry_backoff(timeouts: u32) -> Duration {
-    TIER2_CACHE_WRITER_RETRY_BACKOFF
-        .saturating_mul(1u32 << timeouts.saturating_sub(1).min(16))
-        .min(TIER2_CACHE_WRITER_RETRY_BACKOFF_MAX)
-}
-/// Minimum gap between two roots' first (cold-cache) Tier-2 refreshes.
+/// Minimum gap between two roots' first refreshes after configure.
 ///
 /// Every root configured in the same burst (all sessions rebinding after a
 /// daemon restart) used to come due at exactly `configured + 90s`, so dozens
-/// of scans each opening their root's callgraph and build-breaker stores
-/// started together while the fleet was still rebinding. The process-wide
-/// pacer hands out cold-refresh start times at least this far apart.
+/// of refreshes started together while the fleet was still rebinding. The
+/// process-wide pacer hands out first-refresh start times at least this far
+/// apart.
 pub const TIER2_COLD_START_SPACING: Duration = Duration::from_secs(3);
 /// Upper bound on how far past the cold-cache delay pacing may push one root's
 /// first refresh. A burst larger than `MAX_SPREAD / SPACING` roots shares the
 /// last slot rather than delaying later roots' first refresh without limit.
 pub const TIER2_COLD_START_MAX_SPREAD: Duration = Duration::from_secs(5 * 60);
-/// First pause before an automatic refresh retries a Tier-2 category whose
-/// last build failed.
-///
-/// A failed category build stores nothing, so every automatic refresh used to
-/// rerun the whole build from scratch and fail again for the same reason (one
-/// field report: seven identical failures in 77 minutes, each costing 6-11 s
-/// of CPU). Automatic refreshes now skip a failed category until its pause
-/// elapses. An explicit `aft_inspect` is not held back by the pause.
-pub const TIER2_FAILED_BUILD_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
-/// Longest pause between automatic retries of a category that keeps failing
-/// with the same reason.
-pub const TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4 * 60 * 60);
-
-/// Pause before the next automatic retry of a Tier-2 category build after
-/// `identical_failures` consecutive failures with the same reason (at least
-/// 1). The pause doubles with each repeat, up to
-/// [`TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX`]; a failure with a new reason
-/// starts again at [`TIER2_FAILED_BUILD_RETRY_BACKOFF`].
-pub fn tier2_failed_build_retry_backoff(identical_failures: u32) -> Duration {
-    let doublings = identical_failures.saturating_sub(1).min(16);
-    TIER2_FAILED_BUILD_RETRY_BACKOFF
-        .saturating_mul(1u32 << doublings)
-        .min(TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX)
-}
 
 /// Hands out first-refresh times for roots configured close together, so
-/// their cold-cache Tier-2 refreshes start one at a time instead of at once.
+/// their first refreshes start one at a time instead of at once.
 #[derive(Debug, Default)]
 pub struct Tier2ColdStartPacer {
     last_slot: Option<Instant>,
@@ -76,7 +44,7 @@ impl Tier2ColdStartPacer {
     }
 
     /// Reserve the earliest moment a root configured at `now` may run its
-    /// cold-cache refresh: never before `now + TIER2_REFRESH_COLD_CACHE_DELAY`,
+    /// first refresh: never before `now + TIER2_REFRESH_COLD_CACHE_DELAY`,
     /// and at least `TIER2_COLD_START_SPACING` after the previous reservation.
     pub fn reserve(&mut self, now: Instant) -> Instant {
         let earliest = now + TIER2_REFRESH_COLD_CACHE_DELAY;
@@ -98,7 +66,6 @@ pub fn process_tier2_cold_start_pacer() -> &'static parking_lot::Mutex<Tier2Cold
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2TriggerReason {
-    ResourceRetry,
     Debounce,
     Ceiling,
     Pull,
@@ -108,7 +75,6 @@ pub enum Tier2TriggerReason {
 impl Tier2TriggerReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ResourceRetry => "resource_retry",
             Self::Debounce => "debounce",
             Self::Ceiling => "ceiling",
             Self::Pull => "pull",
@@ -117,27 +83,22 @@ impl Tier2TriggerReason {
     }
 }
 
-/// Why a dispatch did not happen even though the deadline the scheduler
-/// publishes (`next_dispatch_at`, which health reports as `next_refresh_at_ms`)
-/// has already passed. Reported once per overdue stretch so the daemon log
-/// names the predicate holding a root's Tier-2 refresh back.
+/// Why a dispatch did not happen even though the deadline this scheduler
+/// works out (`next_dispatch_at`) has already passed. Reported once per
+/// overdue stretch so the daemon log names the predicate holding a root's
+/// refresh back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2DispatchBlock {
     /// The root may not write inspect artifacts, or heavy root work is off.
     ReadOnly,
-    /// Another Tier-2 category is still building.
+    /// An inspect analysis is still running for this root.
     InFlight,
     /// The semantic cold seed owns the machine until it finishes.
     SemanticColdSeed,
-    /// This root's callgraph store is still being cold-built.
-    CallgraphColdBuild,
-    /// The first scan after configure is still inside its cold-cache delay.
+    /// The first refresh after configure is still inside its cold-cache delay.
     ColdCacheDelay,
-    /// A dispatch the cold-build limiter turned away is waiting out its retry
-    /// pause.
-    DeferralBackoff,
     /// Nothing external is holding the dispatch back and no trigger matched:
-    /// the published deadline and the dispatch predicate disagree.
+    /// the deadline and the dispatch predicate disagree.
     NoTrigger,
 }
 
@@ -147,9 +108,7 @@ impl Tier2DispatchBlock {
             Self::ReadOnly => "read_only",
             Self::InFlight => "tier2_in_flight",
             Self::SemanticColdSeed => "semantic_cold_seed",
-            Self::CallgraphColdBuild => "callgraph_cold_build",
             Self::ColdCacheDelay => "cold_cache_delay",
-            Self::DeferralBackoff => "deferral_backoff",
             Self::NoTrigger => "deadline_without_trigger",
         }
     }
@@ -162,29 +121,11 @@ impl Tier2DispatchBlock {
 pub struct Tier2ExternalGates {
     /// The semantic cold seed owns the machine until it finishes.
     pub semantic_cold_seed_active: bool,
-    /// This root's callgraph store is being built from cold in the background.
-    ///
-    /// A Tier-2 scan reads the very store that build is still filling, and its
-    /// own peak memory lands on top of the build's instead of after it, so the
-    /// two together cost far more than either alone. Waiting costs nothing the
-    /// scan needs: the demand stays pending and dispatches once the build
-    /// publishes.
-    pub callgraph_cold_build_active: bool,
-}
-
-#[derive(Debug, Clone)]
-struct Tier2DispatchRollback {
-    last_change_at: Option<Instant>,
-    activity_started_at: Option<Instant>,
-    debounce_delay: Duration,
-    last_scan_started_at: Option<Instant>,
-    pull_demand_pending: bool,
-    configure_warm_pending: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Tier2RefreshScheduler {
-    /// When the first scan after the last configure may start: the
+    /// When the first refresh after the last configure may start: the
     /// cold-cache delay, pushed later by the process-wide pacer when many
     /// roots were configured together.
     cold_ready_at: Option<Instant>,
@@ -195,9 +136,6 @@ pub struct Tier2RefreshScheduler {
     pull_demand_pending: bool,
     configure_warm_pending: bool,
     last_trigger_reason: Option<Tier2TriggerReason>,
-    dispatch_rollback: Option<Tier2DispatchRollback>,
-    deferred_retry_at: Option<Instant>,
-    resource_retry_at: Option<Instant>,
     overdue_reported: bool,
 }
 
@@ -212,9 +150,6 @@ impl Tier2RefreshScheduler {
             pull_demand_pending: false,
             configure_warm_pending: false,
             last_trigger_reason: None,
-            dispatch_rollback: None,
-            deferred_retry_at: None,
-            resource_retry_at: None,
             overdue_reported: false,
         }
     }
@@ -223,8 +158,8 @@ impl Tier2RefreshScheduler {
         self.reset_after_configure_with_cold_ready_at(now + TIER2_REFRESH_COLD_CACHE_DELAY);
     }
 
-    /// Reset after a configure whose first scan must wait until `cold_ready_at`
-    /// (a slot from [`Tier2ColdStartPacer::reserve`]).
+    /// Reset after a configure whose first refresh must wait until
+    /// `cold_ready_at` (a slot from [`Tier2ColdStartPacer::reserve`]).
     pub fn reset_after_configure_with_cold_ready_at(&mut self, cold_ready_at: Instant) {
         self.cold_ready_at = Some(cold_ready_at);
         self.last_change_at = None;
@@ -234,9 +169,6 @@ impl Tier2RefreshScheduler {
         self.pull_demand_pending = false;
         self.configure_warm_pending = true;
         self.last_trigger_reason = None;
-        self.dispatch_rollback = None;
-        self.deferred_retry_at = None;
-        self.resource_retry_at = None;
         self.overdue_reported = false;
     }
 
@@ -284,19 +216,6 @@ impl Tier2RefreshScheduler {
             return None;
         }
 
-        if gates.callgraph_cold_build_active {
-            return None;
-        }
-
-        if self.deferral_backoff_pending(now) {
-            return None;
-        }
-
-        // Resource retries have their own bounded delay, not the scan interval:
-        // no analysis could run while another process held the cache lease.
-        if self.resource_retry_at.is_some_and(|at| now >= at) {
-            return Some(self.record_scan_start(now, Tier2TriggerReason::ResourceRetry));
-        }
         if !self.min_interval_elapsed(now) {
             return None;
         }
@@ -325,38 +244,12 @@ impl Tier2RefreshScheduler {
         self.last_scan_started_at = Some(now);
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
-        self.dispatch_rollback = None;
-        self.deferred_retry_at = None;
         self.overdue_reported = false;
         self.clear_activity_window();
     }
 
-    /// Restore the trigger state when the cold-build permit rejects a dispatch.
-    /// An automatic debounce must not become pull demand, because pull demand
-    /// intentionally bypasses the watcher quiet window.
-    ///
-    /// The restored demand is held back until the deferral backoff elapses.
-    /// Restoring it alone would re-arm a dispatch the limiter is certain to
-    /// reject again on the very next maintenance tick.
-    pub fn note_dispatch_deferred(&mut self, now: Instant) {
-        let Some(rollback) = self.dispatch_rollback.take() else {
-            return;
-        };
-        self.last_change_at = rollback.last_change_at;
-        self.activity_started_at = rollback.activity_started_at;
-        self.debounce_delay = rollback.debounce_delay;
-        self.last_scan_started_at = rollback.last_scan_started_at;
-        self.pull_demand_pending = rollback.pull_demand_pending;
-        self.configure_warm_pending = rollback.configure_warm_pending;
-        self.deferred_retry_at = Some(now + TIER2_REFRESH_DEFERRAL_BACKOFF);
-    }
-
     pub fn last_trigger_reason(&self) -> Option<Tier2TriggerReason> {
         self.last_trigger_reason
-    }
-
-    pub fn set_resource_retry_at(&mut self, retry_at: Option<Instant>) {
-        self.resource_retry_at = retry_at;
     }
 
     pub fn pull_demand_pending(&self) -> bool {
@@ -364,19 +257,9 @@ impl Tier2RefreshScheduler {
     }
 
     /// Earliest instant at which the scheduler's current demand can dispatch,
-    /// before external gates such as an in-flight builder or semantic cold seed.
+    /// before external gates such as an in-flight analysis or the semantic
+    /// cold seed.
     pub fn next_dispatch_at(&self, now: Instant) -> Option<Instant> {
-        let resource_at = self.resource_retry_at.map(|at| {
-            self.deferred_retry_at
-                .map_or(at, |deferred| at.max(deferred))
-        });
-        [resource_at, self.next_regular_dispatch_at(now)]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
-    fn next_regular_dispatch_at(&self, now: Instant) -> Option<Instant> {
         let min_interval_at = self
             .last_scan_started_at
             .map(|started| started + TIER2_REFRESH_MIN_INTERVAL);
@@ -405,14 +288,14 @@ impl Tier2RefreshScheduler {
             .flatten();
 
         Some(
-            [min_interval_at, cold_cache_at, self.deferred_retry_at]
+            [min_interval_at, cold_cache_at]
                 .into_iter()
                 .flatten()
                 .fold(requested_at, Instant::max),
         )
     }
 
-    /// True when the deadline this scheduler publishes has arrived, so a tick
+    /// True when the deadline this scheduler works out has arrived, so a tick
     /// now would dispatch unless an external gate blocks it.
     ///
     /// The maintenance tick uses this to pump the scheduler while a root sits
@@ -424,9 +307,9 @@ impl Tier2RefreshScheduler {
             .is_some_and(|deadline| now >= deadline)
     }
 
-    /// Name the predicate that held a dispatch back after the published
-    /// deadline passed, at most once per overdue stretch. Returns `None` while
-    /// no deadline is due, when the current stretch was already reported, and
+    /// Name the predicate that held a dispatch back after the deadline
+    /// passed, at most once per overdue stretch. Returns `None` while no
+    /// deadline is due, when the current stretch was already reported, and
     /// again after a dispatch or reset clears the stretch.
     pub fn take_overdue_dispatch_block(
         &mut self,
@@ -446,10 +329,6 @@ impl Tier2RefreshScheduler {
             Tier2DispatchBlock::InFlight
         } else if gates.semantic_cold_seed_active {
             Tier2DispatchBlock::SemanticColdSeed
-        } else if gates.callgraph_cold_build_active {
-            Tier2DispatchBlock::CallgraphColdBuild
-        } else if self.deferral_backoff_pending(now) {
-            Tier2DispatchBlock::DeferralBackoff
         } else if !self.cold_delay_elapsed(now) {
             Tier2DispatchBlock::ColdCacheDelay
         } else {
@@ -495,30 +374,15 @@ impl Tier2RefreshScheduler {
             .unwrap_or(false)
     }
 
-    fn deferral_backoff_pending(&self, now: Instant) -> bool {
-        self.deferred_retry_at
-            .is_some_and(|retry_at| now < retry_at)
-    }
-
     fn record_scan_start(
         &mut self,
         now: Instant,
         reason: Tier2TriggerReason,
     ) -> Tier2TriggerReason {
-        self.dispatch_rollback = Some(Tier2DispatchRollback {
-            last_change_at: self.last_change_at,
-            activity_started_at: self.activity_started_at,
-            debounce_delay: self.debounce_delay,
-            last_scan_started_at: self.last_scan_started_at,
-            pull_demand_pending: self.pull_demand_pending,
-            configure_warm_pending: self.configure_warm_pending,
-        });
         self.last_scan_started_at = Some(now);
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
         self.last_trigger_reason = Some(reason);
-        self.deferred_retry_at = None;
-        self.resource_retry_at = None;
         self.overdue_reported = false;
         self.clear_activity_window();
         reason
@@ -557,93 +421,11 @@ mod tests {
         Tier2ExternalGates::default()
     }
 
-    #[test]
-    fn cache_writer_resource_retry_is_bounded_and_respects_external_gates() {
-        let (mut scheduler, base) = configured_scheduler();
-        scheduler.note_external_scan_started(base);
-        let retry_at = base + TIER2_CACHE_WRITER_RETRY_BACKOFF;
-        scheduler.set_resource_retry_at(Some(retry_at));
-        assert_eq!(TIER2_CACHE_WRITER_RETRY_BACKOFF, Duration::from_secs(30));
-        assert_eq!(scheduler.next_dispatch_at(base), Some(retry_at));
-        assert!(!scheduler.dispatch_due(retry_at - Duration::from_millis(1)));
-        assert_eq!(
-            scheduler.tick(retry_at - Duration::from_millis(1), 0, true, false),
-            None
-        );
-        assert!(scheduler.dispatch_due(retry_at));
-        assert_eq!(scheduler.tick(retry_at, 0, false, false), None);
-        assert_eq!(scheduler.tick(retry_at, 0, true, true), None);
-        assert_eq!(
-            scheduler.tick_with_gates(retry_at, 0, true, false, semantic_cold_seed()),
-            None
-        );
-        assert_eq!(
-            scheduler.tick_with_gates(retry_at, 0, true, false, callgraph_cold_build()),
-            None
-        );
-        assert_eq!(
-            scheduler.tick(retry_at, 0, true, false),
-            Some(Tier2TriggerReason::ResourceRetry)
-        );
-        assert_eq!(
-            scheduler.next_dispatch_at(retry_at),
-            None,
-            "one dispatch consumes the resource deadline"
-        );
-        scheduler.set_resource_retry_at(Some(retry_at));
-        scheduler.note_dispatch_deferred(retry_at);
-        assert_eq!(
-            scheduler.next_dispatch_at(retry_at),
-            Some(retry_at + TIER2_REFRESH_DEFERRAL_BACKOFF)
-        );
-        assert_eq!(scheduler.tick(retry_at, 0, true, false), None);
-        assert_eq!(
-            scheduler.tick(retry_at + TIER2_REFRESH_DEFERRAL_BACKOFF, 0, true, false),
-            Some(Tier2TriggerReason::ResourceRetry)
-        );
-    }
-
     fn semantic_cold_seed() -> Tier2ExternalGates {
         Tier2ExternalGates {
             semantic_cold_seed_active: true,
             ..Tier2ExternalGates::default()
         }
-    }
-
-    fn callgraph_cold_build() -> Tier2ExternalGates {
-        Tier2ExternalGates {
-            callgraph_cold_build_active: true,
-            ..Tier2ExternalGates::default()
-        }
-    }
-
-    #[test]
-    fn failed_build_retry_backoff_doubles_per_identical_failure_up_to_the_cap() {
-        assert!(TIER2_FAILED_BUILD_RETRY_BACKOFF > TIER2_REFRESH_MIN_INTERVAL);
-        assert_eq!(
-            tier2_failed_build_retry_backoff(0),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF
-        );
-        assert_eq!(
-            tier2_failed_build_retry_backoff(1),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF
-        );
-        assert_eq!(
-            tier2_failed_build_retry_backoff(2),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF * 2
-        );
-        assert_eq!(
-            tier2_failed_build_retry_backoff(3),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF * 4
-        );
-        assert_eq!(
-            tier2_failed_build_retry_backoff(50),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX
-        );
-        assert_eq!(
-            tier2_failed_build_retry_backoff(u32::MAX),
-            TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX
-        );
     }
 
     #[test]
@@ -881,112 +663,6 @@ mod tests {
         );
     }
 
-    /// A Tier-2 scan reads the callgraph store the cold build is still filling,
-    /// and pays its own peak memory on top of the build's. The scan is held, not
-    /// dropped: it runs as soon as the build publishes.
-    #[test]
-    fn callgraph_cold_build_defers_the_scan_until_the_build_finishes() {
-        let (mut scheduler, base) = configured_scheduler();
-        let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
-
-        assert_eq!(
-            scheduler.tick_with_gates(warm, 0, true, false, callgraph_cold_build()),
-            None,
-            "a configure-warm scan must not start on top of the callgraph cold build"
-        );
-        assert!(
-            scheduler.configure_warm_pending,
-            "the deferred scan must stay pending rather than being dropped"
-        );
-        assert_eq!(
-            scheduler.take_overdue_dispatch_block(
-                warm + Duration::from_secs(1),
-                true,
-                false,
-                callgraph_cold_build()
-            ),
-            Some(Tier2DispatchBlock::CallgraphColdBuild),
-            "an operator must be able to see which build the refresh is waiting on"
-        );
-
-        // A build that outlives the timer by minutes keeps holding the scan;
-        // the trigger is the build finishing, not a longer delay.
-        assert_eq!(
-            scheduler.tick_with_gates(
-                warm + Duration::from_secs(300),
-                0,
-                true,
-                false,
-                callgraph_cold_build()
-            ),
-            None
-        );
-
-        assert_eq!(
-            scheduler.tick_with_gates(warm + Duration::from_secs(301), 0, true, false, no_gates()),
-            Some(Tier2TriggerReason::ConfigureWarm),
-            "the held scan must dispatch as soon as the cold build completes"
-        );
-    }
-
-    #[test]
-    fn callgraph_cold_build_does_not_consume_pull_demand() {
-        let (mut scheduler, base) = configured_scheduler();
-        let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
-
-        assert!(scheduler.request_pull(true));
-        assert_eq!(
-            scheduler.tick_with_gates(warm, 0, true, false, callgraph_cold_build()),
-            None
-        );
-        assert!(
-            scheduler.pull_demand_pending(),
-            "pull demand must survive a callgraph cold-build deferral"
-        );
-        assert_eq!(
-            scheduler.tick_with_gates(warm + Duration::from_secs(1), 0, true, false, no_gates()),
-            Some(Tier2TriggerReason::Pull)
-        );
-    }
-
-    #[test]
-    fn deferred_debounce_keeps_trickle_in_the_quiet_window() {
-        let (mut scheduler, base) = configured_scheduler();
-        let first_change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
-        assert_eq!(scheduler.tick(first_change, 1, true, false), None);
-
-        let first_deadline = first_change + TIER2_REFRESH_DEBOUNCE;
-        assert_eq!(
-            scheduler.tick(first_deadline, 0, true, false),
-            Some(Tier2TriggerReason::Debounce)
-        );
-        scheduler.note_dispatch_deferred(first_deadline);
-
-        let mut last_change = first_deadline;
-        for edit in 1..=6 {
-            last_change = first_deadline + Duration::from_secs(edit * 10);
-            assert_eq!(
-                scheduler.tick(last_change, 1, true, false),
-                None,
-                "edit {edit} must extend the quiet window instead of retrying dispatch"
-            );
-        }
-        assert_eq!(
-            scheduler.tick(
-                last_change + TIER2_REFRESH_DEBOUNCE - Duration::from_secs(1),
-                0,
-                true,
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            scheduler.tick(last_change + TIER2_REFRESH_DEBOUNCE, 0, true, false),
-            Some(Tier2TriggerReason::Debounce),
-            "six edits over one minute should produce one dispatch after quiet"
-        );
-    }
-
     #[test]
     fn explicit_pull_mid_debounce_still_dispatches_immediately() {
         let (mut scheduler, base) = configured_scheduler();
@@ -1137,45 +813,6 @@ mod tests {
         assert_eq!(
             scheduler.take_overdue_dispatch_block(deadline, true, false, semantic_cold_seed()),
             Some(Tier2DispatchBlock::SemanticColdSeed)
-        );
-    }
-
-    #[test]
-    fn cold_build_deferral_pauses_retries_and_moves_the_published_deadline() {
-        let (mut scheduler, base) = configured_scheduler();
-        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
-        assert_eq!(scheduler.tick(change, 1, true, false), None);
-        let deadline = change + TIER2_REFRESH_DEBOUNCE;
-        assert_eq!(
-            scheduler.tick(deadline, 0, true, false),
-            Some(Tier2TriggerReason::Debounce)
-        );
-        scheduler.note_dispatch_deferred(deadline);
-
-        let retry_at = deadline + TIER2_REFRESH_DEFERRAL_BACKOFF;
-        assert_eq!(
-            scheduler.next_dispatch_at(deadline),
-            Some(retry_at),
-            "health must publish the retry pause, not a deadline already passed"
-        );
-        assert!(!scheduler.dispatch_due(retry_at - Duration::from_secs(1)));
-        assert_eq!(
-            scheduler.tick(retry_at - Duration::from_secs(1), 0, true, false),
-            None,
-            "a deferred dispatch must not be retried on every maintenance tick"
-        );
-        assert_eq!(
-            scheduler.take_overdue_dispatch_block(
-                retry_at - Duration::from_secs(1),
-                true,
-                false,
-                no_gates()
-            ),
-            None
-        );
-        assert_eq!(
-            scheduler.tick(retry_at, 0, true, false),
-            Some(Tier2TriggerReason::Debounce)
         );
     }
 }

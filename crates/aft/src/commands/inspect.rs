@@ -1666,51 +1666,17 @@ fn inspect_shutdown_terminal(
     })
 }
 
-/// Feed fleet-status values from inspect outcomes. Only a verified payload
-/// supplies a category count; pending or failed categories remain absent in the
-/// truthful values state instead of being replaced with zero.
+/// Feed the status bar's TODO count from inspect outcomes. Only a verified
+/// payload supplies the count; a pending or failed TODO scan leaves the last
+/// known value in place instead of replacing it with zero.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
-    if outcomes
-        .get(&InspectCategory::DeadCode)
-        .and_then(JobOutcome::payload)
-        .is_some_and(|payload| payload["supported_language_files"] == 0)
-    {
-        ctx.clear_status_bar_dead_code_count();
-    }
     // `JobOutcome::payload()` exposes only Fresh data or a stat-verified stale
     // cache, so an unavailable category cannot overwrite a proven value.
-    let count_of = |category: InspectCategory| -> Option<usize> {
-        outcomes
-            .get(&category)
-            .and_then(JobOutcome::payload)
-            .and_then(|payload| available_count_from_payload(category, payload))
-    };
-    let any_tier2_stale = [
-        InspectCategory::DeadCode,
-        InspectCategory::UnusedExports,
-        InspectCategory::Duplicates,
-    ]
-    .iter()
-    .any(|category| match outcomes.get(category) {
-        Some(JobOutcome::Fresh { payload }) => {
-            category_is_incomplete(payload)
-                && (available_count_from_payload(*category, payload).is_none()
-                    || partial_parse_findings_available(*category, payload))
-        }
-        Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
-            true
-        }
-        None => false,
-    });
-    let todos = count_of(InspectCategory::Todos);
-
-    ctx.update_status_bar_tier2(
-        count_of(InspectCategory::DeadCode),
-        count_of(InspectCategory::UnusedExports),
-        count_of(InspectCategory::Duplicates),
-        todos,
-        any_tier2_stale,
-    );
+    let todos = outcomes
+        .get(&InspectCategory::Todos)
+        .and_then(JobOutcome::payload)
+        .and_then(|payload| available_count_from_payload(InspectCategory::Todos, payload));
+    ctx.update_status_bar_todos(todos);
 }
 
 /// A blocking `aft_inspect` may update alert state only from accepted snapshots
@@ -2925,100 +2891,20 @@ fn build_inspect_terminal(
     }
 }
 
-pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response {
-    let categories = match parse_tier2_categories(req.params.get("categories")) {
-        Ok(categories) => categories,
-        Err(message) => return invalid_request(&req.id, message),
-    };
-
-    if !ctx.inspect_writer() {
-        let skipped = categories
-            .iter()
-            .map(|category| {
-                serde_json::json!({
-                    "category": category.as_str(),
-                    "reason": "inspect_read_only",
-                })
-            })
-            .collect::<Vec<_>>();
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "queued_categories": [],
-                "in_flight_categories": [],
-                "errors": [],
-                "skipped_categories": skipped,
-            }),
-        );
-    }
-
-    let snapshot = match build_snapshot(ctx) {
-        Ok(snapshot) => snapshot,
-        Err(response) => return response.with_id(&req.id),
-    };
-    let manager = ctx.inspect_manager();
-    let submission = manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
-    if submission.has_new_work() {
-        ctx.note_tier2_refresh_started();
-    }
-
-    let queued = submission
-        .queued_categories
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let errors = submission
-        .errors
-        .iter()
-        .map(|error| {
-            serde_json::json!({
-                "category": error.category.as_str(),
-                "message": error.message.as_str(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut data = serde_json::json!({
-        "queued_categories": queued.clone(),
-        "in_flight_categories": queued,
-        "errors": errors,
-    });
-    if !submission.retry_paused.is_empty() {
-        data["skipped_categories"] = Value::Array(
-            submission
-                .retry_paused
-                .iter()
-                .map(|pause| {
-                    serde_json::json!({
-                        "category": pause.category.as_str(),
-                        "reason": "last_build_failed",
-                        "last_failure": pause.reason,
-                        "identical_failures": pause.identical_failures,
-                        "retry_at_ms": pause.retry_at_ms,
-                    })
-                })
-                .collect(),
-        );
-    }
-    if !submission.resource_waits.is_empty() {
-        let skipped = data["skipped_categories"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        data["skipped_categories"] = Value::Array(
-            skipped
-                .into_iter()
-                .chain(submission.resource_waits.iter().map(|wait| {
-                    serde_json::json!({
-                        "category": wait.category.as_str(),
-                        "reason": "waiting_for_inspect_cache_writer_lease",
-                        "retry_at_ms": wait.retry_at_ms,
-                    })
-                }))
-                .collect(),
-        );
-    }
-
-    Response::success(&req.id, data)
+/// Answers the retired `inspect_tier2_run` request with success and does
+/// nothing. Plugin builds from before whole-repository analyses became
+/// on-demand-only send it when a session goes idle, until their host reloads
+/// the plugin; answering success keeps them from logging a failure each time.
+/// Remove this handler, and its dispatch entry, in the next release.
+pub fn handle_inspect_tier2_run(req: &RawRequest, _ctx: &AppContext) -> Response {
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "queued_categories": [],
+            "in_flight_categories": [],
+            "errors": [],
+        }),
+    )
 }
 
 trait ResponseIdExt {
@@ -3348,23 +3234,6 @@ fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Res
     }
     categories.insert(category);
     Ok(())
-}
-
-fn parse_tier2_categories(value: Option<&Value>) -> Result<Vec<InspectCategory>, String> {
-    let sections = parse_sections(value)?.detail_categories;
-    let categories = if sections.is_empty() {
-        InspectCategory::active()
-            .iter()
-            .copied()
-            .filter(|category| category.is_tier2())
-            .collect::<Vec<_>>()
-    } else {
-        sections
-            .into_iter()
-            .filter(|category| category.is_tier2())
-            .collect::<Vec<_>>()
-    };
-    Ok(categories)
 }
 
 fn parse_scope(
@@ -5663,74 +5532,16 @@ mod status_bar_refresh_tests {
         );
     }
 
-    #[test]
-    fn unsupported_language_gap_does_not_hide_failed_supported_files() {
-        let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(5), Some(0), Some(0), Some(0), false);
-        let outcome = JobOutcome::Fresh {
-            payload: serde_json::json!({
-                "count": 8, "complete": false, "supported_language_files": 1,
-                "gaps": [{"kind": "language_unsupported", "language": "python", "files": 1}],
-                "parse_errors": [{"file": "broken.ts", "message": "syntax error"}],
-            }),
-        };
-        refresh_status_bar_counts(
-            &ctx,
-            &[(InspectCategory::DeadCode, outcome)].into_iter().collect(),
-        );
-        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
-        assert!(ctx.status_bar_count_values().tier2_stale);
-    }
-
     fn outcomes(
         entries: Vec<(InspectCategory, JobOutcome)>,
     ) -> BTreeMap<InspectCategory, JobOutcome> {
         entries.into_iter().collect()
     }
 
-    // #1: a Pending-only Tier-2 (no scan has ever produced counts) must NOT
-    // populate the status bar — otherwise it renders fabricated `~D0 U0 C0`
-    // zeros that lie about project health.
+    /// The whole-repository analyses run only inside `aft_inspect`; their
+    /// results never reach the status bar, which keeps only E/W and T.
     #[test]
-    fn pending_tier2_does_not_populate_status_bar() {
-        let ctx = ctx();
-        assert!(ctx.status_bar_counts().is_none());
-
-        refresh_status_bar_counts(
-            &ctx,
-            &outcomes(vec![
-                (InspectCategory::DeadCode, JobOutcome::pending(true)),
-                (InspectCategory::UnusedExports, JobOutcome::pending(true)),
-                (InspectCategory::Duplicates, JobOutcome::pending(true)),
-            ]),
-        );
-
-        assert!(
-            ctx.status_bar_counts().is_none(),
-            "Pending Tier-2 must leave the bar unpopulated (no fabricated zeros)"
-        );
-    }
-
-    // Stale-without-cache is equally untrustworthy — also must not populate.
-    #[test]
-    fn stale_without_cache_does_not_populate_status_bar() {
-        let ctx = ctx();
-        refresh_status_bar_counts(
-            &ctx,
-            &outcomes(vec![(
-                InspectCategory::DeadCode,
-                JobOutcome::Stale {
-                    cached: None,
-                    in_flight: true,
-                },
-            )]),
-        );
-        assert!(ctx.status_bar_counts().is_none());
-    }
-
-    // A real Fresh outcome populates the bar with the actual counts.
-    #[test]
-    fn fresh_tier2_populates_status_bar() {
+    fn whole_repository_outcomes_leave_the_status_bar_alone() {
         let ctx = ctx();
         refresh_status_bar_counts(
             &ctx,
@@ -5742,12 +5553,6 @@ mod status_bar_refresh_tests {
                     },
                 ),
                 (
-                    InspectCategory::UnusedExports,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({ "count": 3 }),
-                    },
-                ),
-                (
                     InspectCategory::Duplicates,
                     JobOutcome::Fresh {
                         payload: serde_json::json!({ "count": 1 }),
@@ -5755,100 +5560,58 @@ mod status_bar_refresh_tests {
                 ),
             ]),
         );
-        let counts = ctx.status_bar_count_values();
-        assert_eq!(counts.errors, None);
-        assert_eq!(counts.warnings, None);
-        assert_eq!(counts.dead_code, Some(7));
-        assert_eq!(counts.unused_exports, Some(3));
-        assert_eq!(counts.duplicates, Some(1));
-        assert!(!counts.tier2_stale);
+        assert_eq!(
+            ctx.status_bar_count_values(),
+            AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+                .status_bar_count_values()
+        );
     }
 
-    // Stale-WITH-cache populates (last-known counts) and marks the bar stale.
-    // All three categories must carry a cached value — the bar stays suppressed
-    // until every Tier-2 category is real, never fabricating a 0 (#1).
+    // A Pending TODO scan (no count produced yet) must NOT populate the bar
+    // with a fabricated zero.
     #[test]
-    fn stale_with_cache_populates_and_marks_stale() {
+    fn pending_todos_do_not_populate_status_bar() {
         let ctx = ctx();
-        let stale_cache = |count: i64| JobOutcome::Stale {
-            cached: Some(serde_json::json!({ "count": count })),
-            in_flight: true,
-        };
         refresh_status_bar_counts(
             &ctx,
-            &outcomes(vec![
-                (InspectCategory::DeadCode, stale_cache(12)),
-                (InspectCategory::UnusedExports, stale_cache(4)),
-                (InspectCategory::Duplicates, stale_cache(2)),
-            ]),
+            &outcomes(vec![(InspectCategory::Todos, JobOutcome::pending(true))]),
         );
-        let counts = ctx.status_bar_count_values();
-        assert_eq!(counts.errors, None);
-        assert_eq!(counts.warnings, None);
-        assert_eq!(counts.dead_code, Some(12));
-        assert_eq!(counts.unused_exports, Some(4));
-        assert_eq!(counts.duplicates, Some(2));
-        assert!(counts.tier2_stale);
+        assert_eq!(ctx.status_bar_count_values().todos, None);
     }
 
-    // A single category (others Pending) must NOT surface the bar — the core
-    // partial-completion fabrication guard at the sync refresh path (#1).
+    // Stale-without-cache is equally untrustworthy — also must not populate.
     #[test]
-    fn single_category_does_not_populate_status_bar() {
+    fn stale_todos_without_cache_do_not_populate_status_bar() {
         let ctx = ctx();
         refresh_status_bar_counts(
             &ctx,
             &outcomes(vec![(
-                InspectCategory::DeadCode,
-                JobOutcome::Fresh {
-                    payload: serde_json::json!({ "count": 9 }),
+                InspectCategory::Todos,
+                JobOutcome::Stale {
+                    cached: None,
+                    in_flight: true,
                 },
             )]),
         );
-        assert!(
-            ctx.status_bar_counts().is_none(),
-            "one real category must not surface a bar with fabricated U0 C0"
-        );
+        assert_eq!(ctx.status_bar_count_values().todos, None);
     }
 
     #[test]
-    fn incomplete_fresh_payload_keeps_status_bar_counts_stale_not_current() {
+    fn fresh_todos_populate_status_bar() {
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(7), Some(3), Some(1), None, false);
         refresh_status_bar_counts(
             &ctx,
-            &outcomes(vec![
-                (
-                    InspectCategory::DeadCode,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({
-                            "unavailable": true, "complete": false,
-                            "building": {"state": "building"},
-                            "gaps": [{"reason": "still building"}]
-                        }),
-                    },
-                ),
-                (
-                    InspectCategory::UnusedExports,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({
-                            "count": 0, "complete": false, "parse_errors": [{"file": "a.ts"}]
-                        }),
-                    },
-                ),
-                (
-                    InspectCategory::Duplicates,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({"count": 1}),
-                    },
-                ),
-            ]),
+            &outcomes(vec![(
+                InspectCategory::Todos,
+                JobOutcome::Fresh {
+                    payload: serde_json::json!({ "count": 7 }),
+                },
+            )]),
         );
         let counts = ctx.status_bar_count_values();
-        assert!(counts.tier2_stale);
-        assert_eq!(counts.dead_code, Some(7));
-        assert_eq!(counts.unused_exports, Some(3));
-        assert_eq!(counts.duplicates, Some(1));
+        assert_eq!(counts.errors, None);
+        assert_eq!(counts.warnings, None);
+        assert_eq!(counts.todos, Some(7));
     }
 }
 
@@ -6519,7 +6282,6 @@ mod fresh_payload_tests {
                 .unwrap()
                 .contains("dead code: off"));
             assert_eq!(manager.reuse_start_count_for_test(), 0);
-            assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
             assert_eq!(manager.source_scan_files_for_test(), 0);
             assert_eq!(ctx.lsp().server_count(), 0);
         }
@@ -9304,15 +9066,6 @@ mod deferred_terminal_tests {
             Some("pending"),
             "{outcome:?}"
         );
-        ctx.update_status_bar_tier2(Some(41), Some(0), Some(0), Some(0), false);
-        refresh_status_bar_counts(
-            &ctx,
-            &[(InspectCategory::DeadCode, outcome.clone())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(ctx.status_bar_count_values().dead_code, Some(41));
-        assert!(ctx.status_bar_count_values().tier2_stale);
         let mut payloads = InspectCategory::active()
             .iter()
             .map(|category| (*category, serde_json::json!({"count": 0})))

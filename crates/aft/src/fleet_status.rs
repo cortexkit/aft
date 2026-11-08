@@ -1881,7 +1881,7 @@ mod tests {
             Path::new("/tmp/project"),
             "opencode",
             "session-1",
-            "E0 W0 | D0 U0 C0 | T0"
+            "E0 W0 | T0"
         ));
         let state = client.inner.state.lock();
         assert!(state.last_publish_at.is_empty());

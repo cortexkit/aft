@@ -168,7 +168,8 @@ pub(crate) struct ColdBuildLimiterCensus {
 }
 
 /// Attempt immediate admission without bypassing queued requests from the other
-/// class. Background schedulers use this when they can defer rejected work.
+/// class. Tests use it to hold a slot of a given class.
+#[cfg(test)]
 pub(crate) fn try_acquire_classified_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     request: &ColdBuildAdmissionRequest,

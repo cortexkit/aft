@@ -522,50 +522,23 @@ pub fn drain_inspect_events(ctx: &AppContext) {
 }
 
 pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: u64) {
-    let Some((drained, reuse_completed)) = ctx.run_if_subc_bound_generation(generation, || {
-        let drained = ctx.inspect_manager().drain_completions();
-        // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
-        // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
-        // background scan still refreshes the bar (#3), otherwise the counts and
-        // `~` marker would only update on a manual `aft_inspect`.
-        (drained, ctx.take_new_reuse_completions())
-    }) else {
+    let Some(drained) =
+        ctx.run_if_subc_bound_generation(generation, || ctx.inspect_manager().drain_completions())
+    else {
         return;
     };
-    // A completed background Tier-2 scan refreshes the agent status-bar counts
-    // to the freshly-persisted aggregate, and clears the stale marker, so the
-    // bar reflects the new numbers on the next tool result without waiting for
-    // an explicit aft_inspect call.
-    if drained > 0 || reuse_completed {
+    // A completed background TODO scan refreshes the status bar's TODO count,
+    // so the bar reflects it on the next tool result without waiting for an
+    // explicit aft_inspect call.
+    if drained > 0 {
         if let Some(project_root) = ctx.config().project_root.clone() {
-            // Failed reuse attempts also advance `reuse_completions`. Read only
-            // caches already held by InspectManager: opening one here could
-            // wait on a foreign writer and stall standalone request/reply service.
-            let inspect_dir = ctx.inspect_dir();
-            let (dead_code, unused_exports, duplicates) = ctx
-                .inspect_manager()
-                .latest_tier2_counts(inspect_dir.clone(), project_root.clone());
-            // Don't clear the `~` stale marker until the whole serial Tier-2
-            // cycle has drained. While any category is still in flight the
-            // already-persisted categories may predate the latest edit, so
-            // claiming fresh would be premature. `None` counts preserve the
-            // last-known value rather than fabricating a `0`.
-            let stale = ctx.inspect_manager().tier2_any_in_flight();
             // The inspect snapshot keys its project-scoped jobs by the
             // normalized root, so look the todos result up under the same form.
             let todos = ctx.inspect_manager().latest_project_todos_count(
-                inspect_dir.clone(),
+                ctx.inspect_dir(),
                 crate::inspect::job::canonicalize_normalized(&project_root),
             );
-            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, todos, stale);
-            // Health must distinguish "tier2 still building" from "tier2 complete
-            // except dead_code, which is blocked on the callgraph store". Refresh
-            // the flag from the same latest aggregate the counts came from so the
-            // two never disagree.
-            let blocked = ctx
-                .inspect_manager()
-                .dead_code_blocked_on_callgraph(inspect_dir, project_root);
-            ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(blocked);
+            ctx.update_status_bar_todos(todos);
             ctx.signal_status_changed();
         }
     }
@@ -943,7 +916,6 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         }
         ctx.clear_pending_index_updates();
         ctx.reset_symbol_cache();
-        let _ = ctx.mark_status_bar_tier2_stale();
         ctx.clear_tsconfig_membership_cache();
         ctx.lsp_reload_rust_workspaces_after_lost_watcher_events();
         true
@@ -1694,9 +1666,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.rescan_required = true;
                     state.rescan_ignore_checked = false;
                     state.rescan_reason = reason;
-                    // The individual changes are gone, so any Tier-2 input
-                    // may have changed: end automatic-retry pauses.
-                    ctx.inspect_manager().clear_tier2_retry_pauses();
                     state.pending_paths.clear();
                     state.phase = WatcherDrainPhase::Collect;
                     state.semantic_refresh_paths.clear();
@@ -1729,11 +1698,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                             .unwrap_or(crate::context::IgnoreRuleChange::Full {
                                 scopes: Vec::new(),
                             });
-                        // Changed ignore rules change which files the Tier-2
-                        // scope walk yields: end automatic-retry pauses.
-                        if !matches!(change, crate::context::IgnoreRuleChange::Unchanged) {
-                            ctx.inspect_manager().clear_tier2_retry_pauses();
-                        }
                         match change {
                             crate::context::IgnoreRuleChange::Unchanged => {}
                             crate::context::IgnoreRuleChange::AddOnly {
@@ -1988,14 +1952,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 } else {
                     paths.len()
                 };
-                if ctx
-                    .run_if_subc_bound_generation(configure_generation, || {
-                        ctx.mark_status_bar_tier2_stale()
-                    })
-                    .unwrap_or(false)
-                {
-                    state.status_changed = true;
-                }
                 if paths.iter().any(|path| watcher_path_is_tsconfig(path))
                     && ctx
                         .run_if_subc_bound_generation(configure_generation, || {
@@ -2419,14 +2375,9 @@ mod tests {
             );
             assert_eq!(
                 ctx.inspect_manager()
-                    .latest_tier2_counts(ctx.inspect_dir(), root.clone()),
-                (None, None, None),
-                "missing snapshot is unknown, not zero"
+                    .tier2_builder_state(InspectCategory::Duplicates),
+                crate::inspect::InspectBuilderState::WaitingForCacheWriterLease
             );
-            assert!(ctx
-                .inspect_manager()
-                .tier2_resource_wait(InspectCategory::Duplicates)
-                .is_some());
         }
     }
 

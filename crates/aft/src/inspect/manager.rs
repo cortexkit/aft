@@ -32,7 +32,6 @@ use crate::callgraph_store::{
     MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
-use crate::config::Config;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -46,44 +45,6 @@ fn inspect_category_is_off(
 
 type WaiterTx = Sender<JobOutcome>;
 type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
-
-/// Dead code and unused exports read the whole call graph, and a run costs
-/// seconds and hundreds of MB on a large repository where the other Tier-2
-/// categories cost milliseconds. Automatic runs of them therefore follow their
-/// own schedule: once the root's call graph is current after it is bound, then
-/// at most once per this interval while edits keep arriving. An explicit
-/// `aft_inspect` is not held to it. Linked worktrees run no automatic Tier-2
-/// work at all (see `set_automatic_tier2_refresh_allowed`).
-pub(crate) const WHOLE_GRAPH_BACKGROUND_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-fn is_whole_graph_category(category: InspectCategory) -> bool {
-    matches!(
-        category,
-        InspectCategory::DeadCode | InspectCategory::UnusedExports
-    )
-}
-
-/// Set while one root's automatic dead-code or unused-exports run is in
-/// progress: the daemon serves many roots, and two such runs at once would
-/// double the peak memory for answers nobody is waiting on.
-static WHOLE_GRAPH_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// The process-wide turn for an automatic whole-graph run; released on drop.
-struct WholeGraphBackgroundTurn(&'static AtomicBool);
-
-impl WholeGraphBackgroundTurn {
-    fn try_take(gate: &'static AtomicBool) -> Option<Self> {
-        gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self(gate))
-    }
-}
-
-impl Drop for WholeGraphBackgroundTurn {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
 
 #[derive(Clone)]
 struct Waiter {
@@ -214,35 +175,6 @@ pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
 }
 
 #[derive(Debug, Clone)]
-pub struct Tier2RunSubmissionError {
-    pub category: InspectCategory,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Tier2RunSubmission {
-    pub queued_categories: Vec<InspectCategory>,
-    pub newly_queued_categories: Vec<InspectCategory>,
-    pub deferred_categories: Vec<InspectCategory>,
-    /// Dead code or unused exports, due under their automatic schedule but
-    /// not started yet: this root's call graph has not been built, or another
-    /// root's run of them holds the process-wide turn. Retried like
-    /// `deferred_categories`, but these are not cold-build-limit deferrals.
-    pub whole_graph_waits: Vec<InspectCategory>,
-    /// Categories not started because their last build failed and the
-    /// automatic-retry pause has not elapsed.
-    pub retry_paused: Vec<Tier2RetryPause>,
-    pub resource_waits: Vec<Tier2ResourceWait>,
-    pub errors: Vec<Tier2RunSubmissionError>,
-}
-
-impl Tier2RunSubmission {
-    pub fn has_new_work(&self) -> bool {
-        !self.newly_queued_categories.is_empty()
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Tier2ReuseOptions {
     inventory: Option<Arc<super::inventory::InspectInventory>>,
     force_rescan_paths: BTreeSet<PathBuf>,
@@ -314,19 +246,6 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
-    /// Consecutive failed attempts whose terminal equals `last_failure`.
-    identical_failures: u32,
-    /// Automatic refreshes skip this category until this instant (and unix
-    /// millisecond), because its last build failed for a reason a rerun with
-    /// the same inputs would only repeat.
-    retry_paused_until: Option<(Instant, u64)>,
-    /// A resource wait survives source edits: they do not release a foreign lease.
-    resource_retry_at: Option<(Instant, u64)>,
-    cache_writer_timeouts: u32,
-    /// The manager's input-change epoch when the current (or last) attempt
-    /// started. A failure is not paused when inputs changed during the attempt,
-    /// because the build may not have seen that change.
-    input_epoch_at_start: u64,
     suspension: Option<crate::build_breaker::BuildSuspension>,
     progress: String,
 }
@@ -341,11 +260,6 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
-            identical_failures: 0,
-            retry_paused_until: None,
-            resource_retry_at: None,
-            cache_writer_timeouts: 0,
-            input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
         }
@@ -365,7 +279,6 @@ impl BuilderStateEntry {
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
         self.suspension = None;
-        self.resource_retry_at = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -373,39 +286,12 @@ impl BuilderStateEntry {
         }
     }
 
-    /// Record a failed attempt. When `pause_retries` is set, automatic
-    /// refreshes skip the category for a pause that doubles with every
-    /// consecutive failure carrying the same terminal. A watcher-observed
-    /// change to an input ends the pause early (see
-    /// [`InspectManager::note_tier2_input_paths_changed`]); the count of
-    /// identical failures is kept, so a failure that repeats after such a
-    /// change still pauses for longer.
-    fn record_failure(&mut self, terminal: String, pause_retries: bool) {
+    /// Record a failed attempt.
+    fn record_failure(&mut self, terminal: String) {
         self.state = None;
         self.suspension = None;
-        self.resource_retry_at = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
-        self.identical_failures = if self.last_failure.as_deref() == Some(terminal.as_str()) {
-            self.identical_failures.saturating_add(1)
-        } else {
-            1
-        };
         self.last_failure = Some(terminal);
-        self.retry_paused_until = pause_retries.then(|| {
-            let pause =
-                super::tier2_scheduler::tier2_failed_build_retry_backoff(self.identical_failures);
-            (
-                Instant::now() + pause,
-                unix_millis_now().saturating_add(pause.as_millis() as u64),
-            )
-        });
-    }
-
-    /// The unix millisecond automatic retries resume, while a pause is active.
-    fn retry_paused_until_at(&self, now: Instant) -> Option<u64> {
-        self.retry_paused_until
-            .filter(|(until, _)| now < *until)
-            .map(|(_, until_ms)| until_ms)
     }
 
     fn record_cache_writer_wait(&mut self) {
@@ -413,51 +299,17 @@ impl BuilderStateEntry {
         self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = None;
-        self.identical_failures = 0;
-        self.retry_paused_until = None;
-        self.cache_writer_timeouts = self.cache_writer_timeouts.saturating_add(1);
-        let delay =
-            super::tier2_scheduler::tier2_cache_writer_retry_backoff(self.cache_writer_timeouts);
-        self.resource_retry_at = Some((
-            Instant::now() + delay,
-            unix_millis_now().saturating_add(delay.as_millis() as u64),
-        ));
     }
 
     /// Record a pass that found the published call graph view's database
-    /// locked. Nothing else would wake the category once the lock clears: the
-    /// lock clearing is neither a view publication nor a source edit, and the
-    /// pass already consumed any owed publication refresh. So it keeps a
-    /// resource retry with the same bound as a cache writer lease wait. The
-    /// lock says nothing about the inputs, so it is not a failure and does not
-    /// pause retries.
+    /// locked. The lock says nothing about the inputs, so it is not a failure.
     fn record_view_busy_wait(&mut self) {
         self.state = None;
         self.suspension = None;
         self.last_failure = None;
-        self.identical_failures = 0;
-        self.retry_paused_until = None;
-        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
-        self.resource_retry_at = Some((
-            Instant::now() + delay,
-            unix_millis_now().saturating_add(delay.as_millis() as u64),
-        ));
     }
 
     fn detail_at(&self, now_ms: u64) -> String {
-        if let Some((_, retry_at_ms)) = self.resource_retry_at {
-            // Only a cache writer lease wait sets its own state; a resource
-            // retry without it was armed by a locked view database.
-            let waiting_for = if self.state == Some(InspectBuilderState::WaitingForCacheWriterLease)
-            {
-                "the inspect cache writer lease"
-            } else {
-                "the locked checkout call graph view"
-            };
-            return format!(
-                "waiting for {waiting_for}; automatic resource retry at unix_ms={retry_at_ms}"
-            );
-        }
         if let Some(suspension) = self.suspension.as_ref() {
             return format!(
                 "suspended domain={} deaths={} age_s={} reason={}",
@@ -468,18 +320,10 @@ impl BuilderStateEntry {
             );
         }
         if let Some(terminal) = self.last_failure.as_deref() {
-            let mut detail = format!(
+            return format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
                 self.attempt_count, self.first_attempt_unix
             );
-            if let Some(until_ms) = self.retry_paused_until_at(Instant::now()) {
-                detail.push_str(&format!(
-                    "; automatic retries paused until {} after {} identical failure(s)",
-                    until_ms / 1_000,
-                    self.identical_failures
-                ));
-            }
-            return detail;
         }
         match self.state {
             Some(InspectBuilderState::Building) => format!(
@@ -623,107 +467,8 @@ fn builder_failure_terminal(message: &str) -> String {
     }
 }
 
-/// Whether a failed attempt should pause automatic retries of its category.
-///
-/// Failures that say nothing about the category's inputs are excluded: the
-/// work was stopped or never got its turn (cancellation, admission limits,
-/// a worker that exited early), or it waited on another plane that becomes
-/// ready on its own (the call graph dead code needs). Everything else, such
-/// as a file the scanner cannot read or a pass that timed out, would only
-/// repeat on the same inputs, so automatic refreshes stop rerunning it on
-/// every refresh.
-fn failure_pauses_automatic_retries(outcome: &JobOutcome) -> bool {
-    const NOT_INPUT_DETERMINED: &[&str] = &[
-        "callgraph_unavailable",
-        "tier2 dead_code aggregate did not complete",
-        "tier2 pass cancelled",
-        "admission was cancelled",
-        "limiter slot deadline",
-        "cold build concurrency limit",
-        "exited without publishing a result",
-        "lock poisoned",
-        "writer_lease_timeout:",
-    ];
-    match outcome {
-        JobOutcome::Failed { message } => !NOT_INPUT_DETERMINED
-            .iter()
-            .any(|marker| message.contains(marker)),
-        JobOutcome::Fresh { .. } | JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => false,
-    }
-}
-
-/// An automatic-retry pause on a Tier-2 category whose last build failed
-/// for an input-determined reason. Resource waits are reported separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tier2RetryPause {
-    pub category: InspectCategory,
-    /// First line of the failure, as health and the builder detail show it.
-    pub reason: String,
-    /// Consecutive failures with this same reason.
-    pub identical_failures: u32,
-    /// Unix millisecond at which automatic refreshes may retry.
-    pub retry_at_ms: u64,
-}
-
-/// A short resource wait, distinct from failures determined by source inputs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tier2ResourceWait {
-    pub category: InspectCategory,
-    pub retry_at_ms: u64,
-}
-
-/// Ignore files whose edits change which files the Tier-2 scope walk yields.
-const TIER2_SCOPE_IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".aftignore", ".ignore"];
-
-/// Whether a changed path could be a Tier-2 input: a file the project scope
-/// walk can include (judged from the path alone, see
-/// [`crate::callgraph::walk_could_include`]) or an ignore file that reshapes
-/// that walk. Absolute paths outside the project root are not inputs.
-fn path_may_be_tier2_input(
-    project_root: Option<&Path>,
-    canonical_root: Option<&Path>,
-    path: &Path,
-) -> bool {
-    let relative = if path.is_absolute() {
-        let Some(relative) = [project_root, canonical_root]
-            .into_iter()
-            .flatten()
-            .find_map(|root| path.strip_prefix(root).ok())
-        else {
-            return false;
-        };
-        relative
-    } else {
-        path
-    };
-    if relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| TIER2_SCOPE_IGNORE_FILE_NAMES.contains(&name))
-    {
-        return true;
-    }
-    crate::callgraph::walk_could_include(&relative.to_string_lossy())
-}
-
-fn retry_pause_from_states(
-    states: &HashMap<JobKey, BuilderStateEntry>,
-    category: InspectCategory,
-    now: Instant,
-) -> Option<Tier2RetryPause> {
-    let entry = states.get(&JobKey::for_project_category(category))?;
-    let retry_at_ms = entry.retry_paused_until_at(now)?;
-    Some(Tier2RetryPause {
-        category,
-        reason: entry.last_failure.clone().unwrap_or_default(),
-        identical_failures: entry.identical_failures,
-        retry_at_ms,
-    })
-}
-
 fn wake_cache_writer_if_available(
     identity: &InspectCacheIdentity,
-    states: &Mutex<HashMap<JobKey, BuilderStateEntry>>,
     waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
     caches: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
 ) {
@@ -747,13 +492,6 @@ fn wake_cache_writer_if_available(
             .is_some_and(|cache| cache.waiting_for_writer())
         {
             caches.remove(identity);
-        }
-    }
-    if let Ok(mut states) = states.lock() {
-        for entry in states.values_mut() {
-            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
-                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
-            }
         }
     }
 }
@@ -897,27 +635,8 @@ fn cached_tier2_aggregate_usable(
     true
 }
 
-#[derive(Default)]
-struct DeferredViewRefresh {
-    publication_epoch: u64,
-    // The publication observed by the job that could not project its graph.
-    // A later publication makes the owed refresh eligible for dispatch.
-    pending_epoch: Option<u64>,
-}
-
-/// The deferred-refresh map's key for `root`. Callers name the same checkout
-/// in different spellings: the configured cache root is the raw
-/// `fs::canonicalize` result (a `\\?\C:\...` verbatim path on Windows), while
-/// background Tier-2 jobs carry the normalized form. Both must reach one entry,
-/// or a publication bumps one key while the pending result and its dispatch
-/// live under another, and the owed refresh is never cleared or never fires.
-fn deferred_view_key(root: &Path) -> PathBuf {
-    crate::inspect::job::normalize_path(root)
-}
-
 pub struct InspectManager {
     file_progress: Arc<HashMap<InspectCategory, crate::run_tool_call::progress::FileProgress>>,
-    deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     dispatcher: InspectDispatcher,
     result_rx: Receiver<InspectResult>,
@@ -951,38 +670,16 @@ pub struct InspectManager {
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
     builder_states: Arc<Mutex<HashMap<JobKey, BuilderStateEntry>>>,
-    /// Advances whenever a watcher-observed change could alter the Tier-2
-    /// inputs (a file the scope walk can include, an ignore file, a rescan or
-    /// a config change). Compared against each attempt's start epoch.
-    tier2_input_epoch: AtomicU64,
     completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
-    automatic_tier2_schedule_count: AtomicU64,
-    /// When an automatic dead-code or unused-exports run last completed for
-    /// this root; `None` until the first one does. See
-    /// [`WHOLE_GRAPH_BACKGROUND_INTERVAL`].
-    whole_graph_background_done_at: Mutex<Option<Instant>>,
-    /// [`WHOLE_GRAPH_BACKGROUND_RUNNING`], or a test's own gate so tests
-    /// running in parallel do not take each other's turn.
-    whole_graph_gate: &'static AtomicBool,
-    /// Monotonic count of Tier-2 completions delivered via the reuse path
-    /// (watcher-driven scheduler runs). These bypass `result_rx`/
-    /// `drain_completions`, so the `&AppContext`-side drain polls this counter
-    /// to know when to refresh the agent status bar after a background scan.
+    /// Monotonic count of Tier-2 completions delivered via the reuse path,
+    /// which bypass `result_rx`/`drain_completions`.
     reuse_completions: AtomicU64,
-    /// Successful reuse completions are tracked separately because failed passes
-    /// must not make a stale health plane look ready.
-    successful_reuse_completions: AtomicU64,
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
     source_scan_files: AtomicU64,
-    /// Project roots whose latest dead-code pass found the analysis
-    /// unavailable because the root is borrow-only. That result is not stored
-    /// in the inspect cache, so status readers consult this set instead of a
-    /// cached count from an earlier pass.
-    dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,
     /// The data-layer checkouts dead code reads its call graph from while
     /// they are ready; empty unless the process runs the data layer.
     data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
@@ -1130,7 +827,6 @@ impl InspectManager {
         let dispatcher = InspectDispatcher::new(guarded_worker);
         Self {
             file_progress,
-            deferred_view_refreshes: Mutex::new(HashMap::new()),
             root_work_cancellation,
             result_rx: dispatcher.result_rx.clone(),
             pool: Arc::clone(&dispatcher.pool),
@@ -1153,21 +849,15 @@ impl InspectManager {
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
-            dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
             data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
             dead_code_callgraph_waits: AtomicUsize::new(0),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Arc::new(Mutex::new(HashMap::new())),
-            tier2_input_epoch: AtomicU64::new(0),
             completed_build_durations: Mutex::new(HashMap::new()),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
-            automatic_tier2_schedule_count: AtomicU64::new(0),
-            whole_graph_background_done_at: Mutex::new(None),
-            whole_graph_gate: &WHOLE_GRAPH_BACKGROUND_RUNNING,
             reuse_completions: AtomicU64::new(0),
-            successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
             source_scan_files: AtomicU64::new(0),
         }
@@ -1226,14 +916,6 @@ impl InspectManager {
         if token.cancel_requested_before_commit() {
             *token = token.fresh();
         }
-    }
-
-    /// This manager takes its whole-graph turn from `gate` instead of the
-    /// process-wide one.
-    #[cfg(test)]
-    pub(crate) fn with_whole_graph_gate(mut self, gate: &'static AtomicBool) -> Self {
-        self.whole_graph_gate = gate;
-        self
     }
 
     pub(crate) fn set_cold_build_limiter(
@@ -1295,18 +977,10 @@ impl InspectManager {
 
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
         if let Ok(mut states) = self.builder_states.lock() {
-            let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
             if let Some(entry) = states.get_mut(key) {
-                // Only a new attempt takes the epoch; a state change within
-                // one attempt (queued, then building) keeps its start epoch.
-                if !entry.is_in_flight() {
-                    entry.input_epoch_at_start = epoch;
-                }
                 entry.begin_attempt(state);
             } else {
-                let mut entry = BuilderStateEntry::new(state);
-                entry.input_epoch_at_start = epoch;
-                states.insert(key.clone(), entry);
+                states.insert(key.clone(), BuilderStateEntry::new(state));
             }
         }
     }
@@ -1348,16 +1022,11 @@ impl InspectManager {
                     .record_view_busy_wait();
             }
             BuilderAttemptTerminal::Failed(terminal) => {
-                let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
-                let pause_retries = failure_pauses_automatic_retries(outcome);
                 if let Some(entry) = states.get_mut(key) {
-                    // Inputs changed while this attempt ran: it may not have
-                    // seen the change, so the next refresh should try again.
-                    let inputs_unchanged = entry.input_epoch_at_start == epoch;
-                    entry.record_failure(terminal, pause_retries && inputs_unchanged);
+                    entry.record_failure(terminal);
                 } else {
                     let mut entry = BuilderStateEntry::new(InspectBuilderState::Building);
-                    entry.record_failure(terminal, pause_retries);
+                    entry.record_failure(terminal);
                     states.insert(key.clone(), entry);
                 }
             }
@@ -1412,16 +1081,8 @@ impl InspectManager {
         outcome: JobOutcome,
     ) {
         let Some(waiters) = self.take_waiters_after(key, identity, || {
-            let succeeded = matches!(
-                builder_attempt_terminal(&outcome),
-                BuilderAttemptTerminal::Succeeded
-            );
             self.record_builder_attempt_outcome(key, &outcome);
             self.reuse_completions.fetch_add(1, Ordering::SeqCst);
-            if succeeded {
-                self.successful_reuse_completions
-                    .fetch_add(1, Ordering::SeqCst);
-            }
         }) else {
             return;
         };
@@ -1545,129 +1206,6 @@ impl InspectManager {
         }
     }
 
-    /// The automatic-retry pause on `category`, if its last build failed and
-    /// the pause has not elapsed. An explicit `aft_inspect` is not subject to
-    /// it; only automatic (watcher, idle and maintenance) refreshes are.
-    pub fn tier2_retry_pause(&self, category: InspectCategory) -> Option<Tier2RetryPause> {
-        let states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retry_pause_from_states(&states, category, Instant::now())
-    }
-
-    pub(crate) fn tier2_resource_wait(
-        &self,
-        category: InspectCategory,
-    ) -> Option<Tier2ResourceWait> {
-        let states = self.builder_states.lock().ok()?;
-        let entry = states.get(&JobKey::for_project_category(category))?;
-        let (retry_at, retry_at_ms) = entry.resource_retry_at?;
-        (Instant::now() < retry_at).then_some(Tier2ResourceWait {
-            category,
-            retry_at_ms,
-        })
-    }
-
-    /// Include expired waits so maintenance can retry without a source change.
-    /// Disabled categories and active attempts must not keep arming dispatches.
-    pub(crate) fn try_tier2_resource_retry_at(&self, config: &Config) -> Option<Option<Instant>> {
-        let states = self.builder_states.try_lock().ok()?;
-        Some(
-            states
-                .iter()
-                .filter_map(|(key, entry)| {
-                    (config.inspect.enabled
-                        && config.inspect.category_enabled(key.category)
-                        && (key.category != InspectCategory::DeadCode || config.indexes.callgraph)
-                        && !entry.is_in_flight())
-                    .then_some(entry.resource_retry_at)
-                    .flatten()
-                    .map(|(at, _)| at)
-                })
-                .min(),
-        )
-    }
-
-    /// Record watcher-observed (or agent-written) changes. When any of
-    /// `paths` could be a Tier-2 input, every automatic-retry pause ends, so
-    /// the next automatic refresh rebuilds a failed category instead of
-    /// waiting out its pause: the change may be the fix. Paths the scope walk
-    /// can never include (unsupported file types, hidden or always-excluded
-    /// directories, paths outside the root) leave pauses in place.
-    ///
-    /// All Tier-2 categories walk the same project scope, so an input of one
-    /// is an input of all. Returns true when the change counted as an input
-    /// change.
-    pub fn note_tier2_input_paths_changed<'a>(
-        &self,
-        project_root: Option<&Path>,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> bool {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Nothing to end and no attempt that could miss the change: skip the
-        // per-path work on the watcher drain's hot path.
-        if !states.values().any(|entry| {
-            entry.retry_paused_until.is_some()
-                || entry.is_in_flight()
-                || entry.cache_writer_timeouts > 0
-        }) {
-            return false;
-        }
-        let canonical_root = project_root.map(crate::inspect::job::canonicalize_normalized);
-        let affects_inputs = paths
-            .into_iter()
-            .any(|path| path_may_be_tier2_input(project_root, canonical_root.as_deref(), path));
-        if affects_inputs {
-            self.end_tier2_retry_pauses_locked(&mut states);
-        }
-        affects_inputs
-    }
-
-    /// End every automatic-retry pause because the Tier-2 inputs may have
-    /// changed in a way no single path names: a watcher rescan, an ignore-rule
-    /// change, or a config change.
-    pub fn clear_tier2_retry_pauses(&self) {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.end_tier2_retry_pauses_locked(&mut states);
-    }
-
-    fn end_tier2_retry_pauses_locked(&self, states: &mut HashMap<JobKey, BuilderStateEntry>) {
-        self.tier2_input_epoch.fetch_add(1, Ordering::SeqCst);
-        for entry in states.values_mut() {
-            entry.retry_paused_until = None;
-            entry.cache_writer_timeouts = 0;
-            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
-                let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
-                entry.resource_retry_at = Some((
-                    Instant::now() + delay,
-                    unix_millis_now() + delay.as_millis() as u64,
-                ));
-            }
-        }
-    }
-
-    /// Every active automatic-retry pause, for health. `None` when the
-    /// registry is busy, so a health poll never waits on a build.
-    pub(crate) fn try_tier2_retry_pauses(&self) -> Option<Vec<Tier2RetryPause>> {
-        let states = self.builder_states.try_lock().ok()?;
-        let now = Instant::now();
-        Some(
-            InspectCategory::active()
-                .iter()
-                .copied()
-                .filter(|category| category.is_tier2())
-                .filter_map(|category| retry_pause_from_states(&states, category, now))
-                .collect(),
-        )
-    }
-
     fn record_build_progress(&self, key: &JobKey, progress: impl Into<String>) {
         if let Ok(mut states) = self.builder_states.lock() {
             if let Some(entry) = states.get_mut(key) {
@@ -1772,40 +1310,6 @@ impl InspectManager {
         payload
     }
 
-    pub(crate) fn deferred_view_refresh_ready(&self, root: &Path) -> bool {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&deferred_view_key(root))
-            .is_some_and(|state| {
-                state
-                    .pending_epoch
-                    .is_some_and(|epoch| epoch != state.publication_epoch)
-            })
-    }
-
-    pub(crate) fn try_deferred_view_refresh_ready(&self, root: &Path) -> Option<bool> {
-        let states = self.deferred_view_refreshes.try_lock().ok()?;
-        Some(states.get(&deferred_view_key(root)).is_some_and(|state| {
-            state
-                .pending_epoch
-                .is_some_and(|epoch| epoch != state.publication_epoch)
-        }))
-    }
-
-    fn view_refresh_dispatched(&self, root: &Path, category: InspectCategory) {
-        if category == InspectCategory::DeadCode {
-            if let Some(state) = self
-                .deferred_view_refreshes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(&deferred_view_key(root))
-            {
-                state.pending_epoch = None;
-            }
-        }
-    }
-
     pub(crate) fn tier2_builder_state_detail_at(
         &self,
         category: InspectCategory,
@@ -1879,11 +1383,6 @@ impl InspectManager {
     #[doc(hidden)]
     pub fn inspect_pool_for_test(&self) -> Arc<rayon::ThreadPool> {
         Arc::clone(&self.pool)
-    }
-
-    #[doc(hidden)]
-    pub fn automatic_tier2_schedule_count_for_test(&self) -> u64 {
-        self.automatic_tier2_schedule_count.load(Ordering::SeqCst)
     }
 
     fn category_needs_heavy_root_work(category: InspectCategory) -> bool {
@@ -2027,330 +1526,6 @@ impl InspectManager {
         Ok(key)
     }
 
-    pub fn submit_tier2_run_with_reuse_background(
-        self: &Arc<Self>,
-        snapshot: InspectSnapshot,
-        category: InspectCategory,
-    ) -> Result<Option<JobKey>, String> {
-        if inspect_category_is_off(&snapshot.config.inspect, category) {
-            return Ok(None);
-        }
-        if !category.is_active() {
-            return Err(format!(
-                "inspect category '{category}' is disabled in v0.33"
-            ));
-        }
-        if !category.is_tier2() {
-            return Err(format!(
-                "inspect category '{category}' is not a Tier 2 category"
-            ));
-        }
-        if !self.heavy_root_work_allowed() {
-            return Err(Self::heavy_root_work_block_message(category));
-        }
-        if !self.automatic_tier2_refresh_allowed() {
-            return Ok(None);
-        }
-        if self.tier2_retry_pause(category).is_some() {
-            return Ok(None);
-        }
-        if self.tier2_resource_wait(category).is_some() {
-            return Ok(None);
-        }
-        self.automatic_tier2_schedule_count
-            .fetch_add(1, Ordering::SeqCst);
-
-        let job = self.tier2_reuse_job(snapshot, category, None);
-        let key = job.key.clone();
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
-        if in_flight.contains_key(&key) {
-            return Ok(Some(key));
-        }
-        let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
-            job.project_root.display().to_string(),
-            format!("tier2-background:{}", category.as_str()),
-            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
-        );
-        let Some(permit) =
-            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
-        else {
-            return Err(format!(
-                "cold build concurrency limit ({}) reached; retrying later",
-                limiter.limit()
-            ));
-        };
-        let permit_slot = Arc::new(Mutex::new(Some(permit)));
-        let worker_permit_slot = Arc::clone(&permit_slot);
-        in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
-        drop(in_flight);
-        self.record_flight_start(&key);
-
-        self.view_refresh_dispatched(&job.project_root, category);
-
-        let manager = Arc::clone(self);
-        let pool = Arc::clone(&self.pool);
-        let cancellation = self
-            .root_work_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let cancellation = cancellation.with_root(&job.project_root);
-        pool.spawn_fifo(move || {
-            let _cancel = crate::executor::install_job_cancellation(cancellation);
-            let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-            let result = manager.tier2_run_with_reuse_job_result_catching(
-                job,
-                Tier2ReuseOptions::default(),
-                Some(worker_permit_slot),
-            );
-            manager.route_tier2_reuse_completion(result);
-        });
-
-        Ok(Some(key))
-    }
-
-    pub fn submit_tier2_run_with_reuse_serial_background(
-        self: &Arc<Self>,
-        snapshot: InspectSnapshot,
-        categories: Vec<InspectCategory>,
-    ) -> Tier2RunSubmission {
-        let mut submission = Tier2RunSubmission::default();
-        let mut requested = Vec::new();
-
-        for category in categories {
-            if inspect_category_is_off(&snapshot.config.inspect, category) {
-                continue;
-            }
-            if !category.is_active() {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: format!("inspect category '{category}' is disabled in v0.33"),
-                });
-                continue;
-            }
-            if !category.is_tier2() {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: format!("inspect category '{category}' is not a Tier 2 category"),
-                });
-                continue;
-            }
-            requested.push(category);
-        }
-
-        if requested.is_empty() {
-            return submission;
-        }
-        if !self.heavy_root_work_allowed() {
-            for category in requested {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: Self::heavy_root_work_block_message(category),
-                });
-            }
-            return submission;
-        }
-        if !self.automatic_tier2_refresh_allowed() {
-            return submission;
-        }
-        // A category whose last build failed is not rebuilt by every
-        // automatic refresh: it waits out its retry pause. An explicit
-        // `aft_inspect` takes the blocking path and is not held back.
-        requested.retain(|category| match self.tier2_retry_pause(*category) {
-            Some(pause) => {
-                submission.retry_paused.push(pause);
-                false
-            }
-            None => true,
-        });
-        requested.retain(|category| match self.tier2_resource_wait(*category) {
-            Some(wait) => {
-                submission.resource_waits.push(wait);
-                false
-            }
-            None => true,
-        });
-        let whole_graph_turn = self.admit_whole_graph_background(
-            &snapshot,
-            &mut requested,
-            &mut submission,
-            Instant::now(),
-        );
-        if requested.is_empty() {
-            return submission;
-        }
-        self.automatic_tier2_schedule_count
-            .fetch_add(requested.len() as u64, Ordering::SeqCst);
-
-        let mut in_flight = match self.in_flight.lock() {
-            Ok(in_flight) => in_flight,
-            Err(_) => {
-                for category in requested {
-                    submission.errors.push(Tier2RunSubmissionError {
-                        category,
-                        message: "inspect in-flight map lock poisoned".to_string(),
-                    });
-                }
-                return submission;
-            }
-        };
-
-        let mut started = Vec::new();
-        for category in requested {
-            let key = JobKey::for_project_category(category);
-            submission.queued_categories.push(category);
-            if in_flight.contains_key(&key) {
-                continue;
-            }
-            in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
-            started.push(key);
-            submission.newly_queued_categories.push(category);
-        }
-        drop(in_flight);
-        for key in &started {
-            self.record_flight_start(key);
-        }
-
-        if submission.newly_queued_categories.is_empty() {
-            return submission;
-        }
-
-        let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
-            snapshot.project_root.display().to_string(),
-            "tier2-serial-background",
-            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
-        );
-        let Some(permit) =
-            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
-        else {
-            let deferred = submission.newly_queued_categories.clone();
-            if let Ok(mut in_flight) = self.in_flight.lock() {
-                for category in &deferred {
-                    in_flight.remove(&JobKey::for_project_category(*category));
-                }
-            }
-            for category in &deferred {
-                self.clear_builder_state(&JobKey::for_project_category(*category));
-            }
-            submission
-                .queued_categories
-                .retain(|category| !deferred.contains(category));
-            submission.deferred_categories.extend(deferred);
-            submission.newly_queued_categories.clear();
-            return submission;
-        };
-
-        let permit_slot = Arc::new(Mutex::new(Some(permit)));
-        let categories_for_worker = submission.newly_queued_categories.clone();
-        // Held for the worker's whole serial run only when it runs a
-        // whole-graph category; otherwise that category was already in flight
-        // and this submission's turn is released here.
-        let whole_graph_turn = whole_graph_turn.filter(|_| {
-            categories_for_worker
-                .iter()
-                .any(|category| is_whole_graph_category(*category))
-        });
-        for category in &categories_for_worker {
-            self.view_refresh_dispatched(&snapshot.project_root, *category);
-        }
-        let manager = Arc::clone(self);
-        let pool = Arc::clone(&self.pool);
-        let cancellation = self
-            .root_work_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let cancellation = cancellation.with_root(&snapshot.project_root);
-        pool.spawn_fifo(move || {
-            let _cancel = crate::executor::install_job_cancellation(cancellation);
-            let _whole_graph_turn = whole_graph_turn;
-            for category in categories_for_worker {
-                let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
-                let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-                let permit_available = permit_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some();
-                let result = if permit_available {
-                    manager.tier2_run_with_reuse_job_result_catching(
-                        job,
-                        Tier2ReuseOptions::default(),
-                        Some(Arc::clone(&permit_slot)),
-                    )
-                } else {
-                    InspectResult::failed(
-                        &job,
-                        "serial Tier-2 run stopped after the limiter slot deadline",
-                        Duration::ZERO,
-                    )
-                };
-                if is_whole_graph_category(category) && result.outcome.is_ok() {
-                    manager.note_whole_graph_background_done(Instant::now());
-                }
-                manager.route_tier2_reuse_completion(result);
-            }
-        });
-
-        submission
-    }
-
-    /// Applies the automatic schedule for dead code and unused exports (see
-    /// [`WHOLE_GRAPH_BACKGROUND_INTERVAL`]) to `requested`. A category not
-    /// due yet is dropped. One that is due but must wait, because this root's
-    /// call graph is still building or another root holds the process-wide
-    /// turn, is reported in `whole_graph_waits`, so the scheduler tries
-    /// again shortly. Returns the turn when a due category stays in.
-    fn admit_whole_graph_background(
-        &self,
-        snapshot: &InspectSnapshot,
-        requested: &mut Vec<InspectCategory>,
-        submission: &mut Tier2RunSubmission,
-        now: Instant,
-    ) -> Option<WholeGraphBackgroundTurn> {
-        if !requested
-            .iter()
-            .any(|category| is_whole_graph_category(*category))
-        {
-            return None;
-        }
-        let due = self
-            .whole_graph_background_done_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none_or(|done| {
-                now.saturating_duration_since(done) >= WHOLE_GRAPH_BACKGROUND_INTERVAL
-            });
-        let graph_ready =
-            !snapshot.config.indexes.callgraph || self.callgraph_ready_for_snapshot(snapshot);
-        let turn = (due && graph_ready)
-            .then(|| WholeGraphBackgroundTurn::try_take(self.whole_graph_gate))
-            .flatten();
-        if turn.is_none() {
-            if due {
-                submission.whole_graph_waits.extend(
-                    requested
-                        .iter()
-                        .copied()
-                        .filter(|category| is_whole_graph_category(*category)),
-                );
-            }
-            requested.retain(|category| !is_whole_graph_category(*category));
-        }
-        turn
-    }
-
-    fn note_whole_graph_background_done(&self, now: Instant) {
-        *self
-            .whole_graph_background_done_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
-    }
-
     pub fn tier2_any_in_flight(&self) -> bool {
         self.in_flight
             .lock()
@@ -2410,21 +1585,6 @@ impl InspectManager {
         }
         self.record_flight_start(&key);
         self.finish_tier2_flight(&key, outcome);
-    }
-
-    /// Bring every armed resource retry due now, standing in for its delay
-    /// elapsing, so a test need not sleep through the real backoff.
-    #[cfg(test)]
-    pub(crate) fn expire_tier2_resource_waits_for_test(&self) {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for entry in states.values_mut() {
-            if entry.resource_retry_at.is_some() {
-                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
-            }
-        }
     }
 
     /// Release per-project inspect caches so their SQLite readers and writer
@@ -2647,79 +1807,9 @@ impl InspectManager {
         self.cache_for_paths(snapshot.inspect_dir.clone(), snapshot.project_root.clone())
     }
 
-    /// Latest persisted counts for the three Tier-2 categories, in
-    /// `(dead_code, unused_exports, duplicates)` order. Reads the most recent
-    /// aggregate regardless of contribution-hash freshness (last-known), so the
-    /// agent status bar can refresh after a background scan completes without a
-    /// freshness round-trip. A category with no readable aggregate reports
-    /// `None` (never a fabricated `0`), so the status bar can preserve any
-    /// last-known value and stay suppressed until every category is real. Status
-    /// observation only uses resident caches; it never acquires a writer lease.
-    pub fn latest_tier2_counts(
-        &self,
-        inspect_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> (Option<usize>, Option<usize>, Option<usize>) {
-        let dead_code_unavailable = self.dead_code_borrow_only_unavailable(&project_root);
-        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
-            return (None, None, None);
-        };
-        let count_of = |category: InspectCategory| -> Option<usize> {
-            cache
-                .latest_aggregate_any_hash(category)
-                .ok()
-                .flatten()
-                .and_then(|payload| {
-                    if category == InspectCategory::DeadCode
-                        && payload
-                            .get("callgraph_available")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false)
-                    {
-                        return None;
-                    }
-                    payload
-                        .get("count")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|count| count as usize)
-                })
-        };
-        (
-            if dead_code_unavailable {
-                None
-            } else {
-                count_of(InspectCategory::DeadCode)
-            },
-            count_of(InspectCategory::UnusedExports),
-            count_of(InspectCategory::Duplicates),
-        )
-    }
-
-    /// Whether the latest dead-code pass for `project_root` found dead code
-    /// unavailable because the root is borrow-only.
-    pub fn dead_code_borrow_only_unavailable(&self, project_root: &Path) -> bool {
-        let root = crate::inspect::job::canonicalize_normalized(project_root);
-        self.dead_code_borrow_only_roots
-            .lock()
-            .map(|roots| roots.contains(&root))
-            .unwrap_or(false)
-    }
-
-    fn set_dead_code_borrow_only_unavailable(&self, project_root: &Path, unavailable: bool) {
-        let root = crate::inspect::job::canonicalize_normalized(project_root);
-        if let Ok(mut roots) = self.dead_code_borrow_only_roots.lock() {
-            if unavailable {
-                roots.insert(root);
-            } else {
-                roots.remove(&root);
-            }
-        }
-    }
-
     /// Latest project-wide TODO count, or `None` when no project-scoped todos
     /// scan has completed yet. Todos is a Tier-1 category whose result lives in
-    /// the cache's in-memory aggregates rather than the Tier-2 table, so
-    /// [`Self::latest_tier2_counts`] cannot see it.
+    /// the cache's in-memory aggregates rather than the Tier-2 table.
     pub fn latest_project_todos_count(
         &self,
         inspect_dir: PathBuf,
@@ -2737,32 +1827,6 @@ impl InspectManager {
             .get("count")
             .and_then(serde_json::Value::as_u64)
             .map(|count| count as usize)
-    }
-
-    /// Whether the latest persisted dead_code aggregate reported
-    /// `callgraph_available:false` — i.e. dead_code was suppressed because the
-    /// callgraph store was not ready when it scanned. Health uses this to avoid
-    /// reporting tier2 as permanently "building" for a root whose only missing
-    /// category is dead_code blocked on the callgraph store. Mirrors the
-    /// suppression rule in [`Self::latest_tier2_counts`].
-    pub fn dead_code_blocked_on_callgraph(
-        &self,
-        inspect_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> bool {
-        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
-            return false;
-        };
-        cache
-            .latest_aggregate_any_hash(InspectCategory::DeadCode)
-            .ok()
-            .flatten()
-            .and_then(|payload| {
-                payload
-                    .get("callgraph_available")
-                    .and_then(serde_json::Value::as_bool)
-            })
-            == Some(false)
     }
 
     fn cache_identity(
@@ -2820,12 +1884,7 @@ impl InspectManager {
     }
 
     fn wake_cache_writer_if_available(&self, identity: &InspectCacheIdentity) {
-        wake_cache_writer_if_available(
-            identity,
-            &self.builder_states,
-            &self.cache_writer_waits,
-            &self.caches,
-        );
+        wake_cache_writer_if_available(identity, &self.cache_writer_waits, &self.caches);
     }
 
     fn watch_cache_writer(&self, dir: &Path, identity: InspectCacheIdentity) {
@@ -2839,7 +1898,6 @@ impl InspectManager {
             return;
         };
         let lease = crate::root_cache::writer_lease_path(&dir);
-        let states = Arc::clone(&self.builder_states);
         let waits = Arc::clone(&self.cache_writer_waits);
         let caches = Arc::clone(&self.caches);
         let watched_identity = identity.clone();
@@ -2851,7 +1909,7 @@ impl InspectManager {
             if let Ok(event) = event {
                 let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
                 if release {
-                    wake_cache_writer_if_available(&watched_identity, &states, &waits, &caches);
+                    wake_cache_writer_if_available(&watched_identity, &waits, &caches);
                 }
                 #[cfg(test)]
                 if let Some(observer) = &event_observer {
@@ -3205,49 +2263,7 @@ impl InspectManager {
         Ok(true)
     }
 
-    fn wait_for_tier2_reuse_waiter_for_debug(&self, job: &InspectJob) {
-        #[cfg(not(debug_assertions))]
-        let _ = job;
-        #[cfg(debug_assertions)]
-        {
-            const WAIT_ROOT_ENV: &str = "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT";
-            if std::env::var_os(WAIT_ROOT_ENV).is_none()
-                || !env_project_root_matches(WAIT_ROOT_ENV, &job.project_root)
-            {
-                return;
-            }
-
-            // This test gate releases on the actual waiter registration, not elapsed
-            // wall-clock time, so a queued background job cannot finish before the
-            // direct-reuse request has attached on a contended runner.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut in_flight = self
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            loop {
-                match in_flight.get(&job.key) {
-                    Some(registration) if registration.waiters.is_empty() => {}
-                    _ => return,
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    return;
-                }
-                let (next, wait_result) = self
-                    .in_flight_changed
-                    .wait_timeout(in_flight, deadline.saturating_duration_since(now))
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                in_flight = next;
-                if wait_result.timed_out() {
-                    return;
-                }
-            }
-        }
-    }
-
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
-        self.view_refresh_dispatched(&job.project_root, job.category);
         // Rebinds retain the persisted contribution cache. Let quick reuse prove
         // that cache before joining the cold-build queue, so an unchanged root can
         // answer immediately even while unrelated background builds own the slots.
@@ -3524,7 +2540,6 @@ impl InspectManager {
             );
         }
         self.reuse_starts.fetch_add(1, Ordering::SeqCst);
-        self.wait_for_tier2_reuse_waiter_for_debug(&job);
         panic_tier2_reuse_for_debug(&job);
         if !job.category.is_active() {
             let result = InspectResult::failed(
@@ -4285,7 +3300,6 @@ impl InspectManager {
             // cannot help. Return an unavailable result that names this cause
             // and carries no count, so it is not mistaken for zero dead code.
             if job.config.indexes.callgraph && job_is_borrow_only(job) {
-                self.set_dead_code_borrow_only_unavailable(&job.project_root, true);
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
                     contributions: Vec::new(),
@@ -4306,11 +3320,6 @@ impl InspectManager {
         let rollup_started = Instant::now();
         if crate::executor::current_job_cancelled() {
             return Err("tier2 pass cancelled before rollup".to_string().into());
-        }
-        if aggregate_job.category == InspectCategory::DeadCode {
-            // This pass reached a rollup, so dead code is not borrow-only
-            // unavailable any more.
-            self.set_dead_code_borrow_only_unavailable(&job.project_root, false);
         }
         // Dead code over the data layer's call graph is worked out from the
         // graph and the facts its content records store; the per-file facts
@@ -4677,15 +3686,9 @@ impl InspectManager {
         // counts and `~` marker would only update on a manual `aft_inspect`.
     }
 
-    /// Snapshot the cumulative count of reuse-path (watcher-driven) Tier-2
-    /// completions. The main-thread drain compares this against its last-seen
-    /// value to detect background scans that finished since the previous tick.
+    /// Snapshot the cumulative count of reuse-path Tier-2 completions.
     pub fn reuse_completion_count(&self) -> u64 {
         self.reuse_completions.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn successful_reuse_completion_count(&self) -> u64 {
-        self.successful_reuse_completions.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
@@ -6968,83 +5971,6 @@ mod guard_tests {
         )
     }
 
-    /// Automatic dead code and unused exports wait for the call graph, run on
-    /// one root at a time, and then only once per interval; other categories
-    /// are untouched.
-    #[test]
-    fn whole_graph_categories_follow_their_background_schedule() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let gate: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-        let manager = InspectManager::new().with_whole_graph_gate(gate);
-        let other = InspectManager::new().with_whole_graph_gate(gate);
-        let with_callgraph = |callgraph: bool| {
-            let mut snapshot = tier1_snapshot(&root);
-            let mut config = (*snapshot.config).clone();
-            config.indexes.callgraph = callgraph;
-            snapshot.config = Arc::new(config);
-            snapshot
-        };
-        let admit = |manager: &InspectManager, snapshot: &InspectSnapshot, now: Instant| {
-            let mut requested = vec![
-                InspectCategory::DeadCode,
-                InspectCategory::UnusedExports,
-                InspectCategory::Complexity,
-            ];
-            let mut submission = Tier2RunSubmission::default();
-            let turn = manager.admit_whole_graph_background(
-                snapshot,
-                &mut requested,
-                &mut submission,
-                now,
-            );
-            (turn, requested, submission.whole_graph_waits)
-        };
-        let whole = vec![InspectCategory::DeadCode, InspectCategory::UnusedExports];
-        let start = Instant::now();
-
-        // No checkout of this root has published a call graph: wait.
-        let (turn, requested, waits) = admit(&manager, &with_callgraph(true), start);
-        assert!(turn.is_none());
-        assert_eq!(requested, vec![InspectCategory::Complexity]);
-        assert_eq!(waits, whole);
-
-        // Without a call graph to wait for, the first run is admitted.
-        let off = with_callgraph(false);
-        let (turn, requested, waits) = admit(&manager, &off, start);
-        assert!(turn.is_some());
-        assert_eq!(requested.len(), 3);
-        assert!(waits.is_empty());
-
-        // Another root waits while that turn is held, and gets it after.
-        let (other_turn, requested, waits) = admit(&other, &off, start);
-        assert!(other_turn.is_none());
-        assert_eq!(requested, vec![InspectCategory::Complexity]);
-        assert_eq!(waits, whole);
-        drop(turn);
-        let (other_turn, _, waits) = admit(&other, &off, start);
-        assert!(other_turn.is_some() && waits.is_empty());
-        drop(other_turn);
-
-        // After a completed run the categories are left out, without waiting,
-        // until the interval has passed.
-        manager.note_whole_graph_background_done(start);
-        let soon = start + WHOLE_GRAPH_BACKGROUND_INTERVAL - Duration::from_secs(1);
-        let (turn, requested, waits) = admit(&manager, &off, soon);
-        assert!(turn.is_none());
-        assert_eq!(requested, vec![InspectCategory::Complexity]);
-        assert!(waits.is_empty());
-        let later = start + WHOLE_GRAPH_BACKGROUND_INTERVAL;
-        let (turn, requested, _) = admit(&manager, &off, later);
-        assert!(turn.is_some());
-        assert_eq!(requested.len(), 3);
-        drop(turn);
-        assert!(
-            !gate.load(Ordering::Acquire),
-            "every turn is released on drop"
-        );
-    }
-
     #[test]
     fn tier1_worker_panic_delivers_failed_to_waiter() {
         let dir = write_ts_project(2);
@@ -7441,62 +6367,6 @@ mod guard_tests {
     }
 
     #[test]
-    fn dead_code_blocked_on_callgraph_reads_latest_aggregate_flag() {
-        // Health asks the manager whether dead_code is only missing because the
-        // callgraph store was not ready when it scanned. The answer must track
-        // the latest persisted dead_code aggregate's `callgraph_available` flag
-        // (mirroring the suppression rule in `latest_tier2_counts`).
-        let dir = tempfile::tempdir().unwrap();
-        let project_root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(project_root.join("lib.rs"), "pub fn marker() {}\n").unwrap();
-        let manager = InspectManager::new();
-        let inspect_dir = dir.path().join("inspect");
-
-        // No aggregate yet → not blocked.
-        assert!(!manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-
-        let cache = manager
-            .cache_for_paths(inspect_dir.clone(), project_root.clone())
-            .expect("open cache");
-        let key = JobKey::for_project_category(InspectCategory::DeadCode);
-        let hash = cache
-            .contribution_set_hash(InspectCategory::DeadCode)
-            .expect("contribution hash");
-
-        // A callgraph-backed dead_code aggregate → not blocked, count surfaced.
-        cache
-            .store_tier2_aggregate(
-                key.clone(),
-                &hash,
-                serde_json::json!({ "count": 3, "callgraph_available": true }),
-            )
-            .expect("store callgraph-backed aggregate");
-        assert!(!manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-        assert_eq!(
-            manager
-                .latest_tier2_counts(inspect_dir.clone(), project_root.clone())
-                .0,
-            Some(3)
-        );
-
-        // A callgraph_unavailable aggregate (store not ready) → blocked, and the
-        // count stays suppressed so the status bar never fabricates a zero.
-        cache
-            .store_tier2_aggregate(
-                key,
-                &hash,
-                crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(1),
-            )
-            .expect("store callgraph_unavailable aggregate");
-        assert!(manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-        assert_eq!(
-            manager.latest_tier2_counts(inspect_dir, project_root).0,
-            None,
-            "callgraph_unavailable dead_code must stay suppressed"
-        );
-    }
-
-    #[test]
     fn foreign_writer_failure_backoff_is_scope_local_and_expires() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -7557,8 +6427,8 @@ mod guard_tests {
             );
             let start = Instant::now();
             assert_eq!(
-                manager.latest_tier2_counts(inspect_dir.clone(), root.clone()),
-                (None, None, None)
+                manager.latest_project_todos_count(inspect_dir.clone(), root.clone()),
+                None
             );
             assert!(start.elapsed() < Duration::from_millis(500));
             assert!(opening
@@ -7704,15 +6574,6 @@ mod guard_tests {
         assert!(manager
             .submit_background(snapshot.clone(), InspectCategory::Todos, scope.clone())
             .is_err());
-        assert!(manager
-            .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::DeadCode)
-            .unwrap()
-            .is_none());
-        let submission = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::DeadCode],
-        );
-        assert!(submission.queued_categories.is_empty());
         let outcome = manager.tier2_run_with_reuse_blocking(
             snapshot.clone(),
             InspectCategory::DeadCode,
@@ -7725,7 +6586,6 @@ mod guard_tests {
             scope.clone(),
         );
         assert_eq!(outcome.payload().unwrap()["off"], true);
-        assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
         assert_eq!(manager.reuse_starts.load(Ordering::SeqCst), 0);
         assert_eq!(manager.next_job_id.load(Ordering::Relaxed), initial);
         assert!(
@@ -8223,7 +7083,7 @@ mod guard_tests {
     }
 
     #[test]
-    fn background_tier2_reuse_panic_clears_builder_registration() {
+    fn tier2_reuse_panic_clears_builder_registration() {
         use crate::config::Config;
         use crate::parser::SymbolCache;
         use std::sync::RwLock;
@@ -8283,9 +7143,11 @@ mod guard_tests {
         };
 
         let manager = Arc::new(InspectManager::new());
-        manager
-            .submit_tier2_run_with_reuse_background(snapshot, InspectCategory::Duplicates)
-            .expect("queue background duplicates scan");
+        let _ = manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Duplicates,
+            JobScope::for_project(root.clone()),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -10623,25 +9485,6 @@ mod tier2_unreadable_source_tests {
         (dir, root, snapshot)
     }
 
-    /// Block until `limiter` has a free slot, then hand it straight back. A
-    /// probe permit can only be taken once every earlier permit has been fully
-    /// returned, so this proves no background worker still holds or is still
-    /// releasing one. The deadline only guards against a hang.
-    fn wait_until_cold_build_slot_is_free(limiter: &Arc<cold_build_limiter::ColdBuildLimiter>) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(probe) = limiter.try_acquire() {
-                drop(probe);
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "an earlier worker never returned its cold-build permit"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     fn aggregate(
         manager: &InspectManager,
         snapshot: &InspectSnapshot,
@@ -10738,164 +9581,6 @@ mod tier2_unreadable_source_tests {
     }
 
     #[test]
-    fn failure_pause_skips_only_input_determined_failures() {
-        let failed = |message: &str| JobOutcome::Failed {
-            message: message.to_string(),
-        };
-        assert!(failure_pauses_automatic_retries(&failed(
-            "complexity incremental scan failed: read failed for /p/a.ts: Permission denied"
-        )));
-        assert!(failure_pauses_automatic_retries(&failed(
-            "tier2 pass timed out after 600000ms and was cancelled"
-        )));
-        for transient in [
-            "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed",
-            "callgraph_unavailable",
-            "tier2 pass cancelled before incremental scan",
-            "explicit inspect Tier-2 cold-build admission was cancelled",
-            "serial Tier-2 run stopped after the limiter slot deadline",
-            "tier2 reuse worker exited without publishing a result",
-        ] {
-            assert!(
-                !failure_pauses_automatic_retries(&failed(transient)),
-                "{transient}"
-            );
-        }
-        assert!(!failure_pauses_automatic_retries(&JobOutcome::Fresh {
-            payload: json!({ "callgraph_available": false }),
-        }));
-    }
-
-    #[test]
-    fn writer_lease_timeout_completion_waits_for_resource_not_input_change() {
-        let (_dir, root, snapshot) = fixture();
-        let category = InspectCategory::Complexity;
-        let project_key = crate::path_identity::project_scope_key(&root);
-        let project_dir = snapshot.inspect_dir.join(project_key);
-        std::fs::create_dir_all(&project_dir).expect("inspect directory");
-        let held = crate::fs_lock::try_acquire(
-            &crate::root_cache::writer_lease_path(&project_dir),
-            Duration::ZERO,
-        )
-        .expect("independent live writer lease");
-        let manager = Arc::new(InspectManager::new());
-        let limiter = cold_build_limiter::test_limiter(1);
-        manager.set_cold_build_limiter(Arc::clone(&limiter));
-        let first =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert_eq!(first.newly_queued_categories, vec![category]);
-        let (flights, timeout) = manager
-            .in_flight_changed
-            .wait_timeout_while(
-                manager.in_flight.lock().unwrap(),
-                Duration::from_secs(30),
-                |flights| !flights.is_empty(),
-            )
-            .unwrap();
-        assert!(!timeout.timed_out(), "lease attempt did not complete");
-        assert!(flights.is_empty());
-        drop(flights);
-        assert_eq!(manager.reuse_completion_count(), 1);
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-        assert!(
-            held.verify_writer_epoch().expect("lease verification"),
-            "never steal a live lease"
-        );
-        assert!(
-            manager.tier2_retry_pause(category).is_none(),
-            "lease timeout must not record an input-failure pause: {:?}",
-            manager.tier2_retry_pause(category),
-        );
-        let wait = manager
-            .tier2_resource_wait(category)
-            .expect("resource wait recorded");
-        assert_eq!(manager.try_tier2_retry_pauses(), Some(Vec::new()));
-        assert_eq!(
-            manager.tier2_builder_state(category),
-            InspectBuilderState::WaitingForCacheWriterLease
-        );
-        let detail = manager.tier2_builder_state_detail(category);
-        assert!(
-            detail.contains("waiting for the inspect cache writer lease"),
-            "{detail}"
-        );
-        assert!(!detail.contains("failed"), "{detail}");
-        let key = JobKey::for_project_category(category);
-        let retry_at = manager
-            .try_tier2_resource_retry_at(&snapshot.config)
-            .unwrap()
-            .unwrap();
-        assert!(retry_at > Instant::now());
-        assert!(retry_at <= Instant::now() + Duration::from_secs(30));
-        assert_eq!(
-            wait.retry_at_ms,
-            manager.builder_states.lock().unwrap()[&key]
-                .resource_retry_at
-                .unwrap()
-                .1
-        );
-        let blocked =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert!(blocked.newly_queued_categories.is_empty(), "{blocked:?}");
-        assert!(blocked.retry_paused.is_empty(), "{blocked:?}");
-        assert_eq!(blocked.resource_waits, vec![wait]);
-        assert!(manager
-            .submit_tier2_run_with_reuse_background(snapshot.clone(), category)
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            manager.automatic_tier2_schedule_count_for_test(),
-            1,
-            "no immediate automatic retry"
-        );
-
-        drop(held);
-        // This checks resource retry state, not native notification latency.
-        // Advance both retry clocks without manufacturing an input change.
-        manager.expire_tier2_resource_waits_for_test();
-        for (retry_at, _) in manager.cache_writer_waits.lock().unwrap().values_mut() {
-            *retry_at = Instant::now();
-        }
-        assert!(
-            manager.tier2_resource_wait(category).is_none(),
-            "the controlled resource deadline must permit retry"
-        );
-        // The serial worker publishes its completion (removing the category
-        // from `in_flight`) before it drops its cold-build limiter permit. While
-        // that permit is being torn down, a same-root admission is refused and
-        // the category is deferred instead of queued. Wait until the earlier
-        // worker has returned its slot, so the admission below tests only the
-        // released lease and the due retry.
-        wait_until_cold_build_slot_is_free(&limiter);
-        let resumed =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert_eq!(
-            resumed.newly_queued_categories,
-            vec![category],
-            "{resumed:?}"
-        );
-        let (flights, timeout) = manager
-            .in_flight_changed
-            .wait_timeout_while(
-                manager.in_flight.lock().unwrap(),
-                Duration::from_secs(30),
-                |flights| !flights.is_empty(),
-            )
-            .unwrap();
-        assert!(!timeout.timed_out(), "retry did not complete");
-        drop(flights);
-        assert_eq!(manager.reuse_completion_count(), 2);
-        assert_eq!(manager.successful_reuse_completion_count(), 1);
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-        assert!(manager.tier2_resource_wait(category).is_none());
-        assert_eq!(
-            manager.try_tier2_resource_retry_at(&snapshot.config),
-            Some(None)
-        );
-        assert!(manager.tier2_retry_pause(category).is_none());
-    }
-
-    #[test]
     fn writer_lease_release_native_watch_acknowledges_retry() {
         let (_dir, root, snapshot) = fixture();
         let project_dir = snapshot
@@ -10919,7 +9604,10 @@ mod tier2_unreadable_source_tests {
         let key = JobKey::for_project_category(category);
         manager.record_flight_start(&key);
         manager.record_builder_attempt_outcome(&key, &JobOutcome::Failed { message: error });
-        assert!(manager.tier2_resource_wait(category).is_some());
+        assert_eq!(
+            manager.tier2_builder_state(category),
+            InspectBuilderState::WaitingForCacheWriterLease
+        );
         let mut active = false;
         loop {
             match received
@@ -10948,8 +9636,9 @@ mod tier2_unreadable_source_tests {
                 CacheWriterWatchObservation::Subscribed => {}
             }
         }
-        assert!(
-            manager.tier2_resource_wait(category).is_some(),
+        assert_eq!(
+            manager.tier2_builder_state(category),
+            InspectBuilderState::WaitingForCacheWriterLease,
             "activity must not release a live holder"
         );
         drop(held);
@@ -10976,274 +9665,6 @@ mod tier2_unreadable_source_tests {
                 _ => {}
             }
         }
-        assert!(
-            manager.tier2_resource_wait(category).is_none(),
-            "the acknowledged callback must make the retry due"
-        );
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn cache_writer_wait_backoff_doubles_caps_and_resets() {
-        let (_dir, root, _snapshot) = fixture();
-        let manager = InspectManager::new();
-        let key = JobKey::for_project_category(InspectCategory::Complexity);
-        let timeout = JobOutcome::Failed {
-            message: "writer_lease_timeout: inspect writer lease deadline elapsed".into(),
-        };
-        for seconds in [30, 60, 120, 240, 480, 960, 1800, 1800] {
-            manager.record_flight_start(&key);
-            manager.record_builder_attempt_outcome(&key, &timeout);
-            let states = manager.builder_states.lock().unwrap();
-            let retry_at = states[&key].resource_retry_at.unwrap().0;
-            let remaining = retry_at.saturating_duration_since(Instant::now());
-            assert!(remaining <= Duration::from_secs(seconds), "{remaining:?}");
-            assert!(
-                remaining > Duration::from_secs(seconds - 1),
-                "{remaining:?}"
-            );
-        }
-        assert!(
-            manager.note_tier2_input_paths_changed(Some(&root), [root.join("source.ts").as_path()])
-        );
-        manager.record_flight_start(&key);
-        manager.record_builder_attempt_outcome(&key, &timeout);
-        let after_input = manager.builder_states.lock().unwrap()[&key]
-            .resource_retry_at
-            .unwrap()
-            .0;
-        assert!(after_input <= Instant::now() + Duration::from_secs(30));
-        manager.record_builder_attempt_outcome(&key, &JobOutcome::Fresh { payload: json!({}) });
-        manager.record_flight_start(&key);
-        manager.record_builder_attempt_outcome(&key, &timeout);
-        let after_success = manager.builder_states.lock().unwrap()[&key]
-            .resource_retry_at
-            .unwrap()
-            .0;
-        assert!(after_success <= Instant::now() + Duration::from_secs(30));
-    }
-
-    #[test]
-    fn repeated_lease_waits_are_bounded_and_explicit_inspect_bypasses_them() {
-        let (_dir, root, snapshot) = fixture();
-        let manager = Arc::new(InspectManager::new());
-        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
-        let category = InspectCategory::Complexity;
-        let key = JobKey::for_project_category(category);
-        let lease_timeout = JobOutcome::Failed {
-            message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
-        };
-        for _ in 0..8 {
-            manager
-                .in_flight
-                .lock()
-                .unwrap()
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            manager.finish_tier2_flight(&key, lease_timeout.clone());
-            let states = manager.builder_states.lock().unwrap();
-            let entry = &states[&key];
-            let retry_at = entry.resource_retry_at.unwrap().0;
-            assert!(retry_at > Instant::now());
-            assert!(retry_at <= Instant::now() + Duration::from_secs(30 * 60));
-            assert!(entry.retry_paused_until.is_none());
-            assert!(entry.last_failure.is_none());
-        }
-        manager.clear_tier2_retry_pauses();
-        assert!(
-            manager.tier2_resource_wait(category).is_some(),
-            "input resets do not release a lease"
-        );
-        let mut disabled = (*snapshot.config).clone();
-        disabled.inspect.enabled = false;
-        assert_eq!(manager.try_tier2_resource_retry_at(&disabled), Some(None));
-        let explicit = manager.tier2_run_with_reuse_blocking(
-            snapshot.clone(),
-            category,
-            JobScope::for_project(root),
-        );
-        assert!(matches!(explicit, JobOutcome::Fresh { .. }), "{explicit:?}");
-        assert!(manager.tier2_resource_wait(category).is_none());
-        assert_eq!(
-            manager.try_tier2_resource_retry_at(&snapshot.config),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn completion_preserves_input_failure_pause_and_transient_controls() {
-        let manager = InspectManager::new();
-        let category = InspectCategory::Complexity;
-        let key = JobKey::for_project_category(category);
-        let complete = |outcome| {
-            manager
-                .in_flight
-                .lock()
-                .unwrap()
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            manager.finish_tier2_flight(&key, outcome);
-        };
-        complete(JobOutcome::Failed {
-            message: "failed to read source input: Permission denied".into(),
-        });
-        assert!(
-            manager.tier2_retry_pause(category).is_some(),
-            "genuine input failures still pause"
-        );
-        assert!(manager.tier2_resource_wait(category).is_none());
-        for outcome in [
-            JobOutcome::Failed {
-                message: "admission was cancelled".into(),
-            },
-            JobOutcome::Failed {
-                message: "tier2 pass cancelled before incremental scan".into(),
-            },
-            JobOutcome::Failed {
-                message: "callgraph_unavailable".into(),
-            },
-            JobOutcome::Fresh {
-                payload: json!({"callgraph_available": false}),
-            },
-        ] {
-            complete(outcome.clone());
-            assert!(manager.tier2_retry_pause(category).is_none(), "{outcome:?}");
-            assert!(
-                manager.tier2_resource_wait(category).is_none(),
-                "{outcome:?}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_build_is_not_rerun_by_automatic_refresh_until_its_pause_ends() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (_dir, root, snapshot) = fixture();
-        // A source the scanner cannot read keeps failing the build (that
-        // contract is unchanged); it stands in for any failure that a rerun
-        // on the same inputs would only repeat.
-        let locked = root.join("src/locked.ts");
-        std::fs::write(&locked, "export const locked = 1;\n").expect("locked");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod 000");
-        if std::fs::read(&locked).is_ok() {
-            // Running as a user that ignores file modes; nothing can fail.
-            return;
-        }
-        let manager = Arc::new(InspectManager::new());
-        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
-        let wait_idle = |manager: &InspectManager| {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while manager.tier2_any_in_flight() {
-                assert!(Instant::now() < deadline, "background build did not finish");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-
-        let first = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert_eq!(
-            first.newly_queued_categories,
-            vec![InspectCategory::Complexity]
-        );
-        wait_idle(&manager);
-        assert_eq!(manager.reuse_start_count_for_test(), 1);
-        let pause = manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .expect("a failed build pauses automatic retries");
-        assert!(pause.reason.contains("failed"), "{pause:?}");
-        assert_eq!(pause.identical_failures, 1);
-        assert!(manager
-            .tier2_builder_state_detail(InspectCategory::Complexity)
-            .contains("automatic retries paused until"));
-        assert_eq!(
-            manager.try_tier2_retry_pauses(),
-            Some(vec![pause.clone()]),
-            "health lists the paused category with its failure reason"
-        );
-
-        // The next automatic refresh, inputs unchanged, does not rerun it.
-        let second = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert!(second.newly_queued_categories.is_empty(), "{second:?}");
-        assert_eq!(second.retry_paused, vec![pause.clone()]);
-        wait_idle(&manager);
-        assert_eq!(
-            manager.reuse_start_count_for_test(),
-            1,
-            "a paused category must not start another build"
-        );
-
-        // Changes the scope walk can never include leave the pause in place.
-        let out_of_scope = [
-            root.join("node_modules/dep/index.ts"),
-            root.join(".git/index"),
-            root.join("notes.unknown-ext"),
-            PathBuf::from("/elsewhere/outside/src/lib.ts"),
-        ];
-        assert!(!manager.note_tier2_input_paths_changed(
-            Some(&root),
-            out_of_scope.iter().map(PathBuf::as_path),
-        ));
-        let third = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert!(third.newly_queued_categories.is_empty(), "{third:?}");
-        assert_eq!(third.retry_paused, vec![pause.clone()]);
-        assert_eq!(manager.reuse_start_count_for_test(), 1);
-
-        // A change to an in-scope file ends the pause: the very next automatic
-        // refresh rebuilds without waiting it out.
-        assert!(manager
-            .note_tier2_input_paths_changed(Some(&root), [root.join("src/good.ts").as_path()],));
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
-        let fourth = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert_eq!(
-            fourth.newly_queued_categories,
-            vec![InspectCategory::Complexity]
-        );
-        wait_idle(&manager);
-        assert_eq!(manager.reuse_start_count_for_test(), 2);
-        // The cause was not fixed, so it fails again with the same reason and
-        // the pause doubles.
-        let repeat = manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .expect("the repeated failure pauses again");
-        assert_eq!(repeat.identical_failures, 2);
-        assert!(repeat.retry_at_ms >= pause.retry_at_ms + 10 * 60 * 1_000);
-
-        // The explicit `aft_inspect` path (the blocking run the inspect command
-        // uses) is not held back by the pause, even with no change observed,
-        // and its success clears the pause.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
-            .expect("chmod 644");
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_some());
-        let explicit = manager.tier2_run_with_reuse_blocking(
-            snapshot,
-            InspectCategory::Complexity,
-            JobScope::for_project(root),
-        );
-        assert!(explicit.payload().is_some(), "{explicit:?}");
-        assert_eq!(manager.reuse_start_count_for_test(), 3);
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
     }
 
     #[test]
@@ -11269,41 +9690,5 @@ mod tier2_unreadable_source_tests {
         assert!(published);
         assert!(waiters.is_some());
         assert!(!manager.tier2_any_in_flight());
-    }
-
-    #[test]
-    fn input_change_during_a_failing_attempt_does_not_pause_it() {
-        let manager = InspectManager::new();
-        let root = PathBuf::from("/project");
-        let key = JobKey::for_project_category(InspectCategory::Complexity);
-        let failed = JobOutcome::Failed {
-            message: "complexity incremental scan failed: read failed for /project/a.ts"
-                .to_string(),
-        };
-        let attempt = |change: Option<&str>| {
-            manager
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            if let Some(change) = change {
-                assert!(manager.note_tier2_input_paths_changed(Some(&root), [Path::new(change)],));
-            }
-            manager.finish_tier2_flight(&key, failed.clone());
-        };
-
-        // The build may not have seen a fix made while it ran, so its failure
-        // must not hold the next automatic refresh back.
-        attempt(Some("/project/src/a.ts"));
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
-
-        attempt(None);
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_some());
     }
 }

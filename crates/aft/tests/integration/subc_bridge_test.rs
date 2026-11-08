@@ -21,7 +21,6 @@ use aft::subc::{
     run_subc_mode_for_test_with_lifecycle_probe, run_subc_mode_for_test_with_response_body_limit,
     SubcError, SubcLifecycleEvent, SubcTestHealthRollupProbe, SubcTestLifecycleProbe,
 };
-use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::{ModuleManifest, ProviderRole};
 use subc_protocol::session::{
@@ -288,7 +287,6 @@ struct BridgeInner {
     deferred_push_started: usize,
     deferred_push_release: bool,
     configure_events: Vec<ConfigureEvent>,
-    watcher_senders: Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>,
 }
 
 fn bridge_state_slot() -> &'static Mutex<Option<Arc<BridgeState>>> {
@@ -544,11 +542,6 @@ impl BridgeState {
                 "timed out waiting for deferred push release"
             );
         }
-    }
-
-    fn retain_watcher_sender(&self, sender: crossbeam_channel::Sender<WatcherDispatchEvent>) {
-        let mut guard = self.inner.lock().expect("bridge state lock");
-        guard.watcher_senders.push(sender);
     }
 
     fn assert_overlap(&self) {
@@ -997,51 +990,6 @@ fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
         .expect("queue configure warning");
 }
 
-fn enqueue_watcher_event_for_test(
-    req: &RawRequest,
-    ctx: &AppContext,
-    state: &BridgeState,
-) -> Response {
-    let Some(root) = ctx.config().project_root.clone() else {
-        return Response::error(
-            &req.id,
-            "missing_project_root",
-            "subc watcher test requires a configured project root",
-        );
-    };
-    let path = root.join("subc_watcher_tick.rs");
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            return Response::error(
-                &req.id,
-                "watcher_test_setup_failed",
-                format!("failed to create watcher test dir: {error}"),
-            );
-        }
-    }
-    if let Err(error) = std::fs::write(&path, "pub fn subc_watcher_tick() {}\n") {
-        return Response::error(
-            &req.id,
-            "watcher_test_setup_failed",
-            format!("failed to write watcher test file: {error}"),
-        );
-    }
-
-    // Seed visible Tier-2 counts so the watcher drain has an observable stale-bit
-    // transition to emit as a StatusChanged Push.
-    ctx.update_status_bar_tier2(Some(31), Some(32), Some(33), Some(34), false);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    *ctx.watcher_rx().lock() = Some(rx);
-    tx.send(WatcherDispatchEvent::Paths(vec![path.clone()]))
-        .expect("queue watcher event");
-    state.retain_watcher_sender(tx);
-
-    Response::success(
-        &req.id,
-        json!({ "queued": true, "path": path.to_string_lossy() }),
-    )
-}
-
 fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -1147,12 +1095,12 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 json!({ "case": "fast", "project_root": ctx_project_root(ctx) }),
             ),
             Some("status_bar") => {
-                let dead_code = req
+                let todos = req
                     .params
-                    .get("dead_code")
+                    .get("todos")
                     .and_then(Value::as_u64)
-                    .unwrap_or(11) as usize;
-                ctx.update_status_bar_tier2(Some(dead_code), Some(12), Some(13), Some(14), false);
+                    .unwrap_or(14) as usize;
+                ctx.update_status_bar_todos(Some(todos));
                 Response::success(req.id, json!({ "case": "status_bar" }))
             }
             Some("epoch") => state.epoch_read(req.id),
@@ -1381,7 +1329,6 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 json!({ "deferred": emitted, "task_id": task_id, "session_id": session_id }),
             )
         }
-        "subc_test_enqueue_watcher_event" => enqueue_watcher_event_for_test(&req, ctx, &state),
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.indexes.callgraph = true);
             Response::success(req.id, json!({ "callgraph_store": true }))
@@ -2362,16 +2309,6 @@ fn subc_bridge_configure_warning_pushes_are_session_scoped() {
         "subc_bridge_configure_warning_pushes_are_session_scoped",
         Duration::from_secs(30),
         drive_configure_warning_daemon,
-        |_, _, _| {},
-    );
-}
-
-#[test]
-fn subc_bridge_watcher_stale_maintenance_push() {
-    run_subc_bridge_test(
-        "subc_bridge_watcher_stale_maintenance_push",
-        Duration::from_secs(30),
-        drive_watcher_stale_daemon,
         |_, _, _| {},
     );
 }
@@ -6722,31 +6659,6 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
-async fn drive_watcher_stale_daemon(input: FakeDaemonInput) {
-    let FakeDaemonSession {
-        mut stream, root1, ..
-    } = open_fake_daemon_session(input).await;
-    bind_route1(&mut stream, &root1).await;
-
-    // Watcher maintenance injects a compact watcher event through the same
-    // watcher_rx seam standalone tests use, then lets the subc maintenance tick
-    // drain it on the Mutating lane and emit the stale-status Push.
-    send_tool_call(
-        &mut stream,
-        1,
-        65,
-        "subc_test_enqueue_watcher_event",
-        json!({}),
-    )
-    .await;
-    let watcher_pushes =
-        expect_watcher_stale_status_pushes_for_tool(&mut stream, 65, HashSet::from([1]), &root1)
-            .await;
-    assert_eq!(watcher_pushes.len(), 1);
-
-    send_connection_goodbye(&mut stream).await;
-}
-
 fn configure_bind_benchmark_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     if req.command == "configure" {
         aft::commands::configure::handle_configure(&req, ctx)
@@ -8558,7 +8470,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         1,
         80,
         "echo",
-        json!({ "case": "status_bar", "dead_code": 21 }),
+        json!({ "case": "status_bar", "todos": 21 }),
     )
     .await;
     loop {
@@ -8687,7 +8599,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         1,
         80,
         "echo",
-        json!({ "case": "status_bar", "dead_code": 21 }),
+        json!({ "case": "status_bar", "todos": 21 }),
     )
     .await;
     loop {
@@ -8730,7 +8642,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
                     1,
                     corr,
                     "echo",
-                    json!({ "case": "status_bar", "dead_code": 21 }),
+                    json!({ "case": "status_bar", "todos": 21 }),
                 )
                 .await;
                 loop {
@@ -8873,7 +8785,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         1,
         81,
         "echo",
-        json!({ "case": "status_bar", "dead_code": 21 }),
+        json!({ "case": "status_bar", "todos": 21 }),
     )
     .await;
     loop {
@@ -8931,7 +8843,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         1,
         82,
         "echo",
-        json!({ "case": "status_bar", "dead_code": 22 }),
+        json!({ "case": "status_bar", "todos": 22 }),
     )
     .await;
     loop {
@@ -9152,20 +9064,20 @@ async fn open_status_bar_module(input: &FakeDaemonInput) -> tokio::net::TcpStrea
     stream
 }
 
-/// Run one tool call that sets Tier-2 dead-code to `dead_code` and return the
+/// Run one tool call that sets the TODO count to `todos` and return the
 /// text the agent receives. The first-party plugin reads `structuredContent.text`
 /// and a generic MCP host reads `content[0].text`; both must be the same text.
 async fn agent_text_after_counts(
     stream: &mut tokio::net::TcpStream,
     corr: u64,
-    dead_code: u64,
+    todos: u64,
 ) -> String {
     send_tool_call(
         stream,
         1,
         corr,
         "echo",
-        json!({ "case": "status_bar", "dead_code": dead_code }),
+        json!({ "case": "status_bar", "todos": todos }),
     )
     .await;
     loop {
@@ -9191,13 +9103,13 @@ async fn agent_text_after_counts(
     }
 }
 
-/// Tier-2 values the `echo` status case sets; diagnostics never reported, so E/W are unknown.
-fn status_bar_for_dead_code(dead_code: u64) -> String {
-    format!("[AFT E? W? | D{dead_code} U12 C13 | T14]")
+/// The bar the `echo` status case sets; diagnostics never reported, so E/W are unknown.
+fn status_bar_for_todos(todos: u64) -> String {
+    format!("[AFT E? W? | T{todos}]")
 }
 
-fn assert_bar(text: &str, dead_code: u64, context: &str) {
-    let expected = status_bar_for_dead_code(dead_code);
+fn assert_bar(text: &str, todos: u64, context: &str) {
+    let expected = status_bar_for_todos(todos);
     assert!(
         text.ends_with(&format!("\n\n{expected}")),
         "{context}: agent text must end with {expected}: {text:?}"
@@ -9210,15 +9122,15 @@ fn assert_bar(text: &str, dead_code: u64, context: &str) {
 async fn assert_eventual_bar(
     stream: &mut tokio::net::TcpStream,
     mut corr: u64,
-    dead_code: u64,
+    todos: u64,
     context: &str,
 ) {
     let mut last_text = String::new();
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            last_text = agent_text_after_counts(stream, corr, dead_code).await;
+            last_text = agent_text_after_counts(stream, corr, todos).await;
             if last_text.contains("[AFT ") {
-                assert_bar(&last_text, dead_code, context);
+                assert_bar(&last_text, todos, context);
                 break;
             }
             corr += 1;
@@ -9335,7 +9247,7 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
         1,
         80,
         "echo",
-        json!({ "case": "status_bar", "dead_code": 21 }),
+        json!({ "case": "status_bar", "todos": 21 }),
     )
     .await;
     let status_bar_read = read_frame_timeout(&mut stream, "status-bar read response").await;
@@ -16070,66 +15982,6 @@ async fn expect_route_bind_ack_without_task_push(
             other => panic!("unexpected frame while waiting for RouteBindAck {corr}: {other:?}"),
         }
     }
-}
-
-async fn expect_watcher_stale_status_pushes_for_tool(
-    stream: &mut tokio::net::TcpStream,
-    corr: u64,
-    expected_channels: HashSet<u16>,
-    expected_root: &std::path::Path,
-) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let expected_root = expected_root.to_string_lossy().into_owned();
-    let mut response_seen = false;
-    let mut pushes = Vec::new();
-    let mut channels = HashSet::new();
-
-    while !response_seen || channels != expected_channels {
-        let now = Instant::now();
-        assert!(now < deadline, "timed out waiting for watcher stale push");
-        let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_subc_frame(stream))
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for watcher stale push"))
-            .expect("read frame")
-            .unwrap_or_else(|| panic!("EOF waiting for watcher stale push"));
-        match frame.header.ty {
-            FrameType::Push => {
-                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
-                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                let snapshot = body.get("snapshot").unwrap_or(&Value::Null);
-                let status_bar = snapshot.get("status_bar").unwrap_or(&Value::Null);
-                let stale = status_bar.get("tier2_stale").and_then(Value::as_bool) == Some(true);
-                let root_matches = snapshot.get("project_root").and_then(Value::as_str)
-                    == Some(expected_root.as_str());
-                if push_type(&body) == Some("status_changed") && root_matches {
-                    assert!(
-                        stale || status_bar.is_null(),
-                        "watcher status must be marked stale or remain absent until all producers report"
-                    );
-                    assert!(
-                        expected_channels.contains(&frame.header.channel),
-                        "watcher stale push leaked to unexpected channel {}",
-                        frame.header.channel
-                    );
-                    channels.insert(frame.header.channel);
-                    pushes.push(body);
-                }
-            }
-            FrameType::Response if frame.header.corr == corr => {
-                let response = tool_response_json(&frame);
-                assert!(
-                    response["success"].as_bool().unwrap_or(false),
-                    "watcher injection response should succeed: {response:?}"
-                );
-                response_seen = true;
-            }
-            other => panic!("unexpected frame while waiting for watcher stale push: {other:?}"),
-        }
-    }
-
-    assert_eq!(channels, expected_channels);
-    pushes
 }
 
 async fn expect_status_pushes_for_tool(

@@ -8462,7 +8462,7 @@ mod grant_path_tests {
                 "bg_completions": completions,
             }),
         );
-        let additions = "[AFT E1 W2 | D0 U0 C0 | T0]";
+        let additions = "[AFT E1 W2 | T0]";
         let live_text = format!(
             "{}\n\n{additions}",
             crate::subc_format::format_response_with_context("bash", &live, &format_context)

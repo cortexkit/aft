@@ -661,25 +661,22 @@ impl SubcLifecycleAdmission {
 pub struct StatusBarCounts {
     pub errors: usize,
     pub warnings: usize,
-    pub dead_code: usize,
-    pub unused_exports: usize,
-    pub duplicates: usize,
     pub todos: usize,
-    pub tier2_stale: bool,
 }
 
 /// Proven status values. A missing category has not produced a trustworthy
 /// value and remains absent instead of being converted to a clean zero.
+///
+/// The bar carries only what stays cheap and current: LSP errors and
+/// warnings, and the TODO count. The whole-repository analyses (dead code,
+/// unused exports, duplicates, cycles, complexity) run only when an agent
+/// calls `aft_inspect`, so the bar has no counts for them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusBarCountValues {
     pub disabled_categories: Vec<&'static str>,
     pub errors: Option<usize>,
     pub warnings: Option<usize>,
-    pub dead_code: Option<usize>,
-    pub unused_exports: Option<usize>,
-    pub duplicates: Option<usize>,
     pub todos: Option<usize>,
-    pub tier2_stale: bool,
     pub diagnostics: Option<&'static str>,
     /// Why `diagnostics` is `"pending"`: `applicability_walk_running` while
     /// the background walk that decides which language servers apply to the
@@ -705,78 +702,32 @@ impl StatusBarCountValues {
             self.errors = None;
             self.warnings = None;
         }
-        if self.disabled_categories.contains(&"dead_code") {
-            self.dead_code = None;
-        }
-        if self.disabled_categories.contains(&"unused_exports") {
-            self.unused_exports = None;
-        }
-        if self.disabled_categories.contains(&"duplicates") {
-            self.duplicates = None;
-        }
         if self.disabled_categories.contains(&"todos") {
             self.todos = None;
-        }
-        if ["dead_code", "unused_exports", "duplicates"]
-            .iter()
-            .all(|key| self.disabled_categories.contains(key))
-        {
-            self.tier2_stale = false;
         }
         self
     }
     pub(crate) fn legacy_projection(&self) -> Option<StatusBarCounts> {
-        let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
-            self.errors,
-            self.warnings,
-            self.dead_code,
-            self.unused_exports,
-            self.duplicates,
-            self.todos,
-        ] else {
+        let [Some(errors), Some(warnings), Some(todos)] = [self.errors, self.warnings, self.todos]
+        else {
             return None;
         };
 
         Some(StatusBarCounts {
             errors,
             warnings,
-            dead_code,
-            unused_exports,
-            duplicates,
             todos,
-            tier2_stale: self.tier2_stale,
         })
     }
 }
 
-/// Last-known Tier-2 + todos counts, refreshed off the hot path. `errors` and
-/// `warnings` are intentionally NOT cached here — they're read live per attach.
-///
-/// Each Tier-2 category is `Option`: `None` means "no scan has ever produced a
-/// count for this category", so we never fabricate a `0`. The bar is only
-/// surfaced once all three Tier-2 categories hold a real value — a partially
-/// completed cold scan (e.g. dead_code done, unused_exports/duplicates still
-/// running) must not render `D<real> U0 C0` and lie about project health (#1).
+/// Last-known TODO count, refreshed off the hot path. `errors` and `warnings`
+/// are intentionally NOT cached here — they're read live per attach. `None`
+/// means no scan has produced a count yet, so we never fabricate a `0`.
 #[derive(Debug, Clone, Default)]
-struct StatusBarTier2 {
-    dead_code: Option<usize>,
-    unused_exports: Option<usize>,
-    duplicates: Option<usize>,
+struct StatusBarTodos {
     todos: Option<usize>,
-    stale: bool,
-    stale_since_ms: Option<u64>,
-    /// Reuse completions observed when this snapshot first became stale. Health
-    /// requires every later completion to have succeeded before reporting ready.
-    stale_after_reuse_completion: u64,
-    stale_after_successful_completion: u64,
     generation: u64,
-    /// True when the latest dead_code aggregate reported `callgraph_available:
-    /// false` (the callgraph store was not ready when dead_code scanned). Health
-    /// uses this to tell "tier2 still building" apart from "tier2 complete except
-    /// dead_code, which is blocked on the callgraph store" — the latter must not
-    /// report "building" forever, because nothing recomputes dead_code until the
-    /// callgraph store becomes ready.
-    dead_code_blocked_on_callgraph: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -784,7 +735,7 @@ struct StatusBarCache {
     valid: bool,
     diagnostics_authoritative: bool,
     diagnostics_generation: u64,
-    tier2_generation: u64,
+    todos_generation: u64,
     tsconfig_generation: u64,
     counts: Option<StatusBarCountValues>,
 }
@@ -1059,28 +1010,11 @@ pub struct ViewSkippedPath {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Tier2HealthSnapshot {
+    /// `building` while an `aft_inspect` run of a whole-repository analysis
+    /// is in flight, otherwise `ready`, or `disabled` when inspect cannot run
+    /// those analyses for this root. Nothing refreshes them in the
+    /// background, so there is no stale state or refresh deadline to report.
     pub status: &'static str,
-    /// Advances when a background Tier-2 pass publishes successfully, even if
-    /// health never sampled the short-lived `building` state.
-    pub completion_generation: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stale_since_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_refresh_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_paths: Option<usize>,
-    /// Categories whose last build failed, with the failure reason, that
-    /// automatic refreshes skip until their retry pause ends.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Tier2RetryPausedHealthSnapshot {
-    pub category: &'static str,
-    pub reason: String,
-    pub identical_failures: u32,
-    pub retry_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1148,11 +1082,6 @@ pub(crate) struct RootHealthSummary {
     view_load_failure_last: Option<ViewLoadFailure>,
     view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     tier2_status: Option<&'static str>,
-    tier2_completion_generation: Option<u64>,
-    tier2_stale_since_ms: Option<u64>,
-    tier2_next_refresh_at_ms: Option<u64>,
-    tier2_pending_paths: Option<usize>,
-    tier2_retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
     data_store: Option<crate::data_layer::surfaces::DataStoreHealth>,
@@ -1170,11 +1099,6 @@ impl RootHealthSummary {
             view_load_failure_last: None,
             view_storage_reserve: BTreeMap::new(),
             tier2_status: None,
-            tier2_completion_generation: None,
-            tier2_stale_since_ms: None,
-            tier2_next_refresh_at_ms: None,
-            tier2_pending_paths: None,
-            tier2_retry_paused: Vec::new(),
             bash: None,
             suspended_domains: Vec::new(),
             data_store: None,
@@ -1224,14 +1148,9 @@ impl RootHealthSummary {
             view_load_failures: self.view_load_failures,
             view_load_failure_last: self.view_load_failure_last,
             view_storage_reserve: self.view_storage_reserve,
-            tier2: self.tier2_status.map(|status| Tier2HealthSnapshot {
-                status,
-                completion_generation: self.tier2_completion_generation.unwrap_or_default(),
-                stale_since_ms: self.tier2_stale_since_ms,
-                next_refresh_at_ms: self.tier2_next_refresh_at_ms,
-                pending_paths: self.tier2_pending_paths,
-                retry_paused: self.tier2_retry_paused,
-            }),
+            tier2: self
+                .tier2_status
+                .map(|status| Tier2HealthSnapshot { status }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
             data_store: self.data_store,
@@ -2833,21 +2752,6 @@ fn semantic_health_unix_millis() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn instant_to_unix_millis(deadline: Instant, now: Instant, now_ms: u64) -> u64 {
-    let delta_ms = if deadline >= now {
-        deadline.duration_since(now).as_millis()
-    } else {
-        now.duration_since(deadline).as_millis()
-    }
-    .min(u128::from(u64::MAX)) as u64;
-
-    if deadline >= now {
-        now_ms.saturating_add(delta_ms)
-    } else {
-        now_ms.saturating_sub(delta_ms)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SemanticColdSeedResume {
     request_tier2: bool,
@@ -4280,10 +4184,6 @@ pub struct AppContext {
     worktree_bridge_probe_spawns: AtomicU64,
     #[cfg(test)]
     force_worktree_bridge_reprobe: AtomicBool,
-    /// Last-seen value of `InspectManager::reuse_completion_count()`, so the
-    /// per-request inspect drain can detect watcher-driven Tier-2 scans that
-    /// finished since the previous tick and refresh the status bar (#3).
-    last_seen_reuse_completions: AtomicU64,
     configure_warnings_tx: crossbeam_channel::Sender<(u64, ConfigureWarningsFrame)>,
     configure_warnings_rx: crossbeam_channel::Receiver<(u64, ConfigureWarningsFrame)>,
     /// Per-context push sender slot. Status and background-bash emitters share
@@ -4342,10 +4242,10 @@ pub struct AppContext {
     gitignore_generation: Arc<AtomicU64>,
     gitignore_inputs: parking_lot::Mutex<Option<gitignore_state::IgnoreInputSnapshot>>,
     gitignore_matcher_rebuilds: AtomicU64,
-    /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
-    /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
+    /// Last-known TODO count for the agent status bar, refreshed off the hot
+    /// path (on `aft_inspect` reads and background TODO scans).
     /// Errors/warnings are read live and not stored here.
-    status_bar_tier2: RwLock<StatusBarTier2>,
+    status_bar_todos: RwLock<StatusBarTodos>,
     /// Persistent TypeScript-project membership cache for the status-bar E/W
     /// count. The bar reads E/W live on every tool result, so resolving the
     /// nearest tsconfig (read + parse + glob-compile) per drain is too costly;
@@ -4747,7 +4647,6 @@ impl AppContext {
             worktree_bridge_probe_spawns: AtomicU64::new(0),
             #[cfg(test)]
             force_worktree_bridge_reprobe: AtomicBool::new(false),
-            last_seen_reuse_completions: AtomicU64::new(0),
             configure_warnings_tx,
             configure_warnings_rx,
             progress_sender: Arc::clone(&progress_sender),
@@ -4776,7 +4675,7 @@ impl AppContext {
             gitignore_generation: Arc::new(AtomicU64::new(0)),
             gitignore_inputs: parking_lot::Mutex::new(None),
             gitignore_matcher_rebuilds: AtomicU64::new(0),
-            status_bar_tier2: RwLock::new(StatusBarTier2::default()),
+            status_bar_todos: RwLock::new(StatusBarTodos::default()),
             tsconfig_membership: parking_lot::Mutex::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
@@ -4811,8 +4710,8 @@ impl AppContext {
     ) -> Option<StatusBarCountValues> {
         #[cfg(test)]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
-        let tier2 = self
-            .status_bar_tier2
+        let todos = self
+            .status_bar_todos
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -4855,7 +4754,7 @@ impl AppContext {
             if cached.valid
                 && cached.diagnostics_authoritative == authoritative
                 && cached.diagnostics_generation == diagnostics_generation
-                && cached.tier2_generation == tier2.generation
+                && cached.todos_generation == todos.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
                 return Some(
@@ -4906,11 +4805,7 @@ impl AppContext {
         let counts = mask_failed(StatusBarCountValues {
             errors,
             warnings,
-            dead_code: tier2.dead_code,
-            unused_exports: tier2.unused_exports,
-            duplicates: tier2.duplicates,
-            todos: tier2.todos,
-            tier2_stale: tier2.stale,
+            todos: todos.todos,
             disabled_categories: Vec::new(),
             diagnostics: None,
             diagnostics_reason: None,
@@ -4924,7 +4819,7 @@ impl AppContext {
             valid: true,
             diagnostics_authoritative: authoritative,
             diagnostics_generation,
-            tier2_generation: tier2.generation,
+            todos_generation: todos.generation,
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
@@ -4988,18 +4883,6 @@ impl AppContext {
             Some(busy) => busy,
             None => return RootHealthSummary::busy(),
         };
-        let tier2_retry_paused = match self.inspect_manager.try_tier2_retry_pauses() {
-            Some(pauses) => pauses
-                .into_iter()
-                .map(|pause| Tier2RetryPausedHealthSnapshot {
-                    category: pause.category.as_str(),
-                    reason: pause.reason,
-                    identical_failures: pause.identical_failures,
-                    retry_at_ms: pause.retry_at_ms,
-                })
-                .collect(),
-            None => return RootHealthSummary::busy(),
-        };
         let bash = match self.bash_background.try_health_counts() {
             Some(counts) => counts,
             None => return RootHealthSummary::busy(),
@@ -5038,16 +4921,7 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
-        let tier2 = match self.status_bar_tier2.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
 
-        // Borrow-only roots (mason worktrees, read-only siblings) never
-        // materialize an in-RAM index or spawn a build: queries go through the
-        // read-only disk openers against the shared artifact. Reporting them
-        // as "building" would never resolve.
-        let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
         // The index store's report below replaces this whenever a checkout
         // is probed.
         let search_index_status = if cache_unavailable {
@@ -5196,72 +5070,17 @@ impl AppContext {
             // describes can ever publish into a disabled configuration.
             "disabled"
         };
-        // dead_code is suppressed while the callgraph store is unavailable.
-        // Let the callgraph component report that dependency instead of leaving
-        // tier2 permanently "building" with no refresh able to complete it.
-        let dead_code_blocked_on_callgraph = tier2.dead_code_blocked_on_callgraph;
-        let tier2_completions = self.inspect_manager.reuse_completion_count();
-        let successful_tier2_completions = self.inspect_manager.successful_reuse_completion_count();
-        let completions_since_stale =
-            tier2_completions.saturating_sub(tier2.stale_after_reuse_completion);
-        let successful_since_stale =
-            successful_tier2_completions.saturating_sub(tier2.stale_after_successful_completion);
-        let background_refresh_completed = tier2.stale
-            && !tier2_builder_busy
-            && completions_since_stale > 0
-            && successful_since_stale == completions_since_stale;
-        let tier2_complete = (tier2.dead_code.is_some() || dead_code_blocked_on_callgraph)
-            && tier2.unused_exports.is_some()
-            && tier2.duplicates.is_some()
-            && (!tier2.stale || background_refresh_completed);
-        let tier2_has_aggregates = tier2.dead_code.is_some()
-            || tier2.unused_exports.is_some()
-            || tier2.duplicates.is_some();
-        let tier2_refresh_gated = borrows_shared_artifacts
-            || !heavy_root_work_allowed
-            || !self.inspect_writer.load(Ordering::SeqCst)
-            || !self.inspect_manager.automatic_tier2_refresh_enabled();
+        // The whole-repository analyses run only inside an `aft_inspect` call,
+        // so this plane has no stale state: it is building while such a run is
+        // registered, and otherwise ready to run one on request.
         let tier2_status = if cache_unavailable {
             crate::root_cache::CACHE_DIR_UNAVAILABLE
         } else if tier2_builder_busy {
-            // A registered rebuild is still in flight, including a first scan
-            // that has no aggregate yet. Keep the root warming until the
-            // registry entry is cleared.
             "building"
-        } else if tier2_complete {
-            "ready"
-        } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
+        } else if !config.inspect.enabled || !heavy_root_work_allowed {
             "disabled"
         } else {
-            "stale"
-        };
-        let (tier2_stale_since_ms, tier2_next_refresh_at_ms, tier2_pending_paths) = if tier2_status
-            == "stale"
-        {
-            let now = Instant::now();
-            let now_ms = semantic_health_unix_millis();
-            let next_dispatch = match self.tier2_refresh_scheduler.try_lock() {
-                Some(mut scheduler) => {
-                    let Some(retry_at) = self.inspect_manager.try_tier2_resource_retry_at(&config)
-                    else {
-                        return RootHealthSummary::busy();
-                    };
-                    scheduler.set_resource_retry_at(retry_at);
-                    scheduler.next_dispatch_at(now).unwrap_or(now)
-                }
-                None => return RootHealthSummary::busy(),
-            };
-            let pending_paths = match self.pending_tier2_paths.try_lock() {
-                Some(paths) => paths.len(),
-                None => return RootHealthSummary::busy(),
-            };
-            (
-                Some(tier2.stale_since_ms.unwrap_or(now_ms)),
-                Some(instant_to_unix_millis(next_dispatch, now, now_ms)),
-                Some(pending_paths),
-            )
-        } else {
-            (None, None, None)
+            "ready"
         };
 
         let (search_index_status, callgraph_store_status) = match &data_store {
@@ -5278,11 +5097,6 @@ impl AppContext {
             view_load_failure_last,
             view_storage_reserve,
             tier2_status: Some(tier2_status),
-            tier2_completion_generation: Some(successful_tier2_completions),
-            tier2_stale_since_ms,
-            tier2_next_refresh_at_ms,
-            tier2_pending_paths,
-            tier2_retry_paused,
             bash: Some(bash),
             suspended_domains,
             data_store: data_store.map(|report| report.health()),
@@ -5331,127 +5145,21 @@ impl AppContext {
         self.tsconfig_membership.lock().generation()
     }
 
-    /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
-    /// changing the numbers — called when the watcher sees a source-file change,
-    /// so the bar honestly signals the counts predate the latest edit until the
-    /// next background scan completes. Returns true only when the visible stale
-    /// bit flips. No-op before the first populate.
-    pub fn mark_status_bar_tier2_stale(&self) -> bool {
-        let mut tier2 = self
-            .status_bar_tier2
+    /// Refresh the cached TODO count for the status bar. `None` preserves the
+    /// last-known value (the category wasn't recomputed or has no real
+    /// aggregate yet) so we never overwrite a real count with a fabricated `0`.
+    pub fn update_status_bar_todos(&self, todos: Option<usize>) {
+        let Some(todos) = todos else {
+            return;
+        };
+        let mut cached = self
+            .status_bar_todos
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // No-op before the first proven count (nothing real to mark stale).
-        if tier2.dead_code.is_some()
-            || tier2.unused_exports.is_some()
-            || tier2.duplicates.is_some()
-            || tier2.todos.is_some()
-        {
-            let changed = !tier2.stale;
-            tier2.stale = true;
-            if changed {
-                tier2.stale_since_ms = Some(semantic_health_unix_millis());
-                tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
-                tier2.stale_after_successful_completion =
-                    self.inspect_manager.successful_reuse_completion_count();
-                tier2.generation = tier2.generation.wrapping_add(1);
-            }
-            return changed;
+        if cached.todos != Some(todos) {
+            cached.todos = Some(todos);
+            cached.generation = cached.generation.wrapping_add(1);
         }
-        false
-    }
-
-    /// Refresh the cached Tier-2 + todos counts for the status bar. Each count
-    /// is `Option`: `None` preserves the last-known value (the category wasn't
-    /// recomputed or has no real aggregate yet) so we never overwrite a real
-    /// count with a fabricated `0`. `stale` marks the Tier-2 numbers as
-    /// not-yet-reconciled with the latest edits.
-    pub fn update_status_bar_tier2(
-        &self,
-        dead_code: Option<usize>,
-        unused_exports: Option<usize>,
-        duplicates: Option<usize>,
-        todos: Option<usize>,
-        stale: bool,
-    ) {
-        // A `None` count keeps the last known value, which is right while a
-        // category is merely pending. In a borrow-only root, though, dead code
-        // is known to be unavailable: keeping an earlier number would show an
-        // old count as current, so the bar shows it as unknown (`?`) instead.
-        let dead_code_unavailable = self
-            .config()
-            .project_root
-            .as_deref()
-            .is_some_and(|root| self.inspect_manager.dead_code_borrow_only_unavailable(root));
-        let mut tier2 = self
-            .status_bar_tier2
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = (
-            tier2.dead_code,
-            tier2.unused_exports,
-            tier2.duplicates,
-            tier2.todos,
-            tier2.stale,
-        );
-        if dead_code_unavailable {
-            tier2.dead_code = None;
-        } else if let Some(dead_code) = dead_code {
-            tier2.dead_code = Some(dead_code);
-        }
-        if let Some(unused_exports) = unused_exports {
-            tier2.unused_exports = Some(unused_exports);
-        }
-        if let Some(duplicates) = duplicates {
-            tier2.duplicates = Some(duplicates);
-        }
-        if let Some(todos) = todos {
-            tier2.todos = Some(todos);
-        }
-        if stale && !tier2.stale {
-            tier2.stale_since_ms = Some(semantic_health_unix_millis());
-            tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
-            tier2.stale_after_successful_completion =
-                self.inspect_manager.successful_reuse_completion_count();
-        } else if !stale {
-            tier2.stale_since_ms = None;
-        }
-        tier2.stale = stale;
-        let current = (
-            tier2.dead_code,
-            tier2.unused_exports,
-            tier2.duplicates,
-            tier2.todos,
-            tier2.stale,
-        );
-        if current != previous {
-            tier2.generation = tier2.generation.wrapping_add(1);
-        }
-    }
-
-    /// A completed scan with no supported-language files invalidates any older
-    /// dead-code count; unlike a pending rebuild, it cannot confirm that number.
-    pub(crate) fn clear_status_bar_dead_code_count(&self) {
-        let mut tier2 = self
-            .status_bar_tier2
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if tier2.dead_code.take().is_some() {
-            tier2.generation = tier2.generation.wrapping_add(1);
-        }
-    }
-
-    /// Record whether the latest dead_code aggregate was suppressed because the
-    /// callgraph store was not ready (`callgraph_available:false`). Kept separate
-    /// from [`update_status_bar_tier2`] because the flag is health metadata, not a
-    /// status-bar count: it never renders in the bar and need not bump the
-    /// count-generation used for status-bar cache invalidation.
-    pub(crate) fn set_status_bar_tier2_dead_code_blocked_on_callgraph(&self, blocked: bool) {
-        let mut tier2 = self
-            .status_bar_tier2
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tier2.dead_code_blocked_on_callgraph = blocked;
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no
@@ -6266,7 +5974,7 @@ impl AppContext {
         }) {
             return true;
         }
-        self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
+        self.inspect_manager().has_pending_completions()
     }
 
     pub fn configure_tail_has_work(&self) -> bool {
@@ -8034,14 +7742,14 @@ impl AppContext {
             changed
         };
         if root_changed {
-            let mut tier2 = self
-                .status_bar_tier2
+            let mut todos = self
+                .status_bar_todos
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let generation = tier2.generation.wrapping_add(1);
-            *tier2 = StatusBarTier2 {
+            let generation = todos.generation.wrapping_add(1);
+            *todos = StatusBarTodos {
                 generation,
-                ..StatusBarTier2::default()
+                ..StatusBarTodos::default()
             };
             self.status_bar_last_emitted.clear();
         }
@@ -8782,7 +8490,6 @@ impl AppContext {
         *self.semantic_embedding_model.lock() = None;
         self.reset_semantic_cold_seed_gate_for_configure();
         let _ = self.inspect_manager.discard_completions();
-        let _ = self.take_new_reuse_completions();
         if semantic_cancelled || semantic_refresh_cancelled {
             let has_index = self
                 .semantic_index
@@ -8862,15 +8569,6 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        // A change to a Tier-2 input ends any automatic-retry pause on a
-        // failed category, so a fix is picked up by the next automatic
-        // refresh instead of after the pause.
-        let project_root = self.config().project_root.clone();
-        self.inspect_manager.note_tier2_input_paths_changed(
-            project_root.as_deref(),
-            paths.iter().map(PathBuf::as_path),
-        );
         self.pending_tier2_paths.lock().extend(paths);
     }
 
@@ -8888,29 +8586,7 @@ impl AppContext {
         }
     }
 
-    /// Returns true when one or more watcher-driven (reuse-path) Tier-2 scans
-    /// have completed since the last call, advancing the last-seen marker. The
-    /// per-request inspect drain uses this to refresh the status bar after a
-    /// background scan — those completions bypass `drain_completions`.
-    /// Peek variant of `take_new_reuse_completions`: reports whether new reuse
-    /// completions exist WITHOUT consuming the observation, so the maintenance
-    /// scheduler's skip probe cannot swallow a status-bar refresh.
-    pub fn has_new_reuse_completions(&self) -> bool {
-        self.inspect_manager.reuse_completion_count()
-            != self.last_seen_reuse_completions.load(Ordering::SeqCst)
-    }
-
-    pub fn take_new_reuse_completions(&self) -> bool {
-        let current = self.inspect_manager.reuse_completion_count();
-        let previous = self
-            .last_seen_reuse_completions
-            .swap(current, Ordering::SeqCst);
-        current != previous
-    }
-
     pub fn reset_tier2_refresh_scheduler(&self) {
-        // A configure that changes the Tier-2 work can change its inputs.
-        self.inspect_manager.clear_tier2_retry_pauses();
         let now = Instant::now();
         let cold_ready_at = crate::inspect::tier2_scheduler::process_tier2_cold_start_pacer()
             .lock()
@@ -8952,34 +8628,19 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
-        // A pending result can arrive after the publication callback already
-        // ran. Epoch comparison recovers only that owed refresh, without probing
-        // the filesystem or waking roots with no deferred analysis.
-        if self
-            .canonical_cache_root_opt()
-            .is_some_and(|root| manager.deferred_view_refresh_ready(&root))
-        {
-            let _ = self.request_tier2_refresh_pull();
-        }
         let can_write = self.inspect_writer()
             && self.heavy_root_work_allowed()
             && manager.automatic_tier2_refresh_allowed();
         let in_flight = manager.tier2_any_in_flight();
         let gates = Tier2ExternalGates {
             semantic_cold_seed_active: self.semantic_cold_seed_active(),
-            callgraph_cold_build_active: false,
         };
         let mut scheduler = self.tier2_refresh_scheduler.lock();
-        scheduler.set_resource_retry_at(
-            manager
-                .try_tier2_resource_retry_at(&self.config())
-                .flatten(),
-        );
         let decision =
             scheduler.tick_with_gates(now, changed_path_count, can_write, in_flight, gates);
-        // A deadline the daemon publishes and then does not honour is invisible
-        // in the daemon's own log; only the external health sentinel sees it.
-        // Name the predicate that held it, once per overdue stretch.
+        // A deadline the scheduler works out and then does not honour is
+        // invisible otherwise. Name the predicate that held it, once per
+        // overdue stretch.
         let overdue_block = if decision.is_none() {
             scheduler.take_overdue_dispatch_block(now, can_write, in_flight, gates)
         } else {
@@ -8989,7 +8650,7 @@ impl AppContext {
 
         if let Some(block) = overdue_block {
             crate::slog_info!(
-                "tier2 refresh deadline passed without dispatch: blocked_by={}, pending_paths={}",
+                "todos refresh deadline passed without dispatch: blocked_by={}, pending_paths={}",
                 block.as_str(),
                 self.pending_tier2_paths
                     .try_lock()
@@ -9005,9 +8666,8 @@ impl AppContext {
         decision
     }
 
-    /// True when the Tier-2 refresh this root's scheduler has already promised
-    /// (the `next_refresh_at_ms` health publishes) is due and no external gate
-    /// is holding it back.
+    /// True when the refresh this root's scheduler has already promised is
+    /// due and no external gate is holding it back.
     ///
     /// The maintenance tick probes this so a due refresh gets a watcher drain
     /// pass to run in. The scheduler is ticked only from that drain, and the
@@ -9015,8 +8675,8 @@ impl AppContext {
     /// so on a root that falls quiet after its last edit, the debounce deadline
     /// passes with nothing left to observe it and the refresh waits for the
     /// next file change. Mirroring the dispatch gates here keeps a blocked root
-    /// (read-only, scan in flight, cold seed, callgraph cold build) from asking
-    /// for a drain pass several times a second.
+    /// (read-only, analysis in flight, cold seed) from asking for a drain pass
+    /// several times a second.
     pub fn tier2_refresh_dispatch_due(&self) -> bool {
         if !self.inspect_writer()
             || self.try_heavy_root_work_allowed() != Some(true)
@@ -9034,27 +8694,9 @@ impl AppContext {
         // contention says nothing about whether a refresh is due. Fail open
         // like the other maintenance probes: the watcher drain re-reads the
         // scheduler under its own lock and does nothing if no refresh is due.
-        let Some(retry_at) = self
-            .inspect_manager
-            .try_tier2_resource_retry_at(&self.config())
-        else {
-            return false;
-        };
-        // A late pending result may owe a published view before the scheduler
-        // knows about it. Include it in the idle probe, or no watcher drain
-        // would be scheduled to run the recovery tick on a quiet checkout.
-        let view_refresh_ready = self.canonical_cache_root_opt().is_some_and(|root| {
-            self.inspect_manager.try_deferred_view_refresh_ready(&root) == Some(true)
-        });
         self.tier2_refresh_scheduler
             .try_lock()
-            .is_none_or(|mut scheduler| {
-                if view_refresh_ready {
-                    scheduler.request_pull(true);
-                }
-                scheduler.set_resource_retry_at(retry_at);
-                scheduler.dispatch_due(Instant::now())
-            })
+            .is_none_or(|scheduler| scheduler.dispatch_due(Instant::now()))
     }
 
     pub fn note_tier2_refresh_started(&self) {
@@ -9094,6 +8736,12 @@ impl AppContext {
         });
     }
 
+    /// Refresh the status bar's TODO count, which only an explicit
+    /// `aft_inspect` would otherwise compute. This is the only analysis the
+    /// scheduler runs: dead code, unused exports, duplicates, cycles and
+    /// complexity cost seconds and hundreds of MB on a large repository, so
+    /// they run only when an agent asks for them. The completion is drained
+    /// with the other inspect completions, which refreshes the bar.
     fn start_tier2_refresh_admitted(
         &self,
         reason: Tier2TriggerReason,
@@ -9102,113 +8750,21 @@ impl AppContext {
         let Some(snapshot) = self.tier2_refresh_snapshot() else {
             return;
         };
-        let categories = Self::automatic_tier2_refresh_categories(&snapshot);
-        // The status bar's TODO count is a Tier-1 category that otherwise only
-        // an explicit aft_inspect computes, which left `T?` on the bar for a
-        // whole session in which nobody ran one. Refresh it on the same cadence
-        // as the Tier-2 counts; its completion is drained with theirs. Linked
-        // worktrees skip automatic scans for Tier-2 and do the same here.
-        if manager.automatic_tier2_refresh_enabled()
-            && snapshot
-                .config
-                .inspect
-                .category_enabled(InspectCategory::Todos)
+        if !snapshot
+            .config
+            .inspect
+            .category_enabled(InspectCategory::Todos)
         {
-            if let Err(error) = manager.submit_background(
-                snapshot.clone(),
-                InspectCategory::Todos,
-                crate::inspect::JobScope::for_project(snapshot.project_root.clone()),
-            ) {
-                crate::slog_info!("todos refresh not scheduled: {}", error);
-            }
+            return;
         }
-        let submission =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
-        if !submission.deferred_categories.is_empty() || !submission.whole_graph_waits.is_empty() {
-            self.tier2_refresh_scheduler
-                .lock()
-                .note_dispatch_deferred(Instant::now());
+        match manager.submit_background(
+            snapshot.clone(),
+            InspectCategory::Todos,
+            crate::inspect::JobScope::for_project(snapshot.project_root.clone()),
+        ) {
+            Ok(_) => crate::slog_info!("todos refresh scheduled: reason={}", reason.as_str()),
+            Err(error) => crate::slog_info!("todos refresh not scheduled: {}", error),
         }
-        if !submission.whole_graph_waits.is_empty() {
-            crate::slog_info!(
-                "tier2 refresh holding whole-graph categories until the call graph is built and no other root runs them: categories={:?}",
-                submission
-                    .whole_graph_waits
-                    .iter()
-                    .map(|category| category.as_str())
-                    .collect::<Vec<_>>()
-            );
-        }
-        if !submission.deferred_categories.is_empty() {
-            crate::slog_info!(
-                "tier2 refresh deferred by cold build limit: categories={:?}",
-                submission
-                    .deferred_categories
-                    .iter()
-                    .map(|category| category.as_str())
-                    .collect::<Vec<_>>()
-            );
-        }
-        if submission.has_new_work() {
-            crate::slog_info!(
-                "tier2 refresh scheduled: reason={}, categories={:?}",
-                reason.as_str(),
-                submission
-                    .newly_queued_categories
-                    .iter()
-                    .map(|category| category.as_str())
-                    .collect::<Vec<_>>()
-            );
-        }
-        for error in submission.errors {
-            crate::slog_warn!(
-                "tier2 refresh schedule failed for {}: {}",
-                error.category,
-                error.message
-            );
-        }
-        for pause in submission.retry_paused {
-            crate::slog_info!(
-                "tier2 refresh skipped {}: last build failed ({}); identical_failures={}, automatic retries paused until unix_ms={}",
-                pause.category,
-                pause.reason,
-                pause.identical_failures,
-                pause.retry_at_ms
-            );
-        }
-        for wait in submission.resource_waits {
-            crate::slog_info!(
-                "tier2 refresh waiting out a resource retry (inspect cache writer lease or locked call graph view): category={}, resource_retry_at_unix_ms={}",
-                wait.category,
-                wait.retry_at_ms
-            );
-        }
-    }
-
-    fn automatic_tier2_refresh_categories(snapshot: &InspectSnapshot) -> Vec<InspectCategory> {
-        let callgraph_store_enabled = snapshot.config.indexes.callgraph;
-        InspectCategory::active()
-            .iter()
-            .copied()
-            .filter(|category| category.is_tier2())
-            .filter(|category| snapshot.config.inspect.category_enabled(*category))
-            .filter(|category| {
-                if *category == InspectCategory::DeadCode && !callgraph_store_enabled {
-                    // With callgraph_store=false, the scan produces zero reusable
-                    // contributions: zero contributions → reuse rejection → full rescan →
-                    // discard, so automatic dead_code work is pure waste.
-                    return false;
-                }
-                true
-            })
-            .collect()
-    }
-
-    #[doc(hidden)]
-    pub fn automatic_tier2_refresh_categories_for_test(&self) -> Vec<InspectCategory> {
-        self.tier2_refresh_snapshot()
-            .map(|snapshot| Self::automatic_tier2_refresh_categories(&snapshot))
-            .unwrap_or_default()
     }
 
     fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {
@@ -11162,7 +10718,6 @@ impl AppContext {
     ) -> Option<crate::lsp::manager::PostEditWaitOutcome> {
         self.notify_watched_config_files(file_paths);
         self.add_pending_tier2_paths(file_paths.iter().cloned());
-        let _ = self.mark_status_bar_tier2_stale();
 
         let wants_diagnostics = params
             .get("diagnostics")
@@ -11221,7 +10776,6 @@ impl AppContext {
         } else {
             self.add_pending_tier2_paths([file_path.to_path_buf()]);
         }
-        let _ = self.mark_status_bar_tier2_stale();
 
         if !wants_diagnostics {
             if let Some(file_paths) = Self::multi_file_write_paths(params) {
@@ -13480,7 +13034,7 @@ mod subc_lifecycle_admission_tests {
         );
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.set_cache_writer_capabilities(true, true);
-        ctx.update_status_bar_tier2(Some(4), None, None, None, true);
+        ctx.update_status_bar_todos(None);
         assert_eq!(
             ctx.try_health_snapshot(Path::new("writer-root"))
                 .tier2
@@ -14353,14 +13907,10 @@ mod callgraph_store_for_ops_tests {
                 JobOutcome::Failed { .. }
             ));
 
-            let submission = manager.submit_tier2_run_with_reuse_serial_background(
-                snapshot,
-                vec![InspectCategory::DeadCode],
-            );
-            assert!(submission.queued_categories.is_empty());
-            assert!(submission.newly_queued_categories.is_empty());
-            assert!(submission.deferred_categories.is_empty());
-            assert_eq!(submission.errors.len(), 1);
+            assert!(matches!(
+                manager.tier2_run_with_reuse_blocking(snapshot, InspectCategory::DeadCode, scope),
+                JobOutcome::Failed { .. }
+            ));
             assert!(
                 !manager.tier2_any_in_flight(),
                 "HOME root gate must reject Tier-2 submission before any job is queued"
@@ -14415,8 +13965,11 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    /// A whole-repository analysis that waited on another process's inspect
+    /// cache lease is not retried in the background: only the next
+    /// `aft_inspect` runs it again.
     #[test]
-    fn tier2_scheduler_rearms_cache_writer_wait_without_source_changes() {
+    fn cache_writer_wait_arms_no_background_retry() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let base = Instant::now();
         ctx.note_tier2_refresh_started_at(base);
@@ -14426,23 +13979,15 @@ mod callgraph_store_for_ops_tests {
                 message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
             },
         );
-        assert!(
-            !ctx.tier2_refresh_dispatch_due(),
-            "no immediate maintenance retry"
-        );
-        let retry_at = ctx
-            .tier2_refresh_scheduler
-            .lock()
-            .next_dispatch_at(base)
-            .expect("maintenance arms a resource retry");
-        assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+        assert!(!ctx.tier2_refresh_dispatch_due());
         assert_eq!(
-            ctx.tick_tier2_refresh_scheduler_at(retry_at - Duration::from_millis(1), 0),
+            ctx.tier2_refresh_scheduler.lock().next_dispatch_at(base),
+            None,
+            "a lease wait must not arm a refresh"
+        );
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(base + Duration::from_secs(30 * 60), 0),
             None
-        );
-        assert_eq!(
-            ctx.tick_tier2_refresh_scheduler_at(retry_at, 0),
-            Some(Tier2TriggerReason::ResourceRetry)
         );
     }
 
@@ -14800,7 +14345,7 @@ mod status_emitter_tests {
                 ..Config::default()
             },
         ));
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
         ctx.lsp().store_project_applicability(Default::default());
         ctx.lsp().diagnostics_store_mut_for_test().publish(
             crate::lsp::roots::ServerKey {
@@ -14823,13 +14368,13 @@ mod status_emitter_tests {
             "read",
             false,
         );
-        assert!(first.contains("D1 U2 C3"));
+        assert!(first.contains("T4"));
         assert!(first.contains("E0 W0"));
         fleet_rx
             .try_recv()
             .expect("initial fleet publish")
             .complete_unavailable();
-        ctx.update_status_bar_tier2(Some(9), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(9));
         let held = ctx.lsp();
         let worker_ctx = Arc::clone(&ctx);
         let (tx, rx) = mpsc::channel();
@@ -14873,7 +14418,7 @@ mod status_emitter_tests {
             false,
         );
         assert!(
-            retry.contains("D9 U2 C3"),
+            retry.contains("T9"),
             "a skipped emission must not consume the change"
         );
     }
@@ -15105,28 +14650,10 @@ mod health_warming_honesty_tests {
     }
 
     #[test]
-    fn tier2_blocked_on_callgraph_reports_ready_not_building() {
-        // dead_code is suppressed (None) while the callgraph store is not ready,
-        // but unused_exports/duplicates are complete and fresh. Health must not
-        // report tier2 as "building" forever for a cycle that is otherwise
-        // complete — the callgraph component tells the callgraph story.
-        let ctx = ctx_with_config(Config::default()); // inspect.enabled defaults true
-        ctx.update_status_bar_tier2(None, Some(3), Some(2), None, false);
-        ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(true);
-
-        assert_eq!(
-            health_tier2_status(&ctx),
-            "ready",
-            "tier2 complete except dead_code-blocked-on-callgraph must not stay building"
-        );
-    }
-
-    #[test]
     fn health_tier2_and_inspect_builder_state_read_the_same_registry() {
-        // Complete published counts must not make health report ready while the
-        // inspect builder registry still has a live registration for this root.
+        // Health must not report ready while the inspect builder registry
+        // still has a live registration for this root.
         let ctx = ctx_with_config(Config::default());
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
 
@@ -15171,17 +14698,16 @@ mod health_warming_honesty_tests {
         );
     }
 
+    /// Nothing refreshes the whole-repository analyses in the background, so
+    /// edits never leave the plane stale with a refresh deadline: it reports
+    /// ready, with only its status field.
     #[test]
-    fn stale_tier2_reports_scheduler_deadline_while_builder_is_idle() {
+    fn edits_leave_the_tier2_plane_ready_without_refresh_fields() {
         let ctx = ctx_with_config(Config::default());
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
-
         let now = Instant::now();
         ctx.note_tier2_refresh_started_at(now);
         assert_eq!(ctx.tick_tier2_refresh_scheduler_at(now, 1), None);
         ctx.add_pending_tier2_paths([PathBuf::from("src/lib.rs")]);
-        let sampled_at_ms = semantic_health_unix_millis();
-        assert!(ctx.mark_status_bar_tier2_stale());
 
         let tier2 = serde_json::to_value(
             ctx.try_health_snapshot(Path::new("/tmp/health-warming-honesty-test"))
@@ -15190,36 +14716,15 @@ mod health_warming_honesty_tests {
         )
         .expect("tier2 health serializes");
 
-        assert_eq!(tier2["status"], "stale");
-        assert_eq!(tier2["pending_paths"], 1);
-        assert!(
-            tier2["stale_since_ms"]
-                .as_u64()
-                .is_some_and(|stale_since| stale_since >= sampled_at_ms),
-            "stale health must expose the first stale mark: {tier2:#}"
-        );
-        assert!(
-            tier2["next_refresh_at_ms"]
-                .as_u64()
-                .is_some_and(|deadline| deadline > sampled_at_ms),
-            "the scheduler's minimum interval must leave a future refresh deadline: {tier2:#}"
-        );
+        assert_eq!(tier2, serde_json::json!({ "status": "ready" }));
         assert!(!ctx.inspect_manager().tier2_any_in_flight());
     }
 
     #[test]
-    fn failed_tier2_pass_does_not_turn_stale_plane_ready() {
+    fn failed_tier2_pass_returns_the_plane_to_ready() {
         let ctx = ctx_with_config(Config::default());
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
-        assert!(ctx.mark_status_bar_tier2_stale());
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
-        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::DeadCode,
-            crate::inspect::JobOutcome::Fresh {
-                payload: serde_json::json!({ "count": 1 }),
-            },
-        );
         assert_eq!(health_tier2_status(&ctx), "building");
 
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
@@ -15228,16 +14733,7 @@ mod health_warming_honesty_tests {
                 message: "scan failed".to_string(),
             },
         );
-        assert_eq!(health_tier2_status(&ctx), "stale");
-    }
-
-    #[test]
-    fn tier2_missing_dead_code_without_callgraph_block_reports_stale_when_idle() {
-        let ctx = ctx_with_config(Config::default());
-        ctx.update_status_bar_tier2(None, Some(3), Some(2), None, true);
-        ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(false);
-
-        assert_eq!(health_tier2_status(&ctx), "stale");
+        assert_eq!(health_tier2_status(&ctx), "ready");
     }
 }
 
@@ -15593,24 +15089,17 @@ mod status_bar_tests {
         let values = ctx.status_bar_count_values();
         assert_eq!(values.errors, None);
         assert_eq!(values.warnings, None);
-        assert_eq!(values.dead_code, None);
-        assert_eq!(values.unused_exports, None);
-        assert_eq!(values.duplicates, None);
         assert_eq!(values.todos, None);
         assert!(ctx.status_bar_counts().is_none());
 
-        ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
+        ctx.update_status_bar_todos(Some(2));
         let values = ctx.status_bar_count_values();
-        assert_eq!(values.dead_code, Some(5));
-        assert_eq!(values.unused_exports, Some(3));
-        assert_eq!(values.duplicates, Some(7));
         assert_eq!(values.todos, Some(2));
         assert_eq!(values.errors, None, "no analyzer report is not a clean E0");
         assert_eq!(
             values.warnings, None,
             "no analyzer report is not a clean W0"
         );
-        assert!(!values.tier2_stale);
 
         assert_eq!(
             ctx.status_bar_counts(),
@@ -15628,15 +15117,13 @@ mod status_bar_tests {
         std::fs::create_dir_all(&second_root).expect("create second root");
         let ctx = ctx();
         ctx.set_canonical_cache_root(first_root);
-        ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
-        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
+        ctx.update_status_bar_todos(Some(2));
+        assert_eq!(ctx.status_bar_count_values().todos, Some(2));
 
         ctx.set_canonical_cache_root(second_root);
 
         let values = ctx.status_bar_count_values();
-        assert_eq!(values.dead_code, None);
-        assert_eq!(values.unused_exports, None);
-        assert_eq!(values.duplicates, None);
+        assert_eq!(values.todos, None);
         assert!(
             ctx.status_bar_counts().is_none(),
             "counts from the previous root must not appear in a newly bound root"
@@ -15644,16 +15131,10 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn partial_tier2_keeps_proven_categories_and_cache_hit_preserves_omissions() {
+    fn cache_hit_preserves_omissions() {
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(5), None, None, None, true);
-
         let first = ctx.status_bar_count_values();
-        assert_eq!(first.dead_code, Some(5));
-        assert_eq!(first.unused_exports, None);
-        assert_eq!(first.duplicates, None);
         assert_eq!(first.todos, None);
-        assert!(first.tier2_stale);
         assert!(ctx.status_bar_counts().is_none());
 
         let cached = ctx.status_bar_count_values();
@@ -15666,56 +15147,18 @@ mod status_bar_tests {
         assert_eq!(cache.counts.as_ref(), Some(&first));
         drop(cache);
 
-        ctx.update_status_bar_tier2(None, Some(3), None, None, true);
-        let partial = ctx.status_bar_count_values();
-        assert_eq!(partial.dead_code, Some(5));
-        assert_eq!(partial.unused_exports, Some(3));
-        assert_eq!(partial.duplicates, None);
-
-        ctx.update_status_bar_tier2(None, None, Some(7), None, false);
-        let complete = ctx.status_bar_count_values();
-        assert_eq!(complete.dead_code, Some(5));
-        assert_eq!(complete.unused_exports, Some(3));
-        assert_eq!(complete.duplicates, Some(7));
+        ctx.update_status_bar_todos(Some(3));
+        assert_eq!(ctx.status_bar_count_values().todos, Some(3));
     }
 
     #[test]
     fn update_with_none_todos_preserves_last_known_todos() {
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(1), Some(1), Some(1), Some(9), false);
-        // A background-scan refresh passes todos=None → todo count preserved.
-        ctx.update_status_bar_tier2(Some(2), Some(2), Some(2), None, false);
+        ctx.update_status_bar_todos(Some(9));
+        // A refresh that produced no TODO count keeps the last known one.
+        ctx.update_status_bar_todos(None);
         let counts = ctx.status_bar_count_values();
         assert_eq!(counts.todos, Some(9));
-        assert_eq!(counts.dead_code, Some(2));
-    }
-
-    #[test]
-    fn update_with_none_count_preserves_last_known_count() {
-        let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(10), Some(20), Some(30), None, false);
-        // A refresh that only recomputed dead_code preserves the other two
-        // real counts rather than overwriting them with a fabricated 0.
-        ctx.update_status_bar_tier2(Some(11), None, None, None, false);
-        let counts = ctx.status_bar_count_values();
-        assert_eq!(counts.dead_code, Some(11));
-        assert_eq!(counts.unused_exports, Some(20));
-        assert_eq!(counts.duplicates, Some(30));
-    }
-
-    #[test]
-    fn mark_stale_sets_flag_after_any_proven_category() {
-        let ctx = ctx();
-        ctx.mark_status_bar_tier2_stale();
-        assert!(!ctx.status_bar_count_values().tier2_stale);
-
-        ctx.update_status_bar_tier2(Some(4), None, None, None, false);
-        ctx.mark_status_bar_tier2_stale();
-        assert!(ctx.status_bar_count_values().tier2_stale);
-
-        // A completed scan clears stale without changing omitted categories.
-        ctx.update_status_bar_tier2(Some(4), None, None, None, false);
-        assert!(!ctx.status_bar_count_values().tier2_stale);
     }
 
     // End-to-end wiring: a diagnostic for a file inflates the status-bar `E`
@@ -15729,7 +15172,7 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
+        ctx.update_status_bar_todos(Some(0)); // populate so the bar surfaces
 
         let fixture = tempfile::tempdir().unwrap();
         let file = fixture.path().join("gone.ts");
@@ -15773,7 +15216,7 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+        ctx.update_status_bar_todos(Some(0));
         let fixture = tempfile::tempdir().unwrap();
         let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
@@ -15854,7 +15297,7 @@ mod status_bar_tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
-        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+        ctx.update_status_bar_todos(Some(0));
 
         let file = root.join("aft.jsonc");
         std::fs::write(&file, "{}\n").unwrap();
