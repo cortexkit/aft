@@ -44,6 +44,7 @@ async fn provisioned_start_view_never_lists_root_and_same_ticket_views_are_indep
 
 async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::protocol::Response {
     let ctx = fixture.ctx.clone();
+    ctx.update_config(|config| config.experimental_bash_background = true);
     let project = ctx.config().project_root.clone().unwrap();
     let root = fixture._dir.path().join("store");
     let state = fixture._dir.path().join("shim");
