@@ -8,7 +8,7 @@
   },
   "binary_sha256": "d4481e723c9ecd4b3844c583fa61a892b2b1e65b62f55d65e1bb74198d5a424a",
   "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
-  "profile": "debug, test-conformance-result-inputs",
+  "profile": "debug, test-hooks",
   "normalization": "only the disposable project root is replaced with {PROJECT}; status snapshot and response id are fixed producer inputs",
   "fixture_project_sha256": "76855e7de25ca208e6d1a449ff591bf5898ec8822021c651aea67fad50e0f58f",
   "status_snapshot": {

@@ -238,7 +238,7 @@ Tool versions: `cargo 1.99.0 (5f94df478 2026-08-27)`,
 - `cargo test -p agent-file-tools --bin aft`: 121 passed, 0 failed. The initial
   `view_publication` filter matched 0 tests and is **not** counted as a pass;
   it was replaced with the full binary suite.
-- `cargo test -p agent-file-tools --test integration per_checkout`: 81 passed,
+- `cargo test --features test-hooks -p agent-file-tools --test integration per_checkout`: 81 passed,
   5 ignored child-process entrypoints, 0 failed.
 - Windows cross-check skipped at the parent's instruction; the train owns it.
 - Scoped diagnostics inspections returned PARTIAL while rust-analyzer was

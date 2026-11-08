@@ -9,7 +9,7 @@ is an Actions run identifier, not a Git ref.
 The reported assertion was reproduced before editing with:
 
 ```sh
-AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS=3000 cargo test -p agent-file-tools --test integration subc_bridge_bash_promote_failure_is_normal_tool_error
+AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS=3000 cargo test --features test-hooks -p agent-file-tools --test integration subc_bridge_bash_promote_failure_is_normal_tool_error
 ```
 
 It failed at `tool_result_is_error(&frame)`, followed by `ConnectionLost`.

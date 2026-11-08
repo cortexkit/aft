@@ -349,7 +349,7 @@ warm_macos_test_binaries() {
   # field in the build JSON — not the incremental fragments under deps/). $@ =
   # the cargo build arguments that define the profile and scope.
   local bins
-  bins="$(cargo test "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
+  bins="$(cargo test --features test-hooks "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
 import sys, json
 seen = set()
 for line in sys.stdin:
@@ -393,7 +393,7 @@ if [[ "$runner" == "cargo" ]]; then
     run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
       warm_macos_test_binaries --workspace
   fi
-  run_phase "cargo test --workspace --quiet" gate_cargo test --workspace --quiet
+  run_phase "cargo test --features test-hooks --workspace --quiet" gate_cargo test --features test-hooks --workspace --quiet
   finish_gate
   exit 0
 fi
@@ -429,7 +429,7 @@ extract_nextest_archive_for_prewarm() {
     --no-pager >/dev/null
 }
 
-# `cargo test --workspace -- --list` currently reports zero doctests for both
+# `cargo test --features test-hooks --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
 # `cargo test --workspace --doc` until doctests actually exist.
 #
@@ -608,8 +608,8 @@ if phase_enabled nextest; then
     nextest_label="cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(test) - binary(=watcher_integration)"
     nextest_args+=(--archive-file "$AFT_NEXTEST_ARCHIVE_FILE")
   else
-    nextest_label="cargo nextest run --workspace -E kind(test) - binary(=watcher_integration)"
-    nextest_args+=(--workspace)
+    nextest_label="cargo nextest run --features test-hooks --workspace -E kind(test) - binary(=watcher_integration)"
+    nextest_args+=(--workspace --features test-hooks)
   fi
   nextest_args+=(-E 'kind(test) - binary(=watcher_integration)')
   if [[ -n "${AFT_NEXTEST_PARTITION:-}" ]]; then
@@ -622,21 +622,21 @@ fi
 if phase_enabled watcher; then
   # test-timing-hooks compiles in the test-only gates the linked-worktree
   # semantic quiet-window test holds; without the feature that test is not built.
-  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
-    gate_cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
+  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
+    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
 fi
 
 if phase_enabled conformance; then
-  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
-    gate_cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
-  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
-    gate_cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
-  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
-    gate_cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
+  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
+    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
+  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
+    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
+  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
+    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
   # Keep promotion failure, deadline handoff, and elicitation TTL coverage in
   # the hook-enabled phase; ordinary production builds cannot inject them.
-  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
-    gate_cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
+  run_phase "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
+    gate_cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies
@@ -653,8 +653,8 @@ if phase_enabled storm; then
   else
     # Storm is intentionally on the retry-free default nextest profile: a retry
     # would hide a real latency regression behind a second warm attempt.
-    run_phase "cargo nextest run --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-      gate_cargo nextest run --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+    run_phase "cargo nextest run --features test-hooks --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
+      gate_cargo nextest run --features test-hooks --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
   fi
 fi
 

@@ -178,6 +178,7 @@ for (( iteration = 1; iteration <= iterations; iteration++ )); do
 
   nextest_cmd=(
     cargo nextest run
+    --features test-hooks
     -p "$package"
     --no-fail-fast
     --failure-output immediate-final

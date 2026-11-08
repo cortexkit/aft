@@ -906,7 +906,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn('"$test_name" -- --exact', timeout_step)
         self.assertIn("expected test missing from integration inventory", timeout_step)
         self.assertIn(
-            "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
+            "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
             GATE_TEXT,
         )
 

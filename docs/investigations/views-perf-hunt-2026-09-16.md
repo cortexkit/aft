@@ -181,8 +181,8 @@ Verification completed before the drill:
 
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --lib --bin aft -j 4`: passed.
 - The three ownership/migration/navigation unit tests above: passed after implementation and after mutation restore.
-- `cargo test -p agent-file-tools --test watcher_integration branch_switch`: 2 passed.
-- `cargo test -p agent-file-tools --test integration tool_call_matches_direct_spine_envelopes`: passed (the 69-fixture parity matrix).
+- `cargo test --features test-hooks -p agent-file-tools --test watcher_integration branch_switch`: 2 passed.
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_matches_direct_spine_envelopes`: passed (the 69-fixture parity matrix).
 
 ### Fresh-storage views-on drill
 

@@ -63,7 +63,8 @@ class StormWorkflowTests(unittest.TestCase):
         self.assertIn("--profile default --cargo-profile ci-storm", commands)
         self.assertIn("test(subc_storm)", commands)
         self.assertIn("--check-inventory", commands)
-        self.assertNotIn("--features", commands)
+        self.assertEqual(commands.count("--features test-hooks"), 3)
+        self.assertNotIn("test-timing-hooks", commands)
 
 
 if __name__ == "__main__":

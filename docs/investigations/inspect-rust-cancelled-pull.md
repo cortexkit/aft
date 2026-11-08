@@ -17,7 +17,7 @@ workspace just because its compiler check later finishes.
 The unchanged settle logic was exercised with:
 
 ```sh
-AFT_TEST_REQUIRE_RUST_ANALYZER=1 cargo test -p agent-file-tools --test integration scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer -- --nocapture
+AFT_TEST_REQUIRE_RUST_ANALYZER=1 cargo test --features test-hooks -p agent-file-tools --test integration scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer -- --nocapture
 ```
 
 Temporary instrumentation printed the reader's LSP responses, progress and

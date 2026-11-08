@@ -124,7 +124,7 @@ tests:
 Rerun:
 
 ```
-AFT_DURABILITY_CENSUS_OUT=/tmp/census cargo test -p agent-file-tools --test integration -- \
+AFT_DURABILITY_CENSUS_OUT=/tmp/census cargo test --features test-hooks -p agent-file-tools --test integration -- \
     durability_census --ignored --nocapture --test-threads=1
 ```
 

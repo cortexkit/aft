@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Prove that every Rust test lands in exactly one split-gate bucket.
 
-By default, this script captures the current workspace inventory from `cargo test
+By default, this script captures the current workspace inventory from `cargo test --features test-hooks
 --workspace -- --list`, then compares it against the split buckets used by
 `scripts/rust-test-gate.sh`:
 
 * `cargo nextest list --workspace --lib --bins`
-* `cargo nextest list --workspace -E 'kind(test) - binary(=watcher_integration)'`
-* `cargo test -p agent-file-tools --test watcher_integration`
+* `cargo nextest list --features test-hooks --workspace -E 'kind(test) - binary(=watcher_integration)'`
+* `cargo test --features test-hooks -p agent-file-tools --test watcher_integration`
 
 When `AFT_NEXTEST_ARCHIVE_FILE` is set, the archived test inventory is also
 compared by test identity with the non-watcher nextest bucket. macOS can provide
@@ -624,7 +624,7 @@ if any(
     sys.exit(0)
 
 
-baseline_output = run_command(["cargo", "test", "--workspace", "--", "--list"])
+baseline_output = run_command(["cargo", "test", "--workspace", "--features", "test-hooks", "--", "--list"])
 baseline_entries = parse_cargo_list(baseline_output)
 
 unit_bin_command = [
@@ -684,6 +684,8 @@ nextest_command = [
     "cargo",
     "nextest",
     "list",
+    "--features",
+    "test-hooks",
     "--profile",
     "gate",
     "--workspace",
@@ -722,6 +724,8 @@ if archive_path:
 watcher_output = run_command([
     "cargo",
     "test",
+    "--features",
+    "test-hooks",
     "-p",
     "agent-file-tools",
     "--test",

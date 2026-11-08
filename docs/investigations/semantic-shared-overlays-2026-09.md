@@ -97,7 +97,7 @@ in the temporary source. The final applied diff was nonempty (2 files,
 314 insertions, 553 deletions). Running
 
 ```sh
-CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test --locked \
+CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test --features test-hooks --locked \
   -p agent-file-tools --lib shared_overlay_equivalence_and_sharing -j 2
 ```
 

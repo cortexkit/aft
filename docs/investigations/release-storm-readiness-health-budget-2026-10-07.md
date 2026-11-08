@@ -50,7 +50,7 @@ There were 320 successful readiness health replies and **zero** `stall watchdog:
 Each revision below was checked out in the isolated worker worktree and tested on Linux with:
 
 ```sh
-cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm_rebinds_stay_live_under_build_and_tool_traffic)'
+cargo nextest run --features test-hooks --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm_rebinds_stay_live_under_build_and_tool_traffic)'
 ```
 
 | Revision | Result |
@@ -73,7 +73,7 @@ The readiness barrier (`subc_storm_test.rs:2843–2872`) still polls health over
 Ran the exact release-storm workflow command five consecutive times:
 
 ```sh
-cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+cargo nextest run --features test-hooks --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
 ```
 
 Each run passed all **18** tests (the existing 15 plus three predicate regressions), without retries. The formerly failing test took 11.282, 11.331, 11.340, 11.306 and 11.407 seconds respectively.

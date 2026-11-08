@@ -139,8 +139,8 @@ Tool versions: `cargo 1.99.0 (5f94df478 2026-08-27)`,
 | --- | --- |
 | `cargo test -p agent-file-tools --lib -- bash_background::` | 140 passed, 0 failed. |
 | `cargo test -p agent-file-tools --lib -- sandbox_` | 40 passed, 0 failed (includes 5 profile tests). |
-| `cargo test -p agent-file-tools --test integration -- bash` | 326 passed, 0 failed, 1 ignored. |
-| `cargo test -p agent-file-tools --test integration -- sandbox` | 6 passed, 0 failed. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration -- bash` | 326 passed, 0 failed, 1 ignored. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration -- sandbox` | 6 passed, 0 failed. |
 | `cargo test -p agent-file-tools --bin aft -- sandbox` | 8 passed, 0 failed. |
 | `cargo fmt --all -- --check` | Exit 0; silent-success gate. |
 | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu` | `Finished` successfully; compile-only, not Windows runtime evidence. |

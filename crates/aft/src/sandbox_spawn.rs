@@ -753,7 +753,7 @@ pub struct SandboxSpawnObservation {
 static TEST_OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Vec<SandboxSpawnObservation>>>> =
     OnceLock::new();
 
-#[cfg(all(unix, any(test, feature = "test-sandbox-launcher")))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 static TEST_LAUNCHERS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
 thread_local! {
@@ -5621,7 +5621,7 @@ fn observation_key(project_root: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
-    #[cfg(any(test, feature = "test-sandbox-launcher"))]
+    #[cfg(any(test, feature = "test-hooks"))]
     if let Some(launchers) = TEST_LAUNCHERS.get() {
         if let Some(root) = ctx.config().project_root.as_deref() {
             if let Some(path) = launchers
@@ -5640,7 +5640,7 @@ fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
 /// Use the real aft executable for an in-process integration fixture. The test
 /// harness cannot re-exec itself as `aft sandbox-launch`; it only accepts libtest
 /// arguments. Only executable selection changes, not the native sandbox policy.
-#[cfg(all(unix, any(test, feature = "test-sandbox-launcher")))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[doc(hidden)]
 pub fn install_sandbox_launcher_for_test(project_root: &Path, launcher_path: PathBuf) -> impl Drop {
     struct LauncherScope(PathBuf, Option<PathBuf>);

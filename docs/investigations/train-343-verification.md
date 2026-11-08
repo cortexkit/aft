@@ -88,13 +88,13 @@ Tools: cargo 1.99.0 (`5f94df478`); rustc 1.99.0 (`b940084d7`); rustfmt 1.10.0-st
 | Integration `bash_background` / `bash_watch` | 88 / 20 pass |
 | Integration `db_` / `migration` / `inspect` / `semantic` | 52 / 10 / 282 / 68 pass; inspect 6 ignored, semantic 4 ignored |
 | Integration `callgraph` | 96 pass / 10 known linked-worktree failures / 2 ignored |
-| `cargo test -p agent-file-tools --test semantic -- --test-threads 4` | 52 pass / 3 ignored |
+| `cargo test --features test-hooks -p agent-file-tools --test semantic -- --test-threads 4` | 52 pass / 3 ignored |
 | Rest `callgraph` after explicit pins | 85 pass / 6 ignored |
 | Feature-enabled rest `tool_provider_conformance` | 19 pass; Prepared/Authorized crash hooks actually ran |
 | Rest `tool_provider_subc_e2e` | NOT a pass: 0 pass / 1 ignored; requires a real ck-subc 0.29+ daemon and AFT_E2E_SUBC_BIN |
 | `cargo test -p agent-file-tools --bin aft -- --test-threads 4` | 121 pass |
 | Mandatory real analyzer restart test with `AFT_TEST_REQUIRE_RUST_ANALYZER=1` | 1 pass, not a silently skipped server test |
-| `cargo test -p agent-file-tools --test list_envelope -- --test-threads 4` | 175 pass |
+| `cargo test --features test-hooks -p agent-file-tools --test list_envelope -- --test-threads 4` | 175 pass |
 | `python3 benchmarks/aft-search/run_search_quality.py --self-test` | Goldens OK; 123 unittest cases / 1 platform skip |
 | Bridge build, typecheck, unit | `bun run --cwd packages/aft-bridge build`, `typecheck`: exit 0; `test:unit`: 797 pass / 0 fail / 3 skip across 67 files |
 | `bun run lint` | Checked 699 files, exit 0 |

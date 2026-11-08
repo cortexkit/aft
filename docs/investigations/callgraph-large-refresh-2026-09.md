@@ -118,7 +118,7 @@ was only read by `git clone` and `git reflog`.
 git clone --no-hardlinks ~/Work/OSS/oh-my-pi /private/tmp/lrb/omp
 cp docs/investigations/scripts/callgraph-large-refresh-bench.rs \
    crates/aft/tests/callgraph_large_refresh_bench.rs
-cargo test --profile stage -p agent-file-tools \
+cargo test --features test-hooks --profile stage -p agent-file-tools \
    --test callgraph_large_refresh_bench --no-run
 ```
 

@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["explicit-test-hooks"],
+  "notes": "Make integration hooks opt-in and remove the self dev-dependency so lib-only test builds compile once, without changing search routing or ranking."
+}

@@ -64,7 +64,7 @@ bun test packages/opencode-plugin/src/__tests__/lsp-auto-install.test.ts package
 bun run --cwd packages/opencode-plugin typecheck
 bun run --cwd packages/pi-plugin typecheck
 cargo test -p agent-file-tools --lib typescript_worktree_tests
-AFT_TEST_LSP_BIN_DIR=/absolute/cache/node_modules/.bin cargo test -p agent-file-tools --test lsp_fresh_worktree_test -- --nocapture
+AFT_TEST_LSP_BIN_DIR=/absolute/cache/node_modules/.bin cargo test --features test-hooks -p agent-file-tools --test lsp_fresh_worktree_test -- --nocapture
 ```
 
 The opt-in real-server test requires Node and a bin directory with

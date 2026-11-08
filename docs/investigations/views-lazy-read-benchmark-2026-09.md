@@ -24,7 +24,7 @@ AFT_HUNT_ROOT=/Users/ufukaltinok/Work/OSS/opencode \
 AFT_HUNT_STORAGE=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/views-on-storage \
 AFT_LAZY_READ_REPORT="$PWD/target/views-lazy-read-report.json" \
 RUSTFLAGS='--cfg aft_views_lazy_benchmark' \
-cargo test -p agent-file-tools --test views_lazy_navigation_profile \
+cargo test --features test-hooks -p agent-file-tools --test views_lazy_navigation_profile \
   --release -- --ignored --nocapture
 ```
 

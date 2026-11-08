@@ -45,7 +45,7 @@ Deterministic contention used one inspect worker plus the existing 300 ms Tier-2
 
 ```text
 AFT_INSPECT_POOL_THREADS=1 AFT_TEST_TIER2_REUSE_DELAY_MS=300 \
-  cargo test -p agent-file-tools --test integration \
+  cargo test --features test-hooks -p agent-file-tools --test integration \
   inspect_tier2_scheduler_test::linked_worktree_explicit_inspect_keeps_parent_aggregates_byte_identical \
   -- --exact --nocapture
 ```

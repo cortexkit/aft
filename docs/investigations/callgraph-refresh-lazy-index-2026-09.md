@@ -67,7 +67,7 @@ Reading the table:
 git clone --no-hardlinks ~/Work/OSS/oh-my-pi .tmp/omp && git -C .tmp/omp checkout e1a86ce4f9
 cp docs/investigations/scripts/callgraph-large-refresh-bench.rs \
    crates/aft/tests/callgraph_large_refresh_bench.rs
-CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test --profile stage -p agent-file-tools \
+CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test --features test-hooks --profile stage -p agent-file-tools \
    --test callgraph_large_refresh_bench --no-run
 ```
 

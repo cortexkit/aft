@@ -140,7 +140,7 @@ The placeholders are replaced with captured test names and output before commit.
 The required bare command was run after the audit changes:
 
 ```text
-cargo test -p agent-file-tools --test integration
+cargo test --features test-hooks -p agent-file-tools --test integration
 test result: FAILED. 1682 passed; 20 failed; 12 ignored; 0 measured; 0 filtered out; finished in 195.69s
 ```
 
@@ -154,4 +154,4 @@ Status-related failures exposed assertions that still treated unavailable diagno
 
 The only remaining failures are 19 callgraph tests that target fixtures inside this linked task worktree and receive the worktree read-only `callgraph_unavailable` response. Positive control: `callgraph_unknown_symbol_error` reproduces that environmental limitation in isolation.
 
-No parity fixture moved. `cargo test -p agent-file-tools --test integration tool_call_parity_test` passed all 12 tests exercising the 69 pinned fixtures: `12 passed; 0 failed; 1702 filtered out`.
+No parity fixture moved. `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test` passed all 12 tests exercising the 69 pinned fixtures: `12 passed; 0 failed; 1702 filtered out`.

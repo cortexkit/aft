@@ -458,7 +458,7 @@ behavior, ranking files, package manifests or generated schemas. Original
 CI-history limitations and other deferred follow-ups remain explicit above.
 
 Final correction gates after stress-helper removal and comment cleanup:
-`cargo test -p agent-file-tools --features test-timing-hooks --test integration --
+`cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration --
 status_answers_while_another_process_holds_the_write_lock
 subc_drain_exits_with_many_live_lsp_servers_in_one_deadline --test-threads 4
 --nocapture`: **2 passed, 0 failed**. `cargo check -p agent-file-tools --lib
