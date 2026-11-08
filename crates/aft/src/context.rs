@@ -13034,13 +13034,14 @@ mod subc_lifecycle_admission_tests {
         );
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.set_cache_writer_capabilities(true, true);
-        ctx.update_status_bar_todos(None);
+        // The whole-repository analyses run only inside aft_inspect, so a
+        // writer root with none running is ready to run one.
         assert_eq!(
             ctx.try_health_snapshot(Path::new("writer-root"))
                 .tier2
                 .expect("tier2 health")
                 .status,
-            "stale"
+            "ready"
         );
 
         ctx.set_cache_role(true, None);
