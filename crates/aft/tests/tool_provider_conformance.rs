@@ -3333,6 +3333,7 @@ impl Route {
                 "role.describe"
                     | "tool.catalog"
                     | "tool.withdraw"
+                    | "tool.yield"
                     | "late_results"
                     | "late_results.ack"
             ) && body.get("name").is_some()
@@ -4371,6 +4372,7 @@ fn registry_manifest_lock_fixture_equalities_and_independent_declaration() {
             "tool.views",
             "tool.call",
             "tool.withdraw",
+            "tool.yield",
             "late_results",
             "late_results.ack"
         ])

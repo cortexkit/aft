@@ -16780,6 +16780,10 @@ async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
 #[path = "scope_revocation_test.rs"]
 mod scope_revocation_test;
 
+#[cfg(unix)]
+#[path = "call_yield_test.rs"]
+mod call_yield_test;
+
 #[path = "confine_admission_test.rs"]
 mod confine_admission_test;
 

@@ -208,6 +208,7 @@ mod bash;
 mod bind_candidates;
 mod bind_log;
 mod call_policy;
+mod call_yield;
 mod carrier_read_only;
 #[cfg(test)]
 mod tool_result_tests;
@@ -1668,6 +1669,9 @@ struct RouteIdentityData {
     held_reply: bool,
     held_update: bool,
     call_keepalive: bool,
+    /// The consumer opted in to `tool.yield` when it opened the route (see
+    /// `call_yield::consumer_reads_call_yield`).
+    call_yield: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -8728,6 +8732,8 @@ async fn handle_control_request(
             let held_reply = consumer_capabilities
                 .as_ref()
                 .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
+            let call_yield =
+                call_yield::consumer_reads_call_yield(consumer_capabilities.as_deref());
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -8822,6 +8828,7 @@ async fn handle_control_request(
                 held_reply,
                 held_update,
                 call_keepalive,
+                call_yield,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -11409,6 +11416,13 @@ async fn handle_tool_call_with_capabilities(
             }
         }
     }
+    // A head's keyed watch on a route that opted in to `tool.yield` can be
+    // ended early; the watch thread holds the signal until it ends.
+    let watch_yield = (bare_name == "bash_watch"
+        && ledger_key.is_some()
+        && !role.is_worker()
+        && call_yield::route_refusal(&identity).is_none())
+    .then(|| metrics.watch_yields.register(route_id, frame.header.corr));
     // Decided before the arguments move into the job: slow-call logging needs
     // to know whether a person is waiting on this call.
     let caller = if manifest::is_native_plumbing_call(&bare_name, &arguments) {
@@ -12004,11 +12018,12 @@ async fn handle_tool_call_with_capabilities(
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
                         } else if bare_name_for_run == "bash_watch" {
-                            crate::commands::bash_watch::handle_deferred_with_observation_only(
+                            crate::commands::bash_watch::handle_deferred_yieldable(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 reply_budget,
                                 carrier_read_only::restricted(&identity_for_run),
+                                watch_yield,
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
@@ -13927,6 +13942,7 @@ pub(crate) mod test_support {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -15205,6 +15221,7 @@ pub(crate) mod test_support {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19013,6 +19030,7 @@ mod tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19149,6 +19167,7 @@ mod tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),

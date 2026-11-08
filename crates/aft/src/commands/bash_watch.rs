@@ -12,6 +12,7 @@
 //! loop picks up its result. A cancelled call or a module drain cancels that
 //! thread through the job's cancellation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -295,6 +296,38 @@ pub(crate) fn handle_deferred_with_observation_only(
     budget: crate::commands::blocking_wait::ReplyBudget,
     observation_only: bool,
 ) -> DispatchOutcome {
+    handle_deferred_yieldable(req, ctx, budget, observation_only, None)
+}
+
+/// Asks a waiting watch to end now, with what it has seen so far, exactly as
+/// when its time limit passes. A session runner hands a call back this way
+/// when a person sends a message while the watch waits; the watched task is
+/// left running.
+#[derive(Default)]
+pub(crate) struct YieldSignal {
+    requested: AtomicBool,
+}
+
+impl YieldSignal {
+    /// Ask the watch to end. False when it was already asked.
+    pub(crate) fn request(&self) -> bool {
+        !self.requested.swap(true, Ordering::SeqCst)
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+/// [`handle_deferred_with_observation_only`] for a watch that `yield_signal`
+/// can end early. The watch thread holds the signal until it ends.
+pub(crate) fn handle_deferred_yieldable(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    budget: crate::commands::blocking_wait::ReplyBudget,
+    observation_only: bool,
+    yield_signal: Option<Arc<YieldSignal>>,
+) -> DispatchOutcome {
     let id = req.id.clone();
     let params = match parse_params(req) {
         Ok(params) => params,
@@ -397,6 +430,7 @@ pub(crate) fn handle_deferred_with_observation_only(
                     observation_only,
                     storage_dir,
                     project_root,
+                    yield_signal,
                 };
                 if watch.observed_status(0).is_none() {
                     let _ = tx.send(Response::error(
@@ -476,6 +510,8 @@ struct WatchJob {
     observation_only: bool,
     storage_dir: std::path::PathBuf,
     project_root: Option<std::path::PathBuf>,
+    /// Set when the watch may be handed back early (see [`YieldSignal`]).
+    yield_signal: Option<Arc<YieldSignal>>,
 }
 
 impl WatchJob {
@@ -559,7 +595,14 @@ impl WatchJob {
             // A nearby process kill may extend an ordinary watch limit, never
             // the reply deadline: the caller must receive its task id in time.
             let window_dropped = stdout.dropped || stderr.dropped;
-            if now >= self.budget.deadline {
+            // A handed-back watch ends the way a watch whose limit passed
+            // does, reporting how long it actually waited.
+            if now >= self.budget.deadline
+                || self
+                    .yield_signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.requested())
+            {
                 let mut result = waited(
                     if terminal {
                         WaitReason::Exited
@@ -1066,6 +1109,7 @@ mod tests {
                 observation_only: false,
                 storage_dir: storage,
                 project_root: Some(dir.path().into()),
+                yield_signal: None,
             };
             (dir, job, snapshot)
         })
