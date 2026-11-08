@@ -839,6 +839,12 @@ pub fn run_tool_call(
             );
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
+            // URL fetch times ride on the slow-call line of the commands that
+            // can fetch a web page, so they are collected only when that line
+            // can exist.
+            let url_fetch_times = (phase_trace.is_some()
+                && fetches_urls(&prepared.request.command))
+            .then(crate::url_fetch::timing::begin);
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {
@@ -868,6 +874,7 @@ pub fn run_tool_call(
                     }
                 }
             }
+            let url_fetch_times = url_fetch_times.and_then(|scope| scope.finish());
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
                 if let Some(mut shape) = arg_shape {
@@ -878,6 +885,10 @@ pub fn run_tool_call(
                     if reports_outcome {
                         shape.push_str(" outcome=");
                         shape.push_str(&response_outcome(&response));
+                    }
+                    if let Some(times) = url_fetch_times {
+                        shape.push(' ');
+                        shape.push_str(&times.render());
                     }
                     trace.note_arg_shape(shape);
                 }
@@ -918,6 +929,12 @@ fn tool_call_intentionally_waits(request: &RawRequest) -> bool {
             .any(|key| request.params.get(*key).and_then(Value::as_bool) == Some(true)),
         _ => false,
     }
+}
+
+/// Commands that can fetch a web page, whose slow-call line also reports
+/// where the fetch's time went.
+fn fetches_urls(command: &str) -> bool {
+    matches!(command, "outline" | "zoom")
 }
 
 /// Commands that change files, whose slow-call line also reports the outcome.
@@ -1410,6 +1427,85 @@ mod tests {
             search_plan_summary(&response),
             "shape=identifier lanes=exact,lexical,semantic"
         );
+    }
+
+    /// A slow URL outline's line says where the fetch's time went (here the
+    /// server's wait before its headers), beside the target kind, and never
+    /// names the URL's path.
+    #[test]
+    fn slow_url_outline_line_carries_url_fetch_times_without_the_url_path() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                let body = b"# Guide\n\n## Install\n";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                url_fetch_allow_private: true,
+                ..Default::default()
+            },
+        );
+        let line = slow_tool_line(
+            &ctx,
+            &root,
+            "outline",
+            json!({"target": format!("http://127.0.0.1:{port}/SECRET_DOC.md")}),
+            &|request, ctx| {
+                assert_eq!(request.command, "outline");
+                let response = crate::commands::outline::handle_outline(&request, ctx);
+                assert!(response.success, "{:?}", response.data);
+                response
+            },
+        );
+        assert!(
+            line.contains(" cmd=outline target=url host=127.0.0.1 url_fetch="),
+            "{line}"
+        );
+        let field = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("url_fetch="))
+            .unwrap_or_else(|| panic!("no url_fetch field: {line}"));
+        let value = |key: &str| {
+            field
+                .split(',')
+                .find_map(|pair| pair.strip_prefix(key)?.strip_prefix(':'))
+                .unwrap_or_else(|| panic!("no {key} in {line}"))
+        };
+        assert_eq!(value("fetches"), "1", "{line}");
+        assert_eq!(value("cache_hits"), "0", "{line}");
+        assert!(
+            value("first_byte").parse::<f64>().unwrap() >= 300.0,
+            "{line}"
+        );
+        assert!(!line.contains("SECRET_DOC"), "{line}");
+        assert!(line.ends_with(" root=/repo"), "{line}");
     }
 
     /// A plain edit target is a file from its spelling, so a prepare never
