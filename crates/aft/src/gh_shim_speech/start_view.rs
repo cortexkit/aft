@@ -72,7 +72,10 @@ pub(crate) fn inject(
         .unwrap_or_else(|| fallback.join("gh-shim"));
     // Tickets can be shared; a launch must never overwrite or unlink another
     // running launch's hint. The digest remains inside the authenticated view.
-    let path = root.join(format!("speech-start-{}.json", uuid::Uuid::new_v4()));
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).ok()?;
+    let name: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = root.join(format!("speech-start-{name}.json"));
     let view = View {
         ticket_digest: digest.to_vec(),
         policy: speech.prepared.classification.clone(),
