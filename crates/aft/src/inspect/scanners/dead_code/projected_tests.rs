@@ -132,7 +132,7 @@ impl NeverConstructed {
 "#,
         ),
     ]);
-    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+    let project_root = crate::inspect::job::canonicalize_normalized(&root);
 
     let first_snapshot =
         crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
@@ -228,7 +228,7 @@ mod tests {
 "#,
         ),
     ]);
-    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+    let project_root = crate::inspect::job::canonicalize_normalized(&root);
 
     let first_snapshot =
         crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
@@ -335,7 +335,7 @@ func (s sortable) Unused() {}
 func Less(i, j int) bool { return false }
 "#,
     )]);
-    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+    let project_root = crate::inspect::job::canonicalize_normalized(&root);
 
     let first_snapshot =
         crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);

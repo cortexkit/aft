@@ -430,11 +430,13 @@ mod tests {
         assert_eq!(run_with(&[], &storage, true, &mut output), 0);
         let output = text(output);
         for name in ["semantic/key-1", "semantic/key-2", "views"] {
+            // Joined part by part, so Windows gets its own separators.
+            let path = name.split('/').fold(storage.clone(), |path, part| path.join(part));
             assert!(
-                output.contains(&format!("Deleted {}.", storage.join(name).display())),
+                output.contains(&format!("Deleted {}.", path.display())),
                 "{output}"
             );
-            assert!(!storage.join(name).exists());
+            assert!(!path.exists());
         }
         assert!(
             output.ends_with("Deleted 3 folders, 26 bytes.\n"),

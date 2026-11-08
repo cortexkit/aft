@@ -7105,7 +7105,7 @@ mod guard_tests {
     #[test]
     fn dead_code_projection_survives_an_undecodable_source_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let root = canonicalize_for_snapshot(dir.path());
         write_projection_cache_file(
             &root.join("src/main.ts"),
             "import { firstTarget } from './target';\nexport function main() { firstTarget(); }\n",
@@ -8686,7 +8686,7 @@ export function bannerUnused() {}
     #[test]
     fn callgraph_snapshot_reads_a_ready_data_layer_checkout_and_never_a_pending_one() {
         let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let root = canonicalize_for_snapshot(dir.path());
         let storage = tempfile::tempdir().expect("storage");
         let inspect_dir = storage.path().join("inspect");
         let job = views_snapshot_job(&root, &inspect_dir);
@@ -8737,7 +8737,7 @@ export function bannerUnused() {}
         // A checkout of another folder never answers for a root.
         let other = InspectManager::new();
         let elsewhere = tempfile::tempdir().expect("elsewhere");
-        let elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonical elsewhere");
+        let elsewhere = canonicalize_for_snapshot(elsewhere.path());
         other.read_dead_code_from_data_layer(&elsewhere, &checkout);
         assert!(matches!(
             other.build_tier2_callgraph_snapshot_with_refresh_and_verdict(

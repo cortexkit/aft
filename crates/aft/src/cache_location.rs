@@ -3768,6 +3768,9 @@ mod prune_legacy_tests {
     fn prune_legacy_also_cleans_the_enrolled_external_cache_root() {
         let temp = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(temp.path()).unwrap();
+        // Plain spelling on Windows, as the command reports it.
+        #[cfg(windows)]
+        let base = crate::windows_path::normalize_windows_path(&base);
         let storage = base.join("storage");
         let parent = base.join("cache-volume");
         fs::create_dir(&parent).unwrap();
