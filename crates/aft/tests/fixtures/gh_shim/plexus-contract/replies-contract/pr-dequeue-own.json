@@ -34,7 +34,7 @@
   "github_writes": [
     {
       "request_body": {
-        "query": "mutation($pullRequestId: ID!) { dequeuePullRequest(input: {pullRequestId: $pullRequestId}) { mergeQueueEntry { pullRequest { id url number headRefOid isInMergeQueue } } } }",
+        "query": "mutation($pullRequestId: ID!) { dequeuePullRequest(input: {id: $pullRequestId}) { mergeQueueEntry { pullRequest { id url number headRefOid isInMergeQueue } } } }",
         "variables": {
           "pullRequestId": "PR_node_7"
         }
