@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-on-demand"
+  ],
+  "note": "Whole-repository inspect analyses (dead code, unused exports, duplicates, cycles, complexity) run only on aft_inspect, and the status bar drops its D/U/C segment. No aft_search ranking, fusion, lane admission or truncation change."
+}

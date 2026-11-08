@@ -1,0 +1,1 @@
+- Dead code, unused exports, duplicates, cycles and complexity now run only when `aft_inspect` is called, never in the background; the status bar shows errors, warnings and TODOs (`[AFT E1 W3 | T5]`), the dead-code graph is released after 10 idle minutes, and `inspect.tier2_idle_minutes` is retired.
