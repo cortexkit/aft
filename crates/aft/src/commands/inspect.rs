@@ -1724,6 +1724,89 @@ fn record_blocking_inspect_observations(
 /// `reports_diagnostics` is false only for a scoped inspect that did not
 /// select diagnostics; every other inspect first waits for the background
 /// applicability walk (see `wait_for_project_applicability_walk`).
+/// How long an inspect waits, once the watcher has acknowledged its flush
+/// marker, for the changes the watcher saw before the marker to be handed to
+/// the index store. The watcher holds a changed path for its 250 ms flush
+/// window before passing it on, and the dispatch thread then records it in
+/// the store, so this leaves room for both.
+const WATCHER_CATCH_UP_LIMIT: Duration = Duration::from_secs(1);
+
+/// Makes the index store hold every change made on disk before this inspect
+/// started, before the TODO count and dead code read the store's records.
+///
+/// The store hears of a change made outside AFT only through the file
+/// watcher, and native file events can arrive after the request does
+/// (FSEvents and Windows notifications are slower than inotify). So the
+/// watcher is asked to acknowledge a flush marker, which it sees only after
+/// every earlier event, and the inspect then waits until those events have
+/// been recorded in the store. When that cannot be confirmed (no watcher
+/// runs, the marker is not acknowledged in time, or the hand-over does not
+/// finish in time), the store compares its files with the disk instead, as it
+/// does when the watcher loses events. The TODO count and dead code wait for
+/// that comparison as they wait for a build, and report themselves pending if
+/// it outlasts their wait, so a count from before the change is never reported
+/// as current.
+fn catch_up_index_store_with_disk(
+    ctx: &AppContext,
+    project_root: &Path,
+    deadline: InspectRequestDeadline,
+) {
+    let config = ctx.config();
+    if !config.inspect.category_enabled(InspectCategory::Todos)
+        && !config.inspect.category_enabled(InspectCategory::DeadCode)
+    {
+        return;
+    }
+    if !watcher_caught_up(ctx, project_root, deadline) {
+        ctx.data_rescan();
+    }
+}
+
+/// Whether every change the watcher of `project_root` was sent before this
+/// call has been recorded in the index store (see
+/// [`catch_up_index_store_with_disk`]).
+fn watcher_caught_up(
+    ctx: &AppContext,
+    project_root: &Path,
+    deadline: InspectRequestDeadline,
+) -> bool {
+    if !ctx.watcher_runtime_active() {
+        return false;
+    }
+    let flush = {
+        let counters = ctx.watcher_counters();
+        // The watcher acknowledges flush markers only once the journal shell
+        // commands use to report changed files exists, so create it as a
+        // command does.
+        counters
+            .bash_changes
+            .get_or_init(|| Arc::new(crate::bash_changed_files::Journal::default()));
+        Arc::clone(&counters.bash_flush)
+    };
+    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let flush_deadline = deadline
+        .work_at()
+        .min(Instant::now() + crate::watcher_backend::flush::BASH_FLUSH_LIMIT);
+    if !flush.wait(&root, flush_deadline) {
+        return false;
+    }
+    // The watcher has taken in every earlier event, but may still hold its
+    // paths in its flush window or the dispatch channel; the dispatch thread's
+    // drain is what records them in the store.
+    let settle_deadline = deadline
+        .work_at()
+        .min(Instant::now() + WATCHER_CATCH_UP_LIMIT);
+    loop {
+        if !ctx.watcher_query_has_pending_changes() {
+            return true;
+        }
+        if Instant::now() >= settle_deadline || inspect_cancellation_requested() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn run_blocking_inspect_body(
     req: &RawRequest,
     ctx: &AppContext,
@@ -1767,6 +1850,10 @@ fn run_blocking_inspect_body(
             );
         }
     };
+    catch_up_index_store_with_disk(ctx, &project_root, deadline);
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
     let initial_stats =
         match capture_inspect_root_stats_from(&project_root, Some(deadline), ctx.data_checkout()) {
             Ok(snapshot) => snapshot,
