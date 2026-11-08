@@ -608,6 +608,7 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
                 agent_id: "agent-a".into(),
             },
             run_id: "earlier-run".into(),
+            task_identity: None,
             owner_route: other,
             owner_route_channel: channel(2),
             run_route: channel(5),
@@ -912,6 +913,7 @@ fn codemode_head_routes_with_different_saved_policies_are_ambiguous() {
                             EffectiveSavedPolicy {
                                 confined: params.is_none(),
                                 params: params.clone(),
+                                task_identity: None,
                             }
                         } else {
                             EffectiveSavedPolicy::default()
@@ -948,6 +950,7 @@ fn codemode_head_routes_with_identical_saved_policies_keep_first_owner() {
                 Some(Ok(EffectiveSavedPolicy {
                     confined: false,
                     params: Some(params.clone()),
+                    task_identity: None,
                 }))
             },
         ));

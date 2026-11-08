@@ -872,6 +872,72 @@ pub(super) fn saved_policy(
     .map_err(|_| policy_unavailable())
 }
 
+/// Resolve task ownership from the bind that fetched this worker's catalog.
+/// A code-mode parent route can be a carrier with a different principal. The
+/// catalog binding changes task visibility only, never the call's authority.
+/// The scope owner fetches the catalog before launch to check available tools;
+/// that fetch does not identify the worker's session host.
+/// Resolve ownership alongside the saved policy on a blocking worker, so the
+/// protocol frame loop never waits for database access.
+pub(super) fn worker_task_identity(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+) -> Result<Option<crate::bash_background::TaskIdentity>, subc_protocol::ErrorBody> {
+    let Some(scope) = identity
+        .scope
+        .as_ref()
+        .filter(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+    else {
+        return Ok(None);
+    };
+    if ctx.database_runtime_unconfigured() {
+        return Ok(None);
+    }
+    let read = || -> rusqlite::Result<Vec<String>> {
+        let db = ctx.db().ok_or(rusqlite::Error::InvalidQuery)?;
+        let conn = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT principal FROM remote_exec_policies
+             WHERE project_root=?1 AND harness=?2 AND session=?3 AND owner=?4
+             AND scope_ref=?5 AND epoch=?6 AND preset='worker' AND principal<>?7",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                identity.project_root.display().to_string(),
+                identity.harness,
+                identity.session,
+                serde_json::to_string(&scope.owner).expect("scope owner serializes"),
+                scope.scope_ref,
+                scope.scope_epoch.to_string(),
+                principal_id(&Some(scope.owner.clone())),
+            ],
+            |row| row.get(0),
+        )?;
+        rows.collect()
+    };
+    let cause = match read() {
+        Ok(bindings) if bindings.len() == 1 => {
+            return Ok(Some(crate::bash_background::TaskIdentity {
+                principal: Some(bindings[0].clone()),
+                harness: identity.harness.clone(),
+                session: identity.session.clone(),
+            }));
+        }
+        Ok(bindings) if bindings.is_empty() => "no catalog binding".into(),
+        Ok(bindings) => format!("{} conflicting bindings", bindings.len()),
+        Err(error) => format!("catalog binding read failed: {error}"),
+    };
+    crate::slog_warn!(
+        "worker task ownership unavailable: scope_ref={} session={} cause={}",
+        scope.scope_ref,
+        identity.session,
+        cause
+    );
+    // Ownership and confinement use the same saved worker policy record. Keep
+    // the existing policy-read refusal text; the log identifies the anomaly.
+    Err(policy_unavailable())
+}
+
 #[cfg(test)]
 #[path = "remote_policy_tests.rs"]
 mod tests;
