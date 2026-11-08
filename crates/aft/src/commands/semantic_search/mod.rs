@@ -24,6 +24,7 @@ pub(crate) mod snippet_bounds;
 pub mod split_query;
 pub mod telemetry;
 pub mod trailer;
+pub mod waits;
 
 pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
 pub use evidence_descriptor::{
@@ -126,8 +127,8 @@ use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
-    GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
+    sort_grep_matches_by_mtime_desc, walk_project_files_from_matching, GrepMatch,
+    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
     INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
@@ -138,6 +139,18 @@ use crate::semantic_index::{
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
+
+/// [`crate::search_index::try_read_with_budget`], timed as a readiness wait:
+/// every artifact read the search makes through it retries a contended lock
+/// in 1 ms sleeps until its budget runs out.
+fn try_read_with_budget<T>(
+    lock: &std::sync::RwLock<T>,
+    budget: Duration,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    waits::timed(waits::SearchWait::Readiness, || {
+        crate::search_index::try_read_with_budget(lock, budget)
+    })
+}
 /// Semantic candidate admission is ranking policy, not a public response-size limit.
 /// Keeping it fixed prevents page-cap changes from rewriting the fused list.
 pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
@@ -1097,7 +1110,9 @@ fn collect_pattern_list(
         path_exclusion: grep_path_exclusion(include_tests),
     };
     Ok(split_query::PatternList::from_bounded_scan(
-        grep_executor::execute(ctx, compiled, &scope, &params),
+        waits::timed(waits::SearchWait::Grep, || {
+            grep_executor::execute(ctx, compiled, &scope, &params)
+        }),
         project_root,
         pattern,
     ))
@@ -1220,8 +1235,10 @@ fn split_semantic_results(
             Some(index) => index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -2430,7 +2447,9 @@ fn handle_external_bounded_lexical_fallback(
         max_results: top_k,
         path_exclusion: grep_path_exclusion(params.include_tests),
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &grep_params);
+    let result = waits::timed(waits::SearchWait::Grep, || {
+        grep_executor::execute(ctx, &compiled, &scope, &grep_params)
+    });
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
@@ -2613,7 +2632,7 @@ fn lexical_candidate_exactness(
     let _cost = telemetry::CostPhase::start("lexical_exactness");
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
-    let Ok(bytes) = fs::read(file) else {
+    let Ok(bytes) = waits::timed(waits::SearchWait::FileRead, || fs::read(file)) else {
         return (false, 0, None);
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -2829,7 +2848,9 @@ fn handle_grep_search(
             path_exclusion: grep_path_exclusion(include_tests),
         };
         (
-            grep_executor::execute(ctx, &compiled, &scope, &params),
+            waits::timed(waits::SearchWait::Grep, || {
+                grep_executor::execute(ctx, &compiled, &scope, &params)
+            }),
             None,
             None,
         )
@@ -3050,7 +3071,9 @@ fn regex_route_collection(
         #[cfg(test)]
         regex_route_lock_hook(false);
         // The checkout's text index names the candidate files, when ready.
-        match data_layer_regex_candidates(ctx, compiled)? {
+        match waits::timed(waits::SearchWait::TextSearch, || {
+            data_layer_regex_candidates(ctx, compiled)
+        })? {
             Ok(snapshot) => snapshot,
             Err(error) => return Some(Err(error)),
         }
@@ -3059,15 +3082,19 @@ fn regex_route_collection(
     if !scope.use_index {
         return None;
     }
-    let collection = snapshot.collect_grep_matches_by_file(
-        compiled,
-        &PathFilters::default(),
-        &scope.root,
-        grep_path_exclusion(include_tests),
-        regex_route::limits(),
-        &regex_route::examine_priority,
-        &regex_route::keep_past_line_limit,
-    );
+    // Candidate files are verified on the global Rayon pool; the searching
+    // thread waits for that whole parallel section.
+    let collection = waits::timed(waits::SearchWait::Rayon, || {
+        snapshot.collect_grep_matches_by_file(
+            compiled,
+            &PathFilters::default(),
+            &scope.root,
+            grep_path_exclusion(include_tests),
+            regex_route::limits(),
+            &regex_route::examine_priority,
+            &regex_route::keep_past_line_limit,
+        )
+    });
     Some(collection)
 }
 
@@ -3601,7 +3628,10 @@ fn matching_line_from_source(
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
     let read_cost = telemetry::CostPhase::start("matching_read");
-    let source = std::fs::read_to_string(file).ok()?;
+    let source = waits::timed(waits::SearchWait::FileRead, || {
+        std::fs::read_to_string(file)
+    })
+    .ok()?;
     drop(read_cost);
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
@@ -3841,8 +3871,10 @@ impl MatchingSourceCache {
 
     fn prepare(&self, source: &str) -> Arc<MatchingSource> {
         let digest = blake3::hash(source.as_bytes());
-        let cell = {
-            let mut state = self.state.lock();
+        // As the exact preparation cache: an unfilled placeholder found here
+        // means another request is preparing the same source.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
@@ -3850,7 +3882,7 @@ impl MatchingSourceCache {
                 if let Some(prepared) = entry.source.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.source)
+                (Arc::clone(&entry.source), true)
             } else {
                 // Bound in-flight placeholders as well as completed entries;
                 // normalization and trigram work never hold the map lock.
@@ -3866,17 +3898,19 @@ impl MatchingSourceCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(waits::SearchWait::PrepareCache));
         let prepared = cell.get_or_init(|| {
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Arc::new(MatchingSource::new(source))
         });
+        drop(other_wait);
         let retained_bytes = prepared.retained_bytes();
-        let mut state = self.state.lock();
+        let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.source, &cell) && entry.bytes == 0 {
                 entry.bytes = retained_bytes;
@@ -3929,7 +3963,10 @@ fn definition_line_from_source(
     file: &Path,
     symbol_range: SymbolOffsetRange,
 ) -> Option<(u32, String)> {
-    let source = std::fs::read_to_string(file).ok()?;
+    let source = waits::timed(waits::SearchWait::FileRead, || {
+        std::fs::read_to_string(file)
+    })
+    .ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
     line_at_offset(&source, symbol_range.start)
@@ -3944,7 +3981,9 @@ pub(crate) fn definition_matches_identifier_token(
     };
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(&candidate.path);
-    let Ok(source) = std::fs::read(&candidate.path) else {
+    let Ok(source) = waits::timed(waits::SearchWait::FileRead, || {
+        std::fs::read(&candidate.path)
+    }) else {
         return false;
     };
     let Some(symbol) = source.get(range.start..range.end) else {
@@ -3983,10 +4022,12 @@ fn identifier_has_code_reference(
 ) -> bool {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    let Ok(source) = std::fs::read_to_string(path) else {
+    let Ok(source) = waits::timed(waits::SearchWait::FileRead, || {
+        std::fs::read_to_string(path)
+    }) else {
         return false;
     };
-    let Ok((tree, _)) = parser.parse(path) else {
+    let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || parser.parse(path)) else {
         return false;
     };
     source.match_indices(identifier).any(|(start, _)| {
@@ -4459,6 +4500,7 @@ fn run_engine_ranking(
             .collect::<Vec<_>>();
         // Reject unrelated filenames before the walker builds metadata and
         // canonical display keys for sorting; the surviving order is unchanged.
+        let _walk = waits::time(waits::SearchWait::Walk);
         walk_project_files_from_matching(
             project_root,
             project_root,
@@ -4899,19 +4941,21 @@ fn run_engine_ranking(
     // the page.
     drop(fusion_cost);
     let rerank_cost = telemetry::CostPhase::start("rerank");
-    let rerank_note = rerank::rerank_canonical_head(
-        &mut page.reply,
-        page_request.offset(),
-        page_request.top_k(),
-        rerank::RerankRequest {
-            search: &ctx.config().search,
-            backend: rerank::installed_backend(ctx),
-            project_root,
-            prose: Some(query),
-            public_query,
-            path_scope: path_scope.as_ref(),
-        },
-    )?;
+    let rerank_note = waits::timed(waits::SearchWait::Rerank, || {
+        rerank::rerank_canonical_head(
+            &mut page.reply,
+            page_request.offset(),
+            page_request.top_k(),
+            rerank::RerankRequest {
+                search: &ctx.config().search,
+                backend: rerank::installed_backend(ctx),
+                project_root,
+                prose: Some(query),
+                public_query,
+                path_scope: path_scope.as_ref(),
+            },
+        )
+    })?;
     drop(rerank_cost);
     let fusion_cost = telemetry::CostPhase::start("fusion");
     // A split request then reorders the first block, which every request
@@ -5637,8 +5681,10 @@ fn handle_semantic_or_hybrid_search(
             Some(semantic_index) => semantic_index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, params.include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, params.include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -6483,7 +6529,9 @@ fn execute_degraded_grep_fallback(
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
     let started = Instant::now();
     let (files, file_cap_reached, walk_budget_reached, skipped_foreign_mounts) =
-        collect_degraded_grep_files(project_root, include_tests, started);
+        waits::timed(waits::SearchWait::Walk, || {
+            collect_degraded_grep_files(project_root, include_tests, started)
+        });
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -6497,6 +6545,7 @@ fn execute_degraded_grep_fallback(
 
     let read_budget_reached = AtomicBool::new(walk_budget_reached);
     let cancellation = crate::executor::current_job_cancellation();
+    let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let mut readable_files = files
         .par_iter()
         .enumerate()
@@ -6515,6 +6564,7 @@ fn execute_degraded_grep_fallback(
                 .map(|content| (index, file.clone(), content))
         })
         .collect::<Vec<_>>();
+    drop(rayon_wait);
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -6993,7 +7043,9 @@ fn embed_query_for_dimension(
     }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
-    let mut model_ref = ctx.semantic_embedding_model().lock();
+    let mut model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+        ctx.semantic_embedding_model().lock()
+    });
     #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
     crate::semantic_index::observe_query_embedding_phase("model_mutex_first_acquired");
 
@@ -7002,12 +7054,18 @@ fn embed_query_for_dimension(
 
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_start");
-        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config);
+        // Building the query model (loading it, or reaching the backend) is
+        // part of the first query's embedding wait.
+        let constructed_model = waits::timed(waits::SearchWait::Embed, || {
+            EmbeddingModel::from_config_for_query(&semantic_config)
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_end");
         let constructed_model = constructed_model?;
 
-        model_ref = ctx.semantic_embedding_model().lock();
+        model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_mutex_second_acquired");
         if model_ref.is_none() {
@@ -7017,7 +7075,9 @@ fn embed_query_for_dimension(
             {
                 let _discarded_model = constructed_model;
             }
-            model_ref = ctx.semantic_embedding_model().lock();
+            model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+                ctx.semantic_embedding_model().lock()
+            });
             #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
             crate::semantic_index::observe_query_embedding_phase("model_mutex_reacquired");
         }
@@ -7029,9 +7089,10 @@ fn embed_query_for_dimension(
     // Preserve the raw error so the timeout marker injected by
     // `send_embedding_request` survives — `classify_embed_query_error` reads it
     // to decide whether the configured query budget fired.
-    let query_vector = model
-        .embed_query_cached(query, query_budget)
-        .map_err(|error| format!("failed to embed query: {error}"))?;
+    let query_vector = waits::timed(waits::SearchWait::Embed, || {
+        model.embed_query_cached(query, query_budget)
+    })
+    .map_err(|error| format!("failed to embed query: {error}"))?;
     drop(model_ref);
 
     check_query_dimension(query_vector, index_dimension)
@@ -8037,6 +8098,7 @@ fn snippet_read_plans(
 }
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+    let _read = waits::time(waits::SearchWait::FileRead);
     let file = fs::File::open(path).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
@@ -8317,9 +8379,11 @@ fn enrich_snippets_from_source_reference(
         }
 
         let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
-            fs::read_to_string(&result.file)
-                .ok()
-                .map(|content| content.lines().map(str::to_string).collect())
+            waits::timed(waits::SearchWait::FileRead, || {
+                fs::read_to_string(&result.file)
+            })
+            .ok()
+            .map(|content| content.lines().map(str::to_string).collect())
         });
 
         if matches!(result.kind, SymbolKind::FileSummary) {

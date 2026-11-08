@@ -25,6 +25,7 @@ pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex};
 use aft_store::text::{plan_pattern, PathText, Query, Scope};
 
 use crate::commands::semantic_search::exact_lane::{self, ExactEvidenceScope};
+use crate::commands::semantic_search::waits::{self, SearchWait};
 use crate::data_layer::checkout::{CheckoutView, DataError, PlaneStatus};
 use crate::search_index::{
     read_search_corpus_file, ExactPassMatch, SearchCorpusEligibility, SearchIndexSnapshot,
@@ -55,7 +56,12 @@ impl DataText {
     /// and the view's text plane is ready; `None` otherwise, and the caller
     /// keeps reading the legacy index.
     pub(crate) fn ready(ctx: &crate::context::AppContext) -> Option<Self> {
-        let view = ctx.data_view()?;
+        // `AppContext::data_view`, with its two waits timed apart: the
+        // context's checkout slot, held while a checkout binds (a bind scans
+        // the folder), and the view, cloned under the checkout's `live` lock.
+        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
+        let view = waits::timed(SearchWait::TextView, || checkout.view())
+            .filter(|view| view.planes().text)?;
         if view.status().text != PlaneStatus::Ready {
             return None;
         }
@@ -355,9 +361,9 @@ impl TextIndex<'_> {
             Self::Snapshot(snapshot) => {
                 snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
             }
-            Self::Data(text) => {
+            Self::Data(text) => waits::timed(SearchWait::TextSearch, || {
                 selected_pool(text, query_trigrams, candidate_filter, paths_holding)
-            }
+            }),
         }
     }
 
@@ -383,6 +389,7 @@ impl TextIndex<'_> {
         if query_trigrams.is_empty() || depth == 0 {
             return Ok(Vec::new());
         }
+        let _wait = waits::time(SearchWait::TextSearch);
         let postings = text.postings(query_trigrams)?;
         let mut non_zero = query_trigrams
             .iter()
@@ -554,6 +561,7 @@ impl TextIndex<'_> {
             }
             Self::Data(text) => text,
         };
+        let _wait = waits::time(SearchWait::TextSearch);
         let mut found: Option<BTreeSet<Vec<u8>>> = None;
         for piece in phrase.split_whitespace().filter(|piece| piece.len() >= 3) {
             let holders = text.candidates(&regex::escape(piece))?;
@@ -597,6 +605,7 @@ fn exact_pass(
     let member = exact_lane::qualified_member_name(query);
     let mut holders = LiteralHolders::new();
     let mut candidates = BTreeSet::new();
+    let candidate_wait = waits::time(SearchWait::TextSearch);
 
     // The verbatim phrase's trigrams.
     if phrase.len() >= 3 {
@@ -633,6 +642,7 @@ fn exact_pass(
                     .is_some_and(|paths| paths.contains(path))
         });
     }
+    drop(candidate_wait);
 
     let search_root_canon = canonicalize_for_search_membership(search_root);
     let mut matches = Vec::new();
@@ -647,9 +657,9 @@ fn exact_pass(
         if !in_scope || candidate_filter.is_some_and(|include| !include(&path)) {
             continue;
         }
-        let SearchCorpusEligibility::Eligible(file) =
+        let SearchCorpusEligibility::Eligible(file) = waits::timed(SearchWait::FileRead, || {
             read_search_corpus_file(&path, text.max_file_size)
-        else {
+        }) else {
             continue;
         };
         let content = String::from_utf8_lossy(&file.bytes);

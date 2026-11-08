@@ -17,15 +17,17 @@ impl Corpus<'_> {
         compiled: &pattern_compile::CompiledPattern,
         include_tests: bool,
     ) -> std::io::Result<crate::search_index::GrepFileCollection> {
-        let mut collection = self.index.snapshot().collect_grep_matches_by_file(
-            compiled,
-            &PathFilters::default(),
-            self.root,
-            grep_path_exclusion(include_tests),
-            regex_route::limits(),
-            &regex_route::examine_priority,
-            &regex_route::keep_past_line_limit,
-        )?;
+        let mut collection = super::waits::timed(super::waits::SearchWait::Rayon, || {
+            self.index.snapshot().collect_grep_matches_by_file(
+                compiled,
+                &PathFilters::default(),
+                self.root,
+                grep_path_exclusion(include_tests),
+                regex_route::limits(),
+                &regex_route::examine_priority,
+                &regex_route::keep_past_line_limit,
+            )
+        })?;
         // Even a completed examination of the postings cannot claim that the
         // pattern matched nothing if the walk or re-read left files unchecked.
         collection.examination_capped |= !self.check.verified();

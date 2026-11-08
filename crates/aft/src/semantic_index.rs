@@ -3621,15 +3621,18 @@ impl SemanticEmbeddingModel {
                 EmbeddingRequestPolicy::Query(budget)
                     if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
                 {
-                    Some(
-                        self.embed_local_query(
-                            texts.clone(),
-                            query_cache_key
-                                .clone()
-                                .expect("query policy has a cache key"),
-                            budget,
-                        ),
-                    )
+                    Some(crate::commands::semantic_search::waits::timed(
+                        crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+                        || {
+                            self.embed_local_query(
+                                texts.clone(),
+                                query_cache_key
+                                    .clone()
+                                    .expect("query policy has a cache key"),
+                                budget,
+                            )
+                        },
+                    ))
                 }
                 _ => None,
             }
@@ -3662,6 +3665,11 @@ impl SemanticEmbeddingModel {
             return result;
         }
 
+        // A query that missed the cache waits here for its remote backend
+        // (Synapse or HTTP) or the in-process model.
+        let backend_wait = crate::commands::semantic_search::waits::time(
+            crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+        );
         let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model
@@ -3832,6 +3840,7 @@ impl SemanticEmbeddingModel {
                 Ok(vectors)
             }
         })();
+        drop(backend_wait);
 
         record_embedding_call(
             self.backend,

@@ -802,8 +802,11 @@ impl PreparedExactCache {
     }
 
     fn prepare(&self, digest: blake3::Hash, text: &str) -> Arc<PreparedExactText> {
-        let cell = {
-            let mut state = self.state.lock();
+        use super::waits::{self, SearchWait};
+        // A placeholder found unfilled means another request is preparing the
+        // same content: waiting for it is a wait, preparing it ourselves is not.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
@@ -811,7 +814,7 @@ impl PreparedExactCache {
                 if let Some(prepared) = entry.text.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.text)
+                (Arc::clone(&entry.text), true)
             } else {
                 // Bound placeholders as well as prepared bytes. A placeholder
                 // single-flights parallel queries without holding the map lock
@@ -828,9 +831,10 @@ impl PreparedExactCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(SearchWait::PrepareCache));
         let prepared = cell.get_or_init(|| {
             #[cfg(test)]
             self.preparations
@@ -839,7 +843,8 @@ impl PreparedExactCache {
             crate::search_hot_path_measurements::record(|counts| counts.exact_preparations += 1);
             Arc::new(PreparedExactText::new(text))
         });
-        let mut state = self.state.lock();
+        drop(other_wait);
+        let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == 0 {
                 entry.bytes = prepared.retained_bytes();

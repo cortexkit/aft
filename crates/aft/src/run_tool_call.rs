@@ -832,6 +832,10 @@ pub fn run_tool_call(
                 .then(|| tool_call_arg_shape(&prepared.request));
             let reports_outcome = is_edit_command(&prepared.request.command);
             let reports_search_plan = prepared.request.command == "semantic_search";
+            // Named search waits ride on the slow-call line beside the plan
+            // summary, so they are collected only when that line can exist.
+            let search_waits = (reports_search_plan && phase_trace.is_some())
+                .then(crate::commands::semantic_search::waits::begin);
             let skipped_before = app_ctx.backup().lock().latest_skipped_order(
                 ctx.session_id
                     .as_deref()
@@ -850,6 +854,7 @@ pub fn run_tool_call(
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            let search_waits = search_waits.and_then(|scope| scope.finish());
             response = crate::bounded_io::finish_response(response);
             crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
             crate::response_finalize::attach_callgraph_pending_gaps(
@@ -881,6 +886,10 @@ pub fn run_tool_call(
                     if reports_search_plan {
                         shape.push(' ');
                         shape.push_str(&search_plan_summary(&response));
+                        if let Some(waits) = search_waits {
+                            shape.push(' ');
+                            shape.push_str(&waits.render());
+                        }
                     }
                     if reports_outcome {
                         shape.push_str(" outcome=");
@@ -1427,6 +1436,64 @@ mod tests {
             search_plan_summary(&response),
             "shape=identifier lanes=exact,lexical,semantic"
         );
+    }
+
+    /// A slow search's line names the waits the search thread spent, by kind,
+    /// and the thread's CPU time, beside the plan summary and before `root=`.
+    #[test]
+    fn slow_search_line_carries_named_waits_and_search_cpu() {
+        use crate::commands::semantic_search::waits::{self, SearchWait};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let line = slow_tool_line(
+            &ctx,
+            &root,
+            "search",
+            json!({"query": "SECRET_QUERY"}),
+            &|request, _ctx| {
+                assert_eq!(request.command, "semantic_search");
+                {
+                    let _lock = waits::time(SearchWait::ModelLock);
+                }
+                {
+                    let _embed = waits::time(SearchWait::Embed);
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+                Response::success(
+                    &request.id,
+                    json!({"structuredContent": {"plan": {
+                        "shape": "identifier", "selected_lanes": ["exact"],
+                    }}}),
+                )
+            },
+        );
+        let waits_field = line
+            .split_whitespace()
+            .find(|field| field.starts_with("waits="))
+            .unwrap_or_else(|| panic!("no waits field: {line}"));
+        assert!(waits_field.starts_with("waits=model_lock:"), "{line}");
+        let embed = waits_field
+            .split(',')
+            .find_map(|wait| wait.strip_prefix("embed:"))
+            .unwrap_or_else(|| panic!("no embed wait: {line}"));
+        let (embed_ms, count) = embed.split_once('/').unwrap();
+        assert!(embed_ms.parse::<f64>().unwrap() >= 3.0, "{line}");
+        assert_eq!(count, "1");
+        assert!(line.contains(" search_cpu="), "{line}");
+        assert!(
+            line.contains("shape=identifier lanes=exact waits="),
+            "{line}"
+        );
+        assert!(!line.contains("SECRET_QUERY"), "{line}");
+        assert!(line.ends_with(" root=/repo"), "{line}");
     }
 
     /// A slow URL outline's line says where the fetch's time went (here the

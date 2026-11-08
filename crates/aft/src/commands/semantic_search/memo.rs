@@ -88,7 +88,7 @@ fn regular_file_stat(path: &Path) -> Option<NativeStat> {
 fn read_digest(path: &Path) -> Result<String, PathBuf> {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_memo_file_read(path);
-    fs::read(path)
+    super::waits::timed(super::waits::SearchWait::FileRead, || fs::read(path))
         .map(|bytes| compute_content_digest(&bytes))
         .map_err(|_| path.to_path_buf())
 }
@@ -761,11 +761,13 @@ impl ExactMemoStore {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_memo_file_read(path);
         before_read();
+        let read_wait = super::waits::time(super::waits::SearchWait::FileRead);
         let mut file = fs::File::open(path).map_err(|_| path.to_path_buf())?;
         let opened = NativeStat::read_open_file(&file, path).ok();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|_| path.to_path_buf())?;
+        drop(read_wait);
         let digest = compute_content_digest(&bytes);
         after_read();
         if digest != expected {
@@ -826,7 +828,9 @@ impl ExactMemoStore {
         H: FnOnce(),
     {
         // 1. Check if we have an active entry
-        let existing_entry = self.entries.read().get(key).cloned();
+        let existing_entry = super::waits::timed(super::waits::SearchWait::ExactMemo, || {
+            self.entries.read().get(key).cloned()
+        });
 
         if let Some(entry) = existing_entry {
             // Slice the requested page
@@ -880,9 +884,13 @@ impl ExactMemoStore {
         miss_hook();
         // Admission, publication and eviction share this gate. Store lock order
         // is admission -> entries -> lifecycle; disk verification holds none.
+        // Waiting for the gate, and for another request verifying the same
+        // key, is the memo wait; this request's own verifier is not.
+        let memo_wait = super::waits::time(super::waits::SearchWait::ExactMemo);
         let mut in_flight = self.in_flight.lock();
         if self.entries.read().contains_key(key) {
             drop(in_flight);
+            drop(memo_wait);
             return self.get_or_verify(key, offset, top_k, verifier);
         }
         let current_epoch = self
@@ -905,8 +913,10 @@ impl ExactMemoStore {
                     .wait_for(&mut in_flight, Duration::from_millis(25));
             }
             drop(in_flight);
+            drop(memo_wait);
             return self.get_or_verify(key, offset, top_k, verifier);
         }
+        drop(memo_wait);
         let epoch = self.allocate_epoch();
         let is_poisoned = {
             let mut lifecycle = self.lifecycle.write();
@@ -939,7 +949,9 @@ impl ExactMemoStore {
 
         // Publish before dropping the permit so same-key waiters observe the entry.
         {
-            let admission = self.in_flight.lock();
+            let admission = super::waits::timed(super::waits::SearchWait::ExactMemo, || {
+                self.in_flight.lock()
+            });
             let current_epoch = self
                 .lifecycle
                 .read()
