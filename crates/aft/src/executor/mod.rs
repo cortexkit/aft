@@ -1178,11 +1178,26 @@ impl Drop for SubmissionExecutor {
 }
 
 impl RootMaintenanceExecutor {
-    /// Submits `job` as this root's maintenance on `lane`. The executor
-    /// refuses it, and drops it unrun, while the root is unbound, and a
-    /// root unbinding cancels it at its checkpoints through `cancellation`.
-    /// `false` when the executor has shut down; the caller must not run the
-    /// work some other way, which would reactivate a retired root.
+    /// Admits `job` as this root's maintenance and runs it at once on the
+    /// calling thread, with the root's cancellation installed as the current
+    /// job's: `cancellation` gains the root and its bind lifecycle, so a root
+    /// unbinding cancels whatever the job starts at its checkpoints. The
+    /// executor refuses the job, and drops it unrun, under the same rules as
+    /// a maintenance job on a worker: the root is unbound, its folder is
+    /// gone, its actor is not registered or failed, or the token is already
+    /// cancelled. `false` when the executor has shut down; the caller must
+    /// not run the work some other way, which would reactivate a retired
+    /// root.
+    ///
+    /// The data layer's background work is the only caller, and its job only
+    /// hands the work to a pool of its own threads. The job does not wait
+    /// for a worker: a call-graph read waits on a worker for the build or
+    /// refresh it asked for, and the scheduler keeps its last
+    /// `interactive_reserve` general workers from maintenance. When the
+    /// handoff was queued as maintenance, two such reads on a four-worker
+    /// pool (one on a two-worker pool) held exactly the workers the handoff
+    /// waited for, so the build started only after each read had given up.
+    /// `lane` only labels the admission in the log.
     pub(crate) fn submit_maintenance(
         &self,
         request_id: &str,
@@ -1193,23 +1208,42 @@ impl RootMaintenanceExecutor {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
-        let executor = SubmissionExecutor(Some(Executor { inner }));
-        let (tx, _rx) = oneshot::channel();
-        executor
-            .0
-            .as_ref()
-            .unwrap()
-            .submit_with_completion_cancellable(
-                self.root_id.clone(),
-                JobClass::Maintenance,
-                lane,
-                request_id.into(),
-                job,
-                CompletionSender::Async(tx),
-                Some(cancellation),
-                None,
-                None,
+        // Dropped off-worker if it turns out to be the executor's last owner.
+        let owner = SubmissionExecutor(Some(Executor { inner }));
+        let executor = owner.0.as_ref().unwrap();
+        // A root stat can stall on disk I/O; probe it before taking the
+        // scheduler lock, as a queued submission does.
+        let root_exists = executor.maintenance_root_is_dir(&self.root_id);
+        let admitted = {
+            let state = executor.inner.state.lock();
+            state
+                .actors
+                .get(&self.root_id)
+                .filter(|actor| !actor.fatal && !actor.ctx.subc_unbound_quiesced())
+                .map(|actor| {
+                    let token = cancellation
+                        .with_root(self.root_id.as_path())
+                        .with_lifecycle(actor.ctx.subc_lifecycle_admission());
+                    (Arc::clone(&actor.ctx), token)
+                })
+        };
+        let Some((ctx, token)) = admitted.filter(|_| root_exists) else {
+            log::debug!(
+                "executor refused maintenance: request_id={request_id} lane={lane:?} root={} \
+                 (unbound, missing or unregistered)",
+                self.root_id.as_path().display()
             );
+            return true;
+        };
+        if token.cancel_requested_before_commit() || !token.mark_running() {
+            return true;
+        }
+        log::debug!(
+            "executor admitted maintenance: request_id={request_id} lane={lane:?} root={}",
+            self.root_id.as_path().display()
+        );
+        let _installed = JobCancellationContextGuard::install(Some(token));
+        let _ = job(&ctx);
         true
     }
 }

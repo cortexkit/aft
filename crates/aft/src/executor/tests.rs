@@ -5209,3 +5209,93 @@ fn call_ledger_lane_refuses_maintenance_admission() {
     assert!(!response.success);
     assert_eq!(response.data["code"], "invalid_lane");
 }
+
+/// A call-graph read waits on an executor worker for the data-layer build or
+/// refresh it asked for, and that work reaches its pool through
+/// `RootMaintenanceExecutor::submit_maintenance`. When the handoff was queued
+/// as maintenance it needed a general worker beyond the interactive reserve:
+/// with the subc bridge's executor (four general workers, two kept for
+/// interactive work), two waiting reads held exactly the workers it waited
+/// for, so the build started only after both reads had given up.
+#[test]
+fn data_layer_handoff_runs_while_reads_wait_for_it() {
+    let executor = test_executor(4, 3, 3, 2);
+    let (_dir, root) = test_root("handoff-under-reads");
+    let ctx = test_ctx();
+    ctx.mark_subc_bound();
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let maintenance = ctx
+        .callgraph_executor_for_test()
+        .expect("registering the actor installs its maintenance executor");
+
+    const READS: usize = 2;
+    let running = Arc::new(AtomicUsize::new(0));
+    let reads: Vec<_> = (0..READS)
+        .map(|index| {
+            let maintenance = maintenance.clone();
+            let running = Arc::clone(&running);
+            let request_id = format!("callers-{index}");
+            let reply_id = request_id.clone();
+            executor.submit_async(
+                root.clone(),
+                Lane::HeavyInit,
+                request_id,
+                Box::new(move |_| {
+                    // Hand off only once every read holds its worker, as two
+                    // call-graph reads sent together do.
+                    running.fetch_add(1, Ordering::AcqRel);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while running.load(Ordering::Acquire) < READS && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    let together = running.load(Ordering::Acquire) == READS;
+                    let (ran_tx, ran_rx) = crossbeam_channel::bounded(1);
+                    assert!(maintenance.submit_maintenance(
+                        "data-layer-build",
+                        Lane::MaintenanceCommit,
+                        JobCancellation::new(),
+                        Box::new(move |_| {
+                            let _ = ran_tx.send(current_job_cancellation().is_some());
+                            ok("data-layer-build")
+                        }),
+                    ));
+                    let handoff = ran_rx.recv_timeout(Duration::from_secs(5)).ok();
+                    Response::success(
+                        reply_id,
+                        serde_json::json!({ "together": together, "handoff": handoff }),
+                    )
+                }),
+            )
+        })
+        .collect();
+    for (index, read) in reads.into_iter().enumerate() {
+        let response = recv_async(read, "call-graph read");
+        assert!(response.success, "read {index}: {response:?}");
+        assert_eq!(
+            response.data["together"], true,
+            "read {index} never ran beside the other read"
+        );
+        assert_eq!(
+            response.data["handoff"], true,
+            "read {index}: the handoff never ran, or ran without the root's cancellation, \
+             while the reads waited for it"
+        );
+    }
+
+    // An unbound root still starts nothing.
+    ctx.mark_subc_unbound();
+    let (ran_tx, ran_rx) = crossbeam_channel::bounded(1);
+    assert!(maintenance.submit_maintenance(
+        "data-layer-build",
+        Lane::MaintenanceCommit,
+        JobCancellation::new(),
+        Box::new(move |_| {
+            let _ = ran_tx.send(());
+            ok("data-layer-build")
+        }),
+    ));
+    assert!(
+        ran_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "an unbound root's maintenance ran"
+    );
+}
