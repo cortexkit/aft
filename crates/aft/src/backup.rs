@@ -5723,8 +5723,9 @@ const MIRROR_BUSY_WAIT: Duration = Duration::from_millis(50);
 /// `shared`, so an edit's mirror write never waits for the process-wide
 /// connection mutex. Other writers hold that mutex for their whole statement,
 /// including while SQLite's busy handler sleeps behind another process's write
-/// lock. The mirror's connection keeps the standard busy timeout, so it still
-/// waits while another connection's write transaction is running.
+/// lock. Reads on this connection keep the standard busy timeout; an edit's
+/// mirror write lowers it to `MIRROR_BUSY_WAIT` for that write only (see the
+/// write site).
 ///
 /// Returns `None`, and the mirror uses `shared`, for an in-memory database
 /// (a second connection would open a different one), for a read-only
