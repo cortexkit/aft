@@ -968,6 +968,7 @@ mod preset_writer_tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),

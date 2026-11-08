@@ -55,6 +55,7 @@ pub(super) fn recognized_operation(op: &str) -> bool {
             | "tool.views"
             | "tool.call"
             | "tool.withdraw"
+            | "tool.yield"
             | "late_results"
             | "late_results.ack"
             | "grants.list"
@@ -174,15 +175,14 @@ pub(super) fn check_program_scope(
     }
 }
 
-/// The tool-provider contract's session-notices capability (contract 2.2),
-/// spelled out because the pinned role crate predates its constant. AFT
-/// declares it in `role.describe` and in its manifest so a session runner may
-/// let AFT's notices start a run on an idle session. The promise is that only
+/// The tool-provider contract's session-notices capability (contract 2.2).
+/// AFT declares it in `role.describe` and in its manifest so a session runner
+/// may let AFT's notices start a run on an idle session. The promise is that only
 /// a completion may start one: a finished background task is a completion,
 /// while long-running reminders and drain nudges are not and never start a
 /// run. Pattern-watch matches are not completions either, and AFT offers no
 /// asynchronous pattern watches on runner-hosted sessions.
-pub(crate) const SESSION_NOTICES: &str = "session-notices/v1";
+pub(crate) const SESSION_NOTICES: &str = cortexkit_role_tool_provider::SESSION_NOTICES_V1;
 
 pub(super) fn describe() -> Value {
     serde_json::to_value(
@@ -195,6 +195,7 @@ pub(super) fn describe() -> Value {
                     "tool.views".into(),
                     "tool.call".into(),
                     "tool.withdraw".into(),
+                    super::call_yield::TOOL_YIELD.into(),
                     "late_results".into(),
                     "late_results.ack".into(),
                 ],
@@ -207,6 +208,7 @@ pub(super) fn describe() -> Value {
             cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
             SESSION_NOTICES.into(),
+            super::call_yield::CALL_YIELD.into(),
         ]),
     )
     .expect("the commons role declaration is JSON")
@@ -549,7 +551,16 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
                     1
                 };
             let entry = |schema: Value, description: Option<String>| {
-                catalog_entry(&name, semantics, schema, description)
+                let mut entry = catalog_entry(&name, semantics, schema, description);
+                // A head's waiting `bash` call can be handed back with
+                // `tool.yield`; a delegated worker's keeps holding (see
+                // `call_yield::route_refusal`), so the worker preset is untagged.
+                if preset == CatalogPreset::Head && name == "bash" {
+                    entry
+                        .capabilities
+                        .push(super::call_yield::CALL_YIELD_TOOL_TAG.into());
+                }
+                entry
             };
             let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
             let with_runon = manifest::remote_tool(preset_name, &name)
@@ -624,8 +635,13 @@ static RUNNER_HEAD_TOOLS: LazyLock<RunnerHeadTools> = LazyLock::new(|| {
     };
     let (schema, description) = manifest::preset_tool(CatalogPreset::Head.name(), "bash_watch")
         .expect("the head preset artifact carries bash_watch");
+    // A head's waiting watch can be handed back with `tool.yield`.
+    let mut bash_watch = catalog_entry("bash_watch", 1, schema, description);
+    bash_watch
+        .capabilities
+        .push(super::call_yield::CALL_YIELD_TOOL_TAG.into());
     RunnerHeadTools {
-        bash_watch: served(catalog_entry("bash_watch", 1, schema, description)),
+        bash_watch: served(bash_watch),
         hashline_edit: served(catalog_entry(
             "edit",
             1,
@@ -1949,6 +1965,11 @@ struct LedgerCall {
     /// A `tool.withdraw` settled this held call before the frame loop filed
     /// its question; the request is answered `not_started` when it arrives.
     withdrawn: Option<&'static str>,
+    /// Set for a `bash` or `bash_watch` call, which `tool.yield` may hand back.
+    yieldable: Option<super::call_yield::YieldableTool>,
+    /// A `tool.yield` was accepted for this call; a repeat answers
+    /// `unknown_call`, as the contract asks.
+    yielded: bool,
 }
 
 /// Test-only gate between a keyed call's durable admission and the frame
@@ -2325,6 +2346,8 @@ impl LedgerEdge {
                 detached: false,
                 expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 withdrawn: None,
+                yieldable: None,
+                yielded: false,
             },
         );
     }
@@ -2427,6 +2450,11 @@ impl LedgerEdge {
                 let op = op.to_owned();
                 let body = body.clone();
                 self.custody(decoded, &op, &body, identity, executor, writer, metrics);
+                return Ok(());
+            }
+            if body.get("name").and_then(Value::as_str) == Some(super::call_yield::TOOL_YIELD) {
+                let body = body.clone();
+                self.call_yield(decoded, &body, &identity, writer, metrics);
                 return Ok(());
             }
         }
@@ -2646,6 +2674,8 @@ impl LedgerEdge {
                                         + bash_elicitation_timeout(),
                                     withdrawn: None,
                                     shell: matches!(call.name.as_str(), "bash" | "powershell"),
+                                    yieldable: super::call_yield::YieldableTool::of(&call.name),
+                                    yielded: false,
                                     detached: false,
                                 },
                             );
@@ -2988,6 +3018,119 @@ impl LedgerEdge {
                 Err(error) => {
                     let _ = send_provider_error(&writer, &metrics, &request, error).await;
                 }
+            }
+        });
+    }
+
+    /// Answers a `tool.yield` on a v1 route (see `call_yield` for the
+    /// contract it follows). The decision reads only in-memory call state, so
+    /// neither the answer nor an accepted call's final frame waits for the
+    /// executor or the database: the final frame of a handed-back `bash` call
+    /// is sent right here, before the answer, and a `bash_watch` thread checks
+    /// its signal at least once a second.
+    fn call_yield(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        body: &Value,
+        identity: &super::RouteIdentity,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    ) {
+        use super::call_yield::{NotYieldable, YieldAnswer, YieldableTool};
+        let request = decoded.frame;
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let yielded = match super::call_yield::parse_request(body) {
+            Ok(yielded) => yielded,
+            Err(error) => {
+                tokio::spawn(async move {
+                    let _ = super::send_provider_error(&writer, &metrics, &request, error).await;
+                });
+                return;
+            }
+        };
+        let route = super::route_key(request.header.channel, request.header.epoch);
+        // Calls are recorded under the route's attested carrier, so this key
+        // finds only the caller's own calls.
+        let key = Self::key(identity, &yielded.call_key);
+        let mut handed_back = None;
+        let answer = {
+            let mut calls = self.calls.lock().unwrap();
+            match calls.iter_mut().find(|((call_route, _), call)| {
+                *call_route == route
+                    && call.key == key
+                    && !call.detached
+                    && call.withdrawn.is_none()
+            }) {
+                None => YieldAnswer::UnknownCall,
+                // The contract never accepts a yield twice.
+                Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
+                Some((&(_, corr), call)) => {
+                    let decision = if let Some(refusal) = super::call_yield::route_refusal(identity)
+                    {
+                        Err(refusal)
+                    } else if yielded.reason != super::call_yield::PERSON_MESSAGE {
+                        Err(NotYieldable::Reason)
+                    } else {
+                        match call.yieldable {
+                            None => Err(NotYieldable::Tool),
+                            Some(YieldableTool::Bash) => metrics
+                                .held_bash_calls
+                                .claim_for_yield(route, corr)
+                                .map(|target| handed_back = Some((corr, target))),
+                            Some(YieldableTool::BashWatch) => {
+                                if metrics.watch_yields.request(route, corr) {
+                                    Ok(())
+                                } else {
+                                    Err(NotYieldable::NotWaiting)
+                                }
+                            }
+                        }
+                    };
+                    match decision {
+                        Ok(()) => {
+                            call.yielded = true;
+                            YieldAnswer::Accepted
+                        }
+                        Err(reason) => YieldAnswer::NotYieldable(reason),
+                    }
+                }
+            }
+        };
+        log::info!(
+            "subc attach: tool.yield on route {route} corr={} for call key {:?} (reason {}): {}",
+            request.header.corr,
+            yielded.call_key,
+            yielded.reason,
+            answer.body()
+        );
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            if let Some((corr, target)) = handed_back {
+                if let Err(error) = super::bash::answer_yielded_bash_call(
+                    &writer, &identity, &metrics, route, corr, target,
+                )
+                .await
+                {
+                    log::warn!("subc attach: handed-back bash call could not be answered: {error}");
+                }
+            }
+            let body = serde_json::to_vec(&answer.body()).expect("yield answers are JSON");
+            match subc_protocol::Frame::build_with_version(
+                request.header.ver,
+                subc_protocol::FrameType::Response,
+                request.header.flags,
+                request.header.channel,
+                request.header.epoch,
+                request.header.corr,
+                body,
+            ) {
+                Ok(frame) => {
+                    let _ =
+                        super::send_reliable_writer_frame(&writer, &metrics, frame, "yield answer")
+                            .await;
+                }
+                Err(error) => log::warn!("subc attach: tool.yield answer not built: {error}"),
             }
         });
     }
@@ -4363,8 +4506,8 @@ mod tests {
 
     /// `role.describe` serves exactly the declaration pinned in the
     /// conformance fixture: `role.describe`, `tool.catalog` and `tool.call`
-    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, and the
-    /// root-confinement capability used for worker admission.
+    /// plus `tool.withdraw`, `tool.yield`, `late_results` and `late_results.ack`,
+    /// and the root-confinement capability used for worker admission.
     #[test]
     fn slice_b_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
@@ -6537,6 +6680,7 @@ pub(in crate::subc) mod route_tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -7938,6 +8082,7 @@ pub(in crate::subc) mod route_tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -8170,6 +8315,7 @@ pub(in crate::subc) mod route_tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(scope),
@@ -9094,6 +9240,7 @@ pub(in crate::subc) mod route_tests {
             held_reply: false,
             held_update: false,
             call_keepalive: false,
+            call_yield: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
@@ -10618,6 +10765,8 @@ mod settlement_failure_tests {
                 shell: false,
                 detached: false,
                 withdrawn: None,
+                yieldable: None,
+                yielded: false,
                 expires_at: Instant::now() + Duration::from_secs(60),
             },
         );
@@ -10877,6 +11026,8 @@ mod authorization_failure_tests {
                 shell: true,
                 detached: false,
                 withdrawn: None,
+                yieldable: None,
+                yielded: false,
                 expires_at: Instant::now() + Duration::from_secs(60),
             },
         );

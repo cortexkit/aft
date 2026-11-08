@@ -460,6 +460,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // with one of AFT's notices; only completions may do that (see
     // `tool_provider::SESSION_NOTICES`).
     //
+    // `call-yield/v1` promises `tool.yield`: a runner may hand back a head's
+    // waiting `bash` or `bash_watch` call when a person sends a message (see
+    // `call_yield`).
+    //
     // `worker-runs/v1` admits worker runs: codemode runs that carry
     // `on_behalf_of_agent` and no `agent_id`. Declaring it promises that AFT
     // runs such a call with only its worker's own access (see `codemode`) and
@@ -492,6 +496,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 "tool-views/v1".to_string(),
                 super::tool_provider::SESSION_NOTICES.to_string(),
+                super::call_yield::CALL_YIELD.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
@@ -875,6 +880,7 @@ mod tests {
                 "call-modes/v1".to_string(),
                 "tool-views/v1".to_string(),
                 "session-notices/v1".to_string(),
+                "call-yield/v1".to_string(),
                 "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
@@ -891,6 +897,7 @@ mod tests {
                 "call-modes/v1",
                 "tool-views/v1",
                 "session-notices/v1",
+                "call-yield/v1",
                 "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
@@ -1190,7 +1197,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
