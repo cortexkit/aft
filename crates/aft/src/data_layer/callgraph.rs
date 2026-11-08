@@ -675,6 +675,36 @@ pub(crate) struct BoundFile {
     pub(crate) binding: ViewBindingDependencies,
 }
 
+/// The files some work read one at a time on a resolving thread, the first
+/// time it read each, recorded in tests only: they check that an update did
+/// that work beforehand, in parallel. Outside tests it holds and records
+/// nothing.
+#[derive(Debug, Default)]
+pub(crate) struct FirstReads {
+    #[cfg(test)]
+    files: Mutex<Vec<String>>,
+}
+
+impl FirstReads {
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn note(&self, path: &str) {
+        #[cfg(test)]
+        self.files
+            .lock()
+            .expect("no panics while holding it")
+            .push(path.to_string());
+        #[cfg(not(test))]
+        let _ = path;
+    }
+
+    #[cfg(test)]
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.files.lock().expect("no panics while holding it"))
+    }
+}
+
+aft_store::heap_bytes_none!(FirstReads);
+
 /// Lists over every parsed file that the resolver's whole-checkout lookups
 /// read, each in path order.
 #[derive(Clone, Debug, Default)]
@@ -717,10 +747,9 @@ impl FileLists {
 pub(crate) struct BindCache {
     files: Mutex<HashMap<String, Arc<BoundFile>>>,
     lists: Mutex<Option<Arc<FileLists>>>,
-    /// Every file a resolver bound on first use, in order: what resolution
-    /// waited on that nothing bound beforehand.
-    #[cfg(test)]
-    bound_on_first_use: Mutex<Vec<String>>,
+    /// Every file a resolver bound on first use: what resolution waited on
+    /// that nothing bound beforehand.
+    bound_on_first_use: FirstReads,
 }
 
 impl BindCache {
@@ -871,12 +900,7 @@ impl BindCache {
     /// The files resolution bound on first use since the last call.
     #[cfg(test)]
     pub(crate) fn take_bound_on_first_use(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .bound_on_first_use
-                .lock()
-                .expect("no panics while holding it"),
-        )
+        self.bound_on_first_use.take()
     }
 
     /// Binds, in parallel, every file of `paths` not bound yet.
@@ -929,12 +953,7 @@ impl<'a> BoundFiles<'a> {
             return Some(bound);
         }
         let (_, parse) = self.inputs.parses.get(path)?;
-        #[cfg(test)]
-        self.cache
-            .bound_on_first_use
-            .lock()
-            .expect("no panics while holding it")
-            .push(path.to_string());
+        self.cache.bound_on_first_use.note(path);
         match bind_file(path, parse, &self.facts, None) {
             Ok((surface, binding)) => Some(self.cache.set_new(
                 path,
@@ -1474,9 +1493,8 @@ pub(crate) struct MethodCallInputs {
     /// Method name to the Go files of `own` whose interfaces require it.
     go_required: HashMap<String, BTreeSet<String>>,
     /// Every file whose inputs pass 4 computed on the resolving thread, the
-    /// first time the resolver read it, in order.
-    #[cfg(test)]
-    computed_while_resolving: Mutex<Vec<String>>,
+    /// first time the resolver read it.
+    computed_while_resolving: FirstReads,
 }
 
 /// Below this many files, pass 4 runs on one thread instead of in parallel
@@ -1488,12 +1506,7 @@ impl MethodCallInputs {
     /// call.
     #[cfg(test)]
     pub(crate) fn take_computed_while_resolving(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .computed_while_resolving
-                .lock()
-                .expect("no panics while holding it"),
-        )
+        self.computed_while_resolving.take()
     }
 
     /// Every file's inputs, from `resolved`.
@@ -1691,12 +1704,7 @@ impl<'s> SiteSource<'s> {
         self.loaded
             .get(path)?
             .get_or_init(|| {
-                #[cfg(test)]
-                self.calls
-                    .computed_while_resolving
-                    .lock()
-                    .expect("no panics while holding it")
-                    .push(path.to_string());
+                self.calls.computed_while_resolving.note(path);
                 self.compute(path)
             })
             .as_deref()
@@ -2097,7 +2105,11 @@ aft_store::heap_bytes_of_fields!(FileLists {
     rust,
     module_declaring,
 });
-aft_store::heap_bytes_of_fields!(BindCache { files, lists });
+aft_store::heap_bytes_of_fields!(BindCache {
+    files,
+    lists,
+    bound_on_first_use
+});
 aft_store::heap_bytes_of_fields!(OrdinaryCalls {
     syntax,
     associated,
@@ -2114,4 +2126,5 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     own,
     methods,
     go_required,
+    computed_while_resolving,
 });
