@@ -4,8 +4,11 @@ Copied byte-for-byte from the Plexus repository (`cortexkit/plexus`),
 `crates/plexus-core/tests/fixtures/gh_shim_wire/`:
 
 - `README.md` and `replies-contract/` (27 vectors): commit
-  `4afa4f9e8488b29ac0fa4663aa3831eb6c349f5e` (2026-11-07,
-  "github facade: match GraphQL bot slugs in merge-queue ownership").
+  `92aeb8771f5ecfb7c86a5048cbd2c68f6e3c3eb8` (2026-11-08), which carries
+  `092b2776` ("github catalog: dequeue sends GitHub's id input field"). Only
+  `pr-dequeue-own.json` and `pr-dequeue-graphql-errors.json` changed since
+  the previous import from `4afa4f9e`: their GitHub-side query now names the
+  dequeue input field `id`.
 - `requests-contract/` (159 vectors): commit
   `3a702b4dc39eca2013407c8bed82b2adc5bc968b` (2026-10-29,
   "mason: add owned bot pull request merge queue operations").
@@ -35,9 +38,9 @@ The hashes below cover the exact Git blob bytes at the pinned Plexus commit;
 | `README.md` | `cda24bab7c08fb2caf7b5b7542ece62629a22d2f6645f47ff69731ff61cc03c4` |
 | `replies-contract/comment-edit-pre-read-unknown.json` | `f46647cf863fdeb0919f38df2e530df1ac1860a5b88462defbc19aad038a8331` |
 | `replies-contract/pr-dequeue-closed.json` | `c4e5799d628eb35cc662c5952158df984b78bd10aa4407d802f60039352136e8` |
-| `replies-contract/pr-dequeue-graphql-errors.json` | `21d2d0a4b0692ed6a648a6d80ebf5c8cb71ee69adb62a4b55b437616250880b4` |
+| `replies-contract/pr-dequeue-graphql-errors.json` | `6f7fb14918d3df5e7b92c0b37a4c6a7da4ed166acb8210e0e27f6aff17ac1711` |
 | `replies-contract/pr-dequeue-not-own.json` | `3a44f8aef93ec5ffd4e9867fdf7f4a92a12305dc90ebec5990f9781ddb33e036` |
-| `replies-contract/pr-dequeue-own.json` | `28fa66c1339ed652b05108c63c106878d7fb46b69b529224df717b57356a04b9` |
+| `replies-contract/pr-dequeue-own.json` | `73cdfe44607210fa5a22e6e998320b6413542980a6702b05fd36206c6c4bf42f` |
 | `replies-contract/pr-draft-not-own.json` | `2291c88046bf5f97179f06a26091861beda31b3fc66cab8c1d88439ca8c9a3e5` |
 | `replies-contract/pr-edit-not-own.json` | `fdb61597f7b15e9e1da6ca5648250e1fcae09a98ae42d9ea3552111695c71621` |
 | `replies-contract/pr-edit-pull-request-not-found.json` | `1a19a35d2929e989bbe6f5213a123efce5e4101ff00e4ca774893456b30f8982` |
