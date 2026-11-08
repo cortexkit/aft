@@ -67,7 +67,7 @@ The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation
 From the repository root, regenerate the vector files from the real handler with:
 
 ```sh
-ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked project_resolve_ -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --features test-hooks --locked project_resolve_ -- --nocapture
 ```
 
 Refresh the `project-resolve-v1` manifest from the repository root with:
@@ -87,5 +87,5 @@ PY
 Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored `served_vectors::project_resolve_v1_records_match_published_files` and `served_vectors::project_resolve_remote_v1_records_match_published_file` tests regenerate all five files from entorhinal's real request handling and compare each file byte for byte. Both tests also run under nextest:
 
 ```sh
-cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::project_resolve_)'
+cargo nextest run --workspace --all-targets --features test-hooks --locked -E 'test(served_vectors::project_resolve_)'
 ```

@@ -653,8 +653,12 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Library and binaries as shipped (no test hooks), then every target
+      # with the hooks the test suites need.
       - name: Cargo check (locked, MSRV floor)
-        run: cargo check --workspace --all-targets --locked
+        run: |
+          cargo check --workspace --lib --bins --locked
+          cargo check --workspace --all-targets --features test-hooks --locked
 
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
@@ -1530,8 +1534,15 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Library and binaries as shipped (no test hooks), then every target
+      # with the hooks the test suites need. pwsh doesn't stop on a failing
+      # native command, so each one checks its own exit code.
       - name: Cargo check (deny warnings)
-        run: cargo check --workspace --all-targets
+        run: |
+          cargo check --workspace --lib --bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --workspace --all-targets --features test-hooks
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: pwsh
         env:
           RUSTFLAGS: "-D warnings"
