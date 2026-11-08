@@ -12454,8 +12454,10 @@ mod edit_latency_tests {
         fs::write(&path, "original").unwrap();
         let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
         // Start from an empty WAL, then let any commit of two or more pages
-        // pass the threshold, so the mirror commit would checkpoint inline
-        // while staying far below the limit that forces an inline one.
+        // pass the threshold, so the mirror commit would checkpoint inline.
+        // The hook still checkpoints inline once the WAL holds
+        // `DEFERRED_CHECKPOINT_LIMIT` (8) thresholds, 16 pages here; a
+        // single mirror commit to an empty WAL stays well under that.
         conn.checkpoint_wal_as(
             crate::db::lifecycle::WalCheckpointMode::Truncate,
             crate::write_ledger::Domain::AftDb,

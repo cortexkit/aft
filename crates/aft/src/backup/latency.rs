@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 pub enum Part {
     /// Waiting for the process-wide backup store mutex.
     StoreLock,
-    /// Pending-discard retries, legacy-layout checks and once-per-process
+    /// Retrying removals of undo entries that an earlier failed call left
+    /// behind, legacy-layout checks and once-per-process
     /// backup maintenance that run before a snapshot.
     Maintenance,
     /// Taking the backup namespace, session and per-file stack locks.
