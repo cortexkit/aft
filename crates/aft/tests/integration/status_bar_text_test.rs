@@ -98,3 +98,36 @@ fn standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result() {
 
     assert!(aft.shutdown().success());
 }
+
+/// The TODO count comes from the index store, which hears of an edit made
+/// outside AFT only through the file watcher. An inspect sent right after such
+/// an edit must count the edited file as it now is, even though the watcher's
+/// event may not have been handed on yet (FSEvents and Windows notifications
+/// arrive later than inotify, and every platform holds a change for a short
+/// flush window before passing it on).
+#[test]
+fn inspect_right_after_an_outside_edit_counts_the_edited_todos() {
+    let project = tempfile::tempdir().expect("todo count project");
+    let file = project.path().join("a.ts");
+    std::fs::write(&file, "// TODO: first\nexport const a = 1;\n").expect("write fixture");
+    let mut aft = AftProcess::spawn_with_real_watcher();
+    aft.configure(project.path());
+
+    let text = inspect(&mut aft, "inspect-before");
+    let bar = trailing_bar(&text).unwrap_or_else(|| panic!("no trailing bar: {text:?}"));
+    assert!(bar.ends_with("| T1]"), "unexpected bar {bar:?}");
+
+    std::fs::write(
+        &file,
+        "// TODO: first\n// TODO: second\n// TODO: third\nexport const a = 1;\n",
+    )
+    .expect("rewrite fixture");
+    let text = inspect(&mut aft, "inspect-after");
+    let bar = trailing_bar(&text).unwrap_or_else(|| panic!("no trailing bar: {text:?}"));
+    assert!(
+        bar.ends_with("| T3]"),
+        "the outside edit's TODOs are not counted: {bar:?} in {text:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
