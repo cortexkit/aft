@@ -6,7 +6,9 @@ mod standalone_input;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: aft::alloc_trace::TracingAllocator = aft::alloc_trace::TracingAllocator;
 
-#[cfg(test)]
+// The tests read frames back through the unix loader, and only unix
+// targets record frames at all.
+#[cfg(all(test, unix))]
 #[path = "alloc_trace/process_tests.rs"]
 mod alloc_trace_process_tests;
 
