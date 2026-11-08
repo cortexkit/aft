@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -784,6 +784,22 @@ fn callgraph_pending_payload() -> Value {
     json!({"status": "pending", "reason": "callgraph_building", "complete": false})
 }
 
+/// One wait counted in a counter for as long as it lasts.
+struct CountedWait<'a>(&'a AtomicUsize);
+
+impl<'a> CountedWait<'a> {
+    fn start(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for CountedWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn callgraph_pending_result(job: &InspectJob, duration: Duration) -> InspectResult {
     InspectResult::success(
         job,
@@ -970,6 +986,10 @@ pub struct InspectManager {
     /// The data-layer checkouts dead code reads its call graph from while
     /// they are ready; empty unless the process runs the data layer.
     data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
+    /// How many dead-code passes are waiting for their call graph right now:
+    /// for it to be published, or to catch up with recorded edits. A pass
+    /// that is building but not waiting is working out dead code itself.
+    dead_code_callgraph_waits: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1135,6 +1155,7 @@ impl InspectManager {
             interactive_tier2_permits: Mutex::new(HashMap::new()),
             dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
             data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
+            dead_code_callgraph_waits: AtomicUsize::new(0),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Arc::new(Mutex::new(HashMap::new())),
@@ -1493,6 +1514,35 @@ impl InspectManager {
                     )
                 })
         })
+    }
+
+    /// What a dead-code pass still building waits for, as the pending
+    /// reason inspect reports: `callgraph_building` while it waits for its
+    /// call graph, `dead_code_building` while it works out dead code itself
+    /// (or waits for a build slot to). `None` when no pass is building.
+    pub(crate) fn dead_code_pending_reason(&self) -> Option<&'static str> {
+        if !self.dead_code_build_is_pending() {
+            return None;
+        }
+        Some(
+            if self.dead_code_callgraph_waits.load(Ordering::SeqCst) > 0 {
+                "callgraph_building"
+            } else {
+                "dead_code_building"
+            },
+        )
+    }
+
+    /// Marks a dead-code pass as waiting for its call graph, or no longer.
+    #[cfg(test)]
+    pub(crate) fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
+        if waiting {
+            self.dead_code_callgraph_waits
+                .fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.dead_code_callgraph_waits
+                .fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// The automatic-retry pause on `category`, if its last build failed and
@@ -2546,6 +2596,11 @@ impl InspectManager {
         refresh_paths: &[PathBuf],
     ) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError>
     {
+        // While this waits, a dead-code pass that inspect stops waiting for
+        // is reported as waiting for the call graph, not as working out dead
+        // code (see `dead_code_pending_reason`).
+        let _waiting = (job.category == InspectCategory::DeadCode)
+            .then(|| CountedWait::start(&self.dead_code_callgraph_waits));
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,

@@ -3126,7 +3126,8 @@ fn finish_tier2_phases(
             }
             if let Some(tier2_phase) = tier2_phase {
                 if payload["status"] == "pending" {
-                    tier2_phase.fail("callgraph_building; retry aft_inspect");
+                    let reason = payload["reason"].as_str().unwrap_or("callgraph_building");
+                    tier2_phase.fail(format!("{reason}; retry aft_inspect"));
                 } else {
                     tier2_phase.complete();
                 }
@@ -3172,12 +3173,14 @@ fn receive_tier2_completion_until(
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            if category == InspectCategory::DeadCode && manager.dead_code_build_is_pending() {
-                return Some(JobOutcome::Fresh {
-                    payload: serde_json::json!({
-                        "status": "pending", "reason": "callgraph_building", "complete": false,
-                    }),
-                });
+            if category == InspectCategory::DeadCode {
+                if let Some(reason) = manager.dead_code_pending_reason() {
+                    return Some(JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "status": "pending", "reason": reason, "complete": false,
+                        }),
+                    });
+                }
             }
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
                 return Some(JobOutcome::Failed {
@@ -6990,9 +6993,12 @@ mod fresh_payload_tests {
                     }
                     if key == "status" {
                         if value == "pending" {
-                            assert_eq!(
-                                fields.get("reason"),
-                                Some(&serde_json::json!("callgraph_building"))
+                            assert!(
+                                matches!(
+                                    fields.get("reason").and_then(Value::as_str),
+                                    Some("callgraph_building" | "dead_code_building")
+                                ),
+                                "a pending result names what it waits for: {value}"
                             );
                             assert_eq!(fields.get("complete"), Some(&Value::Bool(false)));
                             assert!(!fields.contains_key("count"));
@@ -9181,6 +9187,10 @@ mod deferred_terminal_tests {
         assert_eq!(manager.reuse_start_count_for_test(), starts_before);
     }
 
+    /// A dead-code pass still working out dead code at inspect's deadline is
+    /// reported as pending on its own analysis, not on the call graph: the
+    /// call graph was ready, and the first analysis of a checkout can take
+    /// tens of seconds by itself.
     #[test]
     fn inspect_builder_timeout_is_pending_while_building() {
         let (_tx, rx) = std::sync::mpsc::channel();
@@ -9194,6 +9204,28 @@ mod deferred_terminal_tests {
             None,
         )
         .expect("deadline produces an honest failure");
+        assert!(matches!(outcome, JobOutcome::Fresh { payload }
+            if payload == serde_json::json!({"status": "pending", "reason": "dead_code_building", "complete": false})));
+    }
+
+    /// A dead-code pass still waiting for its call graph at inspect's
+    /// deadline (to be published, or to catch up with edits) is reported as
+    /// waiting for the call graph.
+    #[test]
+    fn inspect_builder_timeout_names_the_call_graph_while_the_pass_waits_for_it() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let manager = crate::inspect::InspectManager::new();
+        manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+        manager.set_dead_code_waiting_for_callgraph_for_test(true);
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            std::time::Instant::now() + Duration::from_millis(20),
+            None,
+        )
+        .expect("deadline produces an honest failure");
+        manager.set_dead_code_waiting_for_callgraph_for_test(false);
         assert!(matches!(outcome, JobOutcome::Fresh { payload }
             if payload == serde_json::json!({"status": "pending", "reason": "callgraph_building", "complete": false})));
     }
@@ -9295,7 +9327,7 @@ mod deferred_terminal_tests {
         assert_eq!(
             payload["summary"]["dead_code"],
             serde_json::json!({
-            "status": "pending", "reason": "callgraph_building", "complete": false})
+            "status": "pending", "reason": "dead_code_building", "complete": false})
         );
         assert_eq!(
             payload["scanner_state"]["pending_categories"],
