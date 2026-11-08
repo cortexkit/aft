@@ -140,7 +140,7 @@
       "omitted": true,
       "read": "status",
       "reason": "serialized_body_limit",
-      "original_body_bytes": 74215
+      "original_body_bytes": 74081
     }
   }
 }
