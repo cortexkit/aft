@@ -9,15 +9,24 @@
 //! symbol up ([`warm_file`]). A record is used only while the file on disk
 //! still holds the content it was extracted from; any other file is left to
 //! the ordinary parse on first use.
+//!
+//! A table taken from a record is shared with every other checkout of the
+//! process ([`tables`]), so a worktree whose files match a sibling's takes
+//! the sibling's tables instead of decoding the same records again. When
+//! the checkout's recorded stat evidence still proves a file's content, by
+//! the rule the store's own binds trust, the file is not read either.
+
+pub(crate) mod tables;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use aft_store::content::OutlineSymbol;
+use aft_store::content::{OutlineSymbol, RecordKey};
 use aft_store::ids::ContentKey;
 
 use super::checkout::{CheckoutView, DataError};
+use super::content::EXTRACTOR_VERSION;
 use super::runtime::DataCheckout;
 use crate::context::AppContext;
 use crate::parser::{SharedSymbolCache, SymbolCache};
@@ -149,6 +158,9 @@ fn absolute(root: &Path, relative: &[u8]) -> Option<PathBuf> {
 /// Loads the symbols of the file at `relative` (absolute `path`) into
 /// `cache` at `generation`, as a parse would have stored them: under the
 /// modification time seen before reading, with the bytes' size and hash.
+/// The table comes from the process's shared tables when another checkout
+/// (or an earlier cache of this one) took it from the same record, and from
+/// the record otherwise.
 fn load(
     view: &CheckoutView,
     relative: &[u8],
@@ -156,8 +168,10 @@ fn load(
     cache: &SharedSymbolCache,
     generation: u64,
 ) -> Result<Outcome, DataError> {
-    let Ok(modified) = crate::bounded_io::metadata(path).and_then(|metadata| metadata.modified())
-    else {
+    let Ok(metadata) = crate::bounded_io::metadata(path) else {
+        return Ok(Outcome::Left);
+    };
+    let Ok(modified) = metadata.modified() else {
         return Ok(Outcome::Left);
     };
     match cache.read() {
@@ -168,20 +182,65 @@ fn load(
         }
         _ => return Ok(Outcome::Superseded),
     }
-    let Some(stored) = view.outline_symbols(relative)? else {
+    let Some(record) = view.unchanged_record(relative) else {
         return Ok(Outcome::Left);
     };
-    if !parsed_as(path, &stored.language) {
+    if !parsed_as(path, &record.language) {
         return Ok(Outcome::Left);
+    }
+    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+    // The checkout's stat evidence proves the file still holds the bytes
+    // its record was read from: a shared table needs no read of the file.
+    if record.kind.has_content()
+        && aft_store::stat::observe(path)
+            .ok()
+            .flatten()
+            .is_some_and(|now| record.stat.proves_unchanged(&now))
+    {
+        if let Some(table) = tables::shared().get(key) {
+            return Ok(insert(
+                cache,
+                generation,
+                path,
+                modified,
+                metadata.len(),
+                table.content_hash,
+                table.symbols,
+                true,
+            ));
+        }
     }
     // A parse reads the file as UTF-8 text and fails otherwise, so a file
     // that is not text is left to fail the same way.
     let Ok(source) = crate::parser::read_source(path) else {
         return Ok(Outcome::Left);
     };
-    if ContentKey::of(source.as_bytes()) != stored.content {
+    // The cache's content hash is the bytes' BLAKE3 hash up to its size cap,
+    // and a content key is the first half of the same hash.
+    let content_hash = crate::parser::content_hash_for_source(&source);
+    let content = if source.len() as u64 > crate::cache_freshness::CONTENT_HASH_SIZE_CAP {
+        ContentKey::of(source.as_bytes())
+    } else {
+        ContentKey::from_hash(&content_hash)
+    };
+    if content != record.content {
         return Ok(Outcome::Left);
     }
+    if let Some(table) = tables::shared().get(key) {
+        return Ok(insert(
+            cache,
+            generation,
+            path,
+            modified,
+            source.len() as u64,
+            table.content_hash,
+            table.symbols,
+            true,
+        ));
+    }
+    let Some(stored) = view.outline_symbols(relative)? else {
+        return Ok(Outcome::Left);
+    };
     let Some(symbols) = stored
         .symbols
         .iter()
@@ -190,20 +249,68 @@ fn load(
     else {
         return Ok(Outcome::Left);
     };
-    let Ok(mut cache) = cache.write() else {
-        return Ok(Outcome::Superseded);
-    };
-    if cache.generation() != generation {
-        return Ok(Outcome::Superseded);
-    }
-    cache.insert(
-        path.to_path_buf(),
+    let (symbols, shared) = tables::shared().share(key, symbols, content_hash);
+    Ok(insert(
+        cache,
+        generation,
+        path,
         modified,
         source.len() as u64,
-        crate::parser::content_hash_for_source(&source),
+        content_hash,
         symbols,
-    );
-    Ok(Outcome::Loaded)
+        shared,
+    ))
+}
+
+/// Inserts a file's table into `cache` while it is at `generation`; with
+/// `shared`, as a table the process's shared tables count.
+#[allow(clippy::too_many_arguments)]
+fn insert(
+    cache: &SharedSymbolCache,
+    generation: u64,
+    path: &Path,
+    modified: SystemTime,
+    size: u64,
+    content_hash: blake3::Hash,
+    symbols: Arc<Vec<crate::symbols::Symbol>>,
+    shared: bool,
+) -> Outcome {
+    let Ok(mut cache) = cache.write() else {
+        return Outcome::Superseded;
+    };
+    if cache.generation() != generation {
+        return Outcome::Superseded;
+    }
+    let path = path.to_path_buf();
+    if shared {
+        cache.insert_shared_table(path, modified, size, content_hash, symbols);
+    } else {
+        cache.insert(
+            path,
+            modified,
+            size,
+            content_hash,
+            Arc::unwrap_or_clone(symbols),
+        );
+    }
+    Outcome::Loaded
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Content records read for their outline on this thread.
+    static RECORD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a content record read for its outline, for tests.
+#[cfg(test)]
+pub(crate) fn note_record_read() {
+    RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+#[cfg(test)]
+fn record_reads() -> u64 {
+    RECORD_READS.with(std::cell::Cell::get)
 }
 
 /// Whether a parse of `path` would use `language`, the one its record was
@@ -668,5 +775,246 @@ pub fn separator() -> char {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(cache.read().unwrap().len(), sources.len());
+    }
+
+    /// Runs `git` in `dir` with an identity of its own, so a commit needs
+    /// no configuration from the machine.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=AFT",
+                "-c",
+                "user.email=aft@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// AFT's own sources for a checkout of real size: the store crate's
+    /// Rust files and the bridge's TypeScript files, relative to `root`
+    /// once copied there.
+    fn aft_sources(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let crate_dir = crate::test_support::manifest_dir();
+        let repo = crate_dir.parent().unwrap().parent().unwrap();
+        let mut found = Vec::new();
+        walk(&repo.join("crates/aft-store/src"), &mut found);
+        for entry in std::fs::read_dir(repo.join("packages/aft-bridge/src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "ts") {
+                found.push(path);
+            }
+        }
+        let mut sources = found
+            .iter()
+            .map(|path| {
+                let relative = path.strip_prefix(repo).unwrap().to_str().unwrap();
+                let relative = relative.replace('\\', "/");
+                copy(root, path, &relative);
+                relative
+            })
+            .collect::<Vec<_>>();
+        sources.sort();
+        sources
+    }
+
+    /// `value` without the keys that time an answer, which differ between
+    /// any two runs.
+    fn untimed(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .filter(|(key, _)| !key.ends_with("_ms"))
+                .map(|(key, value)| (key, untimed(value)))
+                .collect(),
+            serde_json::Value::Array(items) => items.into_iter().map(untimed).collect(),
+            other => other,
+        }
+    }
+
+    /// What outline, zoom and aft_search answer in `ctx`: an outline of
+    /// every file, a zoom on each of `symbols`, and a search for each of
+    /// their names. Searches are asked again until two rounds agree, so an
+    /// index still building in the background does not count as a change.
+    fn answers(
+        ctx: &AppContext,
+        root: &Path,
+        sources: &[String],
+        symbols: &[(String, String)],
+    ) -> Vec<serde_json::Value> {
+        let mut answers = Vec::new();
+        for source in sources {
+            let answer = outline(ctx, &root.join(source));
+            answers.push(untimed(serde_json::to_value(answer).unwrap()));
+        }
+        for (source, name) in symbols {
+            let answer = crate::commands::zoom::handle_zoom(
+                &request(
+                    "zoom",
+                    serde_json::json!({ "file": root.join(source), "symbol": name }),
+                ),
+                ctx,
+            );
+            answers.push(untimed(serde_json::to_value(answer).unwrap()));
+        }
+        let search = || {
+            symbols
+                .iter()
+                .map(|(_, name)| {
+                    let answer = crate::commands::semantic_search::handle_semantic_search(
+                        &request(
+                            "semantic_search",
+                            serde_json::json!({ "query": name, "top_k": 5 }),
+                        ),
+                        ctx,
+                    );
+                    untimed(serde_json::to_value(answer).unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last = search();
+        loop {
+            let next = search();
+            if next == last || Instant::now() > deadline {
+                break;
+            }
+            last = next;
+        }
+        answers.extend(last);
+        answers
+    }
+
+    /// A worktree whose files match its sibling's takes the sibling's
+    /// symbol tables: it reads none of its records and none of its files,
+    /// its cache leaves the shared tables to the process's count, and
+    /// outline, zoom and aft_search answer exactly as when the worktree
+    /// decodes every record itself, as it did before tables were shared.
+    /// Stat evidence proves content only on platforms whose file times
+    /// change on every write, so the test runs on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn a_matching_worktree_takes_its_siblings_tables_and_answers_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let main = base.join("main");
+        let worktree = base.join("worktree");
+        std::fs::create_dir_all(&main).unwrap();
+        let sources = aft_sources(&main);
+        git(&main, &["init", "-q"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-q", "-m", "sources"]);
+        git(
+            &main,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        // A file modified within the store's racy window of its scan proves
+        // nothing by its stat: let every file age past it first.
+        std::thread::sleep(Duration::from_nanos(
+            aft_store::stat::RACY_WINDOW_NS as u64 + 200_000_000,
+        ));
+        let storage = tempfile::tempdir().unwrap();
+        for root in [&main, &worktree] {
+            let outcome = crate::data_layer::surfaces::index_root(
+                root,
+                storage.path(),
+                crate::data_layer::checkout::Planes::ALL,
+            )
+            .unwrap();
+            assert!(outcome.published);
+        }
+        let main_ctx = context(&main, storage.path());
+        let worktree_ctx = context(&worktree, storage.path());
+        let view = |ctx: &AppContext| {
+            let view = ctx.data_checkout().unwrap().view().unwrap();
+            assert!(view.status().callgraph_published);
+            view
+        };
+        let (main_view, worktree_view) = (view(&main_ctx), view(&worktree_ctx));
+        let files = sources.len() as u64;
+
+        // Before tables were shared, the worktree decoded every record.
+        let cache = worktree_ctx.symbol_cache();
+        let generation = cache.read().unwrap().generation();
+        let reads = record_reads();
+        let decoded = tables::without_sharing(|| {
+            prewarm(&worktree_view, &cache, generation, &|| false).unwrap()
+        });
+        assert_eq!(decoded.loaded, files);
+        assert_eq!(record_reads() - reads, files);
+        let decoded_bytes = cache.read().unwrap().estimated_memory().estimated_bytes;
+        // Up to four top-level symbols of each file to zoom on and search.
+        let mut symbols = Vec::new();
+        let mut table_bytes = 0;
+        for source in &sources {
+            let table = crate::parser::FileParser::with_symbol_cache(Arc::clone(&cache))
+                .extract_symbols(&worktree.join(source))
+                .unwrap();
+            table_bytes += crate::parser::symbols_estimated_bytes(&table);
+            symbols.extend(
+                table
+                    .iter()
+                    .filter(|symbol| symbol.parent.is_none())
+                    .take(4)
+                    .map(|symbol| (source.clone(), symbol.name.clone())),
+            );
+        }
+        assert!(symbols.len() > 100, "{} symbols", symbols.len());
+        let before = answers(&worktree_ctx, &worktree, &sources, &symbols);
+
+        // The main checkout's prewarm lists its tables for the process.
+        let main_cache = main_ctx.symbol_cache();
+        let main_generation = main_cache.read().unwrap().generation();
+        let main_report = prewarm(&main_view, &main_cache, main_generation, &|| false).unwrap();
+        assert_eq!(main_report.loaded, files);
+
+        // The worktree bound again takes them: no record and no file read.
+        let generation = cache.write().unwrap().reset();
+        let reads = record_reads();
+        let source_reads = work_counters::SOURCE_READS.with(std::cell::Cell::get);
+        let shared = prewarm(&worktree_view, &cache, generation, &|| false).unwrap();
+        assert_eq!(shared.loaded, files);
+        assert_eq!(record_reads() - reads, 0, "records read");
+        assert_eq!(
+            work_counters::SOURCE_READS.with(std::cell::Cell::get) - source_reads,
+            0,
+            "files read"
+        );
+        // Its cache counts every table but the shared ones, which the
+        // process counts once.
+        let shared_bytes = cache.read().unwrap().estimated_memory().estimated_bytes;
+        assert_eq!(shared_bytes.map(|bytes| bytes + table_bytes), decoded_bytes);
+        let listed = loop {
+            // Another test's prewarm may hold the tables for a moment.
+            if let Some(stats) = tables::shared().stats() {
+                break stats;
+            }
+            std::thread::yield_now();
+        };
+        assert!(listed.bytes >= table_bytes);
+
+        let after = answers(&worktree_ctx, &worktree, &sources, &symbols);
+        assert_eq!(after.len(), before.len());
+        for (after, before) in after.iter().zip(&before) {
+            assert_eq!(after, before);
+        }
     }
 }

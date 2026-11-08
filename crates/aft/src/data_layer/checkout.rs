@@ -4840,6 +4840,20 @@ impl CheckoutView {
 
 /// Outline's symbols for one file, from its stored content record.
 impl CheckoutView {
+    /// The record of the file at `path` (relative to the root,
+    /// `/`-separated) in the view's current state, when the file has not
+    /// changed since the publication and is in a parsed language: the files
+    /// whose published records [`outline_symbols`](Self::outline_symbols)
+    /// reads.
+    pub(crate) fn unchanged_record(&self, path: &[u8]) -> Option<&aft_store::checkout::PathRecord> {
+        let published = self.published.state.get(path)?;
+        let current = self.current_state().get(path)?;
+        (current.content == published.content
+            && current.language == published.language
+            && super::content::is_parsed_language(&published.language))
+        .then_some(current)
+    }
+
     /// The symbols outline lists for the file at `path` (relative to the
     /// root, `/`-separated), as the record of its published content holds
     /// them, with that content's key and language. `None` when the path
@@ -4854,15 +4868,9 @@ impl CheckoutView {
         &self,
         path: &[u8],
     ) -> Result<Option<super::outline::StoredOutline>, DataError> {
-        let Some(published) = self.published.state.get(path) else {
+        let Some(published) = self.unchanged_record(path) else {
             return Ok(None);
         };
-        let unchanged = self.current_state().get(path).is_some_and(|current| {
-            current.content == published.content && current.language == published.language
-        });
-        if !unchanged || !super::content::is_parsed_language(&published.language) {
-            return Ok(None);
-        }
         let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
         for segment in self.published.segments.iter().rev() {
             let Some(content) = ContentSegment::open(segment).map_err(DataError::store)? else {
@@ -4871,6 +4879,8 @@ impl CheckoutView {
             let Some(ordinal) = content.find(key).map_err(DataError::store)? else {
                 continue;
             };
+            #[cfg(test)]
+            super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
             let RecordBody::Parsed { body, .. } = record.data else {
                 return Ok(None);
