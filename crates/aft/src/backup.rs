@@ -12451,9 +12451,15 @@ mod edit_latency_tests {
         let path = project.path().join("edited.txt");
         fs::write(&path, "original").unwrap();
         let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
-        // Every commit passes the threshold, so the mirror commit would
-        // checkpoint inline.
-        conn.set_wal_autocheckpoint(1).unwrap();
+        // Start from an empty WAL, then let any commit of two or more pages
+        // pass the threshold, so the mirror commit would checkpoint inline
+        // while staying far below the limit that forces an inline one.
+        conn.checkpoint_wal_as(
+            crate::db::lifecycle::WalCheckpointMode::Truncate,
+            crate::write_ledger::Domain::AftDb,
+        )
+        .unwrap();
+        conn.set_wal_autocheckpoint(2).unwrap();
         let db_file = PathBuf::from(conn.path().unwrap());
         let pool = Arc::new(Mutex::new(conn));
         let mut store = BackupStore::new();
