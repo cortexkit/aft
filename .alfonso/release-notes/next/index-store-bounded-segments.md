@@ -1,0 +1,1 @@
+- The index store no longer piles up files while worktrees keep editing, and AFT holds at most 1,024 index files open, so busy daemons stay well below macOS's open-file limit.
