@@ -35,8 +35,6 @@ use crate::parser::{SharedSymbolCache, SymbolCache};
 pub(crate) struct StoredOutline {
     /// The content the symbols were extracted from.
     pub(crate) content: ContentKey,
-    /// The language the content was parsed as.
-    pub(crate) language: String,
     pub(crate) symbols: Vec<OutlineSymbol>,
 }
 

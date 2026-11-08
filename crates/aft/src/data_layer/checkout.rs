@@ -4856,7 +4856,7 @@ impl CheckoutView {
 
     /// The symbols outline lists for the file at `path` (relative to the
     /// root, `/`-separated), as the record of its published content holds
-    /// them, with that content's key and language. `None` when the path
+    /// them, with that content's key. `None` when the path
     /// changed since the publication, is not parsed, or its record holds no
     /// outline. The file on disk may still have moved on: compare its bytes
     /// with the key before using the symbols.
@@ -4887,7 +4887,6 @@ impl CheckoutView {
             };
             return Ok(body.outline.map(|symbols| super::outline::StoredOutline {
                 content: published.content,
-                language: published.language.clone(),
                 symbols,
             }));
         }
