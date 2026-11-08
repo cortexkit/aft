@@ -892,15 +892,23 @@ fn build_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<usize, 
 /// Folds `checkout`'s segments as the runtime does, building it again whole
 /// when the fold cannot run, while another thread keeps recording `noise`:
 /// changes recorded during the fold must stay laid over its publication.
-/// Returns how many recordings it made, and what the fold did.
-fn fold_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<(usize, String), String> {
+/// Returns how many recordings it made, whether the fold ran, and what it
+/// did.
+fn fold_under_watcher(
+    checkout: &Checkout,
+    noise: &[Vec<u8>],
+) -> Result<(usize, bool, String), String> {
     let mut outcome = String::new();
+    let mut folded = false;
     let recorded = under_watcher(checkout, noise, || {
         outcome = match checkout.fold().map_err(|error| error.to_string())? {
-            Folded::Done(report) => format!(
-                "folded {} segments into one of {} bytes",
-                report.read_before, report.segment_bytes
-            ),
+            Folded::Done(report) => {
+                folded = true;
+                format!(
+                    "folded {} segments into one of {} bytes",
+                    report.read_before, report.segment_bytes
+                )
+            }
             Folded::Superseded => "stood down for another publication".to_string(),
             Folded::NeedsBuild(why) => {
                 checkout.build().map_err(|error| error.to_string())?;
@@ -909,7 +917,7 @@ fn fold_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<(usize, 
         };
         Ok(())
     })?;
-    Ok((recorded, outcome))
+    Ok((recorded, folded, outcome))
 }
 
 /// Runs `work` while another thread keeps recording `noise` into
@@ -1302,8 +1310,10 @@ pub struct Summary {
     pub failed: usize,
     /// Times A's changes were published on their own.
     pub publications: usize,
-    /// Builds that folded A's segments once it read from too many.
+    /// Folds of A's segments once it read from too many, and the times a
+    /// fold could not run and A was built again whole instead.
     pub compactions: usize,
+    pub compaction_builds: usize,
     /// The most segments only A read from after a publication of its
     /// changes, and the most it read from in all.
     pub most_segments: usize,
@@ -1365,8 +1375,12 @@ impl Summary {
             report.retired_segments
         ));
         if report.wants_fold() {
-            let (recorded, outcome) = fold_under_watcher(checkout, noise)?;
-            self.compactions += 1;
+            let (recorded, folded, outcome) = fold_under_watcher(checkout, noise)?;
+            if folded {
+                self.compactions += 1;
+            } else {
+                self.compaction_builds += 1;
+            }
             events.push(format!(
                 "{outcome} past its segment limits, while a watcher recorded {recorded} times"
             ));

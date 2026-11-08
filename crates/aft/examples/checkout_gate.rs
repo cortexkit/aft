@@ -13,7 +13,7 @@
 //! default); `CHECKOUT_GATE_MEMORY_EVERY=N` writes a `memory {json}` line
 //! to stderr every N edits and around each build and comparison. Exits
 //! nonzero when any comparison differs, when nothing was compared, or when
-//! checkout A never read from enough segments for a build to fold them.
+//! checkout A's segments were never folded.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -28,12 +28,13 @@ fn main() {
             .unwrap();
     eprintln!(
         "compared checkouts with cold builds {} times; {} differed; {} publications of changes, \
-         {} builds that folded A's segments (at most {} segments only A read, {} in all, {} in \
-         the store); {} new worktrees started from a sibling",
+         {} folds of A's segments and {} builds where a fold could not run (at most {} segments \
+         only A read, {} in all, {} in the store); {} new worktrees started from a sibling",
         summary.comparisons,
         summary.failed,
         summary.publications,
         summary.compactions,
+        summary.compaction_builds,
         summary.most_segments,
         summary.most_read_segments,
         summary.most_store_segments,
@@ -43,7 +44,7 @@ fn main() {
     assert_eq!(summary.failed, 0, "a checkout differs from a cold build");
     assert!(
         summary.compactions > 0,
-        "checkout A never read from enough segments for a build to fold them: \
-         replay more edits or lower CHECKOUT_GATE_PUBLISH_EDITS"
+        "checkout A's segments were never folded: replay more edits or lower \
+         CHECKOUT_GATE_PUBLISH_EDITS"
     );
 }
