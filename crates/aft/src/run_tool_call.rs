@@ -796,6 +796,12 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
+    // The allocation tracer attributes what the call allocates, including
+    // pool work that carries the label, to the tool.
+    let _alloc_label = crate::alloc_trace::scope(
+        crate::alloc_trace::Label::tool(bare_name),
+        Some(&ctx.project_root),
+    );
     let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
     // The preflight below and the dispatched command share one config
     // snapshot, even if a live config reload publishes in between.

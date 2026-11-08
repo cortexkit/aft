@@ -68,6 +68,8 @@ pub(crate) fn prewarm(
     generation: u64,
     stop: &dyn Fn() -> bool,
 ) -> Result<Prewarm, DataError> {
+    let _alloc_label =
+        crate::alloc_trace::scope(crate::alloc_trace::Label::SYMBOL_PREWARM, Some(view.root()));
     let root = view.root().to_path_buf();
     if let Ok(mut cache) = cache.write() {
         if !cache.set_project_root_for_generation(generation, root.clone()) {

@@ -319,9 +319,11 @@ impl<'i> SectionsWriter<'i> {
     ) -> Result<(), String> {
         use rayon::prelude::*;
         let this = &*self;
+        let carry = crate::alloc_trace::carry();
         let built = files
             .par_iter()
             .map_init(HashMap::new, |subjects, (file, resolution)| {
+                let _label = carry.enter();
                 this.built(inputs, file, resolution, subjects)
             })
             .collect::<Vec<_>>();

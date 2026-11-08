@@ -637,6 +637,9 @@ impl ProcessMemorySnapshot {
 /// `memory.roots` map pushes later sections past the cut).
 pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
 
+/// Operations the census names by their allocation high-water mark.
+const CENSUS_ALLOCATION_LABELS: usize = 5;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
     pub roots_status: &'static str,
@@ -661,6 +664,12 @@ pub struct MemorySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_layer_block_cache: Option<MemoryEstimate>,
     pub process: ProcessMemorySnapshot,
+    /// The operations whose live heap bytes peaked highest since the
+    /// previous census, highest first, as the `aft` binary's allocation
+    /// tracer counts them. Only the uncapped census carries them, and only
+    /// when an operation allocated since the last one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allocation_labels: Vec<crate::alloc_trace::LabelPeak>,
 }
 
 /// Memory attributed once for the whole process rather than to any root:
@@ -804,6 +813,12 @@ impl MemorySnapshot {
         } else {
             (roots, 0, 0)
         };
+        // Reading the marks restarts them, so only the census reads them.
+        let allocation_labels = if cap_detail {
+            Vec::new()
+        } else {
+            crate::alloc_trace::take_census_peaks(CENSUS_ALLOCATION_LABELS)
+        };
         Self {
             roots_status,
             roots,
@@ -813,6 +828,7 @@ impl MemorySnapshot {
             shared_semantic_bases,
             data_layer_block_cache,
             process,
+            allocation_labels,
         }
     }
 }

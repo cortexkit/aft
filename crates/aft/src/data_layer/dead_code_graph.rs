@@ -561,7 +561,9 @@ impl<'f> DeadCodeGraph<'f> {
     pub(crate) fn open(root: &Path, source: &'f dyn CallGraphFiles) -> Result<Self, String> {
         use rayon::prelude::*;
         let graph = Self::open_lazy(root, source);
+        let carry = crate::alloc_trace::carry();
         graph.files.par_iter().for_each(|(path, _)| {
+            let _label = carry.enter();
             let _ = graph.file(path);
         });
         match graph.failure() {

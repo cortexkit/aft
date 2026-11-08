@@ -154,6 +154,8 @@ impl Checkout {
     /// When the store cannot be written, or a newer build wrote a file it
     /// names. Nothing is published then, and the publication keeps serving.
     pub fn fold(&self) -> Result<Folded, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::SEGMENT_FOLD, Some(self.root()));
         let started = Instant::now();
         self.family.check_formats().map_err(DataError::store)?;
         self.check_disk_floor()?;

@@ -542,7 +542,7 @@ impl LiveCheckout {
     pub(crate) fn cold(inputs: CheckoutInputs) -> Result<Self, ManifestJoinError> {
         let pool = super::callgraph::engine_pool()?;
         let bound = BindCache::default();
-        let (resolved, calls) = pool.install(|| {
+        let (resolved, calls) = crate::alloc_trace::install(&pool, || {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
             bound.bind_missing(&inputs, &paths)?;
             let mut resolved = resolve_files(&inputs, &bound, &paths)?;
@@ -616,7 +616,7 @@ impl LiveCheckout {
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
-        let mut stats = pool.install(|| {
+        let mut stats = crate::alloc_trace::install(&pool, || {
             let stats = self.update_in_pool(next, changed)?;
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
@@ -631,7 +631,7 @@ impl LiveCheckout {
     /// Runs `op` on the engine's thread pool, which every engine of the
     /// process shares (see `callgraph::engine_pool`).
     pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(op)
+        crate::alloc_trace::install(&self.pool, op)
     }
 
     /// Whether this engine and `other` resolve on the same thread pool.

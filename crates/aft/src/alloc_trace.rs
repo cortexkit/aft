@@ -497,13 +497,7 @@ impl Drop for ScopeGuard {
         if !self.owner || self.label == 0 {
             return;
         }
-        let state = &LABELS[usize::from(self.label)];
-        if state.active.fetch_sub(1, Ordering::Relaxed) == 1 {
-            // No scope of the label is open: what it still holds was handed
-            // on, so its count starts again from zero.
-            state.live.store(0, Ordering::Relaxed);
-            end_burst(self.label, root);
-        }
+        close_scope(self.label, root);
     }
 }
 
@@ -522,6 +516,74 @@ pub fn carry() -> Carry {
     })
 }
 
+/// `pool.install(op)`, with `op` run under the caller's label. Parallel
+/// iterators inside `op` carry it further with [`Carry::each`].
+pub fn install<R: Send>(pool: &rayon::ThreadPool, op: impl FnOnce() -> R + Send) -> R {
+    pool.install(carry().wrap(op))
+}
+
+/// `inner`, with every poll run under `label`. For async work, where a
+/// [`ScopeGuard`] cannot be held across an await: the label is open from the
+/// first poll until the future is dropped.
+pub fn future<F: std::future::Future>(label: Label, root: Option<&Path>, inner: F) -> Labelled<F> {
+    Labelled {
+        inner,
+        carry: Carry {
+            label: label.0,
+            root: root.map_or_else(|| carry().root, RootName::from_path),
+        },
+        open: false,
+    }
+}
+
+/// A future whose polls run under a label; see [`future`].
+pub struct Labelled<F> {
+    inner: F,
+    carry: Carry,
+    /// Whether this future counts as an open scope of its label.
+    open: bool,
+}
+
+impl<F: std::future::Future> std::future::Future for Labelled<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // SAFETY: `inner` is never moved out of the pinned wrapper; the other
+        // fields are plain data.
+        let this = unsafe { self.get_unchecked_mut() };
+        if !this.open && this.carry.label != 0 {
+            this.open = true;
+            LABELS[usize::from(this.carry.label)]
+                .active
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let _label = this.carry.enter();
+        // SAFETY: as above.
+        unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx)
+    }
+}
+
+impl<F> Drop for Labelled<F> {
+    fn drop(&mut self) {
+        if self.open {
+            close_scope(self.carry.label, self.carry.root);
+        }
+    }
+}
+
+/// One open scope of `label` closed. When it was the last, the label's count
+/// starts again from zero: what it still holds was handed on.
+fn close_scope(label: u8, root: RootName) {
+    let state = &LABELS[usize::from(label)];
+    if state.active.fetch_sub(1, Ordering::Relaxed) == 1 {
+        state.live.store(0, Ordering::Relaxed);
+        end_burst(label, root);
+    }
+}
+
 impl Carry {
     /// Attributes the pool thread's allocations to the carried label until
     /// the guard drops. The task's owner keeps the label open meanwhile.
@@ -534,6 +596,15 @@ impl Carry {
         move || {
             let _label = self.enter();
             work()
+        }
+    }
+
+    /// `work` for each item of a parallel iterator, each call run under the
+    /// carried label on whichever pool thread takes the item.
+    pub fn each<T, R>(self, work: impl Fn(T) -> R) -> impl Fn(T) -> R {
+        move |item| {
+            let _label = self.enter();
+            work(item)
         }
     }
 
