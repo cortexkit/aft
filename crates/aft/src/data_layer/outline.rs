@@ -1006,7 +1006,6 @@ pub fn separator() -> char {
             "{:?}",
             searches.first()
         );
-        eprintln!("TEMP first search answer: {}", searches[0]);
 
         // The main checkout's prewarm lists its tables for the process.
         let main_cache = main_ctx.symbol_cache();
