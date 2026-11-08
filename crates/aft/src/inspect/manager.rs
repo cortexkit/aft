@@ -6684,6 +6684,8 @@ mod guard_tests {
         .unwrap();
         let snapshot = tier1_snapshot(&root);
         let inspect_dir = snapshot.inspect_dir.clone();
+        // The count reads the index store's records of the root.
+        let _store = crate::data_layer::tools::inspect::bind_published_for_test(&root);
         let manager = InspectManager::new();
 
         assert_eq!(

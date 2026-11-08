@@ -20,6 +20,7 @@ use crate::callgraph_store::join::{
     self, BlobImport, BlobRef, BlobRefKind, BlobSymbol, CallgraphBlob, ConfigBlob,
     ManifestJoinError, ParseBlob,
 };
+use crate::inspect::scanners::todos::{self, TodoLanguage};
 use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
@@ -47,8 +48,25 @@ use crate::parser::LangId;
 /// analysis reads from the syntax tree, so an analysis never parses a file
 /// again; 11 stopped recording a method-call site for a Python call through
 /// a dotted module import (`import pkg.mod` then `pkg.mod.f()`), whose
-/// unresolved site replaced the call's resolved module binding.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-11";
+/// unresolved site replaced the call's resolved module binding; 12 added
+/// each file's TODO markers, and records holding only the markers of the
+/// files whose comments are counted but which the call graph does not parse
+/// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-12";
+
+/// The start of the language of a file whose record holds only its TODO
+/// markers: a Markdown file, a minified bundle, or a C header no grammar
+/// resolves. The rest names the language its comments are read as (see
+/// [`TodoLanguage::name`]), such as `markers-markdown`.
+pub const MARKERS_PREFIX: &str = "markers-";
+
+/// Whether `language` (as [`language_for`] chose it) is one the call graph
+/// parses: not a configuration file read raw, nor a file whose record holds
+/// only its TODO markers.
+#[must_use]
+pub fn is_parsed_language(language: &str) -> bool {
+    !language.is_empty() && language != "config" && !language.starts_with(MARKERS_PREFIX)
+}
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -81,25 +99,88 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
 }
 
 /// The language the call graph parses the file at `path` as, `"config"`
-/// for resolver configuration it reads raw, or `None` for a file the call
-/// graph does not read, a minified bundle among them.
+/// for resolver configuration it reads raw, a [`MARKERS_PREFIX`] language
+/// for a file whose record holds only its TODO markers (a Markdown file, a
+/// minified bundle, a C header no grammar resolves), or `None` for a file
+/// with neither.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
         return Some("config".to_string());
     }
-    if crate::file_kind::is_minified(path, source) {
-        return None;
-    }
+    let path_text = path;
     let path = Path::new(path);
+    if crate::file_kind::is_minified(path_text, source) {
+        return markers_language(path);
+    }
     let language = if path.extension().is_some_and(|extension| extension == "h") {
         // A header's language comes from parsing these bytes: C, then C++,
-        // then Objective-C. A header that is not text parses as nothing.
-        crate::parser::detect_language_from_source(path, std::str::from_utf8(source).ok()?)?
+        // then Objective-C. A header that is not text parses as nothing;
+        // one that no grammar resolves has its comments read lexically.
+        let text = std::str::from_utf8(source).ok()?;
+        match crate::parser::detect_language_from_source(path, text) {
+            Some(language) => language,
+            None => return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name())),
+        }
     } else {
-        crate::callgraph_extractor::source_language(path)?
+        match crate::callgraph_extractor::source_language(path) {
+            Some(language) => language,
+            None => return markers_language(path),
+        }
     };
     Some(format!("{language:?}").to_lowercase())
+}
+
+/// The markers-only language of the file at `path`, when its TODOs are
+/// counted.
+fn markers_language(path: &Path) -> Option<String> {
+    let language = todos::path_todo_language(path)?;
+    Some(format!("{MARKERS_PREFIX}{}", language.name()))
+}
+
+/// The record holding only the TODO markers of `source`, whose comments are
+/// read as `name` (a [`MARKERS_PREFIX`] language without its prefix).
+fn markers_record(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJoinError> {
+    let name = language.strip_prefix(MARKERS_PREFIX).unwrap_or(language);
+    let todos = match TodoLanguage::from_name(name) {
+        Some(TodoLanguage::Lexical) => todos::markers_lexical(source),
+        Some(TodoLanguage::Tree(lang)) => {
+            let tree = parse(source, lang)?;
+            todos::markers_from_tree(source, lang, &tree)
+        }
+        None => return Err(ManifestJoinError::UnsupportedLanguage(language.to_string())),
+    };
+    Ok(ContentRecord {
+        language: language.to_string(),
+        extractor_version: EXTRACTOR_VERSION.to_string(),
+        data: RecordBody::Markers,
+        todos: Some(todos),
+    })
+}
+
+/// Adds to `record`, when it is the configuration record of the file at
+/// `path` (relative to the root) holding `source`, the TODO markers of the
+/// file's comments, read as the language its name calls for (TOML for
+/// `Cargo.toml`, YAML for `pnpm-workspace.yaml`). A configuration record's
+/// key does not name that language, so the markers say which they were
+/// read as.
+///
+/// # Errors
+///
+/// When the source cannot be parsed.
+pub fn add_config_markers(
+    record: &mut ContentRecord,
+    path: &str,
+    source: &[u8],
+) -> Result<(), ManifestJoinError> {
+    if !matches!(record.data, RecordBody::Config { .. }) {
+        return Ok(());
+    }
+    if let Some(TodoLanguage::Tree(lang)) = todos::path_todo_language(Path::new(path)) {
+        let tree = parse(source, lang)?;
+        record.todos = Some(todos::markers_from_tree(source, lang, &tree));
+    }
+    Ok(())
 }
 
 /// Extracts the record of `source` in `language` (as [`language_for`]
@@ -127,6 +208,41 @@ fn parsed_text(source: &[u8]) -> &str {
     std::str::from_utf8(source).unwrap_or("")
 }
 
+/// Parses `source` as `lang` for extraction. Every parse of this module
+/// goes through here.
+fn parse(source: &[u8], lang: LangId) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    #[cfg(test)]
+    note_parsed_for_test(source);
+    join::single_walk::parse_source(parsed_text(source), lang)
+}
+
+/// The contents extraction has parsed, for tests that check what a reader
+/// leaves unparsed. Every parse in this module goes through [`parse`], or
+/// through [`reparse`], which notes its parses too.
+#[cfg(test)]
+static PARSED_FOR_TEST: std::sync::Mutex<Vec<aft_store::ids::ContentKey>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_parsed_for_test(source: &[u8]) {
+    PARSED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(aft_store::ids::ContentKey::of(source));
+}
+
+/// How many times extraction has parsed `source`'s content so far.
+#[cfg(test)]
+pub(crate) fn parses_of_for_test(source: &[u8]) -> usize {
+    let key = aft_store::ids::ContentKey::of(source);
+    PARSED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|parsed| **parsed == key)
+        .count()
+}
+
 /// Extracts the record of `source` in `language`, as [`extract`] does, and
 /// returns the syntax tree it parsed, or `None` for a configuration input,
 /// which is stored raw and never parsed.
@@ -142,11 +258,13 @@ pub fn extract_with_tree(
         let blob = CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION);
         return Ok((record_from_blob(&blob), None));
     }
-    let text = parsed_text(source);
+    if language.starts_with(MARKERS_PREFIX) {
+        return Ok((markers_record(source, language)?, None));
+    }
     let lang = join::language_id(language)
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
     let tree = SyntaxTree {
-        tree: join::single_walk::parse_source(text, lang)?,
+        tree: parse(source, lang)?,
         language: lang,
     };
     let record = extract_parsed(source, language, &tree)?;
@@ -169,11 +287,13 @@ pub fn reparse(
     source: &[u8],
     language: &str,
 ) -> Result<Option<SyntaxTree>, ManifestJoinError> {
-    if language == "config" {
+    if language == "config" || language.starts_with(MARKERS_PREFIX) {
         return Ok(None);
     }
     let lang = join::language_id(language)
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
+    #[cfg(test)]
+    note_parsed_for_test(source);
     let text = parsed_text(source);
     if previous.language != lang {
         // A header can parse as another language after an edit; its old
@@ -213,6 +333,9 @@ pub fn extract_parsed(
             EXTRACTOR_VERSION,
         )));
     }
+    if language.starts_with(MARKERS_PREFIX) {
+        return markers_record(source, language);
+    }
     if join::language_id(language) != Some(tree.language) {
         return Err(ManifestJoinError::Parse(format!(
             "a {:?} syntax tree cannot be extracted as {language}",
@@ -226,6 +349,9 @@ pub fn extract_parsed(
         &tree.tree,
     )?;
     let mut record = record_from_blob(&blob);
+    // The comments' markers come from the same tree, so the count never
+    // parses the file again.
+    record.todos = Some(todos::markers_from_tree(source, tree.language, &tree.tree));
     if let RecordBody::Parsed { body, .. } = &mut record.data {
         body.outline = Some(outline.iter().map(outline_symbol).collect());
         body.dead_code = Some(
@@ -273,6 +399,7 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
             data: RecordBody::Config {
                 source: config.source.clone(),
             },
+            todos: None,
         },
         CallgraphBlob::Parse(parse) => ContentRecord {
             language: parse.language.clone(),
@@ -359,6 +486,7 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
                     dead_code: None,
                 }),
             },
+            todos: None,
         },
     }
 }
@@ -374,6 +502,12 @@ pub fn blob_from_record(record: &ContentRecord) -> Result<CallgraphBlob, Manifes
             .map_err(|_| ManifestJoinError::InvalidBlob(format!("offset {value} exceeds usize")))
     };
     Ok(match &record.data {
+        RecordBody::Markers => {
+            return Err(ManifestJoinError::InvalidBlob(format!(
+                "a {} record holds no parse",
+                record.language
+            )))
+        }
         RecordBody::Config { source } => CallgraphBlob::Config(ConfigBlob {
             extractor_version: record.extractor_version.clone(),
             language: record.language.clone(),
@@ -770,7 +904,7 @@ mod tests {
             let Some(language) = language_for(&name, &bytes) else {
                 continue;
             };
-            if language == "config" {
+            if !is_parsed_language(&language) {
                 continue;
             }
             let record = extract(&bytes, &language).unwrap();
@@ -910,7 +1044,14 @@ mod tests {
             }
             assert_eq!(blob_from_record(&decoded).unwrap(), original, "{path}");
         }
-        assert_eq!(language_for("README.md", b"# x"), None);
+        // Markdown is not parsed by the call graph: its record holds only
+        // its TODO markers, and converts to no call-graph parse.
+        let markdown = language_for("README.md", b"# x").unwrap();
+        assert_eq!(markdown, "markers-markdown");
+        assert!(!is_parsed_language(&markdown));
+        let record = extract(b"# x", &markdown).unwrap();
+        assert_eq!(record.data, RecordBody::Markers);
+        assert!(blob_from_record(&record).is_err());
     }
 
     #[test]

@@ -79,7 +79,7 @@ pub(crate) fn prewarm(
     }
     let mut report = Prewarm::default();
     for record in view.current_state().paths() {
-        if record.language.is_empty() || record.language == "config" {
+        if !super::content::is_parsed_language(&record.language) {
             continue;
         }
         if stop() {

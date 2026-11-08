@@ -156,6 +156,7 @@ impl Files {
                             CallgraphBlob::Config(_) => None,
                         }
                     }
+                    RecordBody::Markers => None,
                 };
                 self.records.insert(key, parsed.clone());
                 parsed

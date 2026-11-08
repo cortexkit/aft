@@ -1263,7 +1263,8 @@ fn warming_rust_inspect_response(
             "id": "configure-partial", "command": "configure", "harness": "opencode",
             "project_root": project, "storage_dir": temp.path().join("storage"),
             "config": user_config(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+                // TODO counts read the call-graph index's records.
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "inspect": {"diagnostics_timeout_ms": diagnostics_timeout_ms},
                 "lsp": {"servers": {
                     "rust": {"binary": binary, "args": [], "root_markers": [root_marker], "env": rust_env},

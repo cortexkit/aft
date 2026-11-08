@@ -201,6 +201,16 @@ fn configured_restricted_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    configured_context_with_diagnostics_timeout_and_callgraph(root, timeout_ms, false)
+}
+
+/// [`configured_context_with_diagnostics_timeout`], with the call-graph
+/// index switched by `callgraph`: TODO counts read its records.
+fn configured_context_with_diagnostics_timeout_and_callgraph(
+    root: &Path,
+    timeout_ms: u64,
+    callgraph: bool,
+) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -219,7 +229,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+            "indexes": { "trigram": false, "semantic": false, "callgraph": callgraph },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
     }));
@@ -413,7 +423,8 @@ fn inspect_command_metrics_summary_uses_production_dispatch() {
         "src/lib.rs",
         "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { alpha() }\n",
     );
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let response = inspect(
         &ctx,
@@ -463,7 +474,6 @@ fn inspect_command_tier1_reuses_file_memo_for_unchanged_files() {
     assert_eq!(first["success"], true, "inspect failed: {first:#}");
 
     aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
-    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
 
     let second = inspect(
         &ctx,
@@ -478,11 +488,6 @@ fn inspect_command_tier1_reuses_file_memo_for_unchanged_files() {
         aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
         0,
         "warm metrics scan should reuse unchanged per-file memo entries: {second:#}"
-    );
-    assert_eq!(
-        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
-        0,
-        "warm todos scan should reuse unchanged per-file memo entries: {second:#}"
     );
     assert_eq!(first["summary"]["metrics"], second["summary"]["metrics"]);
     assert_eq!(first["summary"]["todos"], second["summary"]["todos"]);
@@ -502,7 +507,8 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
         "src/changed.ts",
         "export function changed() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let first = inspect(
         &ctx,
@@ -515,13 +521,20 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
     assert_eq!(first["summary"]["todos"]["count"], 1);
 
     aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
-    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
 
-    write_file(
-        &root,
-        "src/changed.ts",
-        "// TODO: newly counted after memo invalidation\nexport function changed() { return 2; }\n",
+    // Through the edit tool, which the index store hears, as it hears the
+    // watcher.
+    let edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "inspect-tier1-change",
+            "command": "edit_match",
+            "file": root.join("src/changed.ts").display().to_string(),
+            "match": "export function changed()",
+            "replacement": "// TODO: newly counted after memo invalidation\nexport function changed()",
+        })),
+        &ctx,
     );
+    assert!(edit.success, "{edit:?}");
 
     let second = inspect(
         &ctx,
@@ -540,11 +553,6 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
         aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
         1,
         "metrics should rescan only the changed file: {second:#}"
-    );
-    assert_eq!(
-        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
-        1,
-        "todos should rescan only the changed file: {second:#}"
     );
 }
 
@@ -1130,10 +1138,6 @@ fn scoped_inspect_inventory_skips_unrequested_scanners() {
         // unrequested scanner reading the files.
         assert_eq!(
             aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
-            0
-        );
-        assert_eq!(
-            aft::inspect::scanners::todos::file_read_count_for_debug(&root),
             0
         );
         assert_eq!(response.data["scope_files"], 1, "{response:?}");
@@ -2243,7 +2247,8 @@ fn failed_producers(response: &Value) -> Vec<String> {
 fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/main.rs", "fn main() {}\n// TODO: tidy\n");
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let response = serde_json::to_value(handle_with_dispatch(
         &request(json!({
@@ -7700,7 +7705,8 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"partial-diag\"\n");
     let file = write_file(&root, "src/main.rs", "// TODO: finish\nfn main() {}\n");
-    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_diagnostics_timeout_and_callgraph(&root, 10_000, true);
     open_with_server_status_mode(&ctx, &file, "1");
     wait_for_lsp_report_state(&ctx, &file, true);
     let response = serde_json::to_value(handle_inspect_tool_call(
@@ -7752,7 +7758,11 @@ fn configure_and_edits_start_no_whole_repository_analysis() {
         "src/todo.ts",
         "// TODO: one\nexport const todo = 1;\n",
     );
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    // As the standalone loop does after a configure: the index store binds
+    // the root and builds.
+    aft::runtime_drain::standalone_root_configured(&ctx);
     let manager = ctx.inspect_manager();
     let no_whole_repository_work = |phase: &str| {
         // A started analysis registers before it runs, so polling for a
@@ -7785,14 +7795,30 @@ fn configure_and_edits_start_no_whole_repository_analysis() {
         Some(Tier2TriggerReason::ConfigureWarm)
     );
     no_whole_repository_work("configure warm-up");
-    assert_eq!(ctx.status_bar_count_values().todos, Some(1));
+    // The background count waits for the index store's first build.
+    let todos_become = |expected: usize| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.status_bar_count_values().todos != Some(expected) && Instant::now() < deadline {
+            aft::runtime_drain::drain_inspect_events(&ctx);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ctx.status_bar_count_values().todos, Some(expected));
+    };
+    todos_become(1);
 
-    // An edit, then the quiet window after it.
-    write_file(
-        &root,
-        "src/todo.ts",
-        "// TODO: one\n// TODO: two\nexport const todo = 1;\n",
+    // An edit, through the edit tool the index store hears, then the quiet
+    // window after it.
+    let edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "configure-and-edits-change",
+            "command": "edit_match",
+            "file": root.join("src/todo.ts").display().to_string(),
+            "match": "// TODO: one\n",
+            "replacement": "// TODO: one\n// TODO: two\n",
+        })),
+        &ctx,
     );
+    assert!(edit.success, "{edit:?}");
     ctx.add_pending_tier2_paths([root.join("src/todo.ts")]);
     let edited_at = now + TIER2_REFRESH_MIN_INTERVAL;
     assert_eq!(ctx.tick_tier2_refresh_scheduler_at(edited_at, 1), None);
@@ -7801,6 +7827,6 @@ fn configure_and_edits_start_no_whole_repository_analysis() {
         Some(Tier2TriggerReason::Debounce)
     );
     no_whole_repository_work("edit refresh");
-    assert_eq!(ctx.status_bar_count_values().todos, Some(2));
+    todos_become(2);
     assert_eq!(manager.reuse_completion_count(), 0);
 }

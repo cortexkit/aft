@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use crate::data_layer::runtime::DataCheckout;
 use crate::inspect::job::{canonicalize_normalized, normalize_path, CallgraphSnapshot};
-
 /// How long a dead-code run waits for recorded edits to reach the call
 /// graph, as the call-graph commands do.
 const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -186,3 +185,266 @@ impl DeadCodeSources {
 
 #[cfg(test)]
 mod tests {}
+
+// Agent-visible reasons for the TODO count, approved by Ufuk; change them
+// only with his approval.
+/// Why a root whose checkout builds no call graph has no TODO count.
+pub(crate) const TODOS_CALL_GRAPH_OFF: &str =
+    "TODO counts need the call-graph index, which is off (indexes.callgraph)";
+/// Why a root the index store never indexes has no TODO count.
+pub(crate) const TODOS_NO_INDEX_STORE: &str =
+    "this folder is not indexed (home folder, drive root, or all indexes off)";
+/// Why a file the index store could not extract has no TODO markers.
+pub(crate) const TODOS_NOT_PARSED: &str = "no TODO record for this file in the index store";
+/// Why a file of a folder of repositories that is in none of them has no
+/// TODO markers.
+pub(crate) const TODOS_OUTSIDE_REPOSITORIES: &str = "not inside any repository in this folder";
+
+/// Every checkout this process has bound, for the TODO count: it runs on
+/// the inspect pool with only its job's root, and reads the root's
+/// checkout, or for a folder of repositories its children's. Held weakly:
+/// whoever bound a checkout owns it.
+static BOUND: Mutex<Vec<Weak<DataCheckout>>> = Mutex::new(Vec::new());
+
+/// Roots the data layer never binds (see `AppContext::data_layer_withheld`)
+/// and folders of repositories, as their last configure left them,
+/// normalized.
+static ROOTS: Mutex<Vec<(PathBuf, RootKind)>> = Mutex::new(Vec::new());
+
+/// How the data layer serves a configured root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootKind {
+    /// The root gets a checkout of its own.
+    Own,
+    /// A folder of repositories: each repository in it gets a checkout.
+    Repositories,
+    /// The data layer never binds the root.
+    Withheld,
+}
+
+/// Lets the TODO count read `checkout`.
+pub(crate) fn note_bound(checkout: &Arc<DataCheckout>) {
+    let mut bound = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    bound.retain(|held| held.strong_count() > 0);
+    bound.push(Arc::downgrade(checkout));
+}
+
+/// Records how the data layer serves `root`, so the TODO count of a root
+/// that never gets a checkout says why instead of waiting for one, and a
+/// folder of repositories counts its repositories'.
+pub(crate) fn note_root(root: &Path, kind: RootKind) {
+    let root = normalize_path(root);
+    let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
+    roots.retain(|(held, _)| *held != root);
+    roots.push((root, kind));
+}
+
+fn root_kind(root: &Path) -> RootKind {
+    ROOTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(held, _)| held == root)
+        .map_or(RootKind::Own, |(_, kind)| *kind)
+}
+
+/// How long the TODO count waits for a bound checkout that is building or
+/// catching up before it reports itself pending, as dead code waits for its
+/// call graph.
+const TODO_STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The TODO markers of `scope_files` (absolute) of `project_root`, from the
+/// records of the root's bound checkout, or, for a folder of repositories,
+/// of the bound checkouts of the repositories in it. Nothing is parsed: a
+/// file whose record is not there yet makes the whole count pending, after
+/// waiting up to [`TODO_STORE_WAIT`] for a bound checkout to catch up. A
+/// root with no checkout bound yet is pending at once.
+///
+/// # Errors
+///
+/// When a record cannot be read.
+pub(crate) fn stored_todos(
+    project_root: &Path,
+    config: &crate::config::Config,
+    scope_files: &[PathBuf],
+) -> Result<crate::inspect::scanners::todos::StoredTodos, String> {
+    use crate::inspect::scanners::todos::StoredTodos;
+    let deadline = Instant::now() + TODO_STORE_WAIT;
+    loop {
+        let (todos, building) = stored_todos_now(project_root, config, scope_files)?;
+        if !matches!(todos, StoredTodos::Pending)
+            || !building
+            || Instant::now() >= deadline
+            || crate::executor::current_job_cancelled()
+        {
+            return Ok(todos);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// [`stored_todos`] without waiting, and whether a bound checkout is still
+/// building or catching up.
+fn stored_todos_now(
+    project_root: &Path,
+    config: &crate::config::Config,
+    scope_files: &[PathBuf],
+) -> Result<(crate::inspect::scanners::todos::StoredTodos, bool), String> {
+    use crate::inspect::scanners::todos::{file_todos, FileTodos, StoredTodos};
+    let root = canonicalize_normalized(project_root);
+    let bound = BOUND
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|checkout| (canonicalize_normalized(checkout.root()), checkout))
+        .collect::<Vec<_>>();
+    // The root's own checkout, newest first; or, for a folder of
+    // repositories, the checkouts of the repositories in it.
+    let kind = root_kind(&root);
+    let own = bound
+        .iter()
+        .rev()
+        .find(|(checkout_root, _)| *checkout_root == root);
+    let mut covering = match own {
+        Some(own) => vec![own.clone()],
+        None if kind == RootKind::Repositories => {
+            let mut children = bound
+                .iter()
+                .filter(|(checkout_root, _)| {
+                    checkout_root.starts_with(&root) && *checkout_root != root
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            // One checkout per child root, the newest bound.
+            children.reverse();
+            let mut seen = Vec::new();
+            children.retain(|(checkout_root, _)| {
+                let first = !seen.contains(checkout_root);
+                seen.push(checkout_root.clone());
+                first
+            });
+            children
+        }
+        None => Vec::new(),
+    };
+    let indexes = &config.indexes;
+    if covering.is_empty() {
+        let todos = match kind {
+            RootKind::Withheld => StoredTodos::Unavailable(TODOS_NO_INDEX_STORE),
+            RootKind::Own if !indexes.callgraph => StoredTodos::Unavailable(TODOS_CALL_GRAPH_OFF),
+            // Not bound yet; a folder of repositories binds each one the
+            // first time a query reaches it.
+            RootKind::Own | RootKind::Repositories => StoredTodos::Pending,
+        };
+        return Ok((todos, false));
+    }
+    if covering
+        .iter()
+        .any(|(_, checkout)| !checkout.checkout().planes().callgraph)
+    {
+        return Ok((StoredTodos::Unavailable(TODOS_CALL_GRAPH_OFF), false));
+    }
+    // Longest root first, so a file goes to the deepest checkout holding it.
+    covering.sort_by_key(|(checkout_root, _)| std::cmp::Reverse(checkout_root.as_os_str().len()));
+    let mut files = (0..scope_files.len())
+        .map(|_| None)
+        .collect::<Vec<Option<FileTodos>>>();
+    let mut held = vec![false; scope_files.len()];
+    for (checkout_root, checkout) in &covering {
+        let Some(view) = checkout.view() else {
+            return Ok((StoredTodos::Pending, true));
+        };
+        // Records come with the call graph's build, and a rescan can find
+        // changes the view does not have yet.
+        if !view.status().callgraph_published || view.rescanning() {
+            return Ok((StoredTodos::Pending, true));
+        }
+        let mut positions = Vec::new();
+        let mut paths = Vec::new();
+        for (position, file) in scope_files.iter().enumerate() {
+            if held[position] {
+                continue;
+            }
+            let file = normalize_path(file);
+            let Ok(relative) = file.strip_prefix(checkout_root) else {
+                continue;
+            };
+            held[position] = true;
+            let Some(relative) = relative.to_str() else {
+                files[position] = Some(FileTodos::NotScanned);
+                continue;
+            };
+            positions.push(position);
+            paths.push(relative.replace('\\', "/").into_bytes());
+        }
+        let found = checkout
+            .checkout()
+            .todo_markers(
+                &view,
+                &paths,
+                crate::inspect::scanners::source_text::MAX_SOURCE_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
+        for (position, todos) in positions.into_iter().zip(found) {
+            use crate::data_layer::checkout::PathTodos;
+            let path = &scope_files[position];
+            files[position] = Some(match todos {
+                // Plain JSON is never read, whatever the store holds.
+                _ if file_todos_skip(path) => FileTodos::NotScanned,
+                PathTodos::Missing => return Ok((StoredTodos::Pending, true)),
+                PathTodos::Absent | PathTodos::Unrecorded => FileTodos::NotScanned,
+                PathTodos::TooLarge => {
+                    FileTodos::Skipped(crate::inspect::scanners::source_text::TOO_LARGE)
+                }
+                PathTodos::Unextracted | PathTodos::Recorded(None) => {
+                    FileTodos::Skipped(TODOS_NOT_PARSED)
+                }
+                PathTodos::Recorded(Some(todos)) => {
+                    file_todos(path, todos).unwrap_or(FileTodos::Skipped(TODOS_NOT_PARSED))
+                }
+            });
+        }
+    }
+    Ok((
+        StoredTodos::Files(
+            files
+                .into_iter()
+                .map(|todos| todos.unwrap_or(FileTodos::Skipped(TODOS_OUTSIDE_REPOSITORIES)))
+                .collect(),
+        ),
+        false,
+    ))
+}
+
+/// Whether the count never reads the file at `path`, whatever the store
+/// holds for it: plain JSON, which has no comments.
+fn file_todos_skip(path: &Path) -> bool {
+    crate::inspect::scanners::todos::path_todo_language(path).is_none()
+}
+
+/// A context whose index-store checkout of `root` is bound and has
+/// published its call graph, so the TODO count of `root` reads records.
+/// The checkout lives as long as the context.
+#[cfg(test)]
+pub(crate) fn bind_published_for_test(root: &Path) -> crate::context::AppContext {
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            ..crate::config::Config::default()
+        },
+    );
+    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+    let checkout = ctx.data_checkout().expect("the index store binds the root");
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    while !checkout
+        .view()
+        .is_some_and(|view| view.status().callgraph_published)
+        || checkout.checkout().status().building
+    {
+        assert!(Instant::now() < deadline, "the call graph never published");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    ctx
+}

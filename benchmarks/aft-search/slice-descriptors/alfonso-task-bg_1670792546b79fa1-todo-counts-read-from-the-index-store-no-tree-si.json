@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "todos-from-index-store"
+  ],
+  "note": "Content records gain each file's TODO markers (extractor version record-12), and Markdown, minified bundles and headers no grammar resolves get records holding only their markers; the TODO count reads them instead of parsing. Those records give the resolver and outline nothing (markers-only languages are not parsed languages), and no aft_search lane reads them. No ranking, fusion, lane admission or truncation change; text index units and meaning-search vectors are keyed separately and are unchanged."
+}

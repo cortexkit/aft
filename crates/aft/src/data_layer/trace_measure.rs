@@ -225,6 +225,7 @@ pub(crate) fn build(root: &Path, threads: usize) -> Result<Built, String> {
                     .configs
                     .insert(path.into_bytes(), Arc::from(source.as_slice()));
             }
+            RecordBody::Markers => {}
         }
     }
     let resolved = resolve_checkout(&inputs, threads).map_err(|error| error.to_string())?;

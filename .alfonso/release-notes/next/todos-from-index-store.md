@@ -1,0 +1,1 @@
+- TODO counts (the status bar's `T` and `aft_inspect`'s TODO section) now come from the index store, which records each file's TODO markers when it indexes the file, so a TODO refresh no longer re-parses every file; with the call-graph index switched off, or for a folder that is not indexed, the TODO count reports itself unavailable instead.

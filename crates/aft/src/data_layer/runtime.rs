@@ -894,13 +894,15 @@ impl DataCheckout {
         crate::write_intent::register_listener(&listener);
         // A bind may have recorded what changed while nothing watched.
         work.catch_up(Publish::WhenMany);
-        Ok(Arc::new(Self {
+        let checkout = Arc::new(Self {
             work,
             quiet,
             bound_once: AtomicBool::new(false),
             memory_figure: std::sync::Mutex::new(None),
             _listener: listener,
-        }))
+        });
+        super::tools::inspect::note_bound(&checkout);
+        Ok(checkout)
     }
 
     #[must_use]
@@ -1111,6 +1113,19 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
 pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
+    use super::tools::inspect::{note_root, RootKind};
+    if let Some(root) = ctx.canonical_cache_root_opt() {
+        // A folder of repositories is checked first: configure switches its
+        // own indexes off, which alone would withhold it.
+        let kind = if crate::views::parent::session_for(ctx).is_some() {
+            RootKind::Repositories
+        } else if ctx.data_layer_withheld().is_some() {
+            RootKind::Withheld
+        } else {
+            RootKind::Own
+        };
+        note_root(&root, kind);
+    }
     if let Some(checkout) = ctx.data_checkout() {
         if checkout.bound_once.swap(true, Ordering::AcqRel) {
             checkout.work.start_rescan();

@@ -128,6 +128,7 @@ fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> Fixture {
                 };
                 parses.insert((*path).to_string(), (key, Arc::new(parse)));
             }
+            RecordBody::Markers => {}
         }
     }
     for (path, target) in links {

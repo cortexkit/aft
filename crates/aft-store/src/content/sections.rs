@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{ContentRecord, DecodeError, RecordKey};
+use super::{ContentRecord, DecodeError, RecordKey, TodoMarkers};
 use crate::ids::Digest128;
 use crate::packed::{self, PackedBuilder};
 use crate::segment::{
@@ -79,6 +79,15 @@ impl EncodedRecord {
     /// When the bytes are not a record this build encodes.
     pub fn decode(&self) -> Result<ContentRecord, DecodeError> {
         ContentRecord::decode(&self.surface, &self.body)
+    }
+
+    /// The record's TODO markers, read from its surface part alone.
+    ///
+    /// # Errors
+    ///
+    /// When the surface part is not one this build encodes.
+    pub fn todos(&self) -> Result<Option<TodoMarkers>, DecodeError> {
+        ContentRecord::todos_of(&self.surface)
     }
 }
 
@@ -347,6 +356,16 @@ impl<'s> ContentSegment<'s> {
         let body = self.body(ordinal)?;
         Ok(ContentRecord::decode(&surface, &body)?)
     }
+
+    /// The TODO markers of the record at `ordinal`, read from its surface
+    /// part alone (see [`ContentRecord::todos_of`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`surface`](Self::surface), and when the markers do not decode.
+    pub fn todos(&self, ordinal: u32) -> Result<Option<TodoMarkers>, ContentReadError> {
+        Ok(ContentRecord::todos_of(&self.surface(ordinal)?)?)
+    }
 }
 
 /// Why a stored record could not be read.
@@ -368,7 +387,7 @@ mod tests {
 
     use super::*;
     use crate::cache::BlockCache;
-    use crate::content::{Body, RecordBody, RefKind, Reference, Surface};
+    use crate::content::{Body, RecordBody, RefKind, Reference, Surface, TodoMarker, TodoMarkers};
     use crate::ids::{ContentKey, FamilyId, SegmentId, WriterIncarnation};
     use crate::segment::{BLOCK_LEN, SegmentMeta};
 
@@ -404,6 +423,17 @@ mod tests {
                     ..Body::default()
                 }),
             },
+            // Every third record holds TODO markers, read back on their own
+            // by `todos`.
+            todos: (index % 3 == 0).then(|| TodoMarkers {
+                language: "rust".into(),
+                items: Some(vec![TodoMarker {
+                    line: index,
+                    marker: "TODO".into(),
+                    author: None,
+                    text: format!("item {index}"),
+                }]),
+            }),
         }
     }
 
@@ -448,6 +478,7 @@ mod tests {
             let ordinal = content.find(key(index)).unwrap().unwrap();
             assert_eq!(content.key(ordinal).unwrap(), key(index));
             assert_eq!(content.record(ordinal).unwrap(), record(index));
+            assert_eq!(content.todos(ordinal).unwrap(), record(index).todos);
         }
         assert_eq!(
             content

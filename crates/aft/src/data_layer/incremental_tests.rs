@@ -46,6 +46,7 @@ pub(super) fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> Checko
                 let key = Digest128::of(bytes).to_string();
                 parses.insert((*path).to_string(), (key, Arc::new(parse)));
             }
+            RecordBody::Markers => {}
         }
     }
     for (path, target) in links {

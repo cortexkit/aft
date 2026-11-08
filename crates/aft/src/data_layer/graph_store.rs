@@ -834,7 +834,8 @@ impl StoredSlices {
             .map_err(|error| format!("record of {file}: {error}"))?;
         Ok(match record.data {
             aft_store::content::RecordBody::Parsed { body, .. } => body.dead_code,
-            aft_store::content::RecordBody::Config { .. } => None,
+            aft_store::content::RecordBody::Config { .. }
+            | aft_store::content::RecordBody::Markers => None,
         })
     }
 

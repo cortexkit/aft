@@ -14,6 +14,15 @@
 //! Records hold no paths. Positions (lines, columns, byte ranges, syntax-tree
 //! ordinals) are within the content, so they are the same wherever the
 //! content appears.
+//!
+//! A record can also hold the content's TODO markers ([`TodoMarkers`]),
+//! found in its comments when it was parsed, so counting a checkout's TODOs
+//! never parses a file. They are written in the first part, right after
+//! the record's kind, though no other file reads them: that part is stored
+//! uncompressed, so a count reads each file's markers
+//! ([`ContentRecord::todos_of`]) without unpacking its body. Files the call
+//! graph does not parse but whose comments are counted (Markdown, minified
+//! bundles) get a record holding only their markers ([`RecordBody::Markers`]).
 
 pub mod codec;
 mod sections;
@@ -283,6 +292,34 @@ pub enum RecordBody {
     },
     /// A configuration file's raw bytes.
     Config { source: Vec<u8> },
+    /// Nothing but the record's [`ContentRecord::todos`]: a file the call
+    /// graph does not parse whose comments are still counted.
+    Markers,
+}
+
+/// One TODO marker comment line, as AFT's TODO count reports it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TodoMarker {
+    /// The one-based line the marker is on.
+    pub line: u32,
+    /// The marker word, such as `TODO` or `FIXME`.
+    pub marker: String,
+    /// The name in parentheses after the marker (`TODO(name):`), if any.
+    pub author: Option<String>,
+    /// The comment's text after the marker, as the count shows it.
+    pub text: String,
+}
+
+/// The TODO markers of one content.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TodoMarkers {
+    /// The language the content's comments were read as. The same bytes can
+    /// be read as another language at another path, so a reader checks it
+    /// against the path's.
+    pub language: String,
+    /// The markers in line order; `None` when the content is not text the
+    /// count reads (not UTF-8, or holding a NUL byte).
+    pub items: Option<Vec<TodoMarker>>,
 }
 
 /// Everything parsing one content yields.
@@ -293,6 +330,10 @@ pub struct ContentRecord {
     /// version is extracted again, never reused.
     pub extractor_version: String,
     pub data: RecordBody,
+    /// The content's TODO markers. `None` in a record from an extractor
+    /// that did not look for them, or of a file whose comments are not
+    /// counted.
+    pub todos: Option<TodoMarkers>,
 }
 
 /// A parsed record whose body holds no outline. Records of this kind encode
@@ -315,10 +356,25 @@ const PARSED_WITH_ENTRIES_AND_OUTLINE: u8 = 5;
 const PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE: u8 = 6;
 /// [`PARSED_WITH_ENTRIES`], whose body ends with its dead-code facts.
 const PARSED_WITH_ENTRIES_AND_DEAD_CODE: u8 = 7;
+/// A parsed record with its TODO markers. After the kind come a byte of
+/// [`HAS_OUTLINE`] and [`HAS_DEAD_CODE`] flags, saying what the body ends
+/// with, then the markers, the surface and each symbol's entry facts.
+const PARSED_WITH_TODOS: u8 = 8;
+/// [`CONFIG`] with the TODO markers between the kind and the source.
+const CONFIG_WITH_TODOS: u8 = 9;
+/// A [`RecordBody::Markers`] record: the kind, then whether markers follow
+/// (a byte, 0 or 1), then the markers. Its body part is empty.
+const MARKERS: u8 = 10;
+/// In a [`PARSED_WITH_TODOS`] record's flags: the body ends with an outline.
+const HAS_OUTLINE: u8 = 1;
+/// In a [`PARSED_WITH_TODOS`] record's flags: the body ends with dead-code
+/// facts, after the outline when there is one.
+const HAS_DEAD_CODE: u8 = 2;
 
 impl ContentRecord {
     /// The surface part's bytes and the body part's bytes. A configuration
-    /// record has an empty body part.
+    /// or markers-only record has an empty body part. A record without TODO
+    /// markers encodes exactly as it did before records could hold them.
     #[must_use]
     pub fn encode(&self) -> (Vec<u8>, Vec<u8>) {
         let mut head = Encoder::default();
@@ -326,17 +382,45 @@ impl ContentRecord {
         head.str(&self.extractor_version);
         match &self.data {
             RecordBody::Config { source } => {
-                head.byte(CONFIG);
+                match &self.todos {
+                    None => head.byte(CONFIG),
+                    Some(todos) => {
+                        head.byte(CONFIG_WITH_TODOS);
+                        encode_todos(&mut head, todos);
+                    }
+                }
                 head.blob(source);
                 (head.finish(), Vec::new())
             }
+            RecordBody::Markers => {
+                head.byte(MARKERS);
+                head.bool(self.todos.is_some());
+                if let Some(todos) = &self.todos {
+                    encode_todos(&mut head, todos);
+                }
+                (head.finish(), Vec::new())
+            }
             RecordBody::Parsed { surface, body } => {
-                head.byte(match (body.outline.is_some(), body.dead_code.is_some()) {
-                    (true, true) => PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE,
-                    (true, false) => PARSED_WITH_ENTRIES_AND_OUTLINE,
-                    (false, true) => PARSED_WITH_ENTRIES_AND_DEAD_CODE,
-                    (false, false) => PARSED_WITH_ENTRIES,
-                });
+                match &self.todos {
+                    None => head.byte(match (body.outline.is_some(), body.dead_code.is_some()) {
+                        (true, true) => PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE,
+                        (true, false) => PARSED_WITH_ENTRIES_AND_OUTLINE,
+                        (false, true) => PARSED_WITH_ENTRIES_AND_DEAD_CODE,
+                        (false, false) => PARSED_WITH_ENTRIES,
+                    }),
+                    Some(todos) => {
+                        head.byte(PARSED_WITH_TODOS);
+                        let mut flags = 0;
+                        if body.outline.is_some() {
+                            flags |= HAS_OUTLINE;
+                        }
+                        if body.dead_code.is_some() {
+                            flags |= HAS_DEAD_CODE;
+                        }
+                        head.byte(flags);
+                        encode_todos(&mut head, todos);
+                    }
+                }
                 encode_surface(&mut head, surface);
                 encode_entries(&mut head, surface);
                 let mut tail = Encoder::default();
@@ -355,8 +439,12 @@ impl ContentRecord {
         let mut head = Decoder::new(surface)?;
         let language = head.string()?;
         let extractor_version = head.string()?;
+        let mut todos = None;
         let data = match head.byte()? {
-            CONFIG => {
+            kind @ (CONFIG | CONFIG_WITH_TODOS) => {
+                if kind == CONFIG_WITH_TODOS {
+                    todos = Some(decode_todos(&mut head)?);
+                }
                 let source = head.blob()?.to_vec();
                 head.finish()?;
                 if !body.is_empty() {
@@ -364,37 +452,65 @@ impl ContentRecord {
                 }
                 RecordBody::Config { source }
             }
+            MARKERS => {
+                if head.bool()? {
+                    todos = Some(decode_todos(&mut head)?);
+                }
+                head.finish()?;
+                if !body.is_empty() {
+                    return Err(DecodeError("a markers record has a body"));
+                }
+                RecordBody::Markers
+            }
             kind @ (PARSED
             | PARSED_WITH_OUTLINE
             | PARSED_WITH_ENTRIES
             | PARSED_WITH_ENTRIES_AND_OUTLINE
             | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
-            | PARSED_WITH_ENTRIES_AND_DEAD_CODE) => {
+            | PARSED_WITH_ENTRIES_AND_DEAD_CODE
+            | PARSED_WITH_TODOS) => {
+                // What the kind says follows: entry facts after the surface,
+                // and an outline and dead-code facts at the body's end.
+                let (entries, outline, dead_code) = if kind == PARSED_WITH_TODOS {
+                    let flags = head.byte()?;
+                    if flags & !(HAS_OUTLINE | HAS_DEAD_CODE) != 0 {
+                        return Err(DecodeError("parsed record flags"));
+                    }
+                    todos = Some(decode_todos(&mut head)?);
+                    (true, flags & HAS_OUTLINE != 0, flags & HAS_DEAD_CODE != 0)
+                } else {
+                    (
+                        matches!(
+                            kind,
+                            PARSED_WITH_ENTRIES
+                                | PARSED_WITH_ENTRIES_AND_OUTLINE
+                                | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+                                | PARSED_WITH_ENTRIES_AND_DEAD_CODE
+                        ),
+                        matches!(
+                            kind,
+                            PARSED_WITH_OUTLINE
+                                | PARSED_WITH_ENTRIES_AND_OUTLINE
+                                | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+                        ),
+                        matches!(
+                            kind,
+                            PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+                                | PARSED_WITH_ENTRIES_AND_DEAD_CODE
+                        ),
+                    )
+                };
                 let mut surface = decode_surface(&mut head)?;
-                if matches!(
-                    kind,
-                    PARSED_WITH_ENTRIES
-                        | PARSED_WITH_ENTRIES_AND_OUTLINE
-                        | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
-                        | PARSED_WITH_ENTRIES_AND_DEAD_CODE
-                ) {
+                if entries {
                     decode_entries(&mut head, &mut surface)?;
                 }
                 head.finish()?;
                 let mut tail = Decoder::new(body)?;
                 let mut body = decode_body(&mut tail)?;
-                if matches!(
-                    kind,
-                    PARSED_WITH_OUTLINE
-                        | PARSED_WITH_ENTRIES_AND_OUTLINE
-                        | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
-                ) {
+                if outline {
                     body.outline = Some(decode_outline(&mut tail)?);
                 }
-                if matches!(
-                    kind,
-                    PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE | PARSED_WITH_ENTRIES_AND_DEAD_CODE
-                ) {
+                if dead_code {
                     body.dead_code = Some(tail.blob()?.to_vec());
                 }
                 tail.finish()?;
@@ -409,8 +525,75 @@ impl ContentRecord {
             language,
             extractor_version,
             data,
+            todos,
         })
     }
+
+    /// The TODO markers of the record whose surface part is `surface`,
+    /// read without decoding the rest of the record: they come right after
+    /// its kind. `None` when the record holds none.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes before and of the markers are not well formed.
+    pub fn todos_of(surface: &[u8]) -> Result<Option<TodoMarkers>, DecodeError> {
+        let mut head = Decoder::new(surface)?;
+        head.str()?;
+        head.str()?;
+        match head.byte()? {
+            CONFIG_WITH_TODOS => decode_todos(&mut head).map(Some),
+            MARKERS if head.bool()? => decode_todos(&mut head).map(Some),
+            PARSED_WITH_TODOS => {
+                head.byte()?;
+                decode_todos(&mut head).map(Some)
+            }
+            CONFIG
+            | MARKERS
+            | PARSED
+            | PARSED_WITH_OUTLINE
+            | PARSED_WITH_ENTRIES
+            | PARSED_WITH_ENTRIES_AND_OUTLINE
+            | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+            | PARSED_WITH_ENTRIES_AND_DEAD_CODE => Ok(None),
+            _ => Err(DecodeError("record kind")),
+        }
+    }
+}
+
+/// The markers' language, then a byte saying whether the content was text
+/// (1) or not (0), then for text the count of markers and each marker.
+fn encode_todos(out: &mut Encoder, todos: &TodoMarkers) {
+    out.str(&todos.language);
+    out.bool(todos.items.is_some());
+    if let Some(items) = &todos.items {
+        out.usize(items.len());
+        for item in items {
+            out.u32(item.line);
+            out.str(&item.marker);
+            out.opt_str(item.author.as_deref());
+            out.str(&item.text);
+        }
+    }
+}
+
+fn decode_todos(input: &mut Decoder<'_>) -> Result<TodoMarkers, DecodeError> {
+    let language = input.string()?;
+    let items = if input.bool()? {
+        let count = input.count()?;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(TodoMarker {
+                line: input.u32()?,
+                marker: input.string()?,
+                author: input.opt_string()?,
+                text: input.string()?,
+            });
+        }
+        Some(items)
+    } else {
+        None
+    };
+    Ok(TodoMarkers { language, items })
 }
 
 fn encode_surface(out: &mut Encoder, surface: &Surface) {
@@ -850,10 +1033,18 @@ crate::heap_bytes_of_fields!(Body {
     outline,
     dead_code,
 });
+crate::heap_bytes_of_fields!(TodoMarker {
+    line,
+    marker,
+    author,
+    text,
+});
+crate::heap_bytes_of_fields!(TodoMarkers { language, items });
 crate::heap_bytes_of_fields!(ContentRecord {
     language,
     extractor_version,
     data,
+    todos,
 });
 
 impl crate::heap::HeapBytes for RecordBody {
@@ -864,6 +1055,7 @@ impl crate::heap::HeapBytes for RecordBody {
                     + crate::heap::HeapBytes::heap_bytes(body, seen)
             }
             Self::Config { source } => crate::heap::HeapBytes::heap_bytes(source, seen),
+            Self::Markers => 0,
         }
     }
 }
@@ -970,7 +1162,88 @@ mod tests {
                     dead_code: None,
                 }),
             },
+            todos: None,
         }
+    }
+
+    fn todos(language: &str) -> TodoMarkers {
+        TodoMarkers {
+            language: language.into(),
+            items: Some(vec![
+                TodoMarker {
+                    line: 4,
+                    marker: "TODO".into(),
+                    author: Some("ana".into()),
+                    text: "close the store".into(),
+                },
+                TodoMarker {
+                    line: 9,
+                    marker: "FIXME".into(),
+                    author: None,
+                    text: String::new(),
+                },
+            ]),
+        }
+    }
+
+    /// Every kind of record round-trips its TODO markers, which
+    /// `todos_of` reads from the first part alone; a record without them
+    /// encodes exactly as before records could hold them, and every cut of
+    /// the first part is refused.
+    #[test]
+    fn todo_markers_round_trip_in_every_kind_and_read_from_the_first_part() {
+        let mut parsed = sample();
+        let RecordBody::Parsed { body, .. } = &mut parsed.data else {
+            unreachable!("the sample is parsed");
+        };
+        body.outline = Some(outline());
+        body.dead_code = Some(b"facts".to_vec());
+        let without = parsed.clone();
+        parsed.todos = Some(todos("rust"));
+        let config = ContentRecord {
+            language: "config".into(),
+            extractor_version: "v1".into(),
+            data: RecordBody::Config {
+                source: b"# TODO: x\n".to_vec(),
+            },
+            todos: Some(todos("toml")),
+        };
+        let markers = ContentRecord {
+            language: "markers-markdown".into(),
+            extractor_version: "v1".into(),
+            data: RecordBody::Markers,
+            todos: Some(todos("markdown")),
+        };
+        let not_text = ContentRecord {
+            todos: Some(TodoMarkers {
+                language: "markdown".into(),
+                items: None,
+            }),
+            ..markers.clone()
+        };
+        let empty_markers = ContentRecord {
+            todos: None,
+            ..markers.clone()
+        };
+        for record in [&parsed, &config, &markers, &not_text, &empty_markers] {
+            let (surface, body) = record.encode();
+            assert_eq!(&ContentRecord::decode(&surface, &body).unwrap(), record);
+            assert_eq!(ContentRecord::todos_of(&surface).unwrap(), record.todos);
+            for cut in 0..surface.len() {
+                assert!(ContentRecord::decode(&surface[..cut], &body).is_err());
+            }
+        }
+        let (surface, body) = without.encode();
+        assert_eq!(ContentRecord::todos_of(&surface).unwrap(), None);
+        assert_eq!(ContentRecord::decode(&surface, &body).unwrap(), without);
+        // Without markers the kind is the one records had before them.
+        let mut head = Decoder::new(&surface).unwrap();
+        head.str().unwrap();
+        head.str().unwrap();
+        assert_eq!(
+            head.byte().unwrap(),
+            PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
+        );
     }
 
     fn outline() -> Vec<OutlineSymbol> {
@@ -1097,6 +1370,7 @@ mod tests {
             data: RecordBody::Config {
                 source: b"[package]\n".to_vec(),
             },
+            todos: None,
         };
         let (head, tail) = config.encode();
         assert!(tail.is_empty());

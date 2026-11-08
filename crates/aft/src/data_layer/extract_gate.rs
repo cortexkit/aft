@@ -64,7 +64,10 @@ pub fn load(root: &Path, list: &Path) -> std::io::Result<Vec<CorpusFile>> {
         let Some(language) = language_for(path, text.as_bytes()) else {
             continue;
         };
-        if language == "config" {
+        // The gate compares call-graph extractors: configuration is read
+        // raw, and Markdown files, minified bundles and headers no grammar
+        // resolves get records of their TODO markers alone, never a parse.
+        if !crate::data_layer::content::is_parsed_language(&language) {
             continue;
         }
         files.push(CorpusFile {
@@ -489,5 +492,6 @@ fn gate_language(path: &str, text: &str) -> Option<String> {
     if Path::new(path).extension().is_some_and(|ext| ext == "h") {
         let _ = crate::parser::detect_language_from_source(Path::new(path), text);
     }
-    language_for(path, text.as_bytes()).filter(|language| language != "config")
+    language_for(path, text.as_bytes())
+        .filter(|language| crate::data_layer::content::is_parsed_language(language))
 }

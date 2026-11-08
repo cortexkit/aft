@@ -554,6 +554,9 @@ struct ChangeContent {
 
 /// A changed file's bytes as the recording read them, to extract later.
 struct RecordedSource {
+    /// The file's path, relative to the root: a configuration file's TODO
+    /// markers are read as the language its name calls for.
+    path: Vec<u8>,
     /// The language the file's path and bytes chose (see `language_for`).
     language: String,
     content: ContentKey,
@@ -579,6 +582,7 @@ impl ChangeContent {
         }
         Arc::new(Self {
             source: Mutex::new(Some(RecordedSource {
+                path: record.path.clone(),
                 language: record.language.clone(),
                 content: record.content,
                 bytes,
@@ -621,6 +625,9 @@ enum Extracted {
     /// A resolver configuration file's bytes, and its content record,
     /// encoded.
     Config(Arc<[u8]>, Arc<EncodedRecord>),
+    /// A file the call graph does not read but whose TODO markers are
+    /// counted: its record of the markers alone, encoded.
+    Markers(Arc<EncodedRecord>),
 }
 
 /// What publishing the changes since a publication wrote.
@@ -2450,7 +2457,7 @@ impl Checkout {
                             .records
                             .insert(name.to_string(), Arc::clone(record));
                     }
-                    Extracted::Config(..) | Extracted::Nothing => {
+                    Extracted::Config(..) | Extracted::Markers(_) | Extracted::Nothing => {
                         engine.refreshed.records.remove(name);
                     }
                 }
@@ -2568,7 +2575,9 @@ impl Checkout {
             };
             let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
             match change.content.get() {
-                Extracted::Parse(_, _, stored) | Extracted::Config(_, stored) => {
+                Extracted::Parse(_, _, stored)
+                | Extracted::Config(_, stored)
+                | Extracted::Markers(stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
                 Extracted::Nothing => {}
@@ -3870,7 +3879,7 @@ impl super::dead_code_graph::CallGraphFiles for ViewGraphFiles<'_> {
                 .map_err(|error| format!("{path}: changed content record: {error:?}"))?;
             return Ok(match &record.data {
                 RecordBody::Parsed { body, .. } => body.dead_code.clone(),
-                RecordBody::Config { .. } => None,
+                RecordBody::Config { .. } | RecordBody::Markers => None,
             });
         }
         self.published.dead_code_facts_of(path)
@@ -3901,7 +3910,7 @@ fn next_inputs(
             Some(Extracted::Config(source, _)) => {
                 configs.insert(path.clone(), Arc::clone(source));
             }
-            Some(Extracted::Nothing) | None => {}
+            Some(Extracted::Markers(_) | Extracted::Nothing) | None => {}
         }
     }
     CheckoutInputs {
@@ -3962,11 +3971,11 @@ impl ContentSink for ContentOnly {
 
 /// Whether `record` is a text file in a parsed language that has no
 /// resolution: given that it has none, its extraction failed. Resolver
-/// configuration files are read raw and never resolved.
+/// configuration files are read raw and never resolved, and files whose
+/// record holds only their TODO markers are not resolved either.
 fn is_unparsed(record: &PathRecord) -> bool {
     matches!(record.kind, PathKind::Text | PathKind::Large)
-        && !record.language.is_empty()
-        && record.language != "config"
+        && super::content::is_parsed_language(&record.language)
 }
 
 /// The language a changed file is parsed as: the one its path and bytes
@@ -3985,14 +3994,19 @@ fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
 /// in a build, a file the extractor fails on is not parsed.
 fn extract_recorded(source: &RecordedSource) -> Extracted {
     let language = &source.language;
-    let Ok(extracted) = extract(&source.bytes, language) else {
+    let Ok(mut extracted) = extract(&source.bytes, language) else {
         return Extracted::Nothing;
     };
+    if let Ok(path) = std::str::from_utf8(&source.path) {
+        // Without them a configuration file's TODOs are reported unread.
+        let _ = super::content::add_config_markers(&mut extracted, path, &source.bytes);
+    }
     match &extracted.data {
         RecordBody::Config { source } => {
             let source = Arc::from(source.as_slice());
             Extracted::Config(source, Arc::new(EncodedRecord::of(&extracted)))
         }
+        RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(&extracted))),
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
                 let key = RecordKey::new(source.content, language, EXTRACTOR_VERSION);
@@ -4299,7 +4313,12 @@ impl ContentSink for BuildSink {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(record)
             }
-            None => extract(bytes, &language),
+            None => extract(bytes, &language).map(|mut record| {
+                // Without them a configuration file's TODOs are reported
+                // unread; the resolver still reads its bytes.
+                let _ = super::content::add_config_markers(&mut record, path_text, bytes);
+                record
+            }),
         };
         match extracted {
             Ok(record) => {
@@ -4349,6 +4368,7 @@ impl Collected {
                         matches!(blob_from_record(stored), Ok(CallgraphBlob::Parse(_)))
                     });
                 }
+                RecordBody::Markers => {}
             }
         }
         let mut encoded = aft_store::content::ContentSectionsBuilder::new();
@@ -4495,6 +4515,7 @@ impl aft_store::heap::HeapBytes for PathTextMemo {
 aft_store::heap_bytes_of_fields!(RefreshedFile { resolution, parse });
 aft_store::heap_bytes_of_fields!(ChangeContent { source, extracted });
 aft_store::heap_bytes_of_fields!(RecordedSource {
+    path,
     language,
     content,
     bytes,
@@ -4508,6 +4529,7 @@ impl aft_store::heap::HeapBytes for Extracted {
                 key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
             }
             Self::Config(bytes, record) => bytes.heap_bytes(seen) + record.heap_bytes(seen),
+            Self::Markers(record) => record.heap_bytes(seen),
         }
     }
 }
@@ -4826,7 +4848,7 @@ impl CheckoutView {
         let unchanged = self.current_state().get(path).is_some_and(|current| {
             current.content == published.content && current.language == published.language
         });
-        if !unchanged || published.language.is_empty() || published.language == "config" {
+        if !unchanged || !super::content::is_parsed_language(&published.language) {
             return Ok(None);
         }
         let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
@@ -4848,6 +4870,115 @@ impl CheckoutView {
             }));
         }
         Ok(None)
+    }
+}
+
+/// One file's TODO markers as a checkout holds them, for the TODO count.
+#[derive(Debug)]
+pub(crate) enum PathTodos {
+    /// The path is not one of the view's files.
+    Absent,
+    /// Larger than the count reads.
+    TooLarge,
+    /// The file has no record: the store neither parses it nor counts its
+    /// comments (it is binary, or a C header that is not UTF-8).
+    Unrecorded,
+    /// Its record, with the TODO markers it holds, if any.
+    Recorded(Option<aft_store::content::TodoMarkers>),
+    /// The store could not extract the file, so it has no record.
+    Unextracted,
+    /// Its record is not there to read: the view's state names a record a
+    /// build of this extractor version has not written yet, or the file
+    /// changed again since the view was taken.
+    Missing,
+}
+
+impl Checkout {
+    /// The TODO markers of the files of `view` at `paths` (relative to the
+    /// root, `/`-separated), from the records the view's state names: the
+    /// publication's for a file unchanged since it, and for a changed file
+    /// the record its change extracted. A changed file not extracted yet is
+    /// extracted now, once for the change, as a call-graph refresh would;
+    /// nothing else is parsed. Files larger than `max_len` are not read.
+    ///
+    /// # Errors
+    ///
+    /// When a record cannot be read.
+    pub(crate) fn todo_markers(
+        &self,
+        view: &CheckoutView,
+        paths: &[Vec<u8>],
+        max_len: u64,
+    ) -> Result<Vec<PathTodos>, DataError> {
+        // Each changed path's extraction, taken under the lock and run
+        // outside it.
+        let changes = {
+            let live = self.live.read().expect("no panics while holding it");
+            paths
+                .iter()
+                .filter_map(|path| {
+                    let change = live.changes.get(path)?;
+                    let record = change.record.as_ref()?;
+                    Some((
+                        path.as_slice(),
+                        (record.content, Arc::clone(&change.content)),
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        // Newest first, as a reader of the publication finds a record.
+        let contents = view
+            .published
+            .segments
+            .iter()
+            .rev()
+            .filter_map(|segment| ContentSegment::open(segment).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DataError::store)?;
+        paths
+            .iter()
+            .map(|path| {
+                let Some(record) = view.current_state().get(path) else {
+                    return Ok(PathTodos::Absent);
+                };
+                if record.stat.size > max_len {
+                    return Ok(PathTodos::TooLarge);
+                }
+                if record.language.is_empty() {
+                    return Ok(PathTodos::Unrecorded);
+                }
+                let published = view.published.state.get(path).is_some_and(|published| {
+                    published.content == record.content && published.language == record.language
+                });
+                if published {
+                    if view.unparsed.contains(path) {
+                        return Ok(PathTodos::Unextracted);
+                    }
+                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                    for content in &contents {
+                        if let Some(ordinal) = content.find(key).map_err(DataError::store)? {
+                            let todos = content.todos(ordinal).map_err(DataError::store)?;
+                            return Ok(PathTodos::Recorded(todos));
+                        }
+                    }
+                    return Ok(PathTodos::Missing);
+                }
+                let Some((content, change)) = changes.get(path.as_slice()) else {
+                    return Ok(PathTodos::Missing);
+                };
+                if *content != record.content {
+                    return Ok(PathTodos::Missing);
+                }
+                Ok(match change.get() {
+                    Extracted::Parse(_, _, stored)
+                    | Extracted::Config(_, stored)
+                    | Extracted::Markers(stored) => {
+                        PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
+                    }
+                    Extracted::Nothing => PathTodos::Unextracted,
+                })
+            })
+            .collect()
     }
 }
 

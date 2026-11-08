@@ -1,104 +1,178 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-#[cfg(all(test, debug_assertions))]
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::time::{Instant, UNIX_EPOCH};
+//! TODO markers in comments.
+//!
+//! The index store finds a file's markers when it parses the file, with the
+//! rules here ([`markers_from_tree`], [`markers_lexical`]), and keeps them in
+//! the file's content record. Counting them ([`run_todos_scan`]) reads the
+//! records of the root's bound checkout and never parses a file: a file
+//! whose record is not there yet makes the count pending, and a root with no
+//! records at all reports the count unavailable.
 
-use rayon::prelude::*;
-use tree_sitter::{Node, Parser, Tree};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::Instant;
 
-use crate::cache_freshness::{self, FileFreshness};
-use crate::inspect::cache::Tier1FileMemo;
+use aft_store::content::{TodoMarker, TodoMarkers};
+use tree_sitter::{Node, Tree};
+
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
-use crate::parser::{detect_language_from_source, grammar_for, LangId};
+use crate::parser::LangId;
 
 const MAX_LINES_PER_FILE: usize = 100_000;
 const MAX_ITEMS: usize = 100;
 const MAX_TEXT_CHARS: usize = 200;
 const MARKERS: [&str; 5] = ["TODO", "FIXME", "HACK", "XXX", "BUG"];
 
-static TODOS_MEMO: OnceLock<Tier1FileMemo<FileScan>> = OnceLock::new();
-
-thread_local! {
-    static TODOS_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
+/// The language a file's comments are read as, to find its TODO markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TodoLanguage {
+    /// Comments are the comment nodes of the file's syntax tree.
+    Tree(LangId),
+    /// A C header that no grammar resolves: comments are found by their
+    /// opening characters, outside quoted strings.
+    Lexical,
 }
 
-/// Isolated cold-scan timing: inventory and fixture preparation stay outside
-/// the measured interval, and each invocation uses a fresh test process.
-#[cfg(all(test, target_os = "linux"))]
-mod throughput_probe {
-    use super::*;
+impl TodoLanguage {
+    /// The language's name as records store it: the parser's language in
+    /// lower case, or `lexical`.
+    pub(crate) fn name(self) -> String {
+        match self {
+            Self::Tree(language) => format!("{language:?}").to_lowercase(),
+            Self::Lexical => "lexical".to_string(),
+        }
+    }
 
-    #[test]
-    #[ignore = "repository throughput probe; requires AFT_SCAN_BENCH_ROOT on Linux"]
-    fn todos_and_metrics_throughput_probe() {
-        use crate::inspect::{InspectCategory, JobKey, JobScope};
-        use std::sync::{Arc, RwLock};
-        let root = PathBuf::from(std::env::var_os("AFT_SCAN_BENCH_ROOT").expect("corpus root"));
-        let mut files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        files.sort();
-        let input_bytes = files
-            .iter()
-            .map(|path| std::fs::metadata(path).unwrap().len())
-            .sum::<u64>();
-        eprintln!("SCAN_CORPUS files={} bytes={input_bytes}", files.len());
-        let scope = JobScope::for_project(&root);
-        let mut job = InspectJob {
-            job_id: 1,
-            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
-            category: InspectCategory::Todos,
-            scope_files: files,
-            project_root: root.clone(),
-            inspect_dir: root.join("inspect"),
-            config: Arc::new(crate::config::Config::default()),
-            symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
-            inspect_writer: true,
-            callgraph_writer: true,
-            callgraph_snapshot: None,
-        };
-        let started = Instant::now();
-        let todos = run_todos_scan(&job).outcome.expect("TODO scan");
-        let todo_ms = started.elapsed().as_secs_f64() * 1000.0;
-        job.category = InspectCategory::Metrics;
-        job.key = JobKey::for_category_scope(job.category, &scope);
-        let started = Instant::now();
-        let metrics = super::super::metrics::run_metrics_scan(&job)
-            .outcome
-            .expect("metrics scan");
-        let metrics_ms = started.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("SCAN_TIMING files={} todo_ms={todo_ms:.3} metrics_ms={metrics_ms:.3} total_ms={:.3} todo_count={} todo_scanned={} metrics_scanned={}", job.scope_files.len(), todo_ms + metrics_ms, todos.aggregate["count"], todos.scanned_files.len(), metrics.scanned_files.len());
-        assert!(!todos.scanned_files.is_empty());
-        assert!(!metrics.scanned_files.is_empty());
+    /// The language named `name` (see [`Self::name`]).
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        if name == "lexical" {
+            return Some(Self::Lexical);
+        }
+        crate::callgraph_store::join::language_id(name).map(Self::Tree)
     }
 }
 
-#[cfg(debug_assertions)]
-static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
-
-#[derive(Debug, Clone)]
-struct TodoItem {
-    file: String,
-    line: usize,
-    marker: &'static str,
-    author: Option<String>,
-    text: String,
+/// The language the comments of the file at `path` are read as, judged from
+/// the path alone; `None` for a file whose TODOs are not counted: plain JSON
+/// (which has no comments and is never read), or a file of no known
+/// language. A C header's language depends on its text, so this gives C for
+/// one; [`header_matches`] tells whether a header was read as it should be.
+pub(crate) fn path_todo_language(path: &Path) -> Option<TodoLanguage> {
+    if is_plain_json(path) {
+        return None;
+    }
+    crate::parser::language_for_extension(path).map(TodoLanguage::Tree)
 }
 
-#[derive(Debug, Clone)]
-struct FileScan {
-    scanned_file: Option<PathBuf>,
-    skipped: Option<(PathBuf, &'static str)>,
-    items: Vec<TodoItem>,
+/// Whether `path` is a C header, whose comments are read as whichever of C,
+/// C++ or Objective-C its text parses as, or lexically when none does.
+pub(crate) fn is_header(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("h")
+}
+
+/// Whether a header's markers read as `language` (a [`TodoLanguage::name`])
+/// are what reading it now would give: the language a header resolves to is
+/// chosen when it is parsed, so any of the ones it can resolve to is
+/// accepted.
+fn header_matches(language: &str) -> bool {
+    matches!(language, "c" | "cpp" | "objc" | "lexical")
+}
+
+/// Plain JSON cannot hold comments, so its TODOs are never counted and the
+/// file is never read; JSON with comments uses a comment-capable extension.
+fn is_plain_json(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+/// `source` as the text whose comments are read, or `None` when the count
+/// does not read it: it holds a NUL byte or is not UTF-8.
+fn text_of(source: &[u8]) -> Option<&str> {
+    if source.contains(&0) {
+        return None;
+    }
+    std::str::from_utf8(source).ok()
+}
+
+/// The TODO markers of `source` parsed as `language` to `tree`: the markers
+/// opening a line of a comment node (and of an HTML comment in Markdown).
+pub(crate) fn markers_from_tree(source: &[u8], language: LangId, tree: &Tree) -> TodoMarkers {
+    let items = text_of(source).map(|text| {
+        let mut comment_nodes = Vec::new();
+        collect_comment_nodes(tree.root_node(), language, text, &mut comment_nodes);
+        comment_nodes.sort_by_key(|node| node.start_byte());
+        let mut items = Vec::new();
+        for node in comment_nodes {
+            scan_comment_node(node, text, &mut items);
+        }
+        items.sort_by_key(|item| item.line);
+        items.dedup_by_key(|item| item.line);
+        items
+    });
+    TodoMarkers {
+        language: TodoLanguage::Tree(language).name(),
+        items,
+    }
+}
+
+/// The TODO markers of `source` found without a syntax tree, for a header no
+/// grammar resolves.
+pub(crate) fn markers_lexical(source: &[u8]) -> TodoMarkers {
+    let items = text_of(source).map(|text| {
+        let mut state = LexicalState::default();
+        text.lines()
+            .take(MAX_LINES_PER_FILE)
+            .enumerate()
+            .filter_map(|(index, line)| scan_lexical_line(line, index + 1, &mut state))
+            .collect()
+    });
+    TodoMarkers {
+        language: TodoLanguage::Lexical.name(),
+        items,
+    }
+}
+
+/// What the count found for one file of its scope.
+#[derive(Debug)]
+pub(crate) enum FileTodos {
+    /// Not read: plain JSON, or content that is not text.
+    NotScanned,
+    /// Read, with these markers.
+    Scanned(Vec<TodoMarker>),
+    /// Not read, for this agent-visible reason.
+    Skipped(&'static str),
+}
+
+/// What the count found for its scope from the index store.
+#[derive(Debug)]
+pub(crate) enum StoredTodos {
+    /// Each scope file's markers, in scope order.
+    Files(Vec<FileTodos>),
+    /// Some file has no record yet: the store is building or catching up.
+    Pending,
+    /// The root has no records at all, for this agent-visible reason.
+    Unavailable(&'static str),
+}
+
+/// What a file's stored markers make of it in the count: `language` is the
+/// one its comments were read as, which must be the one its path calls for.
+pub(crate) fn file_todos(path: &Path, todos: TodoMarkers) -> Option<FileTodos> {
+    let expected = if is_header(path) {
+        header_matches(&todos.language)
+    } else {
+        path_todo_language(path).is_some_and(|language| language.name() == todos.language)
+    };
+    if !expected {
+        return None;
+    }
+    Some(match todos.items {
+        Some(items) => FileTodos::Scanned(items),
+        None => FileTodos::NotScanned,
+    })
 }
 
 pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
-    run_todos_scan_with_memo(job, todos_memo())
-}
-
-fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) -> InspectResult {
     let started = Instant::now();
     let cancellation = crate::executor::current_job_cancellation();
     let cancelled = || {
@@ -114,29 +188,14 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
             started.elapsed(),
         );
     }
-    memo.reserve_for_scan(job.scope_files.len());
-    let progress = crate::run_tool_call::progress::FileProgress::current();
-    let per_file: Vec<FileScan> = job
-        .scope_files
-        .par_iter()
-        .filter_map(|path| {
-            let _cancel = cancellation
-                .clone()
-                .map(crate::executor::install_job_cancellation);
-            if cancelled() {
-                return None;
-            }
-            // Overlapping project roots can scan the same source file. Keep
-            // TODO paths root-independent in the file memo; aggregation below
-            // formats them relative to the root making this request.
-            Some(memo.get_or_insert_with(path, |path| scan_file(path, Path::new(""))))
-        })
-        .inspect(|_| {
-            if let Some(progress) = &progress {
-                progress.finished();
-            }
-        })
-        .collect();
+    let stored = match crate::data_layer::tools::inspect::stored_todos(
+        &job.project_root,
+        &job.config,
+        &job.scope_files,
+    ) {
+        Ok(stored) => stored,
+        Err(error) => return InspectResult::failed(job, error, started.elapsed()),
+    };
     if cancelled() {
         return InspectResult::failed(
             job,
@@ -144,38 +203,60 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
             started.elapsed(),
         );
     }
-    if job.is_full_project_scope() {
-        memo.prune_to_scope(&job.project_root, &job.scope_files);
-    }
+    let aggregate = match stored {
+        StoredTodos::Files(files) => {
+            return InspectResult::success(job, aggregate(job, files), started.elapsed());
+        }
+        // As dead code reports a call graph still building: the records
+        // come with the call-graph build.
+        StoredTodos::Pending => serde_json::json!({
+            "status": "pending", "reason": "callgraph_building", "complete": false,
+        }),
+        StoredTodos::Unavailable(reason) => serde_json::json!({
+            "unavailable": true,
+            "complete": false,
+            "gaps": [{"kind": "todo_markers_unavailable", "reason": reason}],
+        }),
+    };
+    InspectResult::success(
+        job,
+        InspectScanSuccess {
+            scanned_files: Vec::new(),
+            contributions: Vec::new(),
+            aggregate,
+        },
+        started.elapsed(),
+    )
+}
 
+/// The count's result for `files`, each the stored markers of the scope
+/// file at the same position.
+fn aggregate(job: &InspectJob, files: Vec<FileTodos>) -> InspectScanSuccess {
     let mut scanned_files = Vec::new();
     let mut skipped_files = Vec::new();
     let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
-    for scan in per_file {
-        if let Some((path, reason)) = scan.skipped {
-            skipped_files.push((
-                display_file_path(&job.project_root, &path),
-                reason.to_string(),
-            ));
-        }
-        let file = scan
-            .scanned_file
-            .as_ref()
-            .map(|path| display_file_path(&job.project_root, path));
-        if let Some(path) = scan.scanned_file {
-            scanned_files.push(path);
-        }
+    for (path, todos) in job.scope_files.iter().zip(files) {
+        let items = match todos {
+            FileTodos::NotScanned => continue,
+            FileTodos::Skipped(reason) => {
+                skipped_files.push((
+                    display_file_path(&job.project_root, path),
+                    reason.to_string(),
+                ));
+                continue;
+            }
+            FileTodos::Scanned(items) => items,
+        };
+        scanned_files.push(path.clone());
+        let file = display_file_path(&job.project_root, path);
         // Markers in test trees (generated fixtures, mutation notes in test
         // comments) are not product work items; tally them separately.
-        for mut item in scan.items {
-            if let Some(file) = &file {
-                item.file.clone_from(file);
-            }
-            if is_test_tree_file(&item.file) {
-                excluded.record(&item.file);
+        for item in items {
+            if is_test_tree_file(&file) {
+                excluded.record(&file);
             } else {
-                all_items.push(item);
+                all_items.push((file.clone(), item));
             }
         }
     }
@@ -184,8 +265,8 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     for marker in MARKERS {
         by_kind.insert(marker.to_string(), 0usize);
     }
-    for item in &all_items {
-        if let Some(count) = by_kind.get_mut(item.marker) {
+    for (_, item) in &all_items {
+        if let Some(count) = by_kind.get_mut(item.marker.as_str()) {
             *count += 1;
         }
     }
@@ -195,9 +276,9 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     let items = all_items
         .into_iter()
         .take(MAX_ITEMS)
-        .map(|item| {
+        .map(|(file, item)| {
             serde_json::json!({
-                "file": item.file,
+                "file": file,
                 "line": item.line,
                 "marker": item.marker,
                 "author": item.author,
@@ -214,154 +295,11 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     });
     excluded.write_into(&mut aggregate);
     super::source_text::write_skipped_files(&mut aggregate, skipped_files, None);
-    let success = InspectScanSuccess {
+    InspectScanSuccess {
         scanned_files,
         contributions: Vec::new(),
         aggregate,
-    };
-    InspectResult::success(job, success, started.elapsed())
-}
-
-fn todos_memo() -> &'static Tier1FileMemo<FileScan> {
-    TODOS_MEMO.get_or_init(Tier1FileMemo::default)
-}
-
-fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileScan) {
-    // Plain JSON cannot contain comments. Do not open it, even to sniff for a
-    // language; JSON with comments must use a comment-capable extension.
-    if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-    {
-        return (
-            None,
-            FileScan {
-                scanned_file: None,
-                skipped: None,
-                items: Vec::new(),
-            },
-        );
     }
-    let metadata = std::fs::metadata(path).ok();
-    let _permit =
-        super::source_text::source_scan_permit(metadata.as_ref().map_or(0, std::fs::Metadata::len));
-    let (freshness, source, skipped_reason) = read_text_file(path, metadata);
-    let Some(source) = source else {
-        return (
-            freshness,
-            FileScan {
-                scanned_file: None,
-                skipped: skipped_reason.map(|reason| (path.to_path_buf(), reason)),
-                items: Vec::new(),
-            },
-        );
-    };
-
-    let file = display_file_path(project_root, path);
-    let items = match detect_language_from_source(path, &source) {
-        Some(language) => scan_parser_comments(path, language, &source, &file),
-        None => scan_lexical_comments(&source, &file),
-    };
-
-    (
-        freshness,
-        FileScan {
-            scanned_file: Some(path.to_path_buf()),
-            skipped: None,
-            items,
-        },
-    )
-}
-
-fn scan_parser_comments(path: &Path, language: LangId, source: &str, file: &str) -> Vec<TodoItem> {
-    let Some(tree) = parse_source(path, language, source) else {
-        return Vec::new();
-    };
-
-    let mut comment_nodes = Vec::new();
-    collect_comment_nodes(tree.root_node(), language, source, &mut comment_nodes);
-    comment_nodes.sort_by_key(|node| node.start_byte());
-
-    let mut items = Vec::new();
-    for node in comment_nodes {
-        scan_comment_node(node, source, file, &mut items);
-    }
-    items.sort_by_key(|item| item.line);
-    items.dedup_by_key(|item| item.line);
-    items
-}
-
-#[cfg(all(test, debug_assertions))]
-type ParseDelay = (
-    crossbeam_channel::Sender<()>,
-    crossbeam_channel::Receiver<()>,
-);
-
-#[cfg(all(test, debug_assertions))]
-static PARSE_DELAYS: OnceLock<Mutex<HashMap<PathBuf, ParseDelay>>> = OnceLock::new();
-
-fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
-    #[cfg(all(test, debug_assertions))]
-    {
-        let delay = PARSE_DELAYS
-            .get()
-            .and_then(|delays| delays.lock().unwrap().remove(path));
-        if let Some((entered, release)) = delay {
-            entered.send(()).expect("TODO file reached parser");
-            release
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("release delayed TODO parser");
-        }
-    }
-    if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
-        if crate::executor::current_job_cancelled() || !path.is_file() {
-            return None;
-        }
-        return crate::parser::parse_source_with_cached_parser(path, source, language).ok();
-    }
-    TODOS_PARSERS.with(|parsers| {
-        let mut parsers = parsers.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(language) {
-            let mut parser = Parser::new();
-            if parser.set_language(&grammar_for(language)).is_err() {
-                return None;
-            }
-            entry.insert(parser);
-        }
-
-        let parser = parsers
-            .get_mut(&language)
-            .expect("parser inserted for language");
-        if crate::executor::current_job_cancelled() || !path.is_file() {
-            parser.reset();
-            return None;
-        }
-        // Progress callbacks interrupt large generated files without reparsing
-        // them. Throttle filesystem checks so ordinary parsing stays CPU-bound.
-        let mut last_check = Instant::now();
-        let mut progress = |_: &tree_sitter::ParseState| {
-            if last_check.elapsed() >= std::time::Duration::from_millis(100) {
-                last_check = Instant::now();
-                if crate::executor::current_job_cancelled() || !path.is_file() {
-                    return std::ops::ControlFlow::Break(());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        };
-        let bytes = source.as_bytes();
-        let tree = parser.parse_with_options(
-            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-        );
-        if tree.is_none() {
-            // A cancelled parser keeps resumable state; the next file must not
-            // accidentally resume the abandoned source buffer.
-            parser.reset();
-        }
-        tree
-    })
 }
 
 fn collect_comment_nodes<'tree>(
@@ -404,7 +342,7 @@ fn is_comment_node(node: Node<'_>, language: LangId, source: &str) -> bool {
             .is_ok_and(|text| text.trim_start().starts_with("<!--"))
 }
 
-fn scan_comment_node(node: Node<'_>, source: &str, file: &str, items: &mut Vec<TodoItem>) {
+fn scan_comment_node(node: Node<'_>, source: &str, items: &mut Vec<TodoMarker>) {
     let Ok(comment) = node.utf8_text(source.as_bytes()) else {
         return;
     };
@@ -415,7 +353,7 @@ fn scan_comment_node(node: Node<'_>, source: &str, file: &str, items: &mut Vec<T
         if line_number > MAX_LINES_PER_FILE {
             break;
         }
-        if let Some(item) = scan_line(line, line_number, file, &mut in_block_comment) {
+        if let Some(item) = scan_line(line, line_number, &mut in_block_comment) {
             items.push(item);
         }
     }
@@ -433,22 +371,11 @@ struct LexicalState {
     block_closer: Option<&'static str>,
 }
 
-fn scan_lexical_comments(source: &str, file: &str) -> Vec<TodoItem> {
-    let mut state = LexicalState::default();
-    source
-        .lines()
-        .take(MAX_LINES_PER_FILE)
-        .enumerate()
-        .filter_map(|(line_index, line)| scan_lexical_line(line, line_index + 1, file, &mut state))
-        .collect()
-}
-
 fn scan_lexical_line(
     line: &str,
     line_number: usize,
-    file: &str,
     state: &mut LexicalState,
-) -> Option<TodoItem> {
+) -> Option<TodoMarker> {
     let mut cursor = 0usize;
     while cursor < line.len() {
         if let Some(closer) = state.block_closer {
@@ -457,7 +384,7 @@ fn scan_lexical_line(
                 .map(|offset| cursor + offset)
                 .unwrap_or(line.len());
             let body = strip_block_comment_prefix(&line[cursor..body_end]);
-            let item = parse_todo_body(body, line_number, file);
+            let item = parse_todo_body(body, line_number);
             let Some(closer_offset) = closer_offset else {
                 return item;
             };
@@ -506,7 +433,7 @@ fn scan_lexical_line(
                 .map(|offset| body_start + offset)
                 .unwrap_or(line.len());
             let body = strip_block_comment_prefix(&line[body_start..body_end]);
-            let item = parse_todo_body(body, line_number, file);
+            let item = parse_todo_body(body, line_number);
             if let Some(offset) = closer_offset {
                 cursor = body_start + offset + closer.len();
             } else {
@@ -519,7 +446,7 @@ fn scan_lexical_line(
             continue;
         }
 
-        return parse_todo_body(line[body_start..].trim_start(), line_number, file);
+        return parse_todo_body(line[body_start..].trim_start(), line_number);
     }
 
     None
@@ -599,65 +526,9 @@ fn next_char_len(line: &str, cursor: usize) -> usize {
         .unwrap_or_default()
 }
 
-fn read_text_file(
-    path: &Path,
-    metadata: Option<std::fs::Metadata>,
-) -> (Option<FileFreshness>, Option<String>, Option<&'static str>) {
-    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
-    let bytes = match read_source_bytes(path) {
-        Ok(SourceBytes::Bytes(bytes)) => {
-            #[cfg(debug_assertions)]
-            bump_file_read_count(path);
-            Some(bytes)
-        }
-        Ok(SourceBytes::TooLarge) => return (None, None, Some(TOO_LARGE)),
-        _ => None,
-    };
-    let freshness = metadata
-        .as_ref()
-        .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
-
-    let Some(bytes) = bytes else {
-        return (freshness, None, None);
-    };
-    if bytes.contains(&0) {
-        return (freshness, None, None);
-    }
-    (freshness, String::from_utf8(bytes).ok(), None)
-}
-
-fn freshness_from_metadata(metadata: &std::fs::Metadata, bytes: Option<&[u8]>) -> FileFreshness {
-    let size = metadata.len();
-    let content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
-        bytes
-            .map(cache_freshness::hash_bytes)
-            .unwrap_or_else(cache_freshness::zero_hash)
-    } else {
-        cache_freshness::zero_hash()
-    };
-
-    FileFreshness {
-        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
-        size,
-        content_hash,
-    }
-}
-
-fn display_file_path(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn scan_line(
-    line: &str,
-    line_number: usize,
-    file: &str,
-    in_block_comment: &mut bool,
-) -> Option<TodoItem> {
+fn scan_line(line: &str, line_number: usize, in_block_comment: &mut bool) -> Option<TodoMarker> {
     if *in_block_comment {
-        let item = parse_todo_body(strip_block_comment_prefix(line), line_number, file);
+        let item = parse_todo_body(strip_block_comment_prefix(line), line_number);
         if line.contains("*/") {
             *in_block_comment = false;
         }
@@ -681,7 +552,7 @@ fn scan_line(
         } else {
             body.trim_start()
         };
-        if let Some(item) = parse_todo_body(body, line_number, file) {
+        if let Some(item) = parse_todo_body(body, line_number) {
             found_item = Some(item);
             break;
         }
@@ -740,7 +611,7 @@ fn strip_block_comment_prefix(body: &str) -> &str {
     trimmed
 }
 
-fn parse_todo_body(body: &str, line_number: usize, file: &str) -> Option<TodoItem> {
+fn parse_todo_body(body: &str, line_number: usize) -> Option<TodoMarker> {
     let body = body.trim_start();
     for marker in MARKERS {
         let Some(rest) = body.strip_prefix(marker) else {
@@ -749,10 +620,10 @@ fn parse_todo_body(body: &str, line_number: usize, file: &str) -> Option<TodoIte
         let Some((author, text_start)) = parse_marker_suffix(marker, rest) else {
             continue;
         };
-        return Some(TodoItem {
-            file: file.to_string(),
-            line: line_number,
-            marker,
+        return Some(TodoMarker {
+            // Lines past MAX_LINES_PER_FILE are never scanned.
+            line: u32::try_from(line_number).unwrap_or(u32::MAX),
+            marker: marker.to_string(),
             author,
             text: truncate_text(strip_comment_closer(text_start)),
         });
@@ -815,68 +686,102 @@ fn strip_comment_closer(text: &str) -> &str {
 fn truncate_text(text: &str) -> String {
     text.chars().take(MAX_TEXT_CHARS).collect()
 }
-#[cfg(debug_assertions)]
-fn bump_file_read_count(path: &Path) {
-    FILE_READS.record(path);
+
+fn display_file_path(project_root: &Path, path: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn reset_file_read_count_for_debug(project_root: &Path) {
-    // Normalized like the scanned paths themselves: bare canonicalize is
-    // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    FILE_READS.reset(project_root);
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn file_read_count_for_debug(project_root: &Path) -> usize {
-    // Normalized like the scanned paths themselves: bare canonicalize is
-    // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    FILE_READS.count(&project_root)
-}
-
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
 
     use super::*;
-
-    #[test]
-    fn audit05_todo_read_tracking_is_root_opt_in() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.rs");
-        fs::write(&path, "// TODO: marker\n").unwrap();
-        let _ = read_text_file(&path, fs::metadata(&path).ok());
-        assert_eq!(file_read_count_for_debug(dir.path()), 0);
-        reset_file_read_count_for_debug(dir.path());
-        let _ = read_text_file(&path, fs::metadata(&path).ok());
-        assert_eq!(file_read_count_for_debug(dir.path()), 1);
-    }
     use crate::config::Config;
     use crate::inspect::{InspectCategory, JobKey, JobScope};
     use crate::parser::SymbolCache;
 
-    const OVER_DEFAULT_MEMO_CAPACITY: usize = 4_097;
+    /// The markers extraction records for `source` at `path`, as the index
+    /// store's records hold them.
+    fn markers(path: &str, source: &str) -> TodoMarkers {
+        let language = crate::data_layer::content::language_for(path, source.as_bytes())
+            .expect("a language the store records");
+        let mut record =
+            crate::data_layer::content::extract(source.as_bytes(), &language).expect("extraction");
+        crate::data_layer::content::add_config_markers(&mut record, path, source.as_bytes())
+            .expect("configuration markers");
+        record.todos.expect("the record holds TODO markers")
+    }
 
+    fn lines(todos: &TodoMarkers) -> Vec<(u32, String, String)> {
+        todos
+            .items
+            .as_ref()
+            .expect("text")
+            .iter()
+            .map(|item| (item.line, item.marker.clone(), item.text.clone()))
+            .collect()
+    }
+
+    /// Every marker must open the comment; an upper-case marker word inside
+    /// prose or a string is not a work item.
     #[test]
-    fn audit05_memo_paths_are_relative_to_each_root() {
-        let dir = tempfile::tempdir().expect("project");
-        let parent = dir.path();
-        let nested = parent.join("nested");
-        fs::create_dir_all(nested.join("src")).expect("test directory");
-        let file = nested.join("src/task.rs");
-        fs::write(&file, "// TODO: examine marker\n").expect("source");
-        let memo = Tier1FileMemo::default();
-        let first = run_todos_scan_with_memo(&todos_job(parent, vec![file.clone()]), &memo);
-        let second = run_todos_scan_with_memo(&todos_job(&nested, vec![file]), &memo);
-        let first = first.outcome.expect("parent scan").aggregate;
-        let second = second.outcome.expect("nested scan").aggregate;
-        assert_eq!(first["items"][0]["file"], "nested/src/task.rs");
-        assert_eq!(second["items"][0]["file"], "src/task.rs");
+    fn markers_open_comments_and_strings_never_count() {
+        let todos = markers(
+            "src/lib.rs",
+            "// BUG: leading marker counts\n\
+             // this documents a BUG in prose\n\
+             // the TODO list and the FIXME tag and a HACK and XXX are prose here\n\
+             fn f() { let s = \"// TODO: not a comment\"; }\n\
+             /* FIXME(ana): block */\n",
+        );
+        assert_eq!(todos.language, "rust");
+        assert_eq!(
+            lines(&todos),
+            vec![
+                (1, "BUG".into(), "leading marker counts".into()),
+                (5, "FIXME".into(), "block".into()),
+            ]
+        );
+        assert_eq!(
+            todos.items.as_ref().unwrap()[1].author.as_deref(),
+            Some("ana")
+        );
+    }
+
+    /// Markdown, minified bundles, resolver configuration and headers no
+    /// grammar resolves are not parsed by the call graph, and still hold
+    /// their markers, read as today's count read them.
+    #[test]
+    fn files_the_call_graph_skips_still_hold_their_markers() {
+        let markdown = markers(
+            "docs/notes.md",
+            "# TODO heading is not a comment\n<!-- TODO: real comment -->\n```\n<!-- FIXME: in a fence -->\n```\n",
+        );
+        assert_eq!(markdown.language, "markdown");
+        assert_eq!(
+            lines(&markdown),
+            vec![(2, "TODO".into(), "real comment".into())]
+        );
+
+        let minified = format!("/* HACK: shim */{}\n", "var a=1;".repeat(400));
+        let bundle = markers("dist-like/app.min.js", &minified);
+        assert_eq!(bundle.language, "javascript");
+        assert_eq!(lines(&bundle), vec![(1, "HACK".into(), "shim".into())]);
+
+        let cargo = markers("Cargo.toml", "[package]\n# TODO: publish\nname = \"x\"\n");
+        assert_eq!(cargo.language, "toml");
+        assert_eq!(lines(&cargo), vec![(2, "TODO".into(), "publish".into())]);
+
+        let not_text = crate::inspect::scanners::todos::markers_lexical(b"// TODO: a\0b\n");
+        assert_eq!(not_text.items, None);
+        let lexical = markers_lexical(b"x = \"// TODO: quoted\"\n# XXX: real\n");
+        assert_eq!(lexical.language, "lexical");
+        assert_eq!(lines(&lexical), vec![(2, "XXX".into(), "real".into())]);
     }
 
     fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
@@ -899,367 +804,149 @@ mod tests {
         }
     }
 
-    #[test]
-    fn oversized_todo_source_is_unopened_and_is_a_named_gap() {
-        let project = tempfile::tempdir().unwrap();
-        let large = project.path().join("large.rs");
-        fs::File::create(&large)
-            .unwrap()
-            .set_len(super::super::source_text::MAX_SOURCE_BYTES + 1)
-            .unwrap();
-        let small = project.path().join("small.rs");
-        fs::write(&small, "// TODO: small source still scanned\n").unwrap();
-        let probe = crate::project_content::Probe::new(project.path());
-        let job = todos_job(project.path(), vec![large.clone(), small.clone()]);
-        let memo = Tier1FileMemo::default();
-        for _ in 0..2 {
-            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
-            assert_eq!(result.scanned_files, vec![small.clone()]);
-            assert_eq!(result.aggregate["count"], 1);
-            assert_eq!(result.aggregate["complete"], false);
-            assert_eq!(
-                result.aggregate["skipped_files"],
-                serde_json::json!([
-                    {"file": "large.rs", "reason": "over the 1 MiB size limit"}
-                ])
-            );
-        }
-        assert!(!probe.paths().contains(&large));
-        fs::write(&large, "// TODO: now small enough\n").unwrap();
-        let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
-        assert_eq!(result.aggregate["count"], 2);
-        assert!(result.aggregate.get("skipped_files").is_none());
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
     }
 
+    /// A root with no checkout bound, and no word that it never gets one,
+    /// is pending: it never reports zero TODOs.
     #[test]
-    fn plain_json_is_unopened_but_jsonc_comments_are_scanned() {
-        let project = tempfile::tempdir().unwrap();
-        let plain = project.path().join("data.json");
-        fs::write(&plain, "{\"value\": \"TODO: not a comment\"}").unwrap();
-        let commented = project.path().join("config.jsonc");
-        fs::write(
-            &commented,
-            "{\n// TODO: keep this comment\n\"value\": 1\n}\n",
-        )
-        .unwrap();
-        let probe = crate::project_content::Probe::new(project.path());
-        let job = todos_job(project.path(), vec![plain.clone(), commented.clone()]);
-        let memo = Tier1FileMemo::default();
-        for _ in 0..2 {
-            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
-            assert_eq!(result.scanned_files, vec![commented.clone()]);
-            assert_eq!(result.aggregate["count"], 1);
-            assert_eq!(result.aggregate["items"][0]["file"], "config.jsonc");
-            assert!(result.aggregate.get("skipped_files").is_none());
-            assert_ne!(result.aggregate["complete"], false);
-        }
-        assert!(!probe.paths().contains(&plain));
-        assert!(probe.paths().contains(&commented));
-    }
+    fn a_root_without_records_is_pending_never_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        write(&root, "src/lib.rs", "// TODO: unseen\n");
+        let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
+        let aggregate = result.outcome.unwrap().aggregate;
+        assert_eq!(aggregate["status"], "pending", "{aggregate:#}");
+        assert!(aggregate.get("count").is_none(), "{aggregate:#}");
 
-    #[cfg(debug_assertions)]
-    #[test]
-    fn several_large_todo_files_hold_source_bytes_through_parse_without_a_two_file_cap() {
-        let project = tempfile::tempdir().unwrap();
-        let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
-        let (release_tx, release_rx) = crossbeam_channel::unbounded();
-        let fitting_files = (super::super::source_text::SOURCE_SCAN_BUDGET_BYTES
-            / super::super::source_text::MAX_SOURCE_BYTES) as usize;
-        let total_files = fitting_files + 1;
-        let paths = (0..total_files)
-            .map(|index| {
-                let path = project.path().join(format!("large-{index}.rs"));
-                let mut source = String::from("// TODO: bounded parallel parsing\n");
-                source.extend(std::iter::repeat_n(
-                    ' ',
-                    super::super::source_text::MAX_SOURCE_BYTES as usize - source.len(),
-                ));
-                fs::write(&path, source).unwrap();
-                PARSE_DELAYS
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap()
-                    .insert(path.clone(), (entered_tx.clone(), release_rx.clone()));
-                path
-            })
-            .collect();
-        reset_file_read_count_for_debug(project.path());
-        let job = todos_job(project.path(), paths);
-        let worker = std::thread::spawn(move || {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(total_files)
-                .build()
-                .unwrap()
-                .install(|| {
-                    run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
-                        .outcome
-                        .unwrap()
-                })
-        });
-        let deadline = std::time::Duration::from_secs(5);
-        for _ in 0..fitting_files {
-            entered_rx.recv_timeout(deadline).unwrap();
-        }
-        let over_budget = entered_rx.recv_timeout(std::time::Duration::from_millis(100));
-        let reads_while_blocked = file_read_count_for_debug(project.path());
-        for _ in 0..total_files {
-            release_tx.send(()).unwrap();
-        }
-        let result = worker.join().unwrap();
-        assert!(
-            over_budget.is_err(),
-            "another parser ran while the source-byte budget was fully reserved"
+        crate::data_layer::tools::inspect::note_root(
+            &root,
+            crate::data_layer::tools::inspect::RootKind::Withheld,
         );
+        let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
+        let aggregate = result.outcome.unwrap().aggregate;
+        assert_eq!(aggregate["unavailable"], true, "{aggregate:#}");
         assert_eq!(
-            reads_while_blocked, fitting_files,
-            "permits must cover reads, not only parsing"
-        );
-        assert_eq!(result.scanned_files.len(), total_files);
-        assert_eq!(result.aggregate["count"], total_files);
-    }
-
-    /// Run in its own process under `/usr/bin/time -v`; fixtures are prepared
-    /// separately so their allocation and write cost do not enter the peak
-    /// resident set size (RSS).
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "large-input RSS probe; requires AFT_TODO_RSS_ROOT on Linux"]
-    fn todos_large_json_rss_probe() {
-        let root = PathBuf::from(std::env::var_os("AFT_TODO_RSS_ROOT").expect("fixture root"));
-        let paths = [
-            "data-100.json",
-            "data-125.json",
-            "data-150.json",
-            "small.rs",
-        ]
-        .map(|name| root.join(name))
-        .to_vec();
-        reset_file_read_count_for_debug(&root);
-        let result = run_todos_scan_with_memo(&todos_job(&root, paths), &Tier1FileMemo::default())
-            .outcome
-            .expect("TODO scan");
-        assert_eq!(result.aggregate["count"], 1);
-        eprintln!(
-            "TODO RSS probe: reads={}, scanned={}, aggregate={}",
-            file_read_count_for_debug(&root),
-            result.scanned_files.len(),
-            result.aggregate
+            aggregate["gaps"][0]["reason"],
+            crate::data_layer::tools::inspect::TODOS_NO_INDEX_STORE
         );
     }
 
+    /// Counting the TODOs of a bound, published checkout reads them from the
+    /// store's records: it opens no source file and parses nothing. After
+    /// edits that add, change and remove markers, the count follows, and
+    /// only the edited files are extracted, once each, by the store.
     #[test]
-    fn quiesced_root_aborts_real_executor_todos_scan_mid_parse() {
-        executor_todos_abandonment(false, false);
-    }
+    fn counting_a_bound_checkout_opens_and_parses_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        let app = "// TODO: first unparsed marker\nfn app() {}\n";
+        let notes = "# Notes\n<!-- FIXME: unparsed markdown marker -->\n";
+        let cargo = "[package]\n# HACK: unparsed config marker\nname = \"todo-fixture\"\nversion = \"0.1.0\"\n";
+        write(&root, "src/app.rs", app);
+        write(&root, "src/plain.rs", "fn plain() {}\n");
+        write(&root, "docs/notes.md", notes);
+        write(&root, "Cargo.toml", cargo);
+        write(&root, "data.json", "{\"note\": \"// TODO: never read\"}\n");
+        write(&root, "tests/fixture.rs", "// TODO: test-tree marker\n");
+        write(&root, "src/huge.rs", &"// filler\n".repeat(120_000));
 
-    #[test]
-    fn deleted_root_aborts_real_executor_todos_scan_mid_parse() {
-        executor_todos_abandonment(true, false);
-    }
-
-    #[test]
-    fn quiesced_root_rebound_within_grace_completes_real_executor_todos_scan() {
-        executor_todos_abandonment(false, true);
-    }
-
-    fn executor_todos_abandonment(delete_root: bool, rebind: bool) {
-        use crate::context::AppContext;
-        use crate::executor::{Executor, Lane};
-        use crate::parser::TreeSitterProvider;
-        use crate::path_identity::ProjectRootId;
-        use crate::protocol::Response;
-        use std::time::Duration;
-
-        let directory = tempfile::tempdir().expect("TODO project root");
-        let storage = tempfile::tempdir().expect("isolated TODO storage");
-        let root = ProjectRootId::from_path(directory.path()).expect("canonical TODO root");
-        let path = root.as_path().join("lib.rs");
-        fs::write(&path, "// TODO: retain this marker\npub fn target() {}\n")
-            .expect("write TODO fixture");
-        let job = todos_job(root.as_path(), vec![path.clone()]);
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
-                project_root: Some(root.as_path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
+                project_root: Some(root.clone()),
                 ..Config::default()
             },
-        ));
-        ctx.set_unbound_build_abandon_grace_for_test(if rebind {
-            Duration::from_secs(600)
-        } else {
-            Duration::ZERO
-        });
-        ctx.mark_subc_bound();
-        let executor = Executor::new();
-        executor.register_actor(root.clone(), Arc::clone(&ctx));
-        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        PARSE_DELAYS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .insert(path, (entered_tx, release_rx));
-        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
-        let running = executor.submit_maintenance_async(
-            root.clone(),
-            Lane::HeavyInit,
-            "delayed-todos-scan".to_owned(),
-            Box::new(move |_| {
-                // Run the real scanner and its Rayon file work, not a closure
-                // that merely asserts the executor token was cancelled.
-                let result = run_todos_scan(&job);
-                result_tx.send(result).unwrap();
-                Response::success(
-                    "delayed-todos-scan",
-                    serde_json::json!({ "scan_exited": true }),
-                )
-            }),
         );
-        entered_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("real TODO scan read a file and reached its parser");
-        if delete_root {
-            directory.close().expect("delete TODO root mid-scan");
-        } else {
-            ctx.mark_subc_unbound();
-            executor.cancel_queued_root_maintenance(&root);
-            if rebind {
-                ctx.mark_subc_bound();
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        let checkout = ctx.data_checkout().expect("bound");
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let view = loop {
+            let view = checkout.view().expect("published");
+            if view.status().callgraph_published && !checkout.checkout().status().building {
+                break view;
             }
-        }
-        release_tx.send(()).expect("release TODO parser delay");
-        let result = result_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("TODO scan terminates after abandonment");
-        if rebind {
-            assert!(
-                result.outcome.is_ok(),
-                "short unbind must preserve running TODO scan: {:?}",
-                result.outcome
-            );
-        } else {
-            assert!(
-                matches!(result.outcome, Err(ref error) if error.contains("cancelled")),
-                "abandoned TODO scan must not report a fresh aggregate: {:?}",
-                result.outcome
-            );
-        }
-        let response = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(10), running)
-                    .await
-                    .expect("executor releases TODO scan slot")
-                    .expect("TODO executor completion")
-            });
-        assert!(
-            response.success,
-            "TODO scanner panicked: {:?}",
-            response.data
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !executor.actor_is_idle(&root) {
-            assert!(
-                Instant::now() < deadline,
-                "TODO scan retained executor slot"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+            assert!(Instant::now() < deadline, "the call graph never published");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let scope = crate::inspect::inventory::InspectInventory::from_checkout(&root, &view)
+            .expect("the view stands in for a walk")
+            .sources;
+        let parses =
+            |source: &str| crate::data_layer::content::parses_of_for_test(source.as_bytes());
+        let parsed_before = [app, notes, cargo].map(parses);
 
-    #[test]
-    fn full_scope_larger_than_default_capacity_stays_warm() {
-        let project = tempfile::tempdir().expect("project");
-        let mut files = Vec::with_capacity(OVER_DEFAULT_MEMO_CAPACITY);
-        for index in 0..OVER_DEFAULT_MEMO_CAPACITY {
-            let path = project.path().join(format!("file-{index:04}.rs"));
-            fs::write(
-                &path,
-                format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
-            )
-            .expect("write fixture");
-            files.push(path);
-        }
-        let job = todos_job(project.path(), files);
-        let memo = Tier1FileMemo::default();
-
-        assert!(run_todos_scan_with_memo(&job, &memo).outcome.is_ok());
-        reset_file_read_count_for_debug(project.path());
-        assert!(run_todos_scan_with_memo(&job, &memo).outcome.is_ok());
-
-        assert_eq!(
-            file_read_count_for_debug(project.path()),
-            0,
-            "an unchanged full scan must retain every live file above the default memo capacity"
-        );
-    }
-
-    fn scan_files(files: &[(&str, &str)]) -> serde_json::Value {
-        let project = tempfile::tempdir().expect("project");
-        let paths = files
-            .iter()
-            .map(|(relative, contents)| {
-                let path = project.path().join(relative);
-                fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
-                fs::write(&path, contents).expect("write fixture");
-                path
-            })
-            .collect::<Vec<_>>();
-        let job = todos_job(project.path(), paths);
-        run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
-            .outcome
-            .expect("todos scan succeeds")
-            .aggregate
-    }
-
-    #[test]
-    fn markers_in_test_trees_are_excluded_from_the_product_count() {
-        let aggregate = scan_files(&[
-            (
-                "src/app.ts",
-                "// TODO: product work item\nexport const a = 1;\n",
-            ),
-            (
-                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
-                "// TODO: fixture item 0\n// TODO: fixture item 1\n",
-            ),
-            (
-                "crates/app/tests/mutation.rs",
-                "fn f() -> bool {\n    true // BUG: deliberate mutant\n}\n",
-            ),
-        ]);
-
-        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        let probe = crate::project_content::Probe::new(&root);
+        let job = todos_job(&root, scope.clone());
+        let aggregate = run_todos_scan(&job).outcome.unwrap().aggregate;
+        assert!(probe.paths().is_empty(), "opened {:?}", probe.paths());
+        assert_eq!([app, notes, cargo].map(parses), parsed_before);
+        assert_eq!(aggregate["count"], 3, "{aggregate:#}");
         assert_eq!(aggregate["by_kind"]["TODO"], 1, "{aggregate:#}");
-        assert_eq!(aggregate["by_kind"]["BUG"], 0, "{aggregate:#}");
-        assert_eq!(aggregate["excluded_test_count"], 3, "{aggregate:#}");
-        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["FIXME"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["HACK"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 1, "{aggregate:#}");
         let files = aggregate["items"]
             .as_array()
-            .expect("items")
+            .unwrap()
             .iter()
-            .map(|item| item["file"].as_str().expect("file"))
+            .map(|item| {
+                (
+                    item["file"].as_str().unwrap(),
+                    item["line"].as_u64().unwrap(),
+                )
+            })
             .collect::<Vec<_>>();
-        assert_eq!(files, vec!["src/app.ts"]);
-    }
+        assert_eq!(
+            files,
+            vec![("Cargo.toml", 2), ("docs/notes.md", 2), ("src/app.rs", 1)]
+        );
+        assert_eq!(
+            aggregate["skipped_files"],
+            serde_json::json!([{"file": "src/huge.rs", "reason": "over the 1 MiB size limit"}])
+        );
 
-    /// Every marker must open the comment; an upper-case marker word inside
-    /// prose is not a work item. The rule is the same for all five markers.
-    #[test]
-    fn marker_words_inside_prose_do_not_count() {
-        let aggregate = scan_files(&[(
-            "src/lib.rs",
-            "// BUG: leading marker counts\n\
-             // this documents a BUG in prose\n\
-             // the TODO list and the FIXME tag and a HACK and XXX are prose here\n\
-             fn f() {}\n",
-        )]);
-
-        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
-        assert_eq!(aggregate["by_kind"]["BUG"], 1, "{aggregate:#}");
-        assert_eq!(aggregate["excluded_test_count"], 0, "{aggregate:#}");
+        // Add, change and remove markers.
+        let plain = "fn plain() {}\n// XXX: added marker\n";
+        let changed_app = "fn app() {}\n// TODO: moved and reworded\n";
+        write(&root, "src/plain.rs", plain);
+        write(&root, "src/app.rs", changed_app);
+        write(&root, "docs/notes.md", "# Notes\n");
+        checkout.note_paths(&[
+            root.join("src/plain.rs"),
+            root.join("src/app.rs"),
+            root.join("docs/notes.md"),
+        ]);
+        // Recording the edits read the files; the count must read none.
+        drop(probe);
+        let probe = crate::project_content::Probe::new(&root);
+        let view = checkout.view().unwrap();
+        let scope = crate::inspect::inventory::InspectInventory::from_checkout(&root, &view)
+            .expect("the view stands in for a walk")
+            .sources;
+        let aggregate = run_todos_scan(&todos_job(&root, scope))
+            .outcome
+            .unwrap()
+            .aggregate;
+        assert!(probe.paths().is_empty(), "opened {:?}", probe.paths());
+        assert_eq!(aggregate["count"], 3, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["FIXME"], 0, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["XXX"], 1, "{aggregate:#}");
+        let items = aggregate["items"].as_array().unwrap();
+        assert_eq!(items[1]["file"], "src/app.rs");
+        assert_eq!(items[1]["line"], 2);
+        assert_eq!(items[1]["text"], "moved and reworded");
+        // The edited files were extracted once, for their changes.
+        assert_eq!(parses(plain), 1);
+        assert_eq!(parses(changed_app), 1);
     }
 }
