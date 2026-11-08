@@ -53,6 +53,9 @@ pub mod agent_child_env;
 pub mod agent_data;
 pub mod alert_records;
 pub mod alert_state;
+// The `aft` binary installs its allocator; the library sets the operation
+// labels it attributes allocations to.
+pub mod alloc_trace;
 pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
