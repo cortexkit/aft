@@ -1716,9 +1716,6 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(not(debug_assertions))]
-fn delay_search_rebuild_publish_for_debug() {}
-
 /// Parse the optional `config: [{tier, source, doc}]` raw-tier array from
 /// configure params. Returns `None` when absent or empty, so the resolver only
 /// runs when tiers are actually supplied. Tiers with
