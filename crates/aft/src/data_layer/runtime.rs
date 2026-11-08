@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use aft_store::ids::{Digest128, FamilyId};
 
-use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, Planes};
+use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, DeltaReport, Folded, Planes};
 use super::meaning::{Meaning, MeaningState, Round};
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
@@ -155,6 +155,7 @@ enum Publish {
 
 /// Executor request ids of a checkout's background work.
 const BUILD_REQUEST: &str = "data-layer-build";
+const FOLD_REQUEST: &str = "data-layer-fold";
 const REFRESH_REQUEST: &str = "data-layer-refresh";
 const RESCAN_REQUEST: &str = "data-layer-rescan";
 const FILL_REQUEST: &str = "data-layer-meaning-fill";
@@ -315,6 +316,8 @@ struct Work {
     runner: Runner,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
+    /// A fold of the checkout's segments is queued or running.
+    folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
     /// A rescan is queued or running.
@@ -518,7 +521,7 @@ impl Work {
     }
 
     /// Publishes the changes a refresh resolved, when `publish` asks for it,
-    /// and builds the store again whole once publications of changes have
+    /// and folds the checkout's segments once publications of changes have
     /// piled up.
     fn maybe_publish(self: &Arc<Self>, publish: Publish) {
         let changed = self.checkout.changed_paths();
@@ -539,9 +542,7 @@ impl Work {
                     report.retired_segments,
                     report.ms
                 );
-                if report.wants_build() {
-                    self.start_build();
-                }
+                self.after_publish(&report);
             }
             Ok(None) | Err(DataError::Cancelled) => {}
             Err(error) => crate::slog_warn!(
@@ -549,6 +550,75 @@ impl Work {
                 self.checkout.root().display()
             ),
         }
+    }
+
+    /// Folds the checkout's segments when a publication of its changes left
+    /// it reading from too many.
+    fn after_publish(self: &Arc<Self>, report: &DeltaReport) {
+        if report.wants_fold() {
+            self.start_fold();
+        }
+    }
+
+    /// Folds the segments the checkout reads into one, unless a fold is
+    /// queued or running already. It runs in the build pool and takes the
+    /// store's writer as a build does, but reads no file and parses
+    /// nothing (see [`Checkout::fold`]). When the store cannot give what
+    /// it needs, the checkout is built again whole instead.
+    fn start_fold(self: &Arc<Self>) {
+        if self.folding.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.folding));
+        let work = Arc::clone(self);
+        self.runner.run(FOLD_REQUEST, Pool::Build, move || {
+            if work.building.load(Ordering::Acquire) {
+                // A build queued or running writes everything again anyway.
+                return;
+            }
+            let result = work.checkout.fold();
+            drop(flag);
+            match result {
+                Ok(Folded::Done(report)) => {
+                    crate::slog_info!(
+                        "data layer folded {}: {} segments into one of {} bytes ({} text units, {} records, {} fragments; shared with other checkouts: {} text units, {} records, {} fragments; {} retired), {:.0} ms",
+                        work.checkout.root().display(),
+                        report.read_before,
+                        report.segment_bytes,
+                        report.text_units,
+                        report.records,
+                        report.fragments,
+                        report.shared.text_units,
+                        report.shared.records,
+                        report.shared.fragments,
+                        report.retired_segments,
+                        report.ms
+                    );
+                    work.notify_status_change();
+                    // Changes recorded meanwhile are resolved again over the
+                    // new publication.
+                    work.start_refresh(Publish::WhenMany);
+                }
+                Ok(Folded::Superseded) => {
+                    work.notify_status_change();
+                    work.start_refresh(Publish::WhenMany);
+                }
+                Ok(Folded::NeedsBuild(why)) => {
+                    crate::slog_info!(
+                        "data layer cannot fold the segments of {} ({why}); building it again whole",
+                        work.checkout.root().display()
+                    );
+                    work.start_build();
+                }
+                Err(DataError::Cancelled) => {}
+                // The next publication that leaves too many segments tries
+                // again.
+                Err(error) => crate::slog_warn!(
+                    "data layer could not fold the segments of {}: {error}",
+                    work.checkout.root().display()
+                ),
+            }
+        });
     }
 
     /// Builds the checkout if it needs it, and refreshes its call graph
@@ -565,6 +635,7 @@ impl Work {
 
     fn running(&self) -> bool {
         self.building.load(Ordering::Acquire)
+            || self.folding.load(Ordering::Acquire)
             || self.refreshing.load(Ordering::Acquire)
             || self.rescanning.load(Ordering::Acquire)
     }
@@ -796,6 +867,7 @@ impl DataCheckout {
             },
             checkout,
             building: Arc::new(AtomicBool::new(false)),
+            folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
@@ -1506,6 +1578,63 @@ mod tests {
             Fresh::Failed(reason) => panic!("the build failed: {reason}"),
         };
         assert!(view.status().callgraph_published);
+    }
+
+    /// Once publications of a checkout's changes leave it reading from too
+    /// many segments, the runtime folds them into one from what the store
+    /// holds. It used to build the checkout again whole, which read every
+    /// file and resolved the whole call graph again to write units the
+    /// store already held.
+    #[test]
+    fn too_many_segments_are_folded_without_reading_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() {}\n").unwrap();
+        let handle = DataCheckout::open(&root, storage.path(), None).unwrap();
+        if let Fresh::Building | Fresh::Failed(_) = handle.fresh_view(Duration::from_secs(60)) {
+            panic!("the checkout was never built");
+        }
+        let checkout = handle.checkout();
+        let mut report = None;
+        // Each round adds a file nothing changes again, so each round's
+        // segment stays read.
+        for round in 0..=super::super::checkout::COMPACT_AT {
+            let path = format!("src/added{round}.rs");
+            std::fs::write(root.join(&path), format!("pub fn added{round}() {{}}\n")).unwrap();
+            checkout.record_paths(&[path.into_bytes()]).unwrap();
+            checkout.refresh_callgraph().unwrap();
+            report = checkout.publish_changes().unwrap();
+        }
+        let report = report.expect("published");
+        assert!(report.wants_fold(), "{report:?}");
+        let segments = checkout.store_segments().unwrap();
+        let work = super::super::checkout::source_work_for_test(&root);
+
+        handle.work.after_publish(&report);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while checkout.store_segments().unwrap() == segments && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while handle.work.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(checkout.store_segments().unwrap(), 1, "{segments} segments");
+        assert_eq!(
+            super::super::checkout::source_work_for_test(&root),
+            work,
+            "the segments were folded by reading or resolving files"
+        );
+        let view = checkout.view().unwrap();
+        assert_eq!(view.probe_query("callers", "src/lib.rs", "caller"), Ok(0));
+        let query = aft_store::text::plan_pattern("added3", false).unwrap();
+        assert_eq!(
+            view.text_candidates(&query, aft_store::text::Scope::All)
+                .unwrap(),
+            vec![b"src/added3.rs".to_vec()]
+        );
     }
 
     #[test]

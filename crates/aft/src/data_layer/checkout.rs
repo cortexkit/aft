@@ -24,7 +24,7 @@ use aft_store::content::{
 use aft_store::family::{Family, Publication, Snapshot};
 use aft_store::graph::{FragmentKey, GraphSegment};
 use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId, SegmentId};
-use aft_store::scan::{scan, scan_paths, ContentKind, ContentSink, ScanPolicy};
+use aft_store::scan::{ContentKind, ContentSink, PathScan, Scan, ScanError, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
     candidates, ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator,
@@ -39,6 +39,78 @@ use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
 use super::query::{SliceReader, SliceSource};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
+
+mod fold;
+
+pub use fold::{FoldReport, Folded};
+
+/// [`aft_store::scan::scan`]: every pass over the checkout's files goes
+/// through here, so tests can tell work that reads none.
+fn scan(
+    root: &Path,
+    policy: &ScanPolicy,
+    previous: Option<&CheckoutState>,
+    sink: &dyn ContentSink,
+) -> Result<Scan, ScanError> {
+    note_source_work(root, |work| work.scans += 1);
+    aft_store::scan::scan(root, policy, previous, sink)
+}
+
+/// [`aft_store::scan::scan_paths`], counted as [`scan`] is.
+fn scan_paths(
+    root: &Path,
+    policy: &ScanPolicy,
+    previous: &CheckoutState,
+    paths: &[Vec<u8>],
+    sink: &dyn ContentSink,
+) -> Result<PathScan, ScanError> {
+    note_source_work(root, |work| work.scans += 1);
+    aft_store::scan::scan_paths(root, policy, previous, paths, sink)
+}
+
+/// How often the checkout at a root read its files or resolved its call
+/// graph, for tests of work that must do neither. Only tests keep count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SourceWork {
+    /// Passes over the files: a scan reads every file whose stat does not
+    /// prove its recorded content, and a build's scan parses what it reads.
+    pub(crate) scans: usize,
+    /// Call-graph resolutions: a build's, or a refresh's update.
+    pub(crate) resolutions: usize,
+}
+
+#[cfg(test)]
+fn source_work() -> &'static Mutex<HashMap<PathBuf, SourceWork>> {
+    static WORK: std::sync::OnceLock<Mutex<HashMap<PathBuf, SourceWork>>> =
+        std::sync::OnceLock::new();
+    WORK.get_or_init(Default::default)
+}
+
+/// What the checkout at `root` did so far (see [`SourceWork`]).
+#[cfg(test)]
+pub(crate) fn source_work_for_test(root: &Path) -> SourceWork {
+    source_work()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn note_source_work(root: &Path, note: impl FnOnce(&mut SourceWork)) {
+    note(
+        source_work()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default(),
+    );
+}
+
+#[cfg(not(test))]
+fn note_source_work(_root: &Path, _note: impl FnOnce(&mut SourceWork)) {}
 
 /// The name status gives the data layer's family store when it refuses a
 /// file a newer build wrote: the `store` of its `storage_refusals` entry and
@@ -564,7 +636,7 @@ pub struct DeltaReport {
     pub text_units: usize,
     /// Segments this checkout's text, content and call graph read from
     /// afterwards. Vector segments and other checkouts' segments are not
-    /// counted: a build of this checkout cannot fold them.
+    /// counted: a fold of this checkout's segments leaves them.
     pub segments: usize,
     /// Every segment this checkout's text, content and call graph read from
     /// afterwards, those other checkouts read too included.
@@ -579,38 +651,38 @@ pub struct DeltaReport {
     pub ms: f64,
 }
 
-/// How many segments a build reads shared units from besides its own: the
-/// segments that serve it the most units other checkouts read too.
+/// How many segments a build or a fold reads shared units from besides its
+/// own: the segments that serve it the most units other checkouts read too.
 /// Whatever other segments hold for it, it writes again.
 pub(crate) const SHARE_FROM: usize = 4;
 
 /// A checkout whose text and call graph read from more segments than this
-/// that no other checkout reads is built again whole, which writes
-/// everything it reads into one segment and retires what no other checkout
-/// reads; each publication of its changes adds one. Vector segments are
-/// not counted, since a build does not fold them.
+/// that no other checkout reads has them folded ([`Checkout::fold`]), which
+/// copies every unit it reads into one segment and retires what no other
+/// checkout reads; each publication of its changes adds one. Vector
+/// segments are not counted, since a fold does not copy them.
 pub(crate) const COMPACT_AT: usize = 8;
 
 /// A checkout that reads from more segments than this in all, those other
-/// checkouts read too included, is built again whole as well: a build
-/// reads from at most [`SHARE_FROM`] of them besides its own, so the units
-/// it reads from any others move into its new segment. Without it, a
-/// checkout that takes in other checkouts' changes (a merge, a pull) read
-/// from each of their change segments, and kept every one of them in the
-/// store for as long as it held the same contents.
+/// checkouts read too included, has them folded as well: a fold reads from
+/// at most [`SHARE_FROM`] of them besides its own, so the units it reads
+/// from any others move into its new segment. Without it, a checkout that
+/// takes in other checkouts' changes (a merge, a pull) read from each of
+/// their change segments, and kept every one of them in the store for as
+/// long as it held the same contents.
 pub(crate) const READ_AT: usize = 16;
 
 const _: () = assert!(
     READ_AT > SHARE_FROM + 1,
-    "a build must leave a checkout reading fewer segments than call for one"
+    "a fold must leave a checkout reading fewer segments than call for one"
 );
 
 impl DeltaReport {
-    /// Whether the checkout reads from so many segments that it is to be
-    /// built again whole: past [`COMPACT_AT`] only it reads, or past
-    /// [`READ_AT`] in all.
+    /// Whether the checkout reads from so many segments that they are to be
+    /// folded: past [`COMPACT_AT`] only it reads, or past [`READ_AT`] in
+    /// all.
     #[must_use]
-    pub fn wants_build(&self) -> bool {
+    pub fn wants_fold(&self) -> bool {
         self.segments > COMPACT_AT || self.read_segments > READ_AT
     }
 }
@@ -1365,6 +1437,7 @@ impl Checkout {
         // no more than a batch of resolutions is held decoded at once;
         // `resolve_ms` covers building the fragments too.
         let started = Instant::now();
+        note_source_work(&self.root, |work| work.resolutions += 1);
         let mut sections = super::graph_store::SectionsWriter::new(
             &inputs.state,
             &collected.records,
@@ -2104,37 +2177,27 @@ impl Checkout {
         let Some(read) = self.read_by_others(snapshot)? else {
             return Ok(SharedUnits::default());
         };
-        // How many of this build's units each segment serves the others.
-        let serves = std::cell::RefCell::new(HashMap::<usize, usize>::new());
-        let count = |unit| {
-            if let Some(holder) = read.holder(unit) {
-                *serves.borrow_mut().entry(holder).or_default() += 1;
-            }
-        };
+        // The units this build writes, which `shared_holders` counts by the
+        // segment the others read each from.
+        let mut units = Vec::with_capacity(text.len());
         text.retain(|key| {
-            count(ReadUnit::Text(key));
+            units.push(ReadUnit::Text(key));
             true
         });
+        let mut fragments = Vec::new();
         if let Some(sections) = sections.as_deref_mut() {
             sections.leave_out(
                 |key| {
-                    count(ReadUnit::Record(key));
+                    units.push(ReadUnit::Record(key));
                     false
                 },
                 |key| {
-                    count(ReadUnit::Fragment(key));
+                    fragments.push(ReadUnit::Fragment(key));
                     false
                 },
             );
         }
-        let mut ranked = serves.into_inner().into_iter().collect::<Vec<_>>();
-        // The most units first; between equals, the newer segment.
-        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        let kept = ranked
-            .into_iter()
-            .take(SHARE_FROM)
-            .map(|(holder, _)| holder)
-            .collect::<HashSet<_>>();
+        let kept = fold::shared_holders(&read, units.into_iter().chain(fragments));
         Ok(read.leave_out(Some(text), sections, |holder| kept.contains(&holder)))
     }
 
@@ -2298,6 +2361,7 @@ impl Checkout {
             .collect::<BTreeSet<_>>();
         let mut stats = None;
         if !changed.is_empty() {
+            note_source_work(&self.root, |work| work.resolutions += 1);
             // The changed files are extracted here, all at once on the
             // engine's threads, rather than each when its edit was recorded.
             let extracting = changed
@@ -5692,6 +5756,185 @@ pub fn other() { callee(); }
         );
     }
 
+    /// How many modules the fold tests' crate has.
+    const FOLD_MODULES: usize = 4;
+
+    /// The fold tests' crate: `top` calls `m0::f0`, each module's function
+    /// calls the next one's, and each of `added` is a module of its own
+    /// calling one of them. A binary file and a text file sit beside them.
+    fn fold_crate(root: &Path, added: &[(usize, usize)]) {
+        write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
+        fold_lib(root, added);
+        for index in 0..FOLD_MODULES {
+            fold_module(root, index, "");
+        }
+        write(root, "notes.txt", "nothing to see\n");
+        std::fs::write(root.join("logo.bin"), [0u8, 1, 2, 0, 255, 0, 7]).unwrap();
+    }
+
+    /// The fold tests' `src/lib.rs`, declaring the modules of `added`, and
+    /// those modules.
+    fn fold_lib(root: &Path, added: &[(usize, usize)]) {
+        let mut lib = String::new();
+        for index in 0..FOLD_MODULES {
+            lib.push_str(&format!("mod m{index};\n"));
+        }
+        for (round, index) in added {
+            lib.push_str(&format!("mod added{round};\n"));
+            write(
+                root,
+                &format!("src/added{round}.rs"),
+                &format!("pub fn added{round}() {{ crate::m{index}::f{index}(); }}\n"),
+            );
+        }
+        lib.push_str("pub fn top() { m0::f0(); }\n");
+        write(root, "src/lib.rs", &lib);
+    }
+
+    /// The fold tests' module `index`, with `extra` after its function.
+    fn fold_module(root: &Path, index: usize, extra: &str) {
+        let body = if index + 1 < FOLD_MODULES {
+            format!("crate::m{}::f{}();", index + 1, index + 1)
+        } else {
+            String::new()
+        };
+        write(
+            root,
+            &format!("src/m{index}.rs"),
+            &format!("pub fn f{index}() {{ {body} }}\n{extra}"),
+        );
+    }
+
+    /// What `view` answers that a fold must not change: callers, impact and
+    /// traces of every function, text candidates, and the dead-code
+    /// snapshot.
+    fn fold_answers(view: &CheckoutView, rounds: usize) -> Vec<String> {
+        let mut functions = vec![("src/lib.rs".to_string(), "top".to_string())];
+        for index in 0..FOLD_MODULES {
+            functions.push((format!("src/m{index}.rs"), format!("f{index}")));
+        }
+        for round in 0..rounds {
+            functions.push((format!("src/added{round}.rs"), format!("added{round}")));
+        }
+        let mut answers = Vec::new();
+        for (file, symbol) in &functions {
+            answers.push(format!(
+                "{file} {symbol}: {}",
+                callers_of(view, file, symbol)
+            ));
+            for command in ["callers", "impact", "trace_to"] {
+                answers.push(format!(
+                    "{command} {file} {symbol}: {:?}",
+                    view.probe_query(command, file, symbol)
+                ));
+            }
+        }
+        for pattern in ["pub fn", "nothing to see", "crate::m2", "added1", "marker"] {
+            answers.push(format!("{pattern}: {:?}", candidates_for(view, pattern)));
+        }
+        let mut snapshot = view.rows_dead_code_snapshot().unwrap();
+        snapshot.generated_at = None;
+        answers.push(format!("{snapshot:?}"));
+        answers
+    }
+
+    /// A checkout that published its changes round after round reads from
+    /// a segment per round. Folding them copies what it reads into one new
+    /// segment and retires the rest, without reading a file or resolving
+    /// anything. It answers exactly as before, and as a cold build of its
+    /// files does; the store keeps as many segments as a build leaves; a
+    /// view held across the fold keeps answering from the old segments; a
+    /// change recorded and not published stays laid over the folded
+    /// publication; and a restart serves the fold.
+    #[test]
+    fn folding_published_changes_answers_as_before_and_as_a_cold_build() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        fold_crate(root.path(), &[]);
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        // Each round edits a module and adds a module calling it, which no
+        // later round changes, so every round's segment stays read.
+        let rounds = COMPACT_AT + 1;
+        let mut added = Vec::new();
+        let mut report = None;
+        for round in 0..rounds {
+            let index = round % FOLD_MODULES;
+            added.push((round, index));
+            fold_lib(root.path(), &added);
+            fold_module(root.path(), index, &format!("pub fn r{round}() {{}}\n"));
+            checkout
+                .record_paths(&[
+                    b"src/lib.rs".to_vec(),
+                    format!("src/m{index}.rs").into_bytes(),
+                    format!("src/added{round}.rs").into_bytes(),
+                ])
+                .unwrap();
+            checkout.refresh_callgraph().unwrap();
+            report = checkout.publish_changes().unwrap();
+        }
+        let report = report.expect("published");
+        assert!(report.wants_fold(), "{report:?}");
+        let segments_before = live_segments(&checkout);
+        // A change recorded and resolved, but not published.
+        write(
+            root.path(),
+            "src/m3.rs",
+            "pub fn f3() { marker(); }\npub fn marker() {}\n",
+        );
+        checkout.record_paths(&[b"src/m3.rs".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let held = checkout.view().unwrap();
+        let before = fold_answers(&held, rounds);
+        assert!(before.iter().any(|answer| answer.contains("marker")));
+
+        let work = source_work_for_test(root.path());
+        let Folded::Done(folded) = checkout.fold().unwrap() else {
+            panic!("the fold did not finish");
+        };
+        assert_eq!(
+            source_work_for_test(root.path()),
+            work,
+            "a fold reads no file and resolves nothing"
+        );
+        assert!(folded.read_before > COMPACT_AT, "{folded:?}");
+        assert_eq!(folded.retired_segments, segments_before, "{folded:?}");
+        let segments = live_segments(&checkout);
+        assert_eq!(segments, 1, "{folded:?}");
+        // The unpublished change is still there, and pending again in the
+        // call graph until a refresh resolves it over the new publication.
+        assert_eq!(checkout.changed_paths(), 1);
+        assert_eq!(checkout.view().unwrap().status().callgraph_pending, 1);
+        assert!(
+            candidates_for(&checkout.view().unwrap(), "marker").contains(&"src/m3.rs".to_string())
+        );
+        checkout.refresh_callgraph().unwrap();
+        assert_eq!(fold_answers(&checkout.view().unwrap(), rounds), before);
+        // The view taken before the fold still reads the old segments.
+        assert_eq!(fold_answers(&held, rounds), before);
+        drop(held);
+
+        // A cold build of the same files answers the same, and writes as
+        // many segments.
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        assert_eq!(fold_answers(&cold.view().unwrap(), rounds), before);
+        assert_eq!(live_segments(&cold), segments);
+
+        // The change publishes over the folded publication as over any.
+        checkout.publish_changes().unwrap().expect("published");
+        assert_eq!(fold_answers(&checkout.view().unwrap(), rounds), before);
+        // A restart serves what was published.
+        drop(checkout);
+        let restarted = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        assert_eq!(restarted.changed_paths(), 0);
+        assert_eq!(fold_answers(&restarted.view().unwrap(), rounds), before);
+    }
+
     /// One checkout of the repository the store-growth test replays: its
     /// folder, its files as written there, and the checkout.
     struct Worktree {
@@ -5728,8 +5971,8 @@ pub fn other() { callee(); }
         }
 
         /// Writes each `(path, text)` of `edits`, resolves them and publishes
-        /// them, and builds the checkout again whole when the publication
-        /// asks for it, as the runtime does. Returns whether it was built.
+        /// them, and folds the checkout's segments when the publication asks
+        /// for it, as the runtime does. Returns whether it folded.
         fn edit(&mut self, edits: &[(String, String)]) -> bool {
             for (path, text) in edits {
                 write(self.dir.path(), path, text);
@@ -5742,9 +5985,11 @@ pub fn other() { callee(); }
             self.checkout.record_paths(&paths).unwrap();
             self.checkout.refresh_callgraph().unwrap();
             let report = self.checkout.publish_changes().unwrap().expect("published");
-            if report.wants_build() {
-                self.checkout.build().unwrap();
-                return true;
+            if report.wants_fold() {
+                match self.checkout.fold().unwrap() {
+                    Folded::Done(_) => return true,
+                    other => panic!("the fold did not finish: {other:?}"),
+                }
             }
             false
         }
@@ -5772,13 +6017,13 @@ pub fn other() { callee(); }
     /// new worktree is made from main every few rounds; older worktrees go
     /// idle. Each round's edits change a module, which a later round
     /// changes again, and add a file nobody changes again. Every checkout
-    /// publishes its changes and is built again when the publication asks
-    /// for it, as the runtime does. The family store stays within
-    /// [`READ_AT`] + 2 segments per checkout throughout. It used to grow by
-    /// a segment every round: the change segment holding a round's new file
-    /// was read by both the worker and main, so neither ever counted it as
-    /// its own or folded it. Every checkout then answers as a cold build of
-    /// its files does.
+    /// publishes its changes and has its segments folded when the
+    /// publication asks for it, as the runtime does. The family store stays
+    /// within [`READ_AT`] + 2 segments per checkout throughout. It used to
+    /// grow by a segment every round: the change segment holding a round's
+    /// new file was read by both the worker and main, so neither ever
+    /// counted it as its own or folded it. Every checkout then answers as a
+    /// cold build of its files does.
     #[test]
     fn worktrees_editing_in_turn_keep_the_store_bounded() {
         let store = tempfile::tempdir().unwrap();
@@ -5794,7 +6039,7 @@ pub fn other() { callee(); }
         files.insert("notes.txt".to_string(), "nothing to see\n".to_string());
         let mut main = Worktree::new(&layer, store.path(), files);
         let mut workers: Vec<Worktree> = Vec::new();
-        let mut builds = 0;
+        let mut folds = 0;
         let mut most = (0, 0);
         let mut new_worktree_bytes = Vec::new();
         let mut series = Vec::new();
@@ -5822,9 +6067,9 @@ pub fn other() { callee(); }
                         ),
                     ),
                 ];
-                builds += usize::from(worker.edit(&edits));
+                folds += usize::from(worker.edit(&edits));
                 // Main takes the change in.
-                builds += usize::from(main.edit(&edits));
+                folds += usize::from(main.edit(&edits));
             }
             let checkouts = workers.len() + 1;
             let segments = main.checkout.store_segments().unwrap();
@@ -5836,11 +6081,11 @@ pub fn other() { callee(); }
             );
         }
         eprintln!(
-            "store growth: at most {} segments for {} checkouts; {builds} builds; new \
+            "store growth: at most {} segments for {} checkouts; {folds} folds; new \
              worktrees wrote {new_worktree_bytes:?} bytes; {series:?}",
             most.0, most.1
         );
-        assert!(builds > 0, "no checkout was ever built again");
+        assert!(folds > 0, "no checkout's segments were ever folded");
         for (name, worktree) in
             std::iter::once(("main", &main)).chain(workers.iter().map(|worker| ("worker", worker)))
         {

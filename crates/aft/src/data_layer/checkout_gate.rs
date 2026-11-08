@@ -12,8 +12,8 @@
 //!   and at every third commit end, its changes are published on their own
 //!   with [`Checkout::publish_changes`], as the runtime does when a checkout
 //!   goes quiet; once A's text and call graph read from too many segments
-//!   (`DeltaReport::wants_build`), A is built again whole, as the runtime
-//!   does to fold them. A
+//!   (`DeltaReport::wants_fold`), A's segments are folded into one, as the
+//!   runtime does, while a watcher keeps recording paths. A
 //!   third of the way through, A is built again while a file it was never
 //!   told about has changed and a watcher keeps reporting paths during the
 //!   build. Two thirds through, A is dropped and bound again from the
@@ -59,7 +59,7 @@ use aft_store::content::RecordKey;
 use aft_store::ids::{Digest128, FamilyId};
 use aft_store::text::{plan_pattern, Scope};
 
-use super::checkout::{Checkout, CheckoutView, DataLayer, PlaneStatus, Planes};
+use super::checkout::{Checkout, CheckoutView, DataLayer, Folded, PlaneStatus, Planes};
 use super::content::EXTRACTOR_VERSION;
 use super::edit_gate::{describe_question, Files};
 use super::incremental::LiveCheckout;
@@ -881,6 +881,44 @@ fn settle(handle: &DataCheckout, wait: Duration) -> Result<(), String> {
 /// watcher reporting paths during a build does. A recording that straddles
 /// the build's publication must not put back the state it started from.
 fn build_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<usize, String> {
+    under_watcher(checkout, noise, || {
+        checkout
+            .build()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Folds `checkout`'s segments as the runtime does, building it again whole
+/// when the fold cannot run, while another thread keeps recording `noise`:
+/// changes recorded during the fold must stay laid over its publication.
+/// Returns how many recordings it made, and what the fold did.
+fn fold_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<(usize, String), String> {
+    let mut outcome = String::new();
+    let recorded = under_watcher(checkout, noise, || {
+        outcome = match checkout.fold().map_err(|error| error.to_string())? {
+            Folded::Done(report) => format!(
+                "folded {} segments into one of {} bytes",
+                report.read_before, report.segment_bytes
+            ),
+            Folded::Superseded => "stood down for another publication".to_string(),
+            Folded::NeedsBuild(why) => {
+                checkout.build().map_err(|error| error.to_string())?;
+                format!("could not fold ({why}) and built again whole")
+            }
+        };
+        Ok(())
+    })?;
+    Ok((recorded, outcome))
+}
+
+/// Runs `work` while another thread keeps recording `noise` into
+/// `checkout`, and returns how many recordings it made.
+fn under_watcher(
+    checkout: &Checkout,
+    noise: &[Vec<u8>],
+    work: impl FnOnce() -> Result<(), String>,
+) -> Result<usize, String> {
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let recorder = scope.spawn(|| {
@@ -892,12 +930,12 @@ fn build_under_watcher(checkout: &Checkout, noise: &[Vec<u8>]) -> Result<usize, 
             }
             recorded
         });
-        let built = checkout.build().map_err(|error| error.to_string());
+        let done = work();
         stop.store(true, Ordering::Release);
         let recorded = recorder
             .join()
             .map_err(|_| "the recorder panicked".to_string())?;
-        built.map(|_| recorded)
+        done.map(|()| recorded)
     })
 }
 
@@ -1293,10 +1331,9 @@ impl Summary {
     }
 
     /// Publishes `checkout`'s changes on their own, as the runtime does when
-    /// a checkout goes quiet, and builds it again whole once it reads from
-    /// too many segments ([`super::checkout::DeltaReport::wants_build`]), as
-    /// the runtime then does. A watcher keeps recording `noise` during that
-    /// build.
+    /// a checkout goes quiet, and folds its segments once it reads from too
+    /// many ([`super::checkout::DeltaReport::wants_fold`]), as the runtime
+    /// then does. A watcher keeps recording `noise` during that fold.
     fn publish(
         &mut self,
         checkout: &Checkout,
@@ -1327,11 +1364,11 @@ impl Summary {
             report.read_segments,
             report.retired_segments
         ));
-        if report.wants_build() {
-            let recorded = build_under_watcher(checkout, noise)?;
+        if report.wants_fold() {
+            let (recorded, outcome) = fold_under_watcher(checkout, noise)?;
             self.compactions += 1;
             events.push(format!(
-                "built again whole past its segment limits, while a watcher recorded {recorded} times"
+                "{outcome} past its segment limits, while a watcher recorded {recorded} times"
             ));
         }
         Ok(true)

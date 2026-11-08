@@ -259,7 +259,11 @@ pub fn write_folded(
                 len: UNIT_DATA_LEN_U32,
             },
         );
-        if let TextCopy::Stored { source, ordinal: old } = *copy {
+        if let TextCopy::Stored {
+            source,
+            ordinal: old,
+        } = *copy
+        {
             renumbered[source][old as usize] = ordinal;
         }
         push_unit_data(&mut data, unit);
