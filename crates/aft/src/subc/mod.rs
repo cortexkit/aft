@@ -10556,6 +10556,29 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            // Translation resolves tool paths before dispatch. Keep the agent's
+            // spelling for messages about folders a walk could not read, without
+            // changing the translated paths.
+            let walk_argument = match bare_name.as_str() {
+                "glob" | "grep" | "search" => arguments.get("path"),
+                "outline" => arguments.get("target"),
+                _ => None,
+            };
+            if let Some(argument) = walk_argument {
+                let names = argument.as_str().into_iter().chain(
+                    argument
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                );
+                for name in names.filter(|name| !name.contains("://") && !name.is_empty()) {
+                    let root = tool_call_context
+                        .project_root
+                        .join(crate::readonly_artifacts::expand_tilde(name));
+                    crate::bounded_io::name_walk_root(&root, Path::new(name));
+                }
+            }
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
             let _task_identity =

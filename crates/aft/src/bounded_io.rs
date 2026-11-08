@@ -223,10 +223,8 @@ pub(crate) fn name_walk_root(root: &Path, name: &Path) {
             .walk_names
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                crate::path_identity::lexical_normalize(root),
-                name.to_path_buf(),
-            );
+            .entry(crate::path_identity::lexical_normalize(root))
+            .or_insert_with(|| name.to_path_buf());
     }
 }
 
