@@ -489,11 +489,35 @@ it. A presentation-only repair may declare `presentation_rows`, a map from
 episode id to `{"before": ["exact reference lines"], "after": ["exact replay lines"]}`.
 Only `summary_text` on those rows may differ, and both arrays must match exactly.
 The gate refuses unlisted changes, mismatched lines and listed rows that did not
-change, naming the row and field. Ranked paths, pattern summaries, metrics and
-all existing family checks remain strict. This field is refused on other
-descriptor classes. Copy its lines from a real release-binary replay, not an
-invented expectation; re-record the reference in a subsequent train once the
-presentation repair has landed.
+change, naming the row and field. Ranked paths, metrics and all existing family
+checks remain strict. Pattern summaries also remain strict except for explicit
+count declarations described below. This field is refused on other descriptor classes.
+Copy its lines from a real release-binary replay, not an invented expectation;
+re-record the reference in a later release once the presentation repair has
+landed.
+
+An `engine_unwired` descriptor may also declare `pattern_counts`, mapping episode
+ids to exact transitions for one or both of `pattern_summary.candidate_files`
+and `pattern_summary.files_examined`:
+
+```json
+"pattern_counts": {
+  "followup-census:910002": {
+    "candidate_files": {"before": 972, "after": 860},
+    "files_examined": {"before": 972, "after": 860}
+  }
+}
+```
+
+Each `before` and `after` must be a non-negative integer copied from the reference
+and replay respectively. The row, `pattern_summary` object and declared field
+must exist in both documents, the observed values must match exactly, and each
+declared field must change. Unknown field names, stale declarations and
+undeclared changes fault the gate. `pattern_counts` and `presentation_rows` may
+be combined; both sets of declarations are validated. Row order, identities,
+every other row field (including all other pattern-summary keys), families,
+aggregates and score-document comparisons remain strict. `pattern_counts` is
+refused on every other descriptor class.
 
 Moving that pair is an audited act, never a repair to make a red gate green.
 Re-record only after the cause of the difference is established, on one binary,

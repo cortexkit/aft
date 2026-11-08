@@ -828,6 +828,220 @@ class EngineUnwiredGateTests(unittest.TestCase):
         self.assertIn("train-55", descriptor_labels("alfonso/task/r48-engine-unwired-train-55-"))
 
 
+class EngineUnwiredPatternCountTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.episode_id = "followup-census:1"
+        self.before = {"candidate_files": 972, "files_examined": 972}
+        self.after = {"candidate_files": 860, "files_examined": 860}
+        self.reference["rows"][0]["pattern_summary"] = dict(self.before, matching_files=569)
+        self.score["rows"][0]["pattern_summary"] = dict(self.after, matching_files=569)
+        self.descriptor = {
+            "slice_class": "engine_unwired",
+            "targeted_mechanism": "none",
+            "kind": "harness",
+            "fixtures": [TOOL_CALL_PARITY_FIXTURE_SOURCE],
+            "pattern_counts": {self.episode_id: {
+                name: {"before": self.before[name], "after": self.after[name]}
+                for name in self.before
+            }},
+        }
+        self.paths = ["crates/aft/src/commands/semantic_search/mod.rs"]
+
+    def gate(self):
+        return total_gate(self.reference, self.score, self.manifest, self.descriptor, self.paths)
+
+    def assert_mismatch(self, field: str) -> None:
+        result = self.gate()
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.reasons, (f"engine_unwired_mismatch:row=real_query.{field}",))
+
+    def test_pattern_counts_accepts_only_exact_declared_transitions(self) -> None:
+        original_reference = copy.deepcopy(self.reference)
+        original_score = copy.deepcopy(self.score)
+        self.assertEqual(self.gate().exit_code, 0)
+        self.assertEqual(self.reference, original_reference)
+        self.assertEqual(self.score, original_score)
+        for document in (self.reference, self.score):
+            row = copy.deepcopy(document["rows"][0])
+            row["episode_id"] = "followup-census:2"
+            document["rows"].append(row)
+        manifest_row = copy.deepcopy(self.manifest["rows"][0])
+        manifest_row["episode_id"] = "followup-census:2"
+        self.manifest["rows"].append(manifest_row)
+        self.descriptor["pattern_counts"]["followup-census:2"] = copy.deepcopy(
+            self.descriptor["pattern_counts"][self.episode_id]
+        )
+        self.assertEqual(self.gate().exit_code, 0)
+        self.score["rows"].reverse()
+        self.assert_mismatch(f"{self.episode_id}.episode_id")
+
+    def test_pattern_counts_accepts_a_single_field_and_zero_counts(self) -> None:
+        for name in self.before:
+            with self.subTest(name=name):
+                self.setUp()
+                self.score["rows"][0]["pattern_summary"] = dict(self.before, matching_files=569)
+                self.reference["rows"][0]["pattern_summary"][name] = 0
+                self.descriptor["pattern_counts"][self.episode_id] = {
+                    name: {"before": 0, "after": self.before[name]}
+                }
+                self.assertEqual(self.gate().exit_code, 0)
+
+    def test_pattern_counts_refuses_an_undeclared_count_change(self) -> None:
+        del self.descriptor["pattern_counts"]
+        self.assert_mismatch(self.episode_id)
+
+    def test_pattern_counts_refuses_wrong_before(self) -> None:
+        for name in self.before:
+            with self.subTest(name=name):
+                self.setUp()
+                self.descriptor["pattern_counts"][self.episode_id][name]["before"] = 971
+                self.assert_mismatch(f"{self.episode_id}.pattern_summary.{name}:before_mismatch")
+
+    def test_pattern_counts_refuses_wrong_after(self) -> None:
+        for name in self.after:
+            with self.subTest(name=name):
+                self.setUp()
+                self.descriptor["pattern_counts"][self.episode_id][name]["after"] = 859
+                self.assert_mismatch(f"{self.episode_id}.pattern_summary.{name}:after_mismatch")
+
+    def test_pattern_counts_refuses_a_declared_field_that_did_not_change(self) -> None:
+        for name in self.before:
+            with self.subTest(name=name):
+                self.setUp()
+                self.score["rows"][0]["pattern_summary"][name] = self.before[name]
+                self.descriptor["pattern_counts"][self.episode_id][name]["after"] = self.before[name]
+                self.assert_mismatch(f"{self.episode_id}.pattern_summary.{name}:unchanged")
+
+    def test_pattern_counts_refuses_a_missing_row_summary_or_field(self) -> None:
+        for side in ("reference", "score"):
+            for missing in ("row", "pattern_summary", "field", "non_object_summary"):
+                for name in self.before:
+                    with self.subTest(side=side, missing=missing, name=name):
+                        self.setUp()
+                        self.descriptor["pattern_counts"][self.episode_id] = {
+                            name: {"before": self.before[name], "after": self.after[name]}
+                        }
+                        document = getattr(self, side)
+                        reason = "before_mismatch" if side == "reference" else "after_mismatch"
+                        if missing == "row":
+                            document["rows"].clear()
+                            reason = f"missing_{side}_row"
+                        elif missing == "pattern_summary":
+                            del document["rows"][0]["pattern_summary"]
+                        elif missing == "non_object_summary":
+                            document["rows"][0]["pattern_summary"] = []
+                        else:
+                            del document["rows"][0]["pattern_summary"][name]
+                        self.assert_mismatch(f"{self.episode_id}.pattern_summary.{name}:{reason}")
+
+    def test_pattern_counts_refuses_unknown_field_names(self) -> None:
+        self.descriptor["pattern_counts"][self.episode_id]["matching_files"] = {"before": 569, "after": 570}
+        with self.assertRaisesRegex(InputFault, "fields_must_be_candidate_files_or_files_examined"):
+            resolve_descriptor(self.descriptor, self.paths)
+
+    def test_pattern_counts_refuses_non_integer_or_negative_values(self) -> None:
+        for name in self.before:
+            for side in ("before", "after"):
+                for value in ("972", 972.0, True, False, None, -1):
+                    with self.subTest(name=name, side=side, value=value):
+                        self.setUp()
+                        self.descriptor["pattern_counts"][self.episode_id][name][side] = value
+                        field = f"pattern_counts.{self.episode_id}.{name}.{side}"
+                        with self.assertRaisesRegex(InputFault, f"malformed_descriptor:{field}:not_nonnegative_integer"):
+                            resolve_descriptor(self.descriptor, self.paths)
+
+    def test_pattern_counts_requires_exact_observed_value_types(self) -> None:
+        for side in ("reference", "score"):
+            for value in ("float", "boolean"):
+                with self.subTest(side=side, value=value):
+                    self.setUp()
+                    document = getattr(self, side)
+                    expected = self.before["candidate_files"] if side == "reference" else self.after["candidate_files"]
+                    document["rows"][0]["pattern_summary"]["candidate_files"] = float(expected) if value == "float" else True
+                    reason = "before_mismatch" if side == "reference" else "after_mismatch"
+                    self.assert_mismatch(f"{self.episode_id}.pattern_summary.candidate_files:{reason}")
+
+    def test_pattern_counts_keeps_other_pattern_summary_keys_strict(self) -> None:
+        for change in ("value", "added", "removed", "undeclared_count"):
+            with self.subTest(change=change):
+                self.setUp()
+                summary = self.score["rows"][0]["pattern_summary"]
+                if change == "value":
+                    summary["matching_files"] = 570
+                elif change == "added":
+                    summary["new_key"] = 1
+                elif change == "removed":
+                    del summary["matching_files"]
+                else:
+                    del self.descriptor["pattern_counts"][self.episode_id]["files_examined"]
+                self.assert_mismatch(f"{self.episode_id}.pattern_summary")
+
+    def test_pattern_counts_keeps_every_other_row_key_strict(self) -> None:
+        for field, value in (
+            ("ranked_paths", ["different.rs"]),
+            ("summary_text", ["changed"]),
+            ("metrics", {"mrr_at_10": 0.6}),
+            ("retrieval_depth", 2),
+            ("request_count", 2),
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                self.score["rows"][0][field] = value
+                self.assert_mismatch(f"{self.episode_id}.{field}")
+
+    def test_pattern_counts_keeps_families_aggregates_and_score_document_strict(self) -> None:
+        for family in ("exact_recall", "concept_recall", "real_query"):
+            with self.subTest(family=family):
+                self.setUp()
+                self.score["families"][family]["mrr_at_10"] = 0.6
+                result = self.gate()
+                self.assertEqual(result.exit_code, 2)
+                field = f"real_query.families.{family}.mrr_at_10" if family == "real_query" else f"{family}.family"
+                self.assertEqual(result.reasons, (f"engine_unwired_mismatch:row={field}",))
+        self.setUp()
+        self.score["model_id"] = "changed"
+        self.assert_mismatch("model_id")
+
+    def test_pattern_counts_combines_with_presentation_rows_and_validates_both(self) -> None:
+        self.reference["rows"][0]["summary_text"] = ["before"]
+        self.score["rows"][0]["summary_text"] = ["after"]
+        self.descriptor["presentation_rows"] = {self.episode_id: {"before": ["before"], "after": ["after"]}}
+        self.assertEqual(self.gate().exit_code, 0)
+        self.descriptor["pattern_counts"][self.episode_id]["candidate_files"]["before"] = 971
+        self.assert_mismatch(f"{self.episode_id}.pattern_summary.candidate_files:before_mismatch")
+        self.descriptor["pattern_counts"][self.episode_id]["candidate_files"]["before"] = 972
+        self.descriptor["presentation_rows"][self.episode_id]["after"] = ["wrong"]
+        self.assert_mismatch(f"{self.episode_id}.summary_text:after_mismatch")
+
+    def test_pattern_counts_is_engine_unwired_only(self) -> None:
+        for slice_class, kind, paths in (
+            ("ranking", "paging", self.paths),
+            ("non_ranking", "harness", ["scripts/telemetry/cost-gate.sh"]),
+        ):
+            with self.subTest(slice_class=slice_class):
+                descriptor = dict(self.descriptor, slice_class=slice_class, kind=kind)
+                with self.assertRaisesRegex(InputFault, "malformed_descriptor:pattern_counts:engine_unwired_only"):
+                    resolve_descriptor(descriptor, paths)
+
+    def test_pattern_counts_validator_refuses_malformed_entries(self) -> None:
+        for entries in (
+            [],
+            {1: {"candidate_files": {"before": 1, "after": 2}}},
+            {"invalid-id": {"candidate_files": {"before": 1, "after": 2}}},
+            {"followup-census:01": {"candidate_files": {"before": 1, "after": 2}}},
+            {self.episode_id: []},
+            {self.episode_id: {}},
+            {self.episode_id: {"candidate_files": []}},
+            {self.episode_id: {"candidate_files": {"before": 972}}},
+            {self.episode_id: {"candidate_files": {"before": 972, "after": 860, "extra": 1}}},
+        ):
+            with self.subTest(entries=entries):
+                descriptor = dict(self.descriptor, pattern_counts=entries)
+                with self.assertRaises(InputFault):
+                    resolve_descriptor(descriptor, self.paths)
+
+
 class EngineUnwiredPresentationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest, self.reference, self.score = synthetic_documents()
