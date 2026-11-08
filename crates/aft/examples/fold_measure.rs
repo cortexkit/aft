@@ -66,6 +66,7 @@ fn footprint() -> u64 {
 }
 
 /// User and system CPU time the process spent, in milliseconds.
+#[cfg(unix)]
 fn cpu_ms() -> f64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `usage` is a buffer of the size getrusage writes.
@@ -77,6 +78,12 @@ fn cpu_ms() -> f64 {
     let usage = unsafe { usage.assume_init() };
     let ms = |time: libc::timeval| time.tv_sec as f64 * 1000.0 + time.tv_usec as f64 / 1000.0;
     ms(usage.ru_utime) + ms(usage.ru_stime)
+}
+
+/// Windows has no getrusage; the report shows wall time only there.
+#[cfg(not(unix))]
+fn cpu_ms() -> f64 {
+    0.0
 }
 
 /// Runs `step`, sampling the footprint meanwhile, and prints what it took.
