@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "search-wait-fixes"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/ (mod.rs, memo.rs, exact_lane.rs, external_pattern.rs, waits.rs) and crates/aft/src/semantic_index.rs. Three changes, none of which changes routing, candidates, scores, ordering or caps: (1) named wait timers wrap existing calls and feed only the daemon's slow-call log line; (2) the query embedding runs on a handle that shares the model's query cache, worker and clients, outside the context's model mutex, so the same query text yields the same vector; (3) while a file watcher keeps the index store's view current, the path-lookup lane matches file names and suffixes against the view's path list instead of walking the folder, with the walk's exclusions, test-file filter and mtime order, so it returns the same files in the same order. Ranked rows must stay byte-identical to the committed reference."
+}
