@@ -7086,14 +7086,31 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
+    // Embed through a handle on the installed model rather than under its
+    // mutex: the backend round trip of one query must not hold up another
+    // query whose vector is already cached. The handle keeps the
+    // serialization the backend itself needs (see `share_for_query`).
+    let mut query_model = model.share_for_query();
+    drop(model_ref);
+    let known_dimension = query_model.known_dimension();
     // Preserve the raw error so the timeout marker injected by
     // `send_embedding_request` survives — `classify_embed_query_error` reads it
     // to decide whether the configured query budget fired.
     let query_vector = waits::timed(waits::SearchWait::Embed, || {
-        model.embed_query_cached(query, query_budget)
+        query_model.embed_query_cached(query, query_budget)
     })
     .map_err(|error| format!("failed to embed query: {error}"))?;
-    drop(model_ref);
+    // A backend that reported its dimension with this query tells the
+    // installed model too, as it did when the query ran on that model.
+    if query_model.known_dimension() != known_dimension {
+        if let Some(model) = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        })
+        .as_mut()
+        {
+            model.adopt_query_dimension(&query_model);
+        }
+    }
 
     check_query_dimension(query_vector, index_dimension)
 }
@@ -9821,6 +9838,108 @@ mod tests {
                 live_calls: 0,
             }
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn set_embedding_gate(gate: &(Mutex<bool>, Condvar), open: bool) {
+        let (released, wake) = gate;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = open;
+        wake.notify_all();
+    }
+
+    /// A context whose query model is a local provider that blocks while the
+    /// gate is closed, with its call count and a channel that hears each call
+    /// start.
+    fn context_with_gated_local_model(
+        project: &Path,
+        gate: &Arc<(Mutex<bool>, Condvar)>,
+    ) -> (AppContext, Arc<AtomicUsize>, std::sync::mpsc::Receiver<()>) {
+        let ctx = test_context(project);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(BlockingLocalProvider {
+                    calls: Arc::clone(&calls),
+                    started: started_tx,
+                    gate: Arc::clone(gate),
+                }),
+                project.to_path_buf(),
+            ));
+        (ctx, calls, started_rx)
+    }
+
+    /// A query whose vector is cached answers while another query's
+    /// embedding is still running: the backend round trip does not hold the
+    /// context's model mutex.
+    #[test]
+    fn cached_query_vector_returns_while_another_query_embeds() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let cached = embed_query("where cached vectors live", &ctx).expect("warm the cache");
+        started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("warming embedding ran");
+        set_embedding_gate(&gate, false);
+
+        let (hit, slow) = thread::scope(|scope| {
+            let slow = scope.spawn(|| {
+                with_query_budget_for_test(60_000, || {
+                    embed_query("how slow embeddings are handled", &ctx)
+                })
+            });
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second embedding started");
+            let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let _ = hit_tx.send(embed_query("where cached vectors live", ctx));
+            });
+            // The gate is still closed: the slow query is inside the provider.
+            let hit = hit_rx.recv_timeout(Duration::from_secs(5));
+            set_embedding_gate(&gate, true);
+            (hit, slow.join().expect("slow query thread"))
+        });
+
+        let hit = hit.expect("a cached query must not wait for another query's embedding");
+        assert_eq!(hit.expect("cached query vector"), cached);
+        slow.expect("slow query embeds once the gate opens");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Two searches that miss the cache with the same query text ask the
+    /// backend once: the second waits for the first and reads its vector.
+    #[test]
+    fn concurrent_misses_for_one_query_text_embed_once() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let query = "how one query text is embedded once";
+
+        let (first, second) = thread::scope(|scope| {
+            let first =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first embedding started");
+            let second =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            // Let the second request reach its wait before the first ends;
+            // arriving later would only make it a plain cache hit.
+            thread::sleep(Duration::from_millis(200));
+            set_embedding_gate(&gate, true);
+            (
+                first.join().expect("first query thread"),
+                second.join().expect("second query thread"),
+            )
+        });
+
+        let first = first.expect("first query vector");
+        assert_eq!(second.expect("second query vector"), first);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
