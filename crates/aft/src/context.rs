@@ -13023,7 +13023,7 @@ mod subc_lifecycle_admission_tests {
     }
 
     #[test]
-    fn worktree_guard_prevents_partial_tier2_from_reporting_building() {
+    fn tier2_health_is_ready_without_a_run_in_main_checkouts_and_worktrees() {
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(
             default_language_provider_factory(),
@@ -13046,12 +13046,14 @@ mod subc_lifecycle_admission_tests {
 
         ctx.set_cache_role(true, None);
 
+        // A linked worktree runs them on request too, from its own
+        // index-store checkout.
         assert_eq!(
             ctx.try_health_snapshot(Path::new("worktree-root"))
                 .tier2
                 .expect("tier2 health")
                 .status,
-            "disabled"
+            "ready"
         );
         let tier2_snapshot = ctx.tier2_refresh_snapshot().expect("tier2 snapshot");
         assert!(!tier2_snapshot.callgraph_writer);
