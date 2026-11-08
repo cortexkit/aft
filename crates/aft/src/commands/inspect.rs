@@ -1757,9 +1757,15 @@ fn catch_up_index_store_with_disk(
     {
         return;
     }
-    if !watcher_caught_up(ctx, project_root, deadline) {
+    let started = Instant::now();
+    let caught_up = watcher_caught_up(ctx, project_root, deadline);
+    if !caught_up {
         ctx.data_rescan();
     }
+    crate::slog_info!(
+        "perf inspect_watcher_catch_up: caught_up={caught_up} ms={}",
+        started.elapsed().as_millis()
+    );
 }
 
 /// Whether every change the watcher of `project_root` was sent before this
@@ -1773,7 +1779,7 @@ fn watcher_caught_up(
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let flush = {
+    let (flush, counters) = {
         let counters = ctx.watcher_counters();
         // The watcher acknowledges flush markers only once the journal shell
         // commands use to report changed files exists, so create it as a
@@ -1781,7 +1787,7 @@ fn watcher_caught_up(
         counters
             .bash_changes
             .get_or_init(|| Arc::new(crate::bash_changed_files::Journal::default()));
-        Arc::clone(&counters.bash_flush)
+        (Arc::clone(&counters.bash_flush), counters)
     };
     let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let flush_deadline = deadline
@@ -1792,12 +1798,13 @@ fn watcher_caught_up(
     }
     // The watcher has taken in every earlier event, but may still hold its
     // paths in its flush window or the dispatch channel; the dispatch thread's
-    // drain is what records them in the store.
+    // drain is what records them in the store. The window is read first: it
+    // empties only after its paths are in the channel.
     let settle_deadline = deadline
         .work_at()
         .min(Instant::now() + WATCHER_CATCH_UP_LIMIT);
     loop {
-        if !ctx.watcher_query_has_pending_changes() {
+        if !counters.flush_window_holds_paths() && !ctx.watcher_query_has_pending_changes() {
             return true;
         }
         if Instant::now() >= settle_deadline || inspect_cancellation_requested() {

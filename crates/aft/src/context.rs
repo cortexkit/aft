@@ -1625,6 +1625,12 @@ pub(crate) struct WatcherCounters {
     /// Call-graph source files the watcher thread has received but is still
     /// holding in its flush window, before they reach the dispatch channel.
     unflushed_source_paths: Mutex<BTreeSet<PathBuf>>,
+    /// How many changed paths of any kind the watcher thread has taken into
+    /// its flush window since the window last emptied. Unlike
+    /// `unflushed_source_paths` it counts every file, so a reader that needs
+    /// every pending change to reach the index store can tell that some are
+    /// still held. Reset only once the window has handed its paths on.
+    unflushed_path_count: AtomicUsize,
     /// Events the watcher thread is holding because the dispatch channel was
     /// full when it tried to hand them on.
     dispatch_backlog_events: AtomicUsize,
@@ -1743,9 +1749,20 @@ impl WatcherCounters {
         unflushed.extend(
             paths
                 .into_iter()
+                .inspect(|_| {
+                    self.unflushed_path_count.fetch_add(1, Ordering::AcqRel);
+                })
                 .filter(|path| crate::parser::detect_language(path).is_some())
                 .cloned(),
         );
+    }
+
+    /// Whether the watcher thread holds changed paths of any kind in its
+    /// flush window, not yet handed to the dispatch channel. Read it before
+    /// the dispatch channel: the window is emptied only after its paths are
+    /// in the channel.
+    pub(crate) fn flush_window_holds_paths(&self) -> bool {
+        self.unflushed_path_count.load(Ordering::Acquire) > 0
     }
 
     /// The flush window ended: its files are in the dispatch channel (or were
@@ -1755,6 +1772,7 @@ impl WatcherCounters {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.unflushed_path_count.store(0, Ordering::Release);
         self.clear_directory_files_queued();
     }
 
