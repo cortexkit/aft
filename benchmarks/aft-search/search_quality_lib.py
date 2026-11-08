@@ -808,12 +808,39 @@ def validate_presentation_rows(descriptor: Mapping[str, Any]) -> None:
                 raise InputFault(f"malformed_descriptor:{field}.{side}:not_string_lines")
 
 
+def validate_pattern_counts(descriptor: Mapping[str, Any]) -> None:
+    """Allow only exact candidate-count transitions, never a ranking-field waiver."""
+    if "pattern_counts" not in descriptor:
+        return
+    if descriptor.get("slice_class") != "engine_unwired":
+        raise InputFault("malformed_descriptor:pattern_counts:engine_unwired_only")
+    entries = descriptor["pattern_counts"]
+    if not isinstance(entries, Mapping):
+        raise InputFault("malformed_descriptor:pattern_counts:not_a_map")
+    for episode_id, entry in entries.items():
+        if not isinstance(episode_id, str):
+            raise InputFault("malformed_descriptor:pattern_counts:episode_id")
+        episode_number(episode_id)
+        field = f"pattern_counts.{episode_id}"
+        if not isinstance(entry, Mapping) or not entry or not set(entry) <= {"candidate_files", "files_examined"}:
+            raise InputFault(f"malformed_descriptor:{field}:fields_must_be_candidate_files_or_files_examined")
+        for name, transition in entry.items():
+            count_field = f"{field}.{name}"
+            if not isinstance(transition, Mapping) or set(transition) != {"before", "after"}:
+                raise InputFault(f"malformed_descriptor:{count_field}:keys_must_be_before_after")
+            for side in ("before", "after"):
+                value = transition[side]
+                if type(value) is not int or value < 0:
+                    raise InputFault(f"malformed_descriptor:{count_field}.{side}:not_nonnegative_integer")
+
+
 def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None) -> tuple[dict[str, Any], bool]:
     derived = derive_slice_class(list(diff_paths), schema_blobs=schema_blobs, notes=notes)
     missing_ranking = descriptor is None and derived == "ranking"
     if descriptor is None:
         return {"slice_class": derived, "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}, missing_ranking
     validate_presentation_rows(descriptor)
+    validate_pattern_counts(descriptor)
     declared = descriptor.get("slice_class")
     if declared == "engine_unwired":
         if derived != "ranking":
@@ -967,11 +994,11 @@ def _first_family_difference(reference: Mapping[str, Any], score: Mapping[str, A
     return None
 
 
-def _presentation_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any], presentation_rows: Mapping[str, Any]) -> str | None:
-    """Compare all row fields, exempting only observed, declared line transitions.
+def _declared_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any], presentation_rows: Mapping[str, Any], pattern_counts: Mapping[str, Any]) -> str | None:
+    """Compare all row fields, exempting only observed, declared transitions.
 
     Validate every declaration even when the scores are equal: a stale allowance
-    must fail rather than silently permit a later, unrelated presentation change.
+    must fail rather than silently permit a later, unrelated change.
     Row order and identities remain part of the strict comparison.
     """
     old_rows = reference.get("rows", [])
@@ -992,6 +1019,23 @@ def _presentation_row_difference(reference: Mapping[str, Any], score: Mapping[st
             return f"{field}:after_mismatch"
         if canonical_json(old["summary_text"]) == canonical_json(new["summary_text"]):
             return f"{field}:unchanged"
+    for episode_id, counts in pattern_counts.items():
+        old = next((row for row in old_rows if isinstance(row, Mapping) and row.get("episode_id") == episode_id), None)
+        new = next((row for row in new_rows if isinstance(row, Mapping) and row.get("episode_id") == episode_id), None)
+        for name, transition in counts.items():
+            field = f"real_query.{episode_id}.pattern_summary.{name}"
+            if old is None:
+                return f"{field}:missing_reference_row"
+            if new is None:
+                return f"{field}:missing_score_row"
+            old_summary = old.get("pattern_summary")
+            new_summary = new.get("pattern_summary")
+            if not isinstance(old_summary, Mapping) or name not in old_summary or canonical_json(old_summary[name]) != canonical_json(transition["before"]):
+                return f"{field}:before_mismatch"
+            if not isinstance(new_summary, Mapping) or name not in new_summary or canonical_json(new_summary[name]) != canonical_json(transition["after"]):
+                return f"{field}:after_mismatch"
+            if canonical_json(old_summary[name]) == canonical_json(new_summary[name]):
+                return f"{field}:unchanged"
     for index in range(max(len(old_rows), len(new_rows))):
         old = old_rows[index] if index < len(old_rows) else None
         new = new_rows[index] if index < len(new_rows) else None
@@ -1003,13 +1047,26 @@ def _presentation_row_difference(reference: Mapping[str, Any], score: Mapping[st
         for key in sorted(set(old) | set(new)):
             if key == "summary_text" and episode_id in presentation_rows and episode_id == new.get("episode_id"):
                 continue
-            if key not in old or key not in new or canonical_json(old[key]) != canonical_json(new[key]):
+            if key not in old or key not in new:
+                return f"real_query.{episode_id or index}.{key}"
+            old_value = old[key]
+            if (
+                key == "pattern_summary"
+                and isinstance(episode_id, str)
+                and episode_id in pattern_counts
+                and episode_id == new.get("episode_id")
+                and isinstance(old_value, Mapping)
+            ):
+                old_value = dict(old_value)
+                for name, transition in pattern_counts[episode_id].items():
+                    old_value[name] = transition["after"]
+            if canonical_json(old_value) != canonical_json(new[key]):
                 return f"real_query.{episode_id or index}.{key}"
     return None
 
 
-def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str], presentation_rows: Mapping[str, Any] | None = None) -> str | None:
-    row = _first_row_difference(reference, score) if presentation_rows is None else _presentation_row_difference(reference, score, presentation_rows)
+def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str], presentation_rows: Mapping[str, Any] | None = None, pattern_counts: Mapping[str, Any] | None = None) -> str | None:
+    row = _first_row_difference(reference, score) if presentation_rows is None and pattern_counts is None else _declared_row_difference(reference, score, presentation_rows or {}, pattern_counts or {})
     if row:
         return row
     old_score = _real_query_score_document(reference)
@@ -1446,7 +1503,7 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
             )
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
-            difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"))
+            difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"), resolved.get("pattern_counts"))
             if difference:
                 raise InputFault(f"engine_unwired_mismatch:row={difference}")
         if resolved["slice_class"] == "ranking" and resolved["targeted_mechanism"] == "none":

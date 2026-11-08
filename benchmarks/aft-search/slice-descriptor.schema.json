@@ -4,7 +4,7 @@
   "type": "object",
   "required": ["slice_class", "targeted_mechanism", "kind", "fixtures"],
   "properties": {
-    "slice_class": {"enum": ["ranking", "non_ranking", "engine_unwired"], "description": "Declaration checked against the diff-derived class; engine_unwired requires byte-identical behavior except explicitly pinned summary_text transitions."},
+    "slice_class": {"enum": ["ranking", "non_ranking", "engine_unwired"], "description": "Declaration checked against the diff-derived class; engine_unwired requires byte-identical behavior except explicitly pinned summary_text and pattern-count transitions."},
     "targeted_mechanism": {"type": "string"},
     "kind": {"enum": ["ranking", "readiness", "paging", "confidence", "harness"]},
     "fixtures": {"type": "array", "minItems": 1, "items": {"type": "string"}},
@@ -22,14 +22,43 @@
           "after": {"type": "array", "items": {"type": "string"}}
         }
       }
+    },
+    "pattern_counts": {
+      "type": "object",
+      "description": "Exact pattern_summary candidate_files and files_examined transitions from the reference and replay; each declared field must change, and all other fields remain strict.",
+      "propertyNames": {"pattern": "^followup-census:(0|[1-9][0-9]*)$"},
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": false,
+        "properties": {
+          "candidate_files": {"$ref": "#/$defs/pattern_count_transition"},
+          "files_examined": {"$ref": "#/$defs/pattern_count_transition"}
+        }
+      }
     }
   },
   "allOf": [
     {
       "if": {"required": ["presentation_rows"]},
       "then": {"properties": {"slice_class": {"const": "engine_unwired"}}}
+    },
+    {
+      "if": {"required": ["pattern_counts"]},
+      "then": {"properties": {"slice_class": {"const": "engine_unwired"}}}
     }
   ],
+  "$defs": {
+    "pattern_count_transition": {
+      "type": "object",
+      "required": ["before", "after"],
+      "additionalProperties": false,
+      "properties": {
+        "before": {"type": "integer", "minimum": 0},
+        "after": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
   "ranking_fence_prefixes": [
     "crates/aft/src/commands/semantic_search.rs",
     "crates/aft/src/commands/semantic_search/",
