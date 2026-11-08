@@ -574,8 +574,10 @@ impl<F> Drop for Labelled<F> {
     }
 }
 
-/// One open scope of `label` closed. When it was the last, the label's count
-/// starts again from zero: what it still holds was handed on.
+/// One open scope of `label` closed. When it was the last, the label's live
+/// count is reset to zero: no operation of the label is running, so any
+/// bytes still counted are results it returned to other code, and keeping
+/// them would let the count grow over the daemon's life.
 fn close_scope(label: u8, root: RootName) {
     let state = &LABELS[usize::from(label)];
     if state.active.fetch_sub(1, Ordering::Relaxed) == 1 {

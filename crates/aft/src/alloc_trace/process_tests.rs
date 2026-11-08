@@ -121,6 +121,9 @@ fn large_allocation_logs_one_event_with_its_label_and_caller() {
 #[test]
 fn many_small_allocations_crossing_the_burst_threshold_log_once() {
     alloc_trace::set_line_sink(sink);
+    // The drain below writes the crossing under this test's label; the
+    // sink's own 100 MiB must not count toward the label's peak.
+    ALLOCATE_IN_SINK.store(true, Ordering::SeqCst);
     let label = Label::custom("test_small_burst");
     {
         let _scope = alloc_trace::scope(label, Some(std::path::Path::new("/work/burst-repo")));

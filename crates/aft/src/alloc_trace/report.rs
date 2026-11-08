@@ -78,6 +78,9 @@ pub(super) fn wake() {
 /// Writes every queued event now, on the calling thread.
 pub fn drain_now() {
     let was_busy = THREAD.with(|thread| thread.busy.replace(true));
+    // What writing allocates belongs to no operation, even when the caller
+    // runs under a label.
+    let unlabelled = super::enter(0, None, false);
     let mut events = Vec::new();
     ring::drain(&mut events);
     let dropped = ring::dropped();
@@ -107,6 +110,7 @@ pub fn drain_now() {
         write_line(&format_event(event));
     }
     drop(limiter);
+    drop(unlabelled);
     THREAD.with(|thread| thread.busy.set(was_busy));
 }
 
