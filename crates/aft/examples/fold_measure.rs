@@ -11,11 +11,19 @@
 //! process's physical footprint (macOS `phys_footprint`, sampled every
 //! 10 ms) before, at its peak during, and after the step.
 //!
+//! A process that has built keeps much of what it freed, so the footprint
+//! a later step adds understates it. `mode` runs one part per process:
+//! `setup` builds and publishes, leaving the store reading from many
+//! segments; `fold` and `build` each bind that store in a fresh process
+//! and fold or build it whole. Give `fold` and `build` copies of the store
+//! `setup` left, so both start from the same one. `all` (the default) runs
+//! every step in one process.
+//!
 //! Edits are written to `<root>`, so give it a copy of the repository, and
 //! give `<work>` a throwaway folder: nothing is written anywhere else.
 //!
 //! ```text
-//! cargo run --profile ci-storm -p agent-file-tools --example fold_measure -- <root> <work> [rounds] [per_round] [threads]
+//! cargo run --profile ci-storm -p agent-file-tools --example fold_measure -- <root> <work> [mode] [rounds] [per_round] [threads] [cache_mib]
 //! ```
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
@@ -189,24 +197,41 @@ fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let root = std::fs::canonicalize(&args[1]).unwrap();
     let work = PathBuf::from(&args[2]);
-    let rounds = args.get(3).map_or(20, |value| value.parse().unwrap());
-    let per_round = args.get(4).map_or(5, |value| value.parse().unwrap());
-    let threads = args.get(5).map_or_else(
+    let mode = args.get(3).map_or("all", String::as_str);
+    let rounds = args.get(4).map_or(20, |value| value.parse().unwrap());
+    let per_round = args.get(5).map_or(5, |value| value.parse().unwrap());
+    let threads = args.get(6).map_or_else(
         || std::thread::available_parallelism().map_or(4, usize::from),
         |value| value.parse().unwrap(),
     );
     let store = work.join("store");
     std::fs::create_dir_all(&store).unwrap();
-    // The block cache the running AFT gives its data layer.
-    let layer = Arc::new(DataLayer::new(256 << 20, threads));
+    // The block cache the running AFT gives its data layer, unless asked
+    // for another size.
+    let cache_mib: usize = args.get(7).map_or(256, |value| value.parse().unwrap());
+    let layer = Arc::new(DataLayer::new(cache_mib << 20, threads));
     let family = FamilyId::from_digest(Digest128::of(b"fold measure"));
-    let checkout = Checkout::bind(layer, &store, family, &root).unwrap();
+    let checkout = measure("bind", || {
+        Checkout::bind(Arc::clone(&layer), &store, family, &root).unwrap()
+    });
     let files = source_files(&root);
     assert!(
         !files.is_empty(),
         "no source files under {}",
         root.display()
     );
+    match mode {
+        "fold" => {
+            fold(&checkout, &layer);
+            return;
+        }
+        "build" => {
+            build_again(&checkout, &layer);
+            return;
+        }
+        "setup" | "all" => {}
+        other => panic!("unknown mode {other}"),
+    }
 
     let built = measure("cold build", || checkout.build().unwrap());
     println!(
@@ -219,6 +244,19 @@ fn main() {
         "after {rounds} publications: reads {segments} segments; the store holds {}",
         checkout.store_segments().unwrap()
     );
+    if mode == "setup" {
+        return;
+    }
+    fold(&checkout, &layer);
+    let segments = publish_rounds(&checkout, &root, &files, &mut next, rounds, per_round);
+    println!(
+        "after {rounds} more publications: reads {segments} segments; the store holds {}",
+        checkout.store_segments().unwrap()
+    );
+    build_again(&checkout, &layer);
+}
+
+fn fold(checkout: &Checkout, layer: &DataLayer) {
     let folded = measure("fold", || checkout.fold().unwrap());
     match folded {
         Folded::Done(report) => println!(
@@ -233,11 +271,13 @@ fn main() {
         ),
         other => println!("  did not fold: {other:?}"),
     }
-    let segments = publish_rounds(&checkout, &root, &files, &mut next, rounds, per_round);
     println!(
-        "after {rounds} more publications: reads {segments} segments; the store holds {}",
-        checkout.store_segments().unwrap()
+        "  the block cache holds {} MiB",
+        layer.cache_stats().resident_bytes >> 20
     );
+}
+
+fn build_again(checkout: &Checkout, layer: &DataLayer) {
     let rebuilt = measure("whole build (before folding existed)", || {
         checkout.build().unwrap()
     });
@@ -247,5 +287,9 @@ fn main() {
         rebuilt.parsed_files,
         rebuilt.stored_records,
         checkout.store_segments().unwrap()
+    );
+    println!(
+        "  the block cache holds {} MiB",
+        layer.cache_stats().resident_bytes >> 20
     );
 }
