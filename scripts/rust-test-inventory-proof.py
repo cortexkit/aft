@@ -5,7 +5,7 @@ By default, this script captures the current workspace inventory from `cargo tes
 --workspace -- --list`, then compares it against the split buckets used by
 `scripts/rust-test-gate.sh`:
 
-* `cargo nextest list --workspace --lib --bins`
+* `cargo nextest list --features test-hooks --workspace --lib --bins`
 * `cargo nextest list --features test-hooks --workspace -E 'kind(test) - binary(=watcher_integration)'`
 * `cargo test --features test-hooks -p agent-file-tools --test watcher_integration`
 
@@ -633,6 +633,10 @@ unit_bin_command = [
     "list",
     "--profile",
     "gate",
+    # The same features the CI archive builds with, so listing reuses its
+    # compiled library instead of building a second copy without the hooks.
+    "--features",
+    "test-hooks",
     "--workspace",
     "--lib",
     "--bins",
@@ -677,7 +681,9 @@ serial_unit_keys = {entry.key for entry in serial_tls_entries + serial_backtrace
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
 if doc_baseline_entries:
-    doc_output = run_command(["cargo", "test", "--workspace", "--doc", "--", "--list"])
+    doc_output = run_command(
+        ["cargo", "test", "--workspace", "--features", "test-hooks", "--doc", "--", "--list"]
+    )
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
 
 nextest_command = [
