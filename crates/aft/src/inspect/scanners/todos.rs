@@ -147,8 +147,13 @@ pub(crate) enum FileTodos {
 /// What the count found for its scope from the index store.
 #[derive(Debug)]
 pub(crate) enum StoredTodos {
-    /// Each scope file's markers, in scope order.
-    Files(Vec<FileTodos>),
+    /// Each scope file's markers, in scope order, and the repositories of a
+    /// folder of repositories that have no checkout yet (relative to the
+    /// folder), whose files the count leaves out.
+    Files {
+        files: Vec<FileTodos>,
+        unindexed: Vec<String>,
+    },
     /// Some file has no record yet: the store is building or catching up.
     Pending,
     /// The root has no records at all, for this agent-visible reason.
@@ -196,6 +201,8 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
         Ok(stored) => stored,
         Err(error) => return InspectResult::failed(job, error, started.elapsed()),
     };
+    #[cfg(test)]
+    note_outcome_for_test(&job.project_root, &stored);
     if cancelled() {
         return InspectResult::failed(
             job,
@@ -204,8 +211,10 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
         );
     }
     let aggregate = match stored {
-        StoredTodos::Files(files) => {
-            return InspectResult::success(job, aggregate(job, files), started.elapsed());
+        StoredTodos::Files { files, unindexed } => {
+            let mut success = aggregate(job, files);
+            write_unindexed_gap(&mut success.aggregate, &unindexed);
+            return InspectResult::success(job, success, started.elapsed());
         }
         // As dead code reports a call graph still building: the records
         // come with the call-graph build.
@@ -227,6 +236,42 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
         },
         started.elapsed(),
     )
+}
+
+/// How many repositories with no checkout yet a gap's reason names; the
+/// gap's `repositories` lists them all.
+const UNINDEXED_NAMED: usize = 5;
+
+/// Marks `aggregate` partial when some repositories of a folder of
+/// repositories (`unindexed`, relative to the folder) have no checkout yet:
+/// their TODOs are not counted, and the gap names them.
+fn write_unindexed_gap(aggregate: &mut serde_json::Value, unindexed: &[String]) {
+    if unindexed.is_empty() {
+        return;
+    }
+    let mut names = unindexed
+        .iter()
+        .take(UNINDEXED_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unindexed.len() > UNINDEXED_NAMED {
+        names.push_str(&format!(", and {} more", unindexed.len() - UNINDEXED_NAMED));
+    }
+    let reason = format!(
+        "{}: {names}",
+        crate::data_layer::tools::inspect::TODOS_REPOSITORIES_NOT_INDEXED
+    );
+    aggregate["complete"] = serde_json::Value::Bool(false);
+    let gap = serde_json::json!({
+        "kind": "analysis_incomplete",
+        "reason": reason,
+        "repositories": unindexed,
+    });
+    match aggregate["gaps"].as_array_mut() {
+        Some(gaps) => gaps.push(gap),
+        None => aggregate["gaps"] = serde_json::json!([gap]),
+    }
 }
 
 /// The count's result for `files`, each the stored markers of the scope
@@ -694,6 +739,38 @@ fn display_file_path(project_root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// What each count of a root found, in order, for tests that follow the
+/// counts a background refresh takes.
+#[cfg(test)]
+static OUTCOMES_FOR_TEST: std::sync::Mutex<Vec<(std::path::PathBuf, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_outcome_for_test(root: &Path, stored: &StoredTodos) {
+    let outcome = match stored {
+        StoredTodos::Files { .. } => "counted",
+        StoredTodos::Pending => "pending",
+        StoredTodos::Unavailable(_) => "unavailable",
+    };
+    OUTCOMES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((root.to_path_buf(), outcome));
+}
+
+/// The outcomes of the counts of `root` so far: `counted`, `pending` or
+/// `unavailable`.
+#[cfg(test)]
+pub(crate) fn outcomes_for_test(root: &Path) -> Vec<&'static str> {
+    OUTCOMES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(held, _)| held == root)
+        .map(|(_, outcome)| *outcome)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -808,6 +885,120 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    /// After a cold start the status bar's TODO refresh can run while the
+    /// index store is still building, and come back pending. When the
+    /// store publishes, its status listener asks for the refresh again, so
+    /// the count arrives with no edit and no `aft_inspect` call.
+    #[test]
+    fn a_count_pending_while_the_store_builds_is_taken_again_when_it_publishes() {
+        use crate::inspect::tier2_scheduler::{
+            TIER2_REFRESH_COLD_CACHE_DELAY, TIER2_REFRESH_MIN_INTERVAL,
+        };
+        use crate::inspect::Tier2TriggerReason;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(&dir.path().join("project"));
+        let storage = dir.path().join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&storage).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        write(
+            &root,
+            "src/app.rs",
+            "// TODO: counted once the store publishes\nfn app() {}\n",
+        );
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        // A refresh that finds the store building answers pending at once.
+        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        ctx.bind_status_context();
+        let doc = serde_json::json!({"indexes": {"trigram": false, "semantic": false, "callgraph": true}});
+        let configure: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "configure",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": [{"tier": "user", "source": "/u/aft.jsonc", "doc": doc.to_string()}],
+        }))
+        .unwrap();
+        let response = crate::commands::configure::handle_configure(&configure, &ctx);
+        assert!(response.success, "configure failed: {response:?}");
+        crate::runtime_drain::standalone_root_configured(&ctx);
+        assert!(
+            ctx.data_checkout().is_some(),
+            "the index store binds the root"
+        );
+
+        // The warm-up refresh runs while the build is held.
+        let configured_at = Instant::now()
+            .checked_sub(TIER2_REFRESH_COLD_CACHE_DELAY + Duration::from_secs(1))
+            .unwrap();
+        ctx.reset_tier2_refresh_scheduler_at(configured_at);
+        let now = Instant::now();
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(now, 0),
+            Some(Tier2TriggerReason::ConfigureWarm)
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while outcomes_for_test(&root).is_empty() {
+            assert!(Instant::now() < deadline, "the warm-up refresh never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        crate::runtime_drain::drain_inspect_events(&ctx);
+        assert_eq!(outcomes_for_test(&root), ["pending"]);
+        assert_eq!(ctx.status_bar_count_values().todos, None);
+        // Nothing else asks for a refresh: no edit, no inspect call.
+        let later = now + TIER2_REFRESH_MIN_INTERVAL;
+        assert_eq!(ctx.tick_tier2_refresh_scheduler_at(later, 0), None);
+
+        // The store builds and publishes; its status listener asks for the
+        // refresh, which the next maintenance tick starts.
+        drop(hold);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match ctx.tick_tier2_refresh_scheduler_at(later, 0) {
+                Some(reason) => {
+                    assert_eq!(reason, Tier2TriggerReason::Pull);
+                    break;
+                }
+                None => {
+                    assert!(Instant::now() < deadline, "no refresh was asked for");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.status_bar_count_values().todos != Some(1) {
+            assert!(
+                Instant::now() < deadline,
+                "the count never arrived: {:?}",
+                outcomes_for_test(&root)
+            );
+            crate::runtime_drain::drain_inspect_events(&ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(outcomes_for_test(&root), ["pending", "counted"]);
+        // Asked once for the change, not on every later status change.
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(later + TIER2_REFRESH_MIN_INTERVAL, 0),
+            None
+        );
     }
 
     /// A root with no checkout bound, and no word that it never gets one,
@@ -948,5 +1139,30 @@ mod tests {
         // The edited files were extracted once, for their changes.
         assert_eq!(parses(plain), 1);
         assert_eq!(parses(changed_app), 1);
+
+        // Publish the changes, then fold the publication's segments into
+        // one: the fold copies the stored records, markers and all, so the
+        // count reads the same from the folded segment, still opening and
+        // parsing nothing.
+        checkout.checkout().refresh_callgraph().unwrap();
+        checkout.checkout().publish_changes().unwrap();
+        let crate::data_layer::checkout::Folded::Done(folded) = checkout.checkout().fold().unwrap()
+        else {
+            panic!("the fold did not finish");
+        };
+        assert!(folded.read_before > 1, "{folded:?}");
+        assert!(folded.retired_segments > 0, "{folded:?}");
+        let view = checkout.view().unwrap();
+        let scope = crate::inspect::inventory::InspectInventory::from_checkout(&root, &view)
+            .expect("the view stands in for a walk")
+            .sources;
+        let parsed_before_count = [plain, changed_app].map(parses);
+        let folded_aggregate = run_todos_scan(&todos_job(&root, scope))
+            .outcome
+            .unwrap()
+            .aggregate;
+        assert!(probe.paths().is_empty(), "opened {:?}", probe.paths());
+        assert_eq!(folded_aggregate, aggregate);
+        assert_eq!([plain, changed_app].map(parses), parsed_before_count);
     }
 }

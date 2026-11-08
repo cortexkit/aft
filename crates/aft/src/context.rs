@@ -7811,9 +7811,19 @@ impl AppContext {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
+                    // A TODO count taken while the store was building came
+                    // back pending; once the store publishes, take it again
+                    // rather than wait for the next edit.
+                    let todos_source = Arc::downgrade(&checkout);
                     checkout.on_status_change(Arc::new(move || {
                         if let Some(context) = context.upgrade() {
                             context.signal_status_changed();
+                            if todos_source
+                                .upgrade()
+                                .is_some_and(|checkout| checkout.take_todos_readable())
+                            {
+                                context.request_tier2_refresh_pull();
+                            }
                         }
                     }));
                     Some(checkout)

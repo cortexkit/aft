@@ -421,6 +421,85 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
 /// as still loading; once the root is bound again, the next query starts
 /// their builds. An edit the parent's watcher reports reaches the child
 /// that holds it.
+/// With the data layer on, a parent folder's TODO count sums the markers its
+/// children's checkouts hold, with paths relative to the folder. A child
+/// repository with no checkout bound yet is not counted silently as zero:
+/// the answer is partial, and its gap names the repository.
+#[test]
+fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    for name in ["alpha", "beta"] {
+        init_repo(&root.join(name), name);
+        write(
+            &root.join(name),
+            "src/todo.rs",
+            &format!("// TODO: in {name}\n"),
+        );
+    }
+    let parent = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        configure(&root, &storage, true, true)
+    };
+    let session = parent_session(&parent);
+    assert_eq!(session.children().len(), 2);
+    // Only `alpha` has a checkout, built and published.
+    let alpha = DataCheckout::open(&root.join("alpha"), &storage, None).unwrap();
+    parent
+        .data_children()
+        .insert_for_test(session.root(), &root.join("alpha"), Arc::clone(&alpha));
+    alpha.request_refresh();
+    settled(
+        || {
+            alpha
+                .view()
+                .is_some_and(|view| view.status().callgraph_published)
+                && !alpha.checkout().status().building
+        },
+        |published| *published,
+    );
+
+    let scope = crate::inspect::inventory::InspectInventory::collect(&root, || true).sources;
+    let job = crate::inspect::InspectJob {
+        job_id: 1,
+        key: crate::inspect::JobKey::for_category_scope(
+            crate::inspect::InspectCategory::Todos,
+            &crate::inspect::JobScope::for_project(root.clone()),
+        ),
+        category: crate::inspect::InspectCategory::Todos,
+        scope_files: scope,
+        project_root: root.clone(),
+        inspect_dir: base.join("inspect"),
+        config: parent.config(),
+        symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
+        callgraph_snapshot: None,
+    };
+    let aggregate = crate::inspect::scanners::todos::run_todos_scan(&job)
+        .outcome
+        .unwrap()
+        .aggregate;
+    assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+    assert_eq!(aggregate["items"][0]["file"], "alpha/src/todo.rs");
+    assert_eq!(aggregate["items"][0]["text"], "in alpha");
+    assert_eq!(aggregate["complete"], false, "{aggregate:#}");
+    assert_eq!(
+        aggregate["gaps"],
+        json!([{
+            "kind": "analysis_incomplete",
+            "reason": "repositories in this folder not indexed yet: beta",
+            "repositories": ["beta"],
+        }]),
+        "{aggregate:#}"
+    );
+    // The repository's files are covered by its gap, not listed one by one.
+    assert!(aggregate.get("skipped_files").is_none(), "{aggregate:#}");
+}
+
 #[test]
 fn children_build_nothing_while_the_parent_root_is_unbound() {
     let temp = tempfile::tempdir().unwrap();

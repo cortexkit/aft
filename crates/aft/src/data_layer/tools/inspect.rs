@@ -199,6 +199,10 @@ pub(crate) const TODOS_NOT_PARSED: &str = "no TODO record for this file in the i
 /// Why a file of a folder of repositories that is in none of them has no
 /// TODO markers.
 pub(crate) const TODOS_OUTSIDE_REPOSITORIES: &str = "not inside any repository in this folder";
+/// Opens the reason of the gap naming the repositories of a folder of
+/// repositories whose TODOs are not counted yet: they have no checkout.
+pub(crate) const TODOS_REPOSITORIES_NOT_INDEXED: &str =
+    "repositories in this folder not indexed yet";
 
 /// Every checkout this process has bound, for the TODO count: it runs on
 /// the inspect pool with only its job's root, and reads the root's
@@ -269,7 +273,7 @@ pub(crate) fn stored_todos(
     scope_files: &[PathBuf],
 ) -> Result<crate::inspect::scanners::todos::StoredTodos, String> {
     use crate::inspect::scanners::todos::StoredTodos;
-    let deadline = Instant::now() + TODO_STORE_WAIT;
+    let deadline = Instant::now() + todo_store_wait(project_root);
     loop {
         let (todos, building) = stored_todos_now(project_root, config, scope_files)?;
         if !matches!(todos, StoredTodos::Pending)
@@ -281,6 +285,38 @@ pub(crate) fn stored_todos(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// [`TODO_STORE_WAIT`], or for a test the wait it set for `project_root`.
+fn todo_store_wait(project_root: &Path) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let root = canonicalize_normalized(project_root);
+        if let Some((_, wait)) = STORE_WAITS_FOR_TEST
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(held, _)| *held == root)
+        {
+            return *wait;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = project_root;
+    TODO_STORE_WAIT
+}
+
+#[cfg(test)]
+static STORE_WAITS_FOR_TEST: Mutex<Vec<(PathBuf, std::time::Duration)>> = Mutex::new(Vec::new());
+
+/// Makes the TODO count of `project_root` wait `wait` for a building
+/// checkout instead of [`TODO_STORE_WAIT`].
+#[cfg(test)]
+pub(crate) fn set_todo_store_wait_for_test(project_root: &Path, wait: std::time::Duration) {
+    STORE_WAITS_FOR_TEST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((canonicalize_normalized(project_root), wait));
 }
 
 /// [`stored_todos`] without waiting, and whether a bound checkout is still
@@ -300,12 +336,14 @@ fn stored_todos_now(
         .map(|checkout| (canonicalize_normalized(checkout.root()), checkout))
         .collect::<Vec<_>>();
     // The root's own checkout, newest first; or, for a folder of
-    // repositories, the checkouts of the repositories in it.
+    // repositories, the checkouts of the repositories in it, and the
+    // repositories that have none bound yet.
     let kind = root_kind(&root);
     let own = bound
         .iter()
         .rev()
         .find(|(checkout_root, _)| *checkout_root == root);
+    let mut unindexed = Vec::new();
     let mut covering = match own {
         Some(own) => vec![own.clone()],
         None if kind == RootKind::Repositories => {
@@ -324,6 +362,22 @@ fn stored_todos_now(
                 seen.push(checkout_root.clone());
                 first
             });
+            if let Some(session) = crate::views::parent::session_for_root(&root) {
+                // Until the folder's repositories are found, which of them
+                // lack a checkout is not known.
+                if session.discovery().is_none() {
+                    return Ok((StoredTodos::Pending, false));
+                }
+                for child in session.children() {
+                    let child_root = canonicalize_normalized(&child.root);
+                    if !seen.contains(&child_root) {
+                        unindexed.push((
+                            child_root,
+                            child.relative.to_string_lossy().replace('\\', "/"),
+                        ));
+                    }
+                }
+            }
             children
         }
         None => Vec::new(),
@@ -351,6 +405,18 @@ fn stored_todos_now(
         .map(|_| None)
         .collect::<Vec<Option<FileTodos>>>();
     let mut held = vec![false; scope_files.len()];
+    // A repository with no checkout yet is named as a gap; its files are
+    // neither counted nor listed one by one.
+    for (position, file) in scope_files.iter().enumerate() {
+        let file = normalize_path(file);
+        if unindexed
+            .iter()
+            .any(|(child_root, _)| file.starts_with(child_root))
+        {
+            held[position] = true;
+            files[position] = Some(FileTodos::NotScanned);
+        }
+    }
     for (checkout_root, checkout) in &covering {
         let Some(view) = checkout.view() else {
             return Ok((StoredTodos::Pending, true));
@@ -407,12 +473,16 @@ fn stored_todos_now(
         }
     }
     Ok((
-        StoredTodos::Files(
-            files
+        StoredTodos::Files {
+            files: files
                 .into_iter()
                 .map(|todos| todos.unwrap_or(FileTodos::Skipped(TODOS_OUTSIDE_REPOSITORIES)))
                 .collect(),
-        ),
+            unindexed: unindexed
+                .into_iter()
+                .map(|(_, relative)| relative)
+                .collect(),
+        },
         false,
     ))
 }

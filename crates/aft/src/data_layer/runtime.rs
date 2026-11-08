@@ -780,6 +780,9 @@ pub(crate) struct DataCheckout {
     /// Set once a bind has used the scan that opening the checkout made;
     /// every later bind compares the files again (see [`root_bound`]).
     bound_once: AtomicBool,
+    /// Whether the last [`Self::take_todos_readable`] found the checkout's
+    /// TODO markers readable.
+    todos_readable: AtomicBool,
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
     memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
@@ -898,6 +901,7 @@ impl DataCheckout {
             work,
             quiet,
             bound_once: AtomicBool::new(false),
+            todos_readable: AtomicBool::new(false),
             memory_figure: std::sync::Mutex::new(None),
             _listener: listener,
         });
@@ -1266,6 +1270,21 @@ impl DataCheckout {
             .status_listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    /// Whether the checkout's TODO markers became readable since the last
+    /// call: its call graph is published now and no build or rescan is
+    /// running, where at the last call that was not so. The status listener
+    /// asks this on every status change, so a TODO count that came back
+    /// pending while the store built is taken again once the store has
+    /// published, and only once per such change.
+    pub(crate) fn take_todos_readable(&self) -> bool {
+        let readable = !self.work.checkout.status().building
+            && self
+                .view()
+                .is_some_and(|view| view.status().callgraph_published && !view.rescanning());
+        let was_readable = self.todos_readable.swap(readable, Ordering::AcqRel);
+        readable && !was_readable
     }
 }
 
