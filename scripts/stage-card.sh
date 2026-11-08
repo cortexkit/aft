@@ -213,7 +213,10 @@ HASH="$(shasum -a 256 "$TMP" | awk '{print $1}')"
 CARD="ck-aft.${HASH:0:16}"
 mv "$TMP" "$STAGING/$CARD"
 # The sidecar is written from the final name so `shasum -c` matches as-is.
-(cd "$STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256.postsign" && shasum -c "$CARD.sha256.postsign" >/dev/null)
+# The placer verifies `$CARD.sha256`; the `.postsign` copy keeps the name
+# release.sh and dev-rebuild.sh write for their own builds.
+(cd "$STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256" && shasum -c "$CARD.sha256" >/dev/null \
+  && cp "$CARD.sha256" "$CARD.sha256.postsign")
 # The commit this card was built from, for the next card's source check
 # (lib/card-source-gate.sh) once this one is running.
 if [ "$SKIP_BUILD" -eq 0 ]; then
