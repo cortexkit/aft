@@ -496,7 +496,7 @@ const StatusDialog = (props: StatusDialogProps) => {
       {statusBar() ? (
         <box flexDirection="column" width="100%" marginTop={1}>
           <text fg={t().text}>
-            <b>{statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}</b>
+            <b>Code Health</b>
           </text>
           {(statusBar()!.disabled_categories ?? []).map((key) => (
             <R theme={t()} label={key.replaceAll("_", " ")} value="○ off" tone="muted" />
@@ -515,30 +515,6 @@ const StatusDialog = (props: StatusDialogProps) => {
               label="Warnings"
               value={formatCountShort(statusBar()!.warnings)}
               tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
-            />
-          ) : null}
-          {statusBar()!.dead_code !== undefined ? (
-            <R
-              theme={t()}
-              label="Dead Code"
-              value={formatCountShort(statusBar()!.dead_code)}
-              tone="muted"
-            />
-          ) : null}
-          {statusBar()!.unused_exports !== undefined ? (
-            <R
-              theme={t()}
-              label="Unused Exports"
-              value={formatCountShort(statusBar()!.unused_exports)}
-              tone="muted"
-            />
-          ) : null}
-          {statusBar()!.duplicates !== undefined ? (
-            <R
-              theme={t()}
-              label="Duplicates"
-              value={formatCountShort(statusBar()!.duplicates)}
-              tone="muted"
             />
           ) : null}
           {statusBar()!.todos !== undefined ? (

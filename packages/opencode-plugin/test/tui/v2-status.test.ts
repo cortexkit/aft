@@ -37,11 +37,7 @@ function snapshot(): AftStatusSnapshot {
     status_bar: {
       errors: 1,
       warnings: 2,
-      dead_code: 3,
-      unused_exports: 4,
-      duplicates: 5,
       todos: 6,
-      tier2_stale: true,
     },
     message: "",
   };
@@ -49,13 +45,13 @@ function snapshot(): AftStatusSnapshot {
 
 describe("V2 TUI status presentation", () => {
   test("renders the fleet-compatible AFT footer segment", () => {
-    expect(formatAftStatusSegment(snapshot())).toBe("AFT E1 W2 | ~D3 U4 C5 | T6");
+    expect(formatAftStatusSegment(snapshot())).toBe("AFT E1 W2 | T6");
   });
 
   test("does not turn unproven health categories into clean zeroes", () => {
     const status = snapshot();
     status.status_bar = { warnings: 2 };
-    expect(formatAftStatusSegment(status)).toBe("AFT E? W2 | D? U? C? | T?");
+    expect(formatAftStatusSegment(status)).toBe("AFT E? W2 | T?");
   });
 
   test("claims startup only before a real snapshot has arrived", () => {
@@ -67,29 +63,27 @@ describe("V2 TUI status presentation", () => {
   });
 
   test("shows known categories when one producer is unavailable", () => {
-    // The bridge withholds the complete status_bar while dead-code has no
-    // value (issue #334: callgraph unavailable), but still reports the rest.
+    // The bridge withholds the complete status_bar while any count has no
+    // value, but still reports the counts it has.
     const status = snapshot();
     status.status_bar = undefined;
     status.status_bar_values = {
       errors: 0,
       warnings: 1,
-      unused_exports: 4,
-      duplicates: 5,
       todos: 6,
     };
-    expect(formatAftStatusSegment(status)).toBe("AFT E0 W1 | D? U4 C5 | T6");
+    expect(formatAftStatusSegment(status)).toBe("AFT E0 W1 | T6");
   });
 
   test("marks every category pending when a snapshot has no values yet", () => {
     const status = snapshot();
     status.status_bar = undefined;
-    expect(formatAftStatusSegment(status)).toBe("AFT E? W? | D? U? C? | T?");
+    expect(formatAftStatusSegment(status)).toBe("AFT E? W? | T?");
   });
 
   test("names a missing language server instead of leaving E and W pending", () => {
-    // The snapshot a 1-file project with no language server produces: Tier-2
-    // and todos counts resolved, errors and warnings never will.
+    // The snapshot a 1-file project with no language server produces: the
+    // todos count resolved, errors and warnings never will.
     const status = coerceAftStatus({
       version: "0.58.0",
       cache_role: "main",
@@ -98,14 +92,10 @@ describe("V2 TUI status presentation", () => {
         errors: null,
         warnings: null,
         diagnostics: "no_language_server",
-        dead_code: 1,
-        unused_exports: 1,
-        duplicates: 0,
         todos: 0,
-        tier2_stale: false,
       },
     });
-    expect(formatAftStatusSegment(status)).toBe("AFT no LSP | D1 U1 C0 | T0");
+    expect(formatAftStatusSegment(status)).toBe("AFT no LSP | T0");
   });
 
   test("summarizes only the status data needed by the V2 sidebar slot", () => {
@@ -114,7 +104,7 @@ describe("V2 TUI status presentation", () => {
       version: "0.55.1",
       search: "ready",
       semantic: "loading (embedding)",
-      health: "E1 W2 ~D3 U4 C5 T6",
+      health: "E1 W2 T6",
     });
   });
 

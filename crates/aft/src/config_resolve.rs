@@ -488,8 +488,6 @@ pub struct RawInspect {
     pub diagnostics_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub tier2_pass_timeout_ms: Option<u64>,
-    #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
-    pub tier2_idle_minutes: Option<f64>,
     #[serde(deserialize_with = "deserialize_opt_inspect_categories")]
     pub categories: Option<BTreeMap<String, bool>>,
     pub duplicates: Option<RawInspectDuplicates>,
@@ -500,7 +498,6 @@ impl RawInspect {
         self.enabled.is_none()
             && self.diagnostics_timeout_ms.is_none()
             && self.tier2_pass_timeout_ms.is_none()
-            && self.tier2_idle_minutes.is_none()
             && self.categories.is_none()
             && self.duplicates.is_none()
     }
@@ -2339,9 +2336,6 @@ fn merge_inspect_config(
     inspect.tier2_pass_timeout_ms = override_inspect
         .tier2_pass_timeout_ms
         .or(inspect.tier2_pass_timeout_ms);
-    inspect.tier2_idle_minutes = override_inspect
-        .tier2_idle_minutes
-        .or(inspect.tier2_idle_minutes);
     if let Some(project) = override_inspect.categories {
         let categories = inspect.categories.get_or_insert_with(BTreeMap::new);
         for (key, enabled) in project {
@@ -3636,17 +3630,6 @@ where
         Some(value) if value < MIN_BASH_WORKER_WAIT_MAX_MS => Err(de::Error::custom(format!(
             "bash.worker_wait_max_ms must be at least {MIN_BASH_WORKER_WAIT_MAX_MS}"
         ))),
-        other => Ok(other),
-    }
-}
-
-fn deserialize_opt_nonnegative_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<f64>::deserialize(deserializer)?;
-    match value {
-        Some(value) if value < 0.0 => Err(de::Error::custom("must be non-negative")),
         other => Ok(other),
     }
 }

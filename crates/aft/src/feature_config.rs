@@ -334,7 +334,13 @@ pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
 /// `bridge.hang_threshold` counted request timeouts toward restarting the
 /// bridge; a timeout now fails only its own request, and the bridge's hang
 /// watchdog judges a stuck child by its silence instead.
-pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 1] = [("bridge.hang_threshold", "")];
+/// `inspect.tier2_idle_minutes` delayed the whole-repository analyses the
+/// OpenCode plugin started when a session went idle; those analyses now run
+/// only when `aft_inspect` is called.
+pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 2] = [
+    ("bridge.hang_threshold", ""),
+    ("inspect.tier2_idle_minutes", ""),
+];
 
 /// Notice sentence for a retired `bridge.hang_threshold`. Mirrors the
 /// TypeScript `RETIRED_HANG_THRESHOLD_NOTE`.
@@ -1105,11 +1111,15 @@ fn has_enabled_false_note(translation: &DocumentTranslation) -> bool {
 /// says so. Nothing is applied for them, so a notice never counts them among
 /// the keys whose "current equivalents" were applied. Kept in key order;
 /// mirrors the TypeScript `NO_EFFECT_RETIRED_NOTES`.
-pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 3] = [
+pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 4] = [
     ("bridge.hang_threshold", RETIRED_HANG_THRESHOLD_NOTE),
     (
         "inspect.max_drill_down_items",
         "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
+    ),
+    (
+        "inspect.tier2_idle_minutes",
+        "inspect.tier2_idle_minutes no longer does anything: AFT runs whole-repository analyses only when aft_inspect is called, so the setting can be removed.",
     ),
     (
         "inspect.tier2_soft_deadline_ms",

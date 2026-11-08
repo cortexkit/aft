@@ -8025,7 +8025,7 @@ impl AppContext {
         };
         *self.git_common_dir.lock() = git_common_dir;
         // The configure-time worktree probe already applies the test seam, so
-        // automatic Tier-2 scheduling follows the same effective root role as
+        // the automatic TODO refresh follows the same effective root role as
         // callgraph cold-build gating while explicit inspect demand stays enabled.
         self.inspect_manager
             .set_automatic_tier2_refresh_allowed(!is_worktree_bridge);

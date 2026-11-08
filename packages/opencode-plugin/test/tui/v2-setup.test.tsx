@@ -29,9 +29,6 @@ function statusResponse() {
     status_bar: {
       errors: 0,
       warnings: 0,
-      dead_code: 0,
-      unused_exports: 0,
-      duplicates: 0,
       todos: 0,
     },
     message: "",

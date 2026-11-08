@@ -64,8 +64,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   reads no content and grants nothing; the answer is scoped to the session.
 /// - `bash_owned_tasks`: read-only active task ids from the bound session's
 ///   persisted owner records, used to clean up deliberately stopped workers.
-/// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
-///   the bound root; scan work runs on the maintenance class either way.
+/// - `inspect_tier2_run`: the retired background Tier-2 trigger that older
+///   plugin builds still send on session idle; it answers success and does
+///   nothing.
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
 ///   the session's enabled hashline edit surface; it returns affected paths
 ///   before the plugin requests edit permission.

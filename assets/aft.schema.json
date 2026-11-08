@@ -157,12 +157,6 @@
           "default": 120000,
           "description": "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer."
         },
-        "tier2_idle_minutes": {
-          "type": "number",
-          "minimum": 0,
-          "default": 4,
-          "description": "OpenCode session.idle delay in minutes before Tier 2 inspect prewarm runs. Default: 4."
-        },
         "tier2_pass_timeout_ms": {
           "type": "integer",
           "minimum": 1,
@@ -985,12 +979,6 @@
                 "maximum": 600000,
                 "default": 120000,
                 "description": "Blocking LSP diagnostics deadline in milliseconds. Values are clamped to 10000..600000. User config sets the baseline; project config may only raise the effective deadline so a repository cannot silently reduce diagnostic completeness for another consumer."
-              },
-              "tier2_idle_minutes": {
-                "type": "number",
-                "minimum": 0,
-                "default": 4,
-                "description": "OpenCode session.idle delay in minutes before Tier 2 inspect prewarm runs. Default: 4."
               },
               "tier2_pass_timeout_ms": {
                 "type": "integer",

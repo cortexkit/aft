@@ -1400,7 +1400,7 @@ impl InspectManager {
                 .automatic_tier2_skip_logged
                 .swap(true, Ordering::SeqCst)
         {
-            crate::slog_debug!("automatic Tier-2 scan scheduling skipped for linked worktree root");
+            crate::slog_debug!("automatic TODO refresh skipped for linked worktree root");
         }
         allowed
     }
@@ -2432,8 +2432,8 @@ impl InspectManager {
     /// scanner — returns the latest cached aggregate if present and verifies
     /// its contribution freshness so warm cache hits are reported as fresh.
     /// This is the non-blocking variant intended for the synchronous `inspect`
-    /// command path; Tier 2 scans run via the watcher-driven scheduler or the
-    /// compatibility `aft_inspect_tier2_run` command.
+    /// command path; Tier 2 scans run only from an explicit `aft_inspect`
+    /// through the blocking variants.
     pub fn tier2_read_cached(
         &self,
         snapshot: InspectSnapshot,

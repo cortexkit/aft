@@ -548,10 +548,16 @@ function translateInspectLspPaths(map: JsonRecord, prefix: string, out: Document
  * dropped on load and removed by `doctor --fix`, and the notice says so.
  * `bridge.hang_threshold` counted request timeouts toward restarting the
  * bridge; a timeout now fails only its own request, and the bridge's hang
- * watchdog judges a stuck child by its silence instead. Mirrors
- * `REMOVED_NO_EFFECT_PATHS` in `crates/aft/src/feature_config.rs`.
+ * watchdog judges a stuck child by its silence instead.
+ * `inspect.tier2_idle_minutes` delayed the whole-repository analyses the
+ * OpenCode plugin started when a session went idle; those analyses now run
+ * only when `aft_inspect` is called. Mirrors `REMOVED_NO_EFFECT_PATHS` in
+ * `crates/aft/src/feature_config.rs`.
  */
-export const REMOVED_NO_EFFECT_PATHS: readonly string[] = ["bridge.hang_threshold"];
+export const REMOVED_NO_EFFECT_PATHS: readonly string[] = [
+  "bridge.hang_threshold",
+  "inspect.tier2_idle_minutes",
+];
 
 /** Drop the retired keys that no longer do anything, exactly as `doctor --fix` removes them. */
 function dropNoEffectPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
@@ -915,6 +921,10 @@ export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> =
   [
     "inspect.max_drill_down_items",
     "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
+  ],
+  [
+    "inspect.tier2_idle_minutes",
+    "inspect.tier2_idle_minutes no longer does anything: AFT runs whole-repository analyses only when aft_inspect is called, so the setting can be removed.",
   ],
   [
     "inspect.tier2_soft_deadline_ms",

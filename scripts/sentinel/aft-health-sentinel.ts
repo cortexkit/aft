@@ -14,9 +14,6 @@ export type Plane = {
   since_ms?: number | null;
   next_retry_ms?: number | null;
   last_progress_at_ms?: number | null;
-  stale_since_ms?: number | null;
-  next_refresh_at_ms?: number | null;
-  pending_paths?: number | null;
 };
 export type RootHealth = {
   project_root?: string;
@@ -105,7 +102,6 @@ const CRITICAL_COOLDOWN = 30 * 60_000;
 const WARNING_COOLDOWN = 2 * 60 * 60_000;
 const TEN_MINUTES = 10 * 60_000;
 const FIFTEEN_MINUTES = 15 * 60_000;
-const TIER2_REFRESH_OVERDUE_GRACE = 5 * 60_000;
 const GB = 1024 ** 3;
 
 const MAX_LAUNCHD_LOG_BYTES = 1024 * 1024;
@@ -367,23 +363,6 @@ export function detectIndexes(sample: SentinelSample): Finding[] {
   }
   for (const root of roots(sample)) {
     const rootPath = root.project_root ?? "unknown";
-    const tier2 = root.tier2;
-    if (
-      tier2?.status === "stale"
-      && typeof tier2.next_refresh_at_ms === "number"
-      && sample.now_ms > tier2.next_refresh_at_ms + TIER2_REFRESH_OVERDUE_GRACE
-    ) {
-      const pendingPaths = typeof tier2.pending_paths === "number" ? tier2.pending_paths : 0;
-      const pathLabel = pendingPaths === 1 ? "path" : "paths";
-      const overdueMinutes = Math.round((sample.now_ms - tier2.next_refresh_at_ms) / 60_000);
-      out.push(finding(
-        "tier2.refresh_overdue",
-        "WARNING",
-        `tier2-refresh:${rootPath}`,
-        `${rootPath} tier2 refresh missed its scheduler deadline by ${overdueMinutes}m with ${pendingPaths} pending ${pathLabel}`,
-        "tier2 reports ready or building",
-      ));
-    }
     for (const plane of ["search_index", "semantic_index", "tier2"] as const) {
       const status = root[plane];
       if (status?.status === "backend_unavailable") continue;
@@ -832,7 +811,7 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
 export function detectAll(sample: SentinelSample, state: SentinelState): Finding[] {
   // Missing observations cannot verify recovery. Retain last-known census
   // findings until a fresh census can evaluate them again.
-  const censusRules = new Set(["index.stuck", "tier2.refresh_overdue", "embedding.backend_down", "retention.backlog", "watcher.overflow", "routes.dead_sessions"]);
+  const censusRules = new Set(["index.stuck", "embedding.backend_down", "retention.backlog", "watcher.overflow", "routes.dead_sessions"]);
   const retained = censusUnavailableReason(sample)
     ? Object.entries(state.findings).filter(([, prior]) => !prior.cleared_at && censusRules.has(prior.rule))
       .map(([fingerprint, prior]) => ({ ...prior, fingerprint, clears_when: "a fresh census verifies recovery" }))

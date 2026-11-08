@@ -532,8 +532,6 @@ const InspectConfigSchema = z.object({
     .transform((value) =>
       value === undefined ? undefined : clampInspectDiagnosticsTimeoutMs(value),
     ),
-  /** OpenCode session.idle delay before Tier 2 inspect prewarm. Default: 4 minutes. */
-  tier2_idle_minutes: z.number().min(0).optional(),
   /** Hard deadline for one Tier-2 pass. Default: 10 minutes. */
   tier2_pass_timeout_ms: z.number().int().positive().optional(),
   categories: z

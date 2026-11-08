@@ -103,16 +103,17 @@ describe("shared status helpers", () => {
       },
     });
 
-    expect(status.status_bar?.errors).toBe(7);
-    expect(status.status_bar?.duplicates).toBe(1167);
-    expect(status.status_bar?.tier2_stale).toBe(true);
+    // Dead code, unused exports and duplicates are computed only by
+    // aft_inspect; a snapshot from an older daemon that still carries them
+    // does not bring them into Code Health.
+    expect(status.status_bar).toEqual({ errors: 7, warnings: 13, todos: 5 });
 
     const dialog = formatStatusDialogMessage(status);
-    expect(dialog).toContain("Code Health (~ stale)");
-    expect(dialog).toContain("duplicates: 1,167");
-    expect(status.status_bar?.dead_code).toBe(334);
-    expect(dialog).toContain("dead code: 334");
-    expect(dialog).toContain("unused exports: 222");
+    expect(dialog).toContain("Code Health");
+    expect(dialog).not.toContain("~ stale");
+    expect(dialog).toContain("todos: 5");
+    expect(dialog).not.toContain("dead code");
+    expect(dialog).not.toContain("duplicates");
   });
 
   test("pi_status_snapshot_status_bar_undefined_when_null", () => {

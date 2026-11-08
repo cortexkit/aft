@@ -8,6 +8,6 @@
   "/runtime/live_watchers", "/runtime/live_actor_roots", "/runtime/open_routes",
   "/symbol_cache/local_entries", "/symbol_cache/warm_entries",
   "/compression/project/events", "/compression/project/original_tokens", "/compression/project/compressed_tokens", "/compression/project/savings_tokens",
-  "/status_bar/disabled_categories", "/status_bar/errors", "/status_bar/warnings", "/status_bar/dead_code", "/status_bar/unused_exports", "/status_bar/duplicates", "/status_bar/todos", "/status_bar/diagnostics", "/status_bar/diagnostics_gaps", "/status_bar/tier2_stale",
-  "/status_bar_values/disabled_categories", "/status_bar_values/errors", "/status_bar_values/warnings", "/status_bar_values/dead_code", "/status_bar_values/unused_exports", "/status_bar_values/duplicates", "/status_bar_values/todos", "/status_bar_values/diagnostics", "/status_bar_values/diagnostics_gaps", "/status_bar_values/tier2_stale"
+  "/status_bar/disabled_categories", "/status_bar/errors", "/status_bar/warnings", "/status_bar/todos", "/status_bar/diagnostics", "/status_bar/diagnostics_gaps",
+  "/status_bar_values/disabled_categories", "/status_bar_values/errors", "/status_bar_values/warnings", "/status_bar_values/todos", "/status_bar_values/diagnostics", "/status_bar_values/diagnostics_gaps"
 ]

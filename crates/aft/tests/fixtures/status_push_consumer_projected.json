@@ -89,9 +89,6 @@
       "disabled_categories": [],
       "errors": 1,
       "warnings": 2,
-      "dead_code": 3,
-      "unused_exports": 4,
-      "duplicates": 5,
       "todos": 6,
       "diagnostics": "pending",
       "diagnostics_gaps": [
@@ -100,16 +97,12 @@
           "producer": "rust-analyzer",
           "root": "/project"
         }
-      ],
-      "tier2_stale": true
+      ]
     },
     "status_bar_values": {
       "disabled_categories": [],
       "errors": 1,
       "warnings": 2,
-      "dead_code": 3,
-      "unused_exports": 4,
-      "duplicates": 5,
       "todos": 6,
       "diagnostics": "pending",
       "diagnostics_gaps": [
@@ -118,8 +111,7 @@
           "producer": "rust-analyzer",
           "root": "/project"
         }
-      ],
-      "tier2_stale": true
+      ]
     },
     "lsp": {
       "applicability_by_root": {}

@@ -72,11 +72,7 @@ function emptyProjectSnapshot(
       errors: null,
       warnings: null,
       diagnostics: "no_language_server",
-      dead_code: 0,
-      unused_exports: 0,
-      duplicates: 0,
       todos: 0,
-      tier2_stale: false,
     },
   };
   // A background push carries no session; a direct answer carries the asker's.
@@ -248,7 +244,7 @@ describe("background status pushes reach the OpenCode 2 sidebar and footer", () 
     expect(status.semantic_index.entries).toBe(0);
     expect(status.disk.semantic_disk_bytes).toBe(216);
     expect(status.search_index.files).toBe(0);
-    expect(formatAftStatusSegment(status)).toBe("AFT no LSP | D0 U0 C0 | T0");
+    expect(formatAftStatusSegment(status)).toBe("AFT no LSP | T0");
 
     unsubscribe();
     await registered.dispose();

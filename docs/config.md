@@ -445,7 +445,6 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // it but cannot lower it, so a repository cannot silently reduce another
     // consumer's diagnostic completeness.
     "diagnostics_timeout_ms": 120000,
-    "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
     // Computation switches, all true by default. Projects can turn categories
     // off, never restore a category the user turned off. Applies live.
     "categories": {
@@ -660,7 +659,7 @@ After a Location reload or host restart, AFT restores subscriptions in the backg
 
 The AFT sidebar and the OpenCode 2 prompt footer read their display settings from the `aft` entry of OpenCode's shared `tui-preferences.jsonc`, not from `aft.jsonc`. The file is `$OPENCODE_CONFIG_DIR/tui-preferences.jsonc` when that variable is set, otherwise `$XDG_CONFIG_HOME/opencode/tui-preferences.jsonc` (default `~/.config/opencode/tui-preferences.jsonc`); `OPENCODE_TUI_PREFERENCES_FILE` names a different file. Edits take effect while OpenCode is running, without a restart.
 
-`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | D0 U0 C1 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
+`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
 
 ```jsonc
 {
@@ -816,6 +815,7 @@ notice, and `doctor --fix` deletes it.
 | `idle.lsp_ttl_minutes` | `lsp.idle_minutes` |
 | `inspect.tier2_soft_deadline_ms`, `inspect.max_drill_down_items` | removed (they had no effect) |
 | `bridge.hang_threshold` | removed (no effect: see [Bridge request timeouts](#bridge-request-timeouts)) |
+| `inspect.tier2_idle_minutes` | removed (no effect: whole-repository analyses run only when `aft_inspect` is called) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
 Rewrite rules: an explicit `tool_surface` in the user base is a complete
@@ -913,7 +913,7 @@ until reconnect; trusted user edits may change the user budget in either directi
 to `true`. A false category is not scanned, built or refreshed, for scoped or
 unscoped inspections; it emits only e.g. `dead code: off (inspect.categories.dead_code)`.
 It cannot make the header PARTIAL and does not show a cached findings count.
-Status bars use **`○` for off** (e.g. `D○`), distinct from `?` for unknown and
+Status bars use **`○` for off** (e.g. `T○`), distinct from `?` for unknown and
 `0` for verified clean. Metrics remains internal and always computed for scoped
 file counts; it is not a configurable or rendered category. Project config can
 turn categories off, but cannot turn on a category the user turned off. Category

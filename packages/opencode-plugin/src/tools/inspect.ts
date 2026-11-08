@@ -310,54 +310,6 @@ export function shouldRegisterInspectTool(config: InspectToolConfig): boolean {
   return !(config.disabled_tools ?? []).includes("aft_inspect");
 }
 
-type TimerHandle = ReturnType<typeof setTimeout>;
-
-export interface InspectTier2IdleSchedulerOptions {
-  isEnabled: () => boolean;
-  idleMinutes: () => number | undefined;
-  run: (sessionID: string) => Promise<void>;
-  warn?: (message: string) => void;
-  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
-  clearTimer?: (timer: TimerHandle) => void;
-}
-
-export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedulerOptions) {
-  const timers = new Map<string, TimerHandle>();
-  const setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
-  const clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
-
-  const clear = (sessionID: string): void => {
-    const timer = timers.get(sessionID);
-    if (!timer) return;
-    clearTimer(timer);
-    timers.delete(sessionID);
-  };
-
-  const clearAll = (): void => {
-    for (const timer of timers.values()) clearTimer(timer);
-    timers.clear();
-  };
-
-  const schedule = (sessionID: string): void => {
-    if (!options.isEnabled()) return;
-    clear(sessionID);
-    const idleMinutes = options.idleMinutes() ?? 4;
-    const delayMs = Math.max(0, idleMinutes * 60 * 1000);
-    const timer = setTimer(() => {
-      timers.delete(sessionID);
-      options.run(sessionID).catch((err) => {
-        options.warn?.(
-          `inspect_tier2_run failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
-    }, delayMs);
-    (timer as { unref?: () => void }).unref?.();
-    timers.set(sessionID, timer);
-  };
-
-  return { schedule, clear, clearAll };
-}
-
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:

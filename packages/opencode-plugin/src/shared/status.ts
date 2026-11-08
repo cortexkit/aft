@@ -59,11 +59,7 @@ export interface StatusBar {
   disabled_categories?: string[];
   errors?: number;
   warnings?: number;
-  dead_code?: number;
-  unused_exports?: number;
-  duplicates?: number;
   todos?: number;
-  tier2_stale?: boolean;
   /**
    * `no_language_server` means no server is running. `producer_missing`
    * masks both counts when an expected project producer has failed, even if
@@ -233,9 +229,6 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     : [];
   const errors = readOptionalNumber(bar.errors);
   const warnings = readOptionalNumber(bar.warnings);
-  const deadCode = readOptionalNumber(bar.dead_code);
-  const unusedExports = readOptionalNumber(bar.unused_exports);
-  const duplicates = readOptionalNumber(bar.duplicates);
   const todos = readOptionalNumber(bar.todos);
   const noLanguageServer = bar.diagnostics === "no_language_server";
   const producerMissing = bar.diagnostics === "producer_missing";
@@ -257,9 +250,6 @@ function readStatusBar(value: unknown): StatusBar | undefined {
   if (
     errors === null &&
     warnings === null &&
-    deadCode === null &&
-    unusedExports === null &&
-    duplicates === null &&
     todos === null &&
     !noLanguageServer &&
     !producerMissing &&
@@ -271,11 +261,7 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     ...(disabled.length > 0 ? { disabled_categories: disabled } : {}),
     ...(errors !== null ? { errors } : {}),
     ...(warnings !== null ? { warnings } : {}),
-    ...(deadCode !== null ? { dead_code: deadCode } : {}),
-    ...(unusedExports !== null ? { unused_exports: unusedExports } : {}),
-    ...(duplicates !== null ? { duplicates } : {}),
     ...(todos !== null ? { todos } : {}),
-    ...(bar.tier2_stale === true ? { tier2_stale: true } : {}),
     ...(noLanguageServer ? { diagnostics: "no_language_server" as const } : {}),
     ...(producerMissing
       ? { diagnostics: "producer_missing" as const, diagnostics_gaps: diagnosticsGaps }
@@ -501,13 +487,10 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     const rows = [
       ["errors", sb.errors],
       ["warnings", sb.warnings],
-      ["dead code", sb.dead_code],
-      ["unused exports", sb.unused_exports],
-      ["duplicates", sb.duplicates],
       ["todos", sb.todos],
     ].filter((row): row is [string, number] => typeof row[1] === "number");
     if (rows.length > 0) {
-      lines.push("", `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      lines.push("", "Code Health");
       for (const [label, value] of rows) lines.push(`- ${label}: ${formatCount(value)}`);
     }
   }
@@ -660,13 +643,10 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     const rows = [
       ["Errors", sb.errors],
       ["Warnings", sb.warnings],
-      ["Dead code", sb.dead_code],
-      ["Unused exports", sb.unused_exports],
-      ["Duplicates", sb.duplicates],
       ["TODOs", sb.todos],
     ].filter((row): row is [string, number] => typeof row[1] === "number");
     if (rows.length > 0) {
-      lines.push("", `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      lines.push("", "### Code Health");
       for (const [label, value] of rows) lines.push(`- **${label}:** ${formatCount(value)}`);
     }
   }

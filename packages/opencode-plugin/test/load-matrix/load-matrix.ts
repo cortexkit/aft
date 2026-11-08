@@ -861,11 +861,7 @@ const sidebarProbeStatus = {
   status_bar: {
     errors: 2,
     warnings: 3,
-    dead_code: 4,
-    unused_exports: 5,
-    duplicates: 6,
     todos: 7,
-    tier2_stale: false,
   },
   message: "",
 };

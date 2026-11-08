@@ -243,7 +243,6 @@ export interface LspServerConfig {
 export interface InspectConfig {
   enabled?: boolean;
   diagnostics_timeout_ms?: number;
-  tier2_idle_minutes?: number;
   tier2_pass_timeout_ms?: number;
   categories?: Partial<
     Record<
@@ -1021,7 +1020,6 @@ const InspectConfigSchema = z.object({
     .transform((value) =>
       value === undefined ? undefined : clampInspectDiagnosticsTimeoutMs(value),
     ),
-  tier2_idle_minutes: z.number().min(0).optional(),
   tier2_pass_timeout_ms: z.number().int().positive().optional(),
   categories: z
     .object({
