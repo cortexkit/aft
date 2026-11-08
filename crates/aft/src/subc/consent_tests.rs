@@ -6208,7 +6208,11 @@ impl ConsentTransport for StartupMacosWithdrawal {
                     "injected withdrawal failure".into(),
                 ))
             })
-        } else if self.gone_id.as_ref().is_some_and(|id| call.params["elicitation_id"] == *id) {
+        } else if self
+            .gone_id
+            .as_ref()
+            .is_some_and(|id| call.params["elicitation_id"] == *id)
+        {
             Box::pin(async {
                 Err(ConsentError::ScopeGone(
                     "route.open failed: scope_not_live".into(),
