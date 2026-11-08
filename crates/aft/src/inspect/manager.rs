@@ -1782,8 +1782,8 @@ impl InspectManager {
         let spawned = std::thread::Builder::new()
             .name("aft-dead-code-release".into())
             .spawn(move || loop {
-                // Hold the manager only while checking, so a dropped root
-                // ends the thread at its next wake-up.
+                // Hold the manager only while checking, so dropping the
+                // manager ends the thread at its next wake-up.
                 let Some(current) = manager.upgrade() else {
                     return;
                 };
