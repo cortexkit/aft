@@ -174,6 +174,57 @@ impl ContentSectionsBuilder {
     }
 }
 
+/// Writes into `writer` the content sections of a segment holding `units`,
+/// each `(key, source, ordinal)` the record at `ordinal` of the source
+/// segment at `source`, copied as stored: neither part is decoded, so a
+/// record of any kind folds. The sections are the bytes a
+/// [`ContentSectionsBuilder`] holding the same records writes (see
+/// `crate::fold`). `units` must be in strictly ascending key order.
+///
+/// # Errors
+///
+/// When a read or a write fails, or a source's sections are malformed.
+///
+/// # Panics
+///
+/// When `units` is not in strictly ascending key order or names a source
+/// that is not in `sources`.
+pub fn write_folded(
+    writer: &mut SegmentWriter,
+    sources: &[ContentSegment<'_>],
+    units: &[(RecordKey, usize, u32)],
+) -> Result<(), SegmentError> {
+    // Surfaces first, so each unit's place in them is known as the table
+    // is built.
+    let mut table = UnitTableBuilder::new(Digest128::LEN);
+    let mut offset = 0u64;
+    writer.begin_section(spec(SURFACES))?;
+    for (key, source, ordinal) in units {
+        let surface = sources[*source].surface(*ordinal)?;
+        table.push(
+            key.digest().as_bytes(),
+            UnitLocation {
+                offset,
+                len: u32::try_from(surface.len()).expect("a surface is under 4 GiB"),
+            },
+        );
+        writer.write(&surface)?;
+        offset += surface.len() as u64;
+    }
+    let (table, count) = table.finish();
+    writer.end_section(count)?;
+    writer.begin_section(spec(BODIES))?;
+    let mut bodies = packed::PackedCopy::with_capacity(units.len());
+    for (_, source, ordinal) in units {
+        let source = &sources[*source];
+        let body = packed::read_stored(source.segment, source.bodies, source.index, *ordinal)?;
+        bodies.push(writer, &body)?;
+    }
+    writer.end_section(count)?;
+    writer.write_section(spec(BODY_INDEX), &bodies.finish(), count)?;
+    writer.write_section(spec(UNITS), &table, count)
+}
+
 fn spec(kind: SectionKind) -> SectionSpec {
     SectionSpec {
         id: SectionId::new(kind, KEY_SPACE),

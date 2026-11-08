@@ -336,6 +336,92 @@ fn slice_spec(kind: SectionKind) -> SectionSpec {
     }
 }
 
+/// Writes into `writer` the graph sections of a segment holding `units`,
+/// each `(key, source, ordinal)` the fragment at `ordinal` of the source
+/// segment at `source`, copied as stored with its slice record and its
+/// terms: the sections a [`GraphSectionsBuilder`] holding the same
+/// fragments writes (see `crate::fold`). A fragment whose source has no
+/// slice sections gets an empty slice record, which readers treat as none.
+/// `units` must be in strictly ascending key order.
+///
+/// # Errors
+///
+/// When a read or a write fails, or a source's sections are malformed.
+///
+/// # Panics
+///
+/// When `units` is not in strictly ascending key order, names a source
+/// that is not in `sources`, or an ordinal past its source's units.
+pub fn write_folded(
+    writer: &mut SegmentWriter,
+    sources: &[GraphSegment<'_>],
+    units: &[(FragmentKey, usize, u32)],
+) -> Result<(), SegmentError> {
+    let mut renumbered = sources
+        .iter()
+        .map(|source| vec![crate::fold::NOT_COPIED; source.len() as usize])
+        .collect::<Vec<_>>();
+    let mut table = UnitTableBuilder::new(Digest128::LEN);
+    for (key, source, ordinal) in units {
+        // A fragment's bytes are found through the packed index by
+        // ordinal, so the unit table carries no location.
+        let new = table.push(key.0.as_bytes(), UnitLocation { offset: 0, len: 0 });
+        renumbered[*source][*ordinal as usize] = new;
+    }
+    let (table, count) = table.finish();
+    writer.begin_section(spec(DATA, UNIT_KEY_SPACE))?;
+    let mut data = packed::PackedCopy::with_capacity(units.len());
+    for (_, source, ordinal) in units {
+        let source = &sources[*source];
+        data.push(
+            writer,
+            &packed::read_stored(source.segment, source.data, source.index, *ordinal)?,
+        )?;
+    }
+    writer.end_section(count)?;
+    writer.write_section(spec(INDEX, UNIT_KEY_SPACE), &data.finish(), count)?;
+    writer.begin_section(slice_spec(SLICE_DATA))?;
+    let mut slices = packed::PackedCopy::with_capacity(units.len());
+    for (_, source, ordinal) in units {
+        let source = &sources[*source];
+        let slice = match source.slices {
+            Some((data, index)) => packed::read_stored(source.segment, data, index, *ordinal)?,
+            None => packed::StoredUnit::EMPTY,
+        };
+        slices.push(writer, &slice)?;
+    }
+    writer.end_section(count)?;
+    writer.write_section(slice_spec(SLICE_INDEX), &slices.finish(), count)?;
+    writer.write_section(spec(UNITS, UNIT_KEY_SPACE), &table, count)?;
+    for kind in TermKind::ALL {
+        let postings = sources
+            .iter()
+            .zip(&renumbered)
+            .map(|(source, renumbered)| {
+                let (_, lookup, postings) = source
+                    .terms
+                    .iter()
+                    .find(|(each, ..)| *each == kind)
+                    .expect("every term kind has its sections");
+                crate::fold::PostingSource {
+                    segment: source.segment,
+                    lookup: LookupTable::reopen(source.segment, lookup.section()),
+                    postings: *postings,
+                    renumbered,
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::fold::write_postings(
+            writer,
+            spec(TERM_POSTINGS, kind.key_space()),
+            spec(TERM_LOOKUP, kind.key_space()),
+            &layout(),
+            &postings,
+        )?;
+    }
+    Ok(())
+}
+
 /// The graph sections of one open segment.
 #[derive(Debug)]
 pub struct GraphSegment<'s> {

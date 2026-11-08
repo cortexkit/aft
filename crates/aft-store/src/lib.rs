@@ -25,6 +25,7 @@ pub mod text;
 pub mod vector;
 
 mod fault;
+mod fold;
 mod fs;
 mod le;
 mod packed;

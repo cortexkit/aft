@@ -330,6 +330,34 @@ impl<'s> LookupTable<'s> {
         self.count == 0
     }
 
+    /// The key and posting list at `index`, in ascending key order: what a
+    /// fold walks to merge several tables into one.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails or a block fails its checksum.
+    ///
+    /// # Panics
+    ///
+    /// When `index` is not below [`len`](Self::len).
+    pub fn entry(&self, index: u64) -> Result<(u64, PostingList), SegmentError> {
+        assert!(
+            index < self.count,
+            "lookup index {index} is past {}",
+            self.count
+        );
+        let mut entry = [0; LOOKUP_ENTRY_LEN];
+        self.segment
+            .read(self.section, index * LOOKUP_ENTRY_LEN as u64, &mut entry)?;
+        Ok((
+            u64_at(&entry, 0),
+            PostingList {
+                offset: u64_at(&entry, 8),
+                count: u32_at(&entry, 16),
+            },
+        ))
+    }
+
     /// The posting list of `key`, if the table has it.
     ///
     /// # Errors

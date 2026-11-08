@@ -99,6 +99,9 @@ pub struct PostingList {
 pub struct PostingsBuilder {
     layout: PostingLayout,
     bytes: Vec<u8>,
+    /// Bytes already handed over by [`Self::drain`]: the section offset at
+    /// which `bytes` starts.
+    drained: u64,
     entries: u64,
 }
 
@@ -108,6 +111,7 @@ impl PostingsBuilder {
         Self {
             layout,
             bytes: Vec::new(),
+            drained: 0,
             entries: 0,
         }
     }
@@ -142,7 +146,7 @@ impl PostingsBuilder {
             "posting ordinals must not decrease"
         );
         let list = PostingList {
-            offset: self.bytes.len() as u64,
+            offset: self.drained + self.bytes.len() as u64,
             count: u32::try_from(ordinals.len())
                 .expect("a posting list has fewer than 2^32 entries"),
         };
@@ -161,7 +165,22 @@ impl PostingsBuilder {
         list
     }
 
-    /// The section bytes and its item count: the total number of postings.
+    /// How many bytes are held, not yet handed over by [`Self::drain`].
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Hands over the bytes written so far, so a caller that writes the
+    /// section as it goes holds no more than the lists since the last call.
+    /// Later lists' offsets still count from the section's start.
+    pub fn drain(&mut self) -> Vec<u8> {
+        self.drained += self.bytes.len() as u64;
+        std::mem::take(&mut self.bytes)
+    }
+
+    /// The section bytes not yet drained and its item count: the total
+    /// number of postings.
     #[must_use]
     pub fn finish(self) -> (Vec<u8>, u64) {
         (self.bytes, self.entries)

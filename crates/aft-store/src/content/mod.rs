@@ -19,7 +19,7 @@ pub mod codec;
 mod sections;
 
 pub use sections::{
-    ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN,
+    ContentReadError, ContentSectionsBuilder, ContentSegment, EncodedRecord, KNOWN, write_folded,
 };
 
 use codec::{Decoder, Encoder};

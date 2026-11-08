@@ -12,7 +12,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
 use crate::le::{u32_at, u64_at};
-use crate::segment::{ErrorKind, SectionHandle, Segment, SegmentError};
+use crate::segment::{ErrorKind, SectionHandle, Segment, SegmentError, SegmentWriter};
 
 /// The width of one index entry.
 pub(crate) const INDEX_ENTRY_LEN: usize = 17;
@@ -67,6 +67,71 @@ impl PackedBuilder {
     }
 }
 
+/// One unit as its data section stores it: possibly compressed, with what
+/// its index entry says about it.
+#[derive(Debug)]
+pub(crate) struct StoredUnit {
+    codec: u8,
+    unpacked: u32,
+    bytes: Vec<u8>,
+}
+
+impl StoredUnit {
+    /// A unit with no bytes, as [`PackedBuilder::push`] stores an empty one.
+    pub(crate) const EMPTY: Self = Self {
+        codec: RAW,
+        unpacked: 0,
+        bytes: Vec::new(),
+    };
+}
+
+/// Copies units from other segments' data sections into the data section
+/// open in a writer as they arrive, keeping only the index: a fold moves
+/// stored units into a new segment without unpacking and packing them
+/// again, and without holding them all.
+#[derive(Debug, Default)]
+pub(crate) struct PackedCopy {
+    len: u64,
+    index: Vec<u8>,
+}
+
+impl PackedCopy {
+    pub(crate) fn with_capacity(units: usize) -> Self {
+        Self {
+            len: 0,
+            index: Vec::with_capacity(units * INDEX_ENTRY_LEN),
+        }
+    }
+
+    /// Writes the next unit into `writer`'s open section.
+    ///
+    /// # Errors
+    ///
+    /// When the write fails.
+    pub(crate) fn push(
+        &mut self,
+        writer: &mut SegmentWriter,
+        unit: &StoredUnit,
+    ) -> Result<(), SegmentError> {
+        self.index.extend_from_slice(&self.len.to_le_bytes());
+        self.index.extend_from_slice(
+            &u32::try_from(unit.bytes.len())
+                .expect("a unit is under 4 GiB")
+                .to_le_bytes(),
+        );
+        self.index.extend_from_slice(&unit.unpacked.to_le_bytes());
+        self.index.push(unit.codec);
+        writer.write(&unit.bytes)?;
+        self.len += unit.bytes.len() as u64;
+        Ok(())
+    }
+
+    /// The index section's bytes.
+    pub(crate) fn finish(self) -> Vec<u8> {
+        self.index
+    }
+}
+
 fn pack(bytes: &[u8]) -> (u8, Vec<u8>) {
     if bytes.is_empty() {
         return (RAW, Vec::new());
@@ -96,22 +161,14 @@ pub(crate) fn read(
     ordinal: u32,
 ) -> Result<Vec<u8>, SegmentError> {
     let malformed = |reason| SegmentError::new(segment.path(), ErrorKind::Malformed(reason));
-    let mut entry = [0; INDEX_ENTRY_LEN];
-    segment.read(
-        index,
-        u64::from(ordinal) * INDEX_ENTRY_LEN as u64,
-        &mut entry,
-    )?;
-    let offset = u64_at(&entry, 0);
-    let stored = u32_at(&entry, 8);
-    let unpacked = u32_at(&entry, 12);
-    let end = offset
-        .checked_add(u64::from(stored))
-        .ok_or_else(|| malformed("a packed unit's range overflows"))?;
-    let bytes = segment.read_range(data, offset..end)?;
-    match entry[16] {
-        RAW if stored == unpacked => Ok(bytes),
-        ZLIB if unpacked <= MAX_UNPACKED => {
+    let StoredUnit {
+        codec,
+        unpacked,
+        bytes,
+    } = read_stored(segment, data, index, ordinal)?;
+    match codec {
+        RAW => Ok(bytes),
+        _ => {
             // Grown as bytes arrive rather than sized from the stored length.
             let mut out = Vec::with_capacity((unpacked as usize).min(1 << 20));
             ZlibDecoder::new(bytes.as_slice())
@@ -124,6 +181,45 @@ pub(crate) fn read(
                 Err(malformed("a packed unit unpacks to the wrong length"))
             }
         }
-        _ => Err(malformed("unknown packed unit codec")),
     }
+}
+
+/// The unit at `ordinal` as stored, not unpacked. Its index entry is
+/// checked as [`read`] checks it.
+///
+/// # Errors
+///
+/// When a read fails, a block fails its checksum, or the index entry is
+/// malformed.
+pub(crate) fn read_stored(
+    segment: &Segment,
+    data: SectionHandle,
+    index: SectionHandle,
+    ordinal: u32,
+) -> Result<StoredUnit, SegmentError> {
+    let malformed = |reason| SegmentError::new(segment.path(), ErrorKind::Malformed(reason));
+    let mut entry = [0; INDEX_ENTRY_LEN];
+    segment.read(
+        index,
+        u64::from(ordinal) * INDEX_ENTRY_LEN as u64,
+        &mut entry,
+    )?;
+    let offset = u64_at(&entry, 0);
+    let stored = u32_at(&entry, 8);
+    let unpacked = u32_at(&entry, 12);
+    let codec = entry[16];
+    match codec {
+        RAW if stored == unpacked => {}
+        ZLIB if unpacked <= MAX_UNPACKED => {}
+        _ => return Err(malformed("unknown packed unit codec")),
+    }
+    let end = offset
+        .checked_add(u64::from(stored))
+        .ok_or_else(|| malformed("a packed unit's range overflows"))?;
+    let bytes = segment.read_range(data, offset..end)?;
+    Ok(StoredUnit {
+        codec,
+        unpacked,
+        bytes,
+    })
 }

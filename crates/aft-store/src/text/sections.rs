@@ -176,9 +176,7 @@ impl TextSectionsBuilder {
                     len: UNIT_DATA_LEN_U32,
                 },
             );
-            data.extend_from_slice(&unit.len.to_le_bytes());
-            data.extend_from_slice(&unit.distinct.to_le_bytes());
-            data.push(unit.status.code());
+            push_unit_data(&mut data, unit);
             for (trigram, mask) in trigrams {
                 let (ordinals, masks) = lists.entry(trigram).or_default();
                 ordinals.push(ordinal);
@@ -199,6 +197,94 @@ impl TextSectionsBuilder {
         let (postings, entries) = postings.finish();
         writer.write_section(spec(TRIGRAM_POSTINGS), &postings, entries)
     }
+}
+
+fn push_unit_data(data: &mut Vec<u8>, unit: TextUnit) {
+    data.extend_from_slice(&unit.len.to_le_bytes());
+    data.extend_from_slice(&unit.distinct.to_le_bytes());
+    data.push(unit.status.code());
+}
+
+/// Where a folded segment's text unit comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextCopy {
+    /// The unit at `ordinal` of the source segment at `source`, with its
+    /// postings.
+    Stored { source: usize, ordinal: u32 },
+    /// A content whose trigrams are not indexed: its unit alone, as the
+    /// locator found it.
+    Unindexed { len: u64, status: TextStatus },
+}
+
+/// Writes into `writer` the text sections of a segment holding `units`,
+/// copied from `sources` without reading any content again: the same
+/// sections a [`TextSectionsBuilder`] holding the same units writes (see
+/// `crate::fold`). `units` must be in strictly ascending key order.
+///
+/// # Errors
+///
+/// When a read or a write fails, or a source's sections are malformed.
+///
+/// # Panics
+///
+/// When `units` is not in strictly ascending key order, names a source
+/// that is not in `sources`, or an ordinal past its source's units.
+pub fn write_folded(
+    writer: &mut SegmentWriter,
+    sources: &[TextSegment<'_>],
+    units: &[(ContentKey, TextCopy)],
+) -> Result<(), SegmentError> {
+    let mut renumbered = sources
+        .iter()
+        .map(|source| vec![crate::fold::NOT_COPIED; source.len() as usize])
+        .collect::<Vec<_>>();
+    let mut table = UnitTableBuilder::new(Digest128::LEN);
+    let mut data = Vec::with_capacity(units.len() * UNIT_DATA_LEN);
+    for (key, copy) in units {
+        let unit = match *copy {
+            TextCopy::Stored { source, ordinal } => sources[source].unit(ordinal)?,
+            TextCopy::Unindexed { len, status } => {
+                debug_assert_ne!(status, TextStatus::Indexed);
+                TextUnit {
+                    len,
+                    distinct: 0,
+                    status,
+                }
+            }
+        };
+        let ordinal = table.push(
+            key.digest().as_bytes(),
+            UnitLocation {
+                offset: data.len() as u64,
+                len: UNIT_DATA_LEN_U32,
+            },
+        );
+        if let TextCopy::Stored { source, ordinal: old } = *copy {
+            renumbered[source][old as usize] = ordinal;
+        }
+        push_unit_data(&mut data, unit);
+    }
+    let (table, count) = table.finish();
+    writer.write_section(spec(UNITS), &table, count)?;
+    writer.write_section(spec(UNIT_DATA), &data, count)?;
+    drop(data);
+    let postings = sources
+        .iter()
+        .zip(&renumbered)
+        .map(|(source, renumbered)| crate::fold::PostingSource {
+            segment: source.segment,
+            lookup: LookupTable::reopen(source.segment, source.lookup.section()),
+            postings: source.postings,
+            renumbered,
+        })
+        .collect::<Vec<_>>();
+    crate::fold::write_postings(
+        writer,
+        spec(TRIGRAM_POSTINGS),
+        spec(TRIGRAM_LOOKUP),
+        &posting_layout(),
+        &postings,
+    )
 }
 
 fn spec(kind: SectionKind) -> SectionSpec {
