@@ -1,6 +1,8 @@
 //! Measures a new worktree's first build: the wall time and the CPU time
-//! the process spent, for three checkouts of one repository built into one
-//! family store in turn. The first has nothing to start from; the second is
+//! the process spent, for three checkouts of one repository built in turn
+//! into one index store, the one store every checkout of a repository
+//! shares, so each later build can reuse what earlier ones stored. The
+//! first has nothing to start from; the second is
 //! at the same commit; the third is the same commit with `files` of the
 //! files that differ in `other` taken from it. Each line of stdout is one
 //! build, as JSON, with the build's report.
