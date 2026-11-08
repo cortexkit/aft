@@ -259,6 +259,7 @@ pub(crate) fn start(
         .unwrap_or_else(|error| error.into_inner())
         .clear();
     service.try_serve();
+    super::start_view::queue_sweep(&root);
     service
 }
 
