@@ -552,8 +552,9 @@ Optional `outputOffset` / `stderrOffset` (`output_offset` / `stderr_offset` in P
 
 **`bash_watch`** — block on or register for a background task's output. In a main session sync
 waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
-by default); for anything longer end the turn on `bash({background:true})` and let the completion
-reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
+by default); for anything longer, first do the work that doesn't need the result, end the turn
+only when everything left needs it, and let the completion reminder wake you, or use
+`bash({wait:true})` when the result is needed before anything else. In a
 delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
 `timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
 then reports the command is still running with how long it has run and its latest output; the

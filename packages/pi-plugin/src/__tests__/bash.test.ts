@@ -3083,8 +3083,15 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(on).toContain("foreground");
     expect(on).toContain("wait: true");
     expect(on).toContain("auto-promote can remind you while you work");
-    // Demote background: true to the parallel-work-only case.
-    expect(on).toContain("other useful work to do while it runs");
+    // Demote background: true to the parallel-work-only case, where any work
+    // that doesn't need the command's result counts as parallel work.
+    expect(on).toContain(
+      "other work to do while it runs, and any work that doesn't need this command's result counts",
+    );
+    // A long command ends the turn only once everything left needs its result.
+    expect(on).toContain(
+      "first do the work that doesn't need this result, end the turn only when everything left needs it",
+    );
     // Name the exact anti-pattern this description previously caused.
     expect(on).toContain("never background a command and immediately `bash_watch` it");
     // Still forbid the bash_status polling loop.
@@ -3096,7 +3103,10 @@ describe("bash tool description (agent-facing wording)", () => {
     const watch = createBashWatchTool(ctx);
     expect(watch.description).toContain("short remaining wait on a task");
     expect(watch.description).toContain("120s by default");
-    expect(watch.description).toContain("bash({background:true})");
+    expect(watch.description).toContain(
+      "first do the work that doesn't need the result, end the turn only when everything left needs it",
+    );
+    expect(watch.description).toContain("bash({wait:true})");
     expect(watch.description).toContain("Never loop bash_status");
     const status = createBashStatusTool(ctx);
     expect(status.description).toContain("never loop");
