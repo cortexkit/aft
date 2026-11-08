@@ -640,6 +640,17 @@ impl LiveCheckout {
         Arc::ptr_eq(&self.pool, &other.pool)
     }
 
+    /// The files resolution itself bound, and the files whose method-call
+    /// inputs it computed itself, each the first time it read them, since
+    /// the last call: the serial work an update did on a resolving thread.
+    #[cfg(test)]
+    pub(crate) fn take_first_reads(&self) -> (Vec<String>, Vec<String>) {
+        (
+            self.bound.take_bound_on_first_use(),
+            self.calls.take_computed_while_resolving(),
+        )
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the four passes run in order and each reads the previous one's results"
@@ -939,6 +950,16 @@ impl LiveCheckout {
             if !self.resolved.contains_key(path) {
                 resolve.insert(path.clone());
             }
+        }
+        // Resolving a Rust file reads the module tree, which the resolver
+        // builds by binding every module-declaring file; bind those in
+        // parallel first (see `BindCache::bind_module_declaring`).
+        if resolve
+            .iter()
+            .chain(changed)
+            .any(|path| path.ends_with(".rs"))
+        {
+            self.bound.bind_module_declaring(inputs)?;
         }
         let mut answers = BTreeMap::new();
         for path in self.reverse.resolution_of(&changed_keys) {

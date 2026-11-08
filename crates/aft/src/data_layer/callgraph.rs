@@ -717,6 +717,10 @@ impl FileLists {
 pub(crate) struct BindCache {
     files: Mutex<HashMap<String, Arc<BoundFile>>>,
     lists: Mutex<Option<Arc<FileLists>>>,
+    /// Every file a resolver bound on first use, in order: what resolution
+    /// waited on that nothing bound beforehand.
+    #[cfg(test)]
+    bound_on_first_use: Mutex<Vec<String>>,
 }
 
 impl BindCache {
@@ -804,6 +808,77 @@ impl BindCache {
         }))
     }
 
+    /// Binds, in parallel, every file that declares Rust modules and is not
+    /// bound yet, building the whole-checkout lists first, also in parallel,
+    /// if no resolution has built them.
+    ///
+    /// Resolving a Rust file asks which file declares each of its modules.
+    /// The resolver answers from a map it builds the first time it is asked,
+    /// by binding every module-declaring file one after another on the
+    /// thread that asked (see `ProjectIndex::lazy_module_parents`). An engine
+    /// started from a publication has bound none of them, so without this
+    /// its first Rust update waits on that serial pass, seconds on a large
+    /// checkout. Binding reads only the file and the checkout, so these are
+    /// the bindings the resolver would have made.
+    ///
+    /// # Errors
+    ///
+    /// When binding fails on a file.
+    pub(crate) fn bind_module_declaring(
+        &self,
+        inputs: &CheckoutInputs,
+    ) -> Result<(), ManifestJoinError> {
+        let lists = self.lists_in_parallel(inputs);
+        let paths = lists.module_declaring.iter().collect::<Vec<_>>();
+        self.bind_missing(inputs, &paths)
+    }
+
+    /// [`Self::lists`], reading the parses in parallel when the lists are
+    /// not built yet. The lock is not held while they are read: a pool
+    /// thread waiting on it could be the one a read needs.
+    fn lists_in_parallel(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
+        if let Some(lists) = self
+            .lists
+            .lock()
+            .expect("no panics while holding it")
+            .as_ref()
+        {
+            return Arc::clone(lists);
+        }
+        let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let kinds = paths
+            .par_iter()
+            .map(|path| {
+                inputs
+                    .parses
+                    .get(path)
+                    .map_or((false, false), |(_, parse)| FileLists::kinds(parse))
+            })
+            .collect::<Vec<_>>();
+        let mut lists = FileLists::default();
+        for (path, (rust, declaring)) in paths.into_iter().zip(kinds) {
+            if rust {
+                lists.rust.push(path.clone());
+            }
+            if declaring {
+                lists.module_declaring.push(path.clone());
+            }
+        }
+        let mut slot = self.lists.lock().expect("no panics while holding it");
+        Arc::clone(slot.get_or_insert_with(|| Arc::new(lists)))
+    }
+
+    /// The files resolution bound on first use since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_bound_on_first_use(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .bound_on_first_use
+                .lock()
+                .expect("no panics while holding it"),
+        )
+    }
+
     /// Binds, in parallel, every file of `paths` not bound yet.
     ///
     /// # Errors
@@ -854,6 +929,12 @@ impl<'a> BoundFiles<'a> {
             return Some(bound);
         }
         let (_, parse) = self.inputs.parses.get(path)?;
+        #[cfg(test)]
+        self.cache
+            .bound_on_first_use
+            .lock()
+            .expect("no panics while holding it")
+            .push(path.to_string());
         match bind_file(path, parse, &self.facts, None) {
             Ok((surface, binding)) => Some(self.cache.set_new(
                 path,
@@ -1392,6 +1473,10 @@ pub(crate) struct MethodCallInputs {
     methods: HashMap<String, BTreeSet<String>>,
     /// Method name to the Go files of `own` whose interfaces require it.
     go_required: HashMap<String, BTreeSet<String>>,
+    /// Every file whose inputs pass 4 computed on the resolving thread, the
+    /// first time the resolver read it, in order.
+    #[cfg(test)]
+    computed_while_resolving: Mutex<Vec<String>>,
 }
 
 /// Below this many files, pass 4 runs on one thread instead of in parallel
@@ -1399,6 +1484,18 @@ pub(crate) struct MethodCallInputs {
 const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
+    /// The files whose inputs the resolver computed itself since the last
+    /// call.
+    #[cfg(test)]
+    pub(crate) fn take_computed_while_resolving(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .computed_while_resolving
+                .lock()
+                .expect("no panics while holding it"),
+        )
+    }
+
     /// Every file's inputs, from `resolved`.
     pub(crate) fn build(inputs: &CheckoutInputs, resolved: &(dyn ResolutionLookup + Sync)) -> Self {
         let built = inputs
@@ -1531,6 +1628,7 @@ impl MethodCallInputs {
         }
         let source = SiteSource::new(inputs, resolved, self);
         let results = if paths.len() <= SMALL_SITE_RUN {
+            source.load_declarers(paths);
             let resolver = Resolver::over(&source);
             resolve_chunk(inputs, &source, &resolver, paths)
         } else {
@@ -1593,11 +1691,52 @@ impl<'s> SiteSource<'s> {
         self.loaded
             .get(path)?
             .get_or_init(|| {
-                let (_, parse) = self.inputs.parses.get(path)?;
-                let resolution = self.resolved.resolution(path)?;
-                Some(Arc::new(SiteFile::new(parse, resolution)))
+                #[cfg(test)]
+                self.calls
+                    .computed_while_resolving
+                    .lock()
+                    .expect("no panics while holding it")
+                    .push(path.to_string());
+                self.compute(path)
             })
             .as_deref()
+    }
+
+    fn compute(&self, path: &str) -> Option<Arc<SiteFile>> {
+        let (_, parse) = self.inputs.parses.get(path)?;
+        let resolution = self.resolved.resolution(path)?;
+        Some(Arc::new(SiteFile::new(parse, resolution)))
+    }
+
+    /// Computes, in parallel, the inputs of every file that declares a
+    /// method named like one a site of `paths` calls.
+    ///
+    /// The resolver reads every declarer of a called method's name, one
+    /// after another on the thread resolving the site. A file not read since
+    /// the engine started is computed then, from its stored parse and
+    /// resolution, so the first update after a restart that reaches a
+    /// common method name waits on decoding each of its declarers in turn.
+    /// Computing them here first leaves the resolver finding them computed;
+    /// what it reads, and what it records reading, is unchanged.
+    fn load_declarers(&self, paths: &[&String]) {
+        let members = paths
+            .iter()
+            .filter_map(|path| self.inputs.parses.get(path))
+            .flat_map(|(_, parse)| parse.bound_dispatch_sites())
+            .filter_map(|site| site.member)
+            .collect::<BTreeSet<_>>();
+        let declarers = members
+            .iter()
+            .flat_map(|member| self.files_with_method(member))
+            .filter(|file| !self.calls.files.contains_key(file.as_str()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        declarers.par_iter().for_each(|file| {
+            if let Some(slot) = self.loaded.get(file.as_str()) {
+                slot.get_or_init(|| self.compute(file));
+            }
+        });
     }
 
     /// The stored files filed under `term` that are not filed in memory.

@@ -793,6 +793,68 @@ fn rust_edits_from_a_publication_match_cold() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
+/// The first Rust edit after a restart: an engine started from a
+/// publication has bound no file and computed no method-call input yet.
+/// Resolution reads the module tree, built by binding every file that
+/// declares modules, and resolving a method call reads every file that
+/// declares a method of that name; the resolver does each one file at a
+/// time on its own thread. On a large checkout that serial work made the
+/// first refresh take seconds, so the update does both in parallel first,
+/// and the resolver must find them done. The answers must not change.
+#[test]
+fn first_rust_update_from_a_publication_reads_nothing_one_file_at_a_time() {
+    let helper = |calls: usize| {
+        format!(
+            "use crate::shapes::Square;\npub fn helper() {{\n    let square = Square;\n{}}}\n",
+            "    square.area();\n".repeat(calls)
+        )
+    };
+    let base = Tree::default()
+        .file("Cargo.toml", "[package]\nname = \"demo\"\n")
+        .file(
+            "src/lib.rs",
+            "mod shapes;\nmod util;\npub fn start() {\n    util::helper();\n}\n",
+        )
+        .file(
+            "src/shapes.rs",
+            "pub mod circle;\npub struct Square;\nimpl Square {\n    pub fn area(&self) -> u32 {\n        4\n    }\n}\n",
+        )
+        .file(
+            "src/shapes/circle.rs",
+            "pub struct Circle;\nimpl Circle {\n    pub fn area(&self) -> u32 {\n        3\n    }\n}\n",
+        )
+        .file("src/util.rs", &helper(1));
+    let edited = base.clone().file("src/util.rs", &helper(2));
+    let (before, after) = (base.fixture(), edited.fixture());
+    let dir = tempfile::tempdir().unwrap();
+    let (segment, fragments) = write(&before, dir.path(), 1);
+    let mut engine = Engine::published("publication", &before, vec![segment], &fragments);
+    let changed = changed(&before.inputs, &after.inputs);
+    let inputs = next(&engine.live.inputs, &after, &changed);
+    engine.live.update(inputs, &changed).unwrap();
+
+    let (bound, computed) = engine.live.take_first_reads();
+    for declaring in ["src/lib.rs", "src/shapes.rs"] {
+        assert!(
+            !bound.iter().any(|file| file == declaring),
+            "resolution bound the module-declaring {declaring} itself: {bound:?}"
+        );
+    }
+    for declarer in ["src/shapes.rs", "src/shapes/circle.rs"] {
+        assert!(
+            !computed.iter().any(|file| file == declarer),
+            "the method-call resolver computed {declarer}'s inputs itself: {computed:?}"
+        );
+    }
+    let cold = resolve_checkout(&after.inputs, 1).unwrap();
+    assert!(
+        !cold["src/util.rs"].sites.is_empty(),
+        "the calls of `area` are method-call sites"
+    );
+    let problems = differences(&engine.live, &cold);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// Every kind of edit a checkout sees, in turn, on one Go module: each step
 /// must move an answer of a file it did not edit, except the symlink
 /// retarget. The Go resolver follows neither a symlinked package folder nor
