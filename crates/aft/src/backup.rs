@@ -1059,6 +1059,10 @@ pub struct BackupStore {
     request_namespaces: RwLock<HashSet<String>>,
     maintenance_ttl_hours: u32,
     db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    /// The undo mirror's own connection to the database behind `db_pool`
+    /// (see [`open_mirror_connection`]). `None` means the mirror uses
+    /// `db_pool` itself.
+    mirror_db: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
     /// Stacks whose SQLite mirror has a known-good baseline in this process.
@@ -1167,6 +1171,7 @@ impl BackupStore {
             request_namespaces: RwLock::new(HashSet::new()),
             maintenance_ttl_hours: 0,
             db_pool: RwLock::new(None),
+            mirror_db: RwLock::new(None),
             db_harness: RwLock::new(None),
             db_project_key: RwLock::new(None),
             db_mirrored_stacks: RwLock::new(HashMap::new()),
@@ -1299,8 +1304,12 @@ impl BackupStore {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        let mirror = open_mirror_connection(&conn);
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = Some(conn);
+        }
+        if let Ok(mut slot) = self.mirror_db.write() {
+            *slot = mirror;
         }
         self.clear_db_mirror_sync();
     }
@@ -1309,7 +1318,20 @@ impl BackupStore {
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.mirror_db.write() {
+            *slot = None;
+        }
         self.clear_db_mirror_sync();
+    }
+
+    /// The connection every undo-mirror read and write goes through: the
+    /// mirror's own when one is open, otherwise the shared one.
+    fn mirror_pool(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
+        self.mirror_db
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .or_else(|| self.db_pool.read().ok().and_then(|slot| slot.clone()))
     }
 
     pub fn set_db_harness(&self, harness: crate::harness::Harness) {
@@ -2720,7 +2742,7 @@ impl BackupStore {
     }
 
     fn db_pool_and_harness(&self) -> Option<(Arc<Mutex<TrackedConnection>>, String)> {
-        let pool = self.db_pool.read().ok().and_then(|slot| slot.clone())?;
+        let pool = self.mirror_pool()?;
         let harness = self.effective_db_harness()?;
         Some((pool, harness))
     }
@@ -5435,8 +5457,7 @@ impl BackupStore {
         stack: &[BackupEntry],
         plan: DbMirrorPlan<'_>,
     ) {
-        let pool = self.db_pool.read().ok().and_then(|slot| slot.clone());
-        let Some(pool) = pool else {
+        let Some(pool) = self.mirror_pool() else {
             return;
         };
         let harness = self.effective_db_harness();
@@ -5684,6 +5705,44 @@ impl BackupStore {
                 );
                 Err(error.to_string())
             }
+        }
+    }
+}
+
+/// Open a connection of the undo mirror's own to the database behind
+/// `shared`, so an edit's mirror write never waits for the process-wide
+/// connection mutex. Other writers hold that mutex for their whole statement,
+/// including while SQLite's busy handler sleeps behind another process's write
+/// lock. The mirror's connection keeps the standard busy timeout, so it still
+/// waits while another connection's write transaction is running.
+///
+/// Returns `None`, and the mirror uses `shared`, for an in-memory database
+/// (a second connection would open a different one), for a read-only
+/// connection (a dry-run purge must not migrate or write the database), and
+/// when the open fails.
+fn open_mirror_connection(
+    shared: &Arc<Mutex<TrackedConnection>>,
+) -> Option<Arc<Mutex<TrackedConnection>>> {
+    let path = {
+        let conn = shared.lock().ok()?;
+        if conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        conn.path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(PathBuf::from)?
+    };
+    match crate::db::open_with_mode(&path, crate::db::OpenMode::SingleAttempt) {
+        Ok(conn) => Some(Arc::new(Mutex::new(conn))),
+        Err(error) => {
+            crate::slog_warn!(
+                "undo mirror uses the shared aft.db connection; its own could not open {}: {error}",
+                path.display()
+            );
+            None
         }
     }
 }
@@ -8469,12 +8528,15 @@ mod tests {
         }
 
         MIRROR_SQL_TRACE.lock().unwrap().clear();
-        shared.lock().unwrap().trace(Some(capture_mirror_sql));
+        // The mirror writes through its own connection, not the shared one.
+        let mirror = store.mirror_pool().unwrap();
+        assert!(!Arc::ptr_eq(&mirror, &shared));
+        mirror.lock().unwrap().trace(Some(capture_mirror_sql));
         fs::write(&file, "version-4").unwrap();
         store
             .snapshot(DB_MIRROR_SESSION, &file, "measured append")
             .unwrap();
-        shared.lock().unwrap().trace(None);
+        mirror.lock().unwrap().trace(None);
 
         let traced = MIRROR_SQL_TRACE.lock().unwrap().clone();
         let dml = traced
@@ -12452,25 +12514,31 @@ mod edit_latency_tests {
         let project = tempfile::tempdir().unwrap();
         let path = project.path().join("edited.txt");
         fs::write(&path, "original").unwrap();
-        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
-        // Start from an empty WAL, then let any commit of two or more pages
-        // pass the threshold, so the mirror commit would checkpoint inline.
-        // The hook still checkpoints inline once the WAL holds
-        // `DEFERRED_CHECKPOINT_LIMIT` (8) thresholds, 16 pages here; a
-        // single mirror commit to an empty WAL stays well under that.
-        conn.checkpoint_wal_as(
-            crate::db::lifecycle::WalCheckpointMode::Truncate,
-            crate::write_ledger::Domain::AftDb,
-        )
-        .unwrap();
-        conn.set_wal_autocheckpoint(2).unwrap();
-        let db_file = PathBuf::from(conn.path().unwrap());
-        let pool = Arc::new(Mutex::new(conn));
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
         let mut store = BackupStore::new();
         store.set_storage_dir(storage.path().to_path_buf(), 72);
         store.set_db_pool(Arc::clone(&pool));
         store.set_db_harness(Harness::Opencode);
         store.set_db_project_key("project".to_string());
+        // The mirror commits through its own connection. Start from an empty
+        // WAL, then let any commit of two or more pages pass that
+        // connection's threshold, so the mirror commit would checkpoint
+        // inline. The hook still checkpoints inline once the WAL holds
+        // `DEFERRED_CHECKPOINT_LIMIT` (8) thresholds, 16 pages here; a
+        // single mirror commit to an empty WAL stays well under that.
+        let mirror = store.mirror_pool().unwrap();
+        let db_file = {
+            let conn = mirror.lock().unwrap();
+            conn.checkpoint_wal_as(
+                crate::db::lifecycle::WalCheckpointMode::Truncate,
+                crate::write_ledger::Domain::AftDb,
+            )
+            .unwrap();
+            conn.set_wal_autocheckpoint(2).unwrap();
+            PathBuf::from(conn.path().unwrap())
+        };
 
         let finished_before = test_hooks::finished(&db_file);
         let inline_before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
@@ -12502,5 +12570,54 @@ mod edit_latency_tests {
             test_hooks::wait_finished_after(&db_file, finished_before, Duration::from_secs(10)),
             "the background checkpoint never finished"
         );
+    }
+
+    /// Other aft.db writers hold the shared connection's mutex for their whole
+    /// statement, including while SQLite's busy handler sleeps behind another
+    /// process's write lock. An edit's undo snapshot must not wait for it:
+    /// the mirror writes through a connection of its own.
+    #[test]
+    fn snapshot_does_not_wait_for_the_shared_aft_db_connection_mutex() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_pool(Arc::clone(&pool));
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+
+        let held = pool.lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let snapshot = std::thread::spawn(move || {
+            let result = store
+                .snapshot_with_op("held-mutex", &path, "edit", Some("op-1"))
+                .map(|id| id.is_some());
+            let _ = done.send(result);
+            (store, path)
+        });
+        // Generous: a snapshot takes milliseconds. Today's code waits for
+        // the held mutex for as long as this test holds it.
+        let outcome = finished.recv_timeout(Duration::from_secs(20));
+        drop(held);
+        let (store, path) = snapshot.join().unwrap();
+        assert!(
+            matches!(outcome, Ok(Ok(true))),
+            "the snapshot waited for the shared aft.db connection mutex: {outcome:?}"
+        );
+        // The mirror row was committed and the shared connection sees it.
+        let rows = crate::db::backups::list_backups(
+            &pool.lock().unwrap(),
+            "opencode",
+            "held-mutex",
+            &BackupStore::path_hash(&canonicalize_key(&path)),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(store.history("held-mutex", &path).len(), 1);
     }
 }
