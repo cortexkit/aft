@@ -591,6 +591,8 @@ pub(super) struct DispatchPathMetrics {
     pub(super) deferred_bash_waits_in_flight: AtomicUsize,
     /// Bash calls whose route request is still waiting for a terminal frame.
     pub(super) held_bash_calls: super::drain::HeldBashCalls,
+    /// `bash_watch` calls a `tool.yield` can end early.
+    pub(super) watch_yields: super::call_yield::WatchYields,
     /// Test-only probe that learns when a bash call reaches its foreground
     /// wait. Production never installs one; integration tests wait on its
     /// `BashForegroundWait` event instead of sleeping past the spawn job.
@@ -655,6 +657,7 @@ impl DispatchPathMetrics {
             bash_poll_touch_queued: AtomicUsize::new(0),
             deferred_bash_waits_in_flight: AtomicUsize::new(0),
             held_bash_calls: super::drain::HeldBashCalls::default(),
+            watch_yields: Default::default(),
             lifecycle_probe: StdMutex::new(None),
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),

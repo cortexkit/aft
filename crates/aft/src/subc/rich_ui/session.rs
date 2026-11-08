@@ -185,6 +185,7 @@ fn effective_identity(
         held_reply: false,
         held_update: false,
         call_keepalive: false,
+        call_yield: false,
         run_owner: None,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(true),

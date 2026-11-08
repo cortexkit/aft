@@ -484,6 +484,39 @@ impl HeldBashCalls {
         claimed
     }
 
+    /// Claims, for a `tool.yield`, the held call answering `corr` on `route`,
+    /// and stops tracking it. The caller owes the call its terminal frame and
+    /// must hand its command to the background, never kill it. Refused when
+    /// the call is not sitting in its foreground wait (still starting its
+    /// command, or its own wait task already answering), or when it belongs
+    /// to a delegated worker or a codemode run, which keep holding their calls.
+    pub(super) fn claim_for_yield(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+    ) -> Result<BashDetachTarget, super::call_yield::NotYieldable> {
+        use super::call_yield::NotYieldable;
+        let mut calls = self.lock();
+        let Some(call) = calls.get(&(route, corr)) else {
+            return Err(NotYieldable::NotWaiting);
+        };
+        let Some(target) = call.detach.as_ref() else {
+            return Err(NotYieldable::NotWaiting);
+        };
+        if target.worker_session || target.run_scoped {
+            return Err(NotYieldable::Scope);
+        }
+        if !call.phase.detaches_on_drain()
+            || call.claim.cancel_requested()
+            || !call.claim.claim_for_module_loop()
+        {
+            return Err(NotYieldable::NotWaiting);
+        }
+        let target = target.clone();
+        calls.remove(&(route, corr));
+        Ok(target)
+    }
+
     fn snapshot(&self) -> Vec<(Instant, BashHoldPhase)> {
         self.lock()
             .values()

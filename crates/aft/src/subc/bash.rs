@@ -1044,58 +1044,20 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
             (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
                 Some(build_detached_frame(&target, route.channel, route.epoch, corr)?.into())
             }
-            (drain::BashLoopAnswer::Drain, Some(identity)) => {
-                let cached = target.reply_cache.snapshot();
-                let response = Response::success(
-                    &target.request_id,
-                    json!({
-                        "output": format!(
-                        "{}{}",
-                        crate::commands::bash_orchestrate::format_module_drain_detach_message(
-                            &target.task_id,
-                            target.worker_session,
-                            target
-                                .format_context
-                                .bash_watch_available
-                                .unwrap_or(target.worker_session),
-                        ),
-                        crate::commands::bash_orchestrate::kill_deadline_note_from_parts(
-                            cached.execution_note.as_deref(), cached.deadline, target.worker_session,
-                        ),
-                    ),
-                        "task_id": target.task_id,
-                        "status": "running",
-                    }),
-                );
-                // This function is awaited by the module loop itself, not by a
-                // separate wait task. Even awaiting a blocking-pool read here
-                // would stop it serving other routes. Metadata writers publish
-                // the note and capture inputs before releasing task state;
-                // only pure response formatting happens here.
-                let response = if cached.inputs_captured == Some(false) {
-                    if let Some(terminal) = cached
-                        .uncaptured_terminal
-                        .or(cached.uncaptured_terminal_facts)
-                    {
-                        let mut reply = copy_response(&terminal);
-                        reply.id = target.request_id.clone();
-                        reply
-                    } else {
-                        with_capture_warning(&response)
-                    }
-                } else {
-                    response
-                };
-                let result = bash_result_from_response(response, &target.format_context);
-                Some(build_tool_response_frame(
-                    target.ver,
-                    route,
-                    corr,
-                    target.flags,
-                    &result,
-                    identity.reply_policy(),
-                )?)
-            }
+            (drain::BashLoopAnswer::Drain, Some(identity)) => Some(background_handoff_frame(
+                &target,
+                identity,
+                route,
+                corr,
+                crate::commands::bash_orchestrate::format_module_drain_detach_message(
+                    &target.task_id,
+                    target.worker_session,
+                    target
+                        .format_context
+                        .bash_watch_available
+                        .unwrap_or(target.worker_session),
+                ),
+            )?),
             (drain::BashLoopAnswer::Cancel, Some(_)) => Some(
                 Frame::build_with_version(
                     target.ver,
@@ -1120,6 +1082,97 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         }
     }
     Ok(answered)
+}
+
+/// The terminal reply of a held bash call whose command now runs in the
+/// background: `message`, then the task's kill deadline.
+fn background_handoff_frame(
+    target: &drain::BashDetachTarget,
+    identity: &RouteIdentity,
+    route: RouteChannel,
+    corr: u64,
+    message: String,
+) -> Result<WriterFrame, SubcError> {
+    let cached = target.reply_cache.snapshot();
+    let response = Response::success(
+        &target.request_id,
+        json!({
+            "output": format!(
+                "{message}{}",
+                crate::commands::bash_orchestrate::kill_deadline_note_from_parts(
+                    cached.execution_note.as_deref(),
+                    cached.deadline,
+                    target.worker_session,
+                ),
+            ),
+            "task_id": target.task_id,
+            "status": "running",
+        }),
+    );
+    // The module loop awaits this reply itself, not a separate wait task.
+    // Even awaiting a blocking-pool read here would stop it serving other
+    // routes. Metadata writers publish the note and capture inputs before
+    // releasing task state; only pure response formatting happens here.
+    let response = if cached.inputs_captured == Some(false) {
+        if let Some(terminal) = cached
+            .uncaptured_terminal
+            .or(cached.uncaptured_terminal_facts)
+        {
+            let mut reply = copy_response(&terminal);
+            reply.id = target.request_id.clone();
+            reply
+        } else {
+            with_capture_warning(&response)
+        }
+    } else {
+        response
+    };
+    let result = bash_result_from_response(response, &target.format_context);
+    build_tool_response_frame(
+        target.ver,
+        route,
+        corr,
+        target.flags,
+        &result,
+        identity.reply_policy(),
+    )
+}
+
+/// Answers a held bash call that `tool.yield` handed back (see
+/// [`drain::HeldBashCalls::claim_for_yield`]). The reply names the task the
+/// command now runs as, in the words a foreground wait gets when a user
+/// message detaches it. The command is promoted, never killed: it keeps
+/// running as an ordinary background task, and its completion reaches the
+/// launching session as a notice like any background task's.
+pub(super) async fn answer_yielded_bash_call(
+    tx: &WriterSender,
+    identity: &RouteIdentity,
+    metrics: &DispatchPathMetrics,
+    route: RouteChannel,
+    corr: u64,
+    target: drain::BashDetachTarget,
+) -> Result<(), SubcError> {
+    let frame = background_handoff_frame(
+        &target,
+        identity,
+        route,
+        corr,
+        crate::commands::bash_orchestrate::format_wait_detach_message(
+            &target.task_id,
+            target.worker_session,
+            target
+                .format_context
+                .bash_watch_available
+                .unwrap_or(target.worker_session),
+        ),
+    )?;
+    log::info!(
+        "subc attach: handed back bash call {} on route {route} corr={corr} for tool.yield; task {} keeps running in the background",
+        target.request_id,
+        target.task_id,
+    );
+    detach_held_bash_in_background(target, false);
+    send_reliable_writer_frame(tx, metrics, frame, "yielded bash answer").await
 }
 
 fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashTranslatedSettings {
