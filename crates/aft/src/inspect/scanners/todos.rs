@@ -900,10 +900,14 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(&dir.path().join("project"));
         let storage = dir.path().join("storage");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(dir.path().join("project")).unwrap();
         fs::create_dir_all(&storage).unwrap();
+        // Canonicalize only once the folder exists: the scan keys its outcome by
+        // the job's resolved root, which differs from the spelled temp path
+        // where the temp folder sits behind a link (/var on macOS) or a short
+        // name (Windows).
+        let root = crate::inspect::job::canonicalize_normalized(&dir.path().join("project"));
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(&root)
