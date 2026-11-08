@@ -24,6 +24,9 @@ mod crash;
 mod lifecycle;
 #[path = "pty_dispatch_tests.rs"]
 mod pty;
+#[cfg(unix)]
+#[path = "start_view_tests.rs"]
+mod start_views;
 
 struct Env(&'static str, Option<OsString>);
 impl Env {

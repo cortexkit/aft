@@ -143,12 +143,62 @@ pub(crate) fn open_root(root: &Path) -> io::Result<()> {
 pub(crate) fn tighten_root(root: &Path) {
     tighten_within(root, root);
     #[cfg(unix)]
-    if let Ok(entries) = fs::read_dir(root) {
+    if let Ok(entries) = root_entries(root) {
         for entry in entries.flatten() {
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 tighten_within(root, &entry.path());
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn root_entries(root: &Path) -> io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    ROOT_LISTINGS.with(|count| count.set(count.get() + 1));
+    fs::read_dir(root)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static ROOT_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn root_listings_for_test() -> usize {
+    ROOT_LISTINGS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, unix))]
+mod directory_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_storage_root_repairs_domains_but_open_dir_does_not_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let domain = root.join("domain");
+        fs::create_dir_all(&domain).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&domain, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = root_listings_for_test();
+        open_dir(&root, &root).unwrap();
+        assert_eq!(root_listings_for_test(), before);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&domain).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        open_root(&root).unwrap();
+        assert_eq!(root_listings_for_test(), before + 1);
+        assert_eq!(
+            fs::metadata(&domain).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }
 

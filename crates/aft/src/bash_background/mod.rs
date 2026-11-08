@@ -1242,7 +1242,7 @@ pub(crate) fn spawn_with_secrets(
     ) {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
-    crate::gh_shim_speech::start_view::inject(
+    let start_view = crate::gh_shim_speech::start_view::inject(
         gh_shim_ticket.value(),
         &mut env,
         &child_storage_root,
@@ -1507,6 +1507,7 @@ pub(crate) fn spawn_with_secrets(
 
     match spawn_result {
         Ok(task_id) => {
+            ctx.bash_background().bind_start_view(&task_id, start_view);
             gh_shim_ticket.bind_task(&task_id);
             // A command that finishes very quickly can be terminal before the
             // ticket was bound to it, in which case its terminal write found
