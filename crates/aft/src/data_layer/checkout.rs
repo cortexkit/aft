@@ -1881,7 +1881,8 @@ impl Checkout {
     /// from one of the [`SHARE_FROM`] segments that serve the most of them.
     /// Worktrees of one repository hold mostly the same contents, which
     /// each first build used to store again (about 155 MB for each
-    /// prefrontal worktree); nearly all of them sit in a sibling's build
+    /// worktree of one large repository); nearly all of them sit in a
+    /// sibling's build
     /// segment, which is among those kept.
     ///
     /// Everything else is written again. Other checkouts' small change
