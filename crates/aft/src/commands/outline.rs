@@ -3060,6 +3060,7 @@ where
         let skipped_mounts = Arc::clone(&skipped_mounts);
         let boundary_failed = Arc::clone(&boundary_failed);
         let boundary = *boundary;
+        let permission_root = directory.to_path_buf();
         builder.filter_entry(move |entry| {
             if !crate::bounded_io::walk_path(entry.path()) {
                 return false;
@@ -3092,7 +3093,11 @@ where
                 }
             }
             match boundary.should_descend_with(entry.path(), device_lookup) {
-                Ok(true) => true,
+                Ok(true) => {
+                    !cfg!(target_os = "macos")
+                        || crate::bounded_io::probe_walk_directory(&permission_root, entry.path())
+                            .is_ok()
+                }
                 Ok(false) => {
                     skipped_mounts.fetch_add(1, Ordering::Relaxed);
                     false
@@ -3187,6 +3192,11 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return entries_examined;
+        }
+        if cfg!(target_os = "macos")
+            && crate::bounded_io::probe_walk_directory(directory, &current).is_err()
+        {
+            continue;
         }
         // Load rules only for directories the entry budget lets us enter.
         let ignore_stack = if load_child_rules {

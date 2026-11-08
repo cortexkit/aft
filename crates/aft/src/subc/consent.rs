@@ -3509,6 +3509,79 @@ fn macos_request_params(folder: &str, program: &str, steps: &str) -> Value {
     json!({"kind":"macos_permission","folder":folder,"program":program,"steps":steps})
 }
 
+#[cfg(target_os = "macos")]
+pub(super) async fn withdraw_macos_permission_cards(
+    db: Arc<StdMutex<crate::db::TrackedConnection>>,
+) -> Result<usize, ConsentError> {
+    use rusqlite::params;
+    let transport =
+        transport().ok_or_else(|| ConsentError::Unavailable("Cingulate is unavailable".into()))?;
+    let _serial = MACOS_CARDS_LOCK.lock().await;
+    let rows = {
+        let conn = db
+            .lock()
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+        let mut statement = conn.prepare("SELECT folder,program,selector,project_root,session,elicitation_id FROM macos_permission_cards")
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+    };
+    let mut withdrawn = 0;
+    for (folder, program, scope, root, session, id) in rows {
+        let had_id = id.is_some();
+        let result: Result<(), ConsentError> = async {
+            if let Some(id) = id {
+                let scope = serde_json::from_str(&scope)
+                    .map_err(|e| ConsentError::Unavailable(format!("invalid card scope: {e}")))?;
+                tokio::time::timeout(
+                    UNARY_TIMEOUT,
+                    transport.call(ConsentCall {
+                        scope,
+                        project_root: root.into(),
+                        session,
+                        method: "consent.withdraw",
+                        params: json!({"elicitation_id": id}),
+                        timeout: UNARY_TIMEOUT,
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    ConsentError::Unavailable("macOS permission card withdrawal timed out".into())
+                })??;
+            }
+            db.lock()
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+                .execute(
+                    "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
+                    params![folder, program],
+                )
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => withdrawn += usize::from(had_id),
+            Err(error) => {
+                log::warn!("macOS permission card withdrawal failed for {folder}: {error:?}")
+            }
+        }
+    }
+    log::info!("macOS permission cards withdrawn at startup: {withdrawn}");
+    Ok(withdrawn)
+}
+
 pub(super) async fn macos_permissions(
     db: Arc<StdMutex<crate::db::TrackedConnection>>,
     identity: RouteIdentity,

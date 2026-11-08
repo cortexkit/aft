@@ -992,6 +992,10 @@ fn handle_semantic_search_with_disk_fallback(
     } else {
         None
     };
+    crate::bounded_io::name_walk_root(
+        external_root.as_deref().unwrap_or(&project_root),
+        requested_path.map(Path::new).unwrap_or(&project_root),
+    );
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
@@ -7692,6 +7696,7 @@ fn collect_degraded_grep_files(
     // Skip nested linked worktrees of this repository; the walk root itself is
     // always admitted (depth 0).
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
+    let permission_root = project_root.to_path_buf();
     let mut builder = ignore::WalkBuilder::new(project_root);
     builder.same_file_system(true).hidden(false);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
@@ -7731,7 +7736,12 @@ fn collect_degraded_grep_files(
                             | ".tox"
                             | "dist"
                             | "build"
-                    );
+                    ) && (!cfg!(target_os = "macos")
+                        || crate::bounded_io::probe_walk_directory(
+                            &permission_root,
+                            entry.path(),
+                        )
+                        .is_ok());
                 }
                 !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
             }

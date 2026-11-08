@@ -5495,6 +5495,22 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    // Withdraw the macOS access cards earlier builds filed. It runs beside the
+    // route loop, never before it: each withdrawal waits on Cingulate, and a
+    // slow or absent Cingulate must not delay route binds.
+    #[cfg(target_os = "macos")]
+    match shared_app.open_db(&storage_dir.join("aft.db")) {
+        Ok(db) => {
+            tokio::spawn(async move {
+                if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
+                    log::warn!("macOS permission card startup cleanup failed: {error:?}");
+                }
+            });
+        }
+        Err(error) => {
+            log::warn!("macOS permission card startup cleanup could not open database: {error}")
+        }
+    }
     rich_ui::display::start(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
@@ -10545,6 +10561,29 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            // Translation resolves tool paths before dispatch. Keep the agent's
+            // spelling for messages about folders a walk could not read, without
+            // changing the translated paths.
+            let walk_argument = match bare_name.as_str() {
+                "glob" | "grep" | "search" => arguments.get("path"),
+                "outline" => arguments.get("target"),
+                _ => None,
+            };
+            if let Some(argument) = walk_argument {
+                let names = argument.as_str().into_iter().chain(
+                    argument
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                );
+                for name in names.filter(|name| !name.contains("://") && !name.is_empty()) {
+                    let root = tool_call_context
+                        .project_root
+                        .join(crate::readonly_artifacts::expand_tilde(name));
+                    crate::bounded_io::name_walk_root(&root, Path::new(name));
+                }
+            }
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
             let _task_identity =

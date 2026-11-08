@@ -1,0 +1,1 @@
+- On macOS, a folder search that meets folders macOS protects skips them and says so, instead of failing and asking you to grant access to each one.

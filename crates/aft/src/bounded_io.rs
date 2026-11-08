@@ -141,6 +141,12 @@ pub(crate) struct Budget {
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
     traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
+    /// Keep unreadable walk descendants out of `permissions`: consent uses that
+    /// list to ask the user to grant access to explicitly named folders.
+    walk_permissions:
+        Arc<Mutex<std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<PathBuf>>>>,
+    walk_names: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    walk_root: Option<PathBuf>,
     /// Set once the end of the budget has been kept back for the reply.
     reply_margin_kept: bool,
     #[cfg(test)]
@@ -168,6 +174,9 @@ impl Budget {
             directories: Arc::new(Mutex::new(HashMap::new())),
             traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
+            walk_permissions: Arc::default(),
+            walk_names: Arc::default(),
+            walk_root: None,
             reply_margin_kept: false,
             #[cfg(test)]
             measurements: Arc::new(Measurements::default()),
@@ -208,6 +217,114 @@ pub(crate) struct PermissionObservation {
     pub(crate) readable: bool,
 }
 
+pub(crate) fn name_walk_root(root: &Path, name: &Path) {
+    if let Some(budget) = current() {
+        budget
+            .walk_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(crate::path_identity::lexical_normalize(root))
+            .or_insert_with(|| name.to_path_buf());
+    }
+}
+
+fn walk_permission_gap(root: &Path, display_root: &Path, folders: &[PathBuf]) -> String {
+    let count = folders.len();
+    let mut names = folders
+        .iter()
+        .take(3)
+        .map(|folder| {
+            folder
+                .strip_prefix(root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .unwrap_or(folder)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    if count > 3 {
+        names.push(format!("and {} more", count - 3));
+    }
+    let (folders, pronoun) = if count == 1 {
+        ("folder", "it")
+    } else {
+        ("folders", "them")
+    };
+    format!(
+        "macOS did not let AFT read {count} {folders} under {}, so the result skips {pronoun}: {}.",
+        display_root.display(),
+        names.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod walk_permission_gap_tests {
+    use super::*;
+
+    #[test]
+    fn macos_walk_permission_gap_counts_and_relative_paths() {
+        let root = Path::new("/walk");
+        let folders = (1..=38)
+            .map(|index| root.join(format!("protected-{index}")))
+            .collect::<Vec<_>>();
+        for (count, expected) in [
+            (1, "macOS did not let AFT read 1 folder under /walk, so the result skips it: protected-1."),
+            (2, "macOS did not let AFT read 2 folders under /walk, so the result skips them: protected-1, protected-2."),
+            (3, "macOS did not let AFT read 3 folders under /walk, so the result skips them: protected-1, protected-2, protected-3."),
+            (38, "macOS did not let AFT read 38 folders under /walk, so the result skips them: protected-1, protected-2, protected-3, and 35 more."),
+        ] {
+            assert_eq!(walk_permission_gap(root, root, &folders[..count]), expected);
+        }
+    }
+
+    #[test]
+    fn macos_walk_permission_gap_preserves_other_gaps_and_is_not_a_card_observation() {
+        let mut budget = Budget::after(Duration::from_secs(10));
+        budget.walk_root = Some(PathBuf::from("/walk"));
+        budget
+            .walk_names
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("/walk"), PathBuf::from("."));
+        budget.walk_partial.store(true, Ordering::Release);
+        budget
+            .walk_time_limit_reached
+            .store(true, Ordering::Release);
+        with_budget(Some(budget.clone()), || {
+            for _ in 0..2 {
+                observe_permission(
+                    Path::new("/walk/protected"),
+                    &Err(io::Error::from_raw_os_error(1)),
+                    true,
+                );
+            }
+            assert!(
+                budget.permissions().is_empty(),
+                "a walk denial must never reach card creation"
+            );
+            let response = finish_response(Response::success(
+                "walk",
+                serde_json::json!({"text":"readable.rs\n\nshown 1 of 1 files"}),
+            ));
+            let response = finish_response(response);
+            assert!(response.success);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["gaps"],
+                serde_json::json!([
+                WALK_PARTIAL_GAP,
+                "macOS did not let AFT read 1 folder under ., so the result skips it: protected."
+            ])
+            );
+            let text = response.data["text"].as_str().unwrap();
+            assert_eq!(text.matches("macOS did not let").count(), 1);
+            assert!(text.contains(WALK_PARTIAL_GAP));
+            assert!(text.ends_with("shown 1 of 1 files"));
+        });
+    }
+}
+
 fn observe_permission(path: &Path, result: &io::Result<Access>, macos: bool) {
     if !macos {
         return;
@@ -218,14 +335,26 @@ fn observe_permission(path: &Path, result: &io::Result<Access>, macos: bool) {
         _ => return,
     };
     if let Some(budget) = current() {
+        let folder = permission_folder(path);
+        if let Some(root) = budget
+            .walk_root
+            .as_ref()
+            .filter(|root| !readable && folder != **root && folder.starts_with(root))
+        {
+            budget
+                .walk_permissions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(root.clone())
+                .or_default()
+                .insert(folder);
+            return;
+        }
         budget
             .permissions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(PermissionObservation {
-                folder: permission_folder(path),
-                readable,
-            });
+            .push(PermissionObservation { folder, readable });
     }
 }
 
@@ -338,7 +467,26 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     });
-    if response.success && current().is_some_and(|b| b.walk_partial.load(Ordering::Acquire)) {
+    let permission_gaps = current().map_or_else(Vec::new, |budget| {
+        let names = budget.walk_names.lock().unwrap_or_else(|e| e.into_inner());
+        budget
+            .walk_permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(root, folders)| {
+                walk_permission_gap(
+                    root,
+                    names.get(root).unwrap_or(root),
+                    &folders.iter().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    if response.success
+        && (current().is_some_and(|b| b.walk_partial.load(Ordering::Acquire))
+            || !permission_gaps.is_empty())
+    {
         let named_gap = error.map(|error| error.message).or_else(|| {
             current().and_then(|budget| {
                 budget
@@ -356,6 +504,13 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
             if gap != WALK_PARTIAL_GAP {
                 gaps.push(gap);
             }
+        }
+        gaps.extend(permission_gaps);
+        if let Some(existing) = response.data["gaps"].as_array() {
+            gaps.retain(|gap| !existing.iter().any(|value| value.as_str() == Some(gap)));
+        }
+        if gaps.is_empty() {
+            return response;
         }
         let gap = gaps.join("\n");
         response.data["complete"] = serde_json::json!(false);
@@ -600,6 +755,14 @@ pub(crate) fn command(
         } else {
             root.join(input)
         };
+        if let Some(budget) = current() {
+            budget
+                .walk_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(crate::path_identity::lexical_normalize(&path))
+                .or_insert_with(|| PathBuf::from(input));
+        }
         #[cfg(test)]
         COMMAND_INPUT_PROBES.with(|probes| probes.set(probes.get() + 1));
         if let Err(error) = probe_target(&path) {
@@ -703,6 +866,7 @@ pub(crate) fn run_walk<T: Clone + Send + 'static>(
     let local = parent.clone().map(|mut budget| {
         budget.failure = Arc::new(Mutex::new(None));
         budget.failed = Arc::new(AtomicBool::new(false));
+        budget.walk_root = Some(path.to_path_buf());
         budget
     });
     let (result, failure) = with_budget(local, || {
@@ -1493,6 +1657,16 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
 }
 pub(crate) fn probe_directory(path: &Path, at: Option<Instant>) -> io::Result<()> {
     directory(path, at).map(|_| ())
+}
+
+/// Only descendants discovered by a read-only walk are coverage gaps. The
+/// starting folder and its ancestors still require a named access error.
+pub(crate) fn probe_walk_directory(root: &Path, path: &Path) -> io::Result<()> {
+    let budget = current().map(|mut budget| {
+        budget.walk_root = Some(root.to_path_buf());
+        budget
+    });
+    with_budget(budget, || probe_directory(path, None))
 }
 fn parent(path: &Path, at: Option<Instant>) -> io::Result<Access> {
     directory(
