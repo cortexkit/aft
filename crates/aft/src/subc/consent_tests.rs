@@ -6192,6 +6192,8 @@ async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
 struct StartupMacosWithdrawal {
     fake: Arc<FakeCingulate>,
     failed_id: String,
+    /// A card whose filing scope has ended: the daemon refuses its route.
+    gone_id: Option<String>,
     calls: StdMutex<Vec<Value>>,
 }
 
@@ -6204,6 +6206,16 @@ impl ConsentTransport for StartupMacosWithdrawal {
             Box::pin(async {
                 Err(ConsentError::Unavailable(
                     "injected withdrawal failure".into(),
+                ))
+            })
+        } else if self
+            .gone_id
+            .as_ref()
+            .is_some_and(|id| call.params["elicitation_id"] == *id)
+        {
+            Box::pin(async {
+                Err(ConsentError::ScopeGone(
+                    "route.open failed: scope_not_live".into(),
                 ))
             })
         } else {
@@ -6242,6 +6254,7 @@ async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_fa
     let transport = Arc::new(StartupMacosWithdrawal {
         fake: Arc::clone(&f.fake),
         failed_id: failed_id.clone(),
+        gone_id: None,
         calls: StdMutex::default(),
     });
     install_test_transport(Some(transport.clone()));
@@ -6273,6 +6286,69 @@ async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_fa
         2,
         "startup does not file replacement cards"
     );
+}
+
+/// A card filed by a session that has since ended can't be withdrawn under its
+/// scope; Cingulate settles it, so startup drops the record instead of
+/// retrying it at every start.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_permission_startup_drops_cards_whose_scope_ended() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let db = f.ctx.db().unwrap();
+    let gone = f.dir.path().join("gone");
+    let failed = f.dir.path().join("failed");
+    let observations = [gone.clone(), failed.clone()]
+        .into_iter()
+        .map(|folder| crate::bounded_io::PermissionObservation {
+            folder,
+            readable: false,
+        })
+        .collect();
+    macos_permissions(Arc::clone(&db), f.head.clone(), observations)
+        .await
+        .unwrap();
+    let id_of = |folder: &std::path::Path| -> String {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT elicitation_id FROM macos_permission_cards WHERE folder=?1",
+                [folder.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let transport = Arc::new(StartupMacosWithdrawal {
+        fake: Arc::clone(&f.fake),
+        failed_id: id_of(&failed),
+        gone_id: Some(id_of(&gone)),
+        calls: StdMutex::default(),
+    });
+    install_test_transport(Some(transport.clone()));
+    assert_eq!(
+        withdraw_macos_permission_cards(Arc::clone(&db))
+            .await
+            .unwrap(),
+        0,
+        "a card left to Cingulate is not counted as withdrawn"
+    );
+    assert_eq!(transport.calls.lock().unwrap().len(), 2);
+    let remaining = db
+        .lock()
+        .unwrap()
+        .prepare("SELECT folder FROM macos_permission_cards")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        remaining,
+        vec![failed.to_string_lossy().into_owned()],
+        "the ended scope's card is dropped; an unreachable Cingulate keeps its row for the next start"
+    );
+    install_test_transport(None);
 }
 
 #[cfg(unix)]
