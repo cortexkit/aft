@@ -5495,12 +5495,17 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    // Withdraw the macOS access cards earlier builds filed. It runs beside the
+    // route loop, never before it: each withdrawal waits on Cingulate, and a
+    // slow or absent Cingulate must not delay route binds.
     #[cfg(target_os = "macos")]
     match shared_app.open_db(&storage_dir.join("aft.db")) {
         Ok(db) => {
-            if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
-                log::warn!("macOS permission card startup cleanup failed: {error:?}");
-            }
+            tokio::spawn(async move {
+                if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
+                    log::warn!("macOS permission card startup cleanup failed: {error:?}");
+                }
+            });
         }
         Err(error) => {
             log::warn!("macOS permission card startup cleanup could not open database: {error}")
