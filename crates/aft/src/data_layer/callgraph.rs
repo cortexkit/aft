@@ -1492,8 +1492,8 @@ pub(crate) struct MethodCallInputs {
     methods: HashMap<String, BTreeSet<String>>,
     /// Method name to the Go files of `own` whose interfaces require it.
     go_required: HashMap<String, BTreeSet<String>>,
-    /// Every file whose inputs pass 4 computed on the resolving thread, the
-    /// first time the resolver read it.
+    /// Every file whose method-call inputs the resolver computed itself, on
+    /// its own thread, the first time it read the file.
     computed_while_resolving: FirstReads,
 }
 
