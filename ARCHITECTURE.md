@@ -95,38 +95,43 @@ boundaries. Process-wide heavy builds share slots through
 `cold_build_limiter.rs`, and `build_breaker.rs` suspends a build domain that
 keeps crashing.
 
-**Indexes.** Three background indexes, each on by default (`indexes.*` in
-config):
-- *Trigram* (`search_index.rs`): a disk-backed postings file read with
-  positioned reads, serving indexed `grep`/`glob` and the lexical lane of
-  `aft_search`. `grep_executor.rs` falls back to a bounded walk while the index
-  is building or unavailable.
-- *Semantic* (`semantic_index.rs`): dense embeddings from fastembed (local
-  ONNX), an OpenAI-compatible endpoint, Ollama, or Synapse over subc
-  (`synapse_embed.rs`). `aft_search` blends lexical and semantic lanes
-  (`commands/semantic_search/`, `search_b2/`) and degrades to lexical when a
-  query embedding times out.
-- *Callgraph store* (`callgraph_store/`): a persisted SQLite graph of call
-  edges behind `aft_callgraph` and zoom enrichment. Each build writes a new
-  generation file and swaps a `.current` pointer, so readers never see a
-  half-built graph. `callgraph.rs` keeps the lighter per-file call data.
+**Index store.** Text search, the call graph and meaning search live in one
+index store per repository (`indexes.trigram`, `indexes.callgraph`,
+`indexes.semantic`; each on by default). `crates/aft-store` owns the formats:
+immutable segment files of checksummed sections, read with positioned reads
+through one process-wide block cache, with at most 1,024 segment files open at
+once. A segment can hold text units with trigram postings, content records
+(each file's parsed symbols, references and outline, keyed by content,
+language and extractor version), call-graph fragments, and vectors (int8 rows
+scanned, f32 rows for rescoring). Worktrees and clones of one repository share
+a store under `storage/data/<family>`, keyed by the repository's root commits;
+each checkout keeps its own state file naming its paths and their units. A
+manifest is the commit record of each publication, readers lease the
+generation they read, and cleanup never removes a file a live lease or the
+newest manifest names.
 
-Artifacts live in root-keyed cache directories under the storage root. The
-first checkout of a repository to claim `owner.json` (`artifact_owner.rs`)
-becomes the writer; `root_cache.rs` adds per-domain writer leases, reader
-markers, and publish epochs so a superseded worker cannot publish stale data.
-Another live checkout of the same repository, typically a linked worktree,
-runs **borrow-only**: it opens the owner's search and semantic indexes through
-read-only openers (`readonly_artifacts.rs`) and the callgraph through
-`ReadonlyCallGraphStore`, and never builds or repairs them. With
-`worktree.ram_overlay` (on by default), a borrow-only checkout first compares
-the borrowed search index with its own files, then layers its own edits into
-private in-RAM search deltas. Path-listing answers (glob, `aft_search`) also
-drop any returned path that is missing on disk and report the count, as a guard
-against a stale index. Content-addressed views (`views/`, `blob_store/`,
-`pins/`, `gc/`, `refresh/`; `views.enabled`, off by default) instead assemble
-each checkout's semantic and callgraph artifacts from per-file blobs behind an
-atomic manifest. User-configured standing roots (`index.roots`,
+`data_layer/` is AFT's side. A checkout binds to its published state and
+rescans against disk before serving. A new worktree starts from the sibling
+checkout whose state differs least and processes only the files that differ;
+farther than a quarter of its paths, it builds cold, still reusing stored
+records. Builds, refreshes and meaning-search fill run in small process-wide
+pools (`data_layer/runtime.rs`); under the daemon the root's executor admits
+each job, so an unbound root starts nothing. A first build publishes text
+before the call graph, so `grep` is ready in about a second. Edits update text
+at once; the call graph refreshes after two quiet minutes, or at once when a
+call-graph reader asks (it waits up to 30 s, then reports building). The
+incremental engine (`data_layer/incremental.rs`) re-resolves only files whose
+recorded inputs changed, and changes are published as small segments once
+enough accumulate. The resolver itself (`callgraph_store/`: extraction,
+binding, dispatch) is shared with the gates that compare incremental results
+with cold builds. `aft_search` blends lexical and meaning lanes
+(`commands/semantic_search/`, `search_b2/`); embeddings come from fastembed
+(local ONNX), an OpenAI-compatible endpoint, Ollama, or Synapse over subc
+(`synapse_embed.rs`, chunking in `semantic_index.rs`). A plane that is still
+building says so: `grep` and `glob` walk the folder until text is ready, and
+call-graph tools answer "building" rather than from an old graph.
+Parent-folder sessions (`views/parent.rs`) answer from each child
+repository's checkout. User-configured standing roots (`index.roots`,
 `standing_roots.rs`, `scoped_key.rs`) are indexed by the subc standing actor
 independent of sessions.
 
@@ -272,11 +277,12 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Command handlers | `crates/aft/src/commands/` |
 | Executor | `crates/aft/src/executor/`, `cold_build_limiter.rs`, `build_breaker.rs` |
 | Runtime state | `context.rs` (`AppContext`) |
-| Trigram search | `search_index.rs`, `grep_executor.rs` |
-| Semantic search | `semantic_index.rs`, `synapse_embed.rs`, `commands/semantic_search/`, `search_b2/` |
-| Callgraph | `callgraph_store/`, `callgraph.rs`, `calls.rs` |
-| Artifact ownership and borrowing | `artifact_owner.rs`, `root_cache.rs`, `readonly_artifacts.rs`, `legacy_partitions.rs` |
-| Index views | `views/`, `blob_store/`, `pins/`, `gc/`, `refresh/`, `path_status/`, `alias/`, `migration/` |
+| Index store formats | `crates/aft-store/` |
+| Index store in AFT | `data_layer/` (checkout, runtime, incremental, meaning, `tools/` adapters) |
+| Text search | `grep_executor.rs`, `data_layer/tools/grep.rs` |
+| Semantic search | `commands/semantic_search/`, `search_b2/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs` |
+| Call graph | `callgraph_store/` (resolver), `data_layer/callgraph.rs`, `callgraph.rs`, `calls.rs` |
+| Parent-folder sessions | `views/parent.rs`, `data_layer/parent.rs` |
 | Standing roots | `standing_roots.rs`, `scoped_key.rs`, `subc/standing.rs`, `db/standing_roots.rs` |
 | Parsing and symbols | `parser.rs`, `symbols.rs`, `symbol_cache_disk.rs`, `language.rs`, `imports/` |
 | Edit, patch, hashline | `edit.rs`, `format.rs`, `patch/`, `hashline/`, `fuzzy_match.rs` |
@@ -355,7 +361,6 @@ The canonical field list is the `Response` doc comment in
 - [docs/gh-shim.md](docs/gh-shim.md): `gh` shim routing and refusals
 - [docs/health-digest.md](docs/health-digest.md): the `health.digest` operation
 - [docs/memory-census.md](docs/memory-census.md): memory attribution
-- [docs/design/content-addressed-index-views.md](docs/design/content-addressed-index-views.md): index views
 - [docs/design/subc-readiness-warmup.md](docs/design/subc-readiness-warmup.md): subc readiness and warmup
 - [docs/design/opencode-v2-plugin-playbook.md](docs/design/opencode-v2-plugin-playbook.md): OpenCode V2 plugin
 - [docs/investigations/watcher-backends-reference.md](docs/investigations/watcher-backends-reference.md): watcher backends
