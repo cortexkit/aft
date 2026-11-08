@@ -3368,6 +3368,9 @@ fn build_health_diagnostic_rollup_from_actors(
     shared_app: &App,
     actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
+    // The rollup measures the memory census; the allocation tracer names it
+    // for what measuring allocates.
+    let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::CENSUS, None);
     let mut timer = RollupStepTimer::new();
     struct RootCandidate {
         root_label: String,

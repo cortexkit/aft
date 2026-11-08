@@ -263,11 +263,15 @@ impl Parses {
     pub(crate) fn par_iter(
         &self,
     ) -> impl ParallelIterator<Item = (&String, &(BlobKey, Arc<ParseBlob>))> {
+        let carry = crate::alloc_trace::carry();
         self.map
             .keys()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|path| (path, self.get(path).expect("listed")))
+            .map(move |path| {
+                let _label = carry.enter();
+                (path, self.get(path).expect("listed"))
+            })
     }
 }
 
@@ -521,9 +525,11 @@ impl Resolutions {
     pub(crate) fn encode_changed(&mut self, record_key: impl Fn(&str) -> Option<String> + Sync) {
         let changed = std::mem::take(&mut self.changed);
         let map = &self.map;
+        let carry = crate::alloc_trace::carry();
         let encoded = changed
             .par_iter()
             .filter_map(|path| {
+                let _label = carry.enter();
                 let resolution = map.get(path)?.value.get()?.as_deref()?;
                 let key = record_key(path)?;
                 Some((path, EncodedResolution::encode(&key, resolution)))
@@ -875,9 +881,11 @@ impl BindCache {
             return Arc::clone(lists);
         }
         let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let carry = crate::alloc_trace::carry();
         let kinds = paths
             .par_iter()
             .map(|path| {
+                let _label = carry.enter();
                 inputs
                     .parses
                     .get(path)
@@ -1066,7 +1074,7 @@ pub(crate) fn resolve_checkout_into(
         }
         started = std::time::Instant::now();
     };
-    pool(threads)?.install(|| {
+    crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
         // The whole-checkout lists read every parse, so they are built here,
@@ -1163,9 +1171,11 @@ pub(crate) fn resolve_checkout_into(
                 if chunk.is_empty() {
                     break;
                 }
+                let carry = crate::alloc_trace::carry();
                 let files = chunk
                     .into_par_iter()
                     .map(|(path, bytes, sites, dependencies)| {
+                        let _label = carry.enter();
                         let key = parses.key(&path).expect("every resolved file is parsed");
                         let mut file = super::fragment::decode(&key, &path, &bytes)
                             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
@@ -1261,11 +1271,13 @@ pub(crate) fn bind_all(
     inputs: &CheckoutInputs,
     paths: &[&String],
 ) -> Result<HashMap<String, BoundFile>, ManifestJoinError> {
+    let carry = crate::alloc_trace::carry();
     paths
         .par_iter()
         .map_init(
             || thread_facts(inputs),
             |facts, path| {
+                let _label = carry.enter();
                 let (_, parse) = &inputs.parses[path.as_str()];
                 bind_file(path, parse, facts, None).map(|(surface, binding)| {
                     (
@@ -1313,15 +1325,18 @@ pub(crate) fn resolve_files_with<T: Send>(
     paths: &[&String],
     keep: &(dyn Fn(&str, FileResolution) -> T + Sync),
 ) -> Result<Vec<(String, T)>, ManifestJoinError> {
+    let carry = crate::alloc_trace::carry();
     paths
         .par_iter()
         .map_init(
             || {
+                let _label = carry.enter();
                 let facts = Rc::new(thread_facts(inputs));
                 let (index, files) = resolver_index(inputs, bound, &facts);
                 (facts, index, files)
             },
             |(facts, index, files), path| {
+                let _label = carry.enter();
                 let (key, parse) = &inputs.parses[path.as_str()];
                 let Some(own) = files.bound(path) else {
                     return Err(files.take_error().unwrap_or_else(|| {
@@ -1511,10 +1526,12 @@ impl MethodCallInputs {
 
     /// Every file's inputs, from `resolved`.
     pub(crate) fn build(inputs: &CheckoutInputs, resolved: &(dyn ResolutionLookup + Sync)) -> Self {
+        let carry = crate::alloc_trace::carry();
         let built = inputs
             .parses
             .par_iter()
             .filter_map(|(path, (_, parse))| {
+                let _label = carry.enter();
                 let resolution = resolved.resolution(path)?;
                 Some((path.clone(), Arc::new(SiteFile::new(parse, resolution))))
             })
@@ -1649,9 +1666,11 @@ impl MethodCallInputs {
                 .len()
                 .div_ceil(rayon::current_num_threads() * 4)
                 .max(1);
+            let carry = crate::alloc_trace::carry();
             paths
                 .par_chunks(chunk)
                 .map(|chunk| {
+                    let _label = carry.enter();
                     // The resolver and its memo are single-threaded caches
                     // over the shared source: one per chunk of files.
                     let resolver = Resolver::over(&source);
@@ -1740,7 +1759,9 @@ impl<'s> SiteSource<'s> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let carry = crate::alloc_trace::carry();
         declarers.par_iter().for_each(|file| {
+            let _label = carry.enter();
             if let Some(slot) = self.loaded.get(file.as_str()) {
                 slot.get_or_init(|| self.compute(file));
             }

@@ -1268,6 +1268,8 @@ impl Checkout {
     }
 
     fn build_as(&self, measure: bool) -> Result<BuildReport, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
         self.write_live().building = true;
         let result = self.build_inner(measure);
         self.write_live().building = false;
@@ -2216,6 +2218,10 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        let _alloc_label = crate::alloc_trace::scope(
+            crate::alloc_trace::Label::CALLGRAPH_REFRESH,
+            Some(&self.root),
+        );
         checkpoint()?;
         let result = self.refresh_inner();
         self.touch_memory();
@@ -2376,7 +2382,9 @@ impl Checkout {
                 .collect::<Vec<_>>();
             engine.live.install(|| {
                 use rayon::prelude::*;
+                let carry = crate::alloc_trace::carry();
                 extracting.par_iter().for_each(|change| {
+                    let _label = carry.enter();
                     change.content.get();
                 });
             });
@@ -2415,9 +2423,11 @@ impl Checkout {
             let graph = &published.graph;
             let made = engine.live.install(|| {
                 use rayon::prelude::*;
+                let carry = crate::alloc_trace::carry();
                 files
                     .par_iter()
                     .map(|file| {
+                        let _label = carry.enter();
                         let resolution = resolved.get(file)?;
                         let (key, parse) = parses.get(file)?;
                         let slice = FileSlice::build(file, key, parse, resolution);
@@ -2815,6 +2825,8 @@ impl Checkout {
     /// The incremental state for `published`: every stored resolution, and
     /// the parses and configuration the publication was built from.
     fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::CALLGRAPH_START, Some(&self.root));
         let mut timings = Vec::new();
         let engine = self.start_engine_timed(published, &mut timings)?;
         crate::slog_info!(
