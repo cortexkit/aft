@@ -1459,6 +1459,8 @@ impl Checkout {
         checkpoint()?;
 
         let started = Instant::now();
+        #[cfg(test)]
+        wait_while_publication_held_for_test(&self.root);
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             // Another process published this checkout after the scan began.
@@ -1890,20 +1892,17 @@ impl Checkout {
             live.published = Some(Arc::new(published));
             live.generation += 1;
             // The new publication's graph replaces the old one and whatever
-            // was laid over it; the next refresh starts from it.
+            // was laid over it; the next refresh starts from it. So every
+            // change kept laid over it is pending in the call graph again,
+            // even one a refresh resolved while the build ran: that refresh
+            // laid its answer over the old publication's graph.
             live.graph = None;
             live.refreshed = None;
             let mut text = (*live.text).clone();
             text.retain(|path| kept.contains(path));
             live.text = Arc::new(text);
             live.text_members = Arc::default();
-            live.callgraph_pending = Arc::new(
-                live.callgraph_pending
-                    .iter()
-                    .filter(|path| kept.contains(*path))
-                    .cloned()
-                    .collect(),
-            );
+            live.callgraph_pending = Arc::new(kept);
             let early = std::mem::take(&mut live.early);
             early
                 .into_iter()
@@ -4886,6 +4885,79 @@ impl Drop for CallGraphHold {
     }
 }
 
+/// Roots whose builds wait before they publish, each with whether a build
+/// is waiting now.
+#[cfg(test)]
+fn publication_holds_for_test() -> &'static Mutex<HashMap<PathBuf, bool>> {
+    static HOLDS: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+    HOLDS.get_or_init(Default::default)
+}
+
+/// Holds every build of the checkout at `root` once it has scanned the
+/// files and resolved its call graph, before it publishes, until the
+/// returned guard drops, so a test can record and resolve changes while a
+/// build that did not read them runs.
+#[cfg(test)]
+pub(crate) fn hold_build_publication_for_test(root: &Path) -> PublicationHold {
+    publication_holds_for_test()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), false);
+    PublicationHold(root.to_path_buf())
+}
+
+/// See [`hold_build_publication_for_test`].
+#[cfg(test)]
+pub(crate) struct PublicationHold(PathBuf);
+
+#[cfg(test)]
+impl PublicationHold {
+    /// Waits until a build of the checkout is held before publishing.
+    pub(crate) fn wait_until_held(&self) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while !publication_holds_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.0)
+            .copied()
+            .unwrap_or(false)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no build reached its publication"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationHold {
+    fn drop(&mut self) {
+        publication_holds_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Waits while [`hold_build_publication_for_test`] holds `root`'s builds.
+#[cfg(test)]
+fn wait_while_publication_held_for_test(root: &Path) {
+    loop {
+        {
+            let mut holds = publication_holds_for_test()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match holds.get_mut(root) {
+                Some(held) => *held = true,
+                None => return,
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5753,6 +5825,71 @@ pub fn other() { callee(); }
         assert_eq!(
             ours,
             callers_of(&restarted.view().unwrap(), "src/util.rs", "callee")
+        );
+    }
+
+    /// A change recorded while a build runs, after its scan, stays laid over
+    /// the build's publication. A refresh that resolved it during the build
+    /// laid its answer over the old publication's call graph, which the
+    /// build's replaces, so the change is pending again until a refresh
+    /// resolves it over the new one. The call graph used to report ready
+    /// then and answer without the change.
+    #[test]
+    fn a_change_resolved_while_a_build_ran_is_resolved_again_over_its_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Arc::new(
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap(),
+        );
+        checkout.build().unwrap();
+        let hold = hold_build_publication_for_test(root.path());
+        let building = {
+            let checkout = Arc::clone(&checkout);
+            std::thread::spawn(move || checkout.build())
+        };
+        hold.wait_until_held();
+        // The build has read the files; this change is newer than its scan.
+        write(
+            root.path(),
+            "src/extra.rs",
+            "use crate::util;\npub fn other() { util::callee(); }\n",
+        );
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod extra;\npub fn caller() { util::callee(); }\n",
+        );
+        checkout
+            .record_paths(&[b"src/extra.rs".to_vec(), b"src/lib.rs".to_vec()])
+            .unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        let resolved = callers_of(&view, "src/util.rs", "callee");
+        assert!(resolved.contains("src/extra.rs"), "{resolved}");
+        drop(view);
+
+        drop(hold);
+        building.join().unwrap().unwrap();
+        let status = checkout.status();
+        assert!(
+            matches!(status.callgraph, PlaneStatus::Building { .. }),
+            "the call graph reports ready without the change: {status:?}, callers {}",
+            callers_of(&checkout.view().unwrap(), "src/util.rs", "callee")
+        );
+        assert_eq!(status.callgraph_pending, 2);
+        checkout.refresh_callgraph().unwrap();
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert_eq!(callers, resolved);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(layer, cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        assert_eq!(
+            callers,
+            callers_of(&cold.view().unwrap(), "src/util.rs", "callee")
         );
     }
 

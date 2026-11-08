@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use aft_store::cache::BlockCache;
 use aft_store::content::{ContentSegment, RecordKey};
 use aft_store::family::{Publication, Snapshot};
 use aft_store::graph::{FragmentKey, GraphSegment};
@@ -74,6 +75,12 @@ pub enum Folded {
     /// is needed, and this says why.
     NeedsBuild(String),
 }
+
+/// The block cache a fold copies through (see [`Checkout::fold`]). Each
+/// segment is read in key order, a few blocks at a time per section, so a
+/// few hundred blocks are as fast as a large cache: folding a 7,000-file
+/// checkout's 21 segments took the same time with 16 MiB as with 256 MiB.
+const COPY_CACHE: usize = 16 << 20;
 
 /// Where a unit the fold copies is read from: the place in the manifest of
 /// the segment holding it, and its ordinal there.
@@ -177,10 +184,16 @@ impl Checkout {
             return Ok(Folded::Superseded);
         }
         let known = known_sections();
+        // What the fold reads it reads once, in order, so it reads through a
+        // small cache of its own: through the block cache every checkout
+        // shares, copying a large checkout's units evicted the blocks other
+        // checkouts' queries keep reading. The fold opens each segment again
+        // for this, apart from the shared copy, and closes it when it ends.
+        let copying = Arc::new(BlockCache::new(COPY_CACHE));
         let mut segments = Vec::with_capacity(snapshot.manifest().segments().len());
         for entry in snapshot.manifest().segments() {
-            match snapshot.open_shared_segment(entry.id, &known, &self.layer.cache) {
-                Ok(segment) => segments.push(segment),
+            match snapshot.open_segment(entry.id, &known, Arc::clone(&copying)) {
+                Ok(segment) => segments.push(Arc::new(segment)),
                 Err(error) if error.is_unusable_file() => {
                     return Ok(Folded::NeedsBuild(format!(
                         "a segment this build cannot read: {error}"
