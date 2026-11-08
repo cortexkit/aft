@@ -352,7 +352,8 @@ fn store_error(error: DataError) -> io::Error {
 /// the index store's scan, so the view's members cannot stand in for the
 /// walk's files: under confinement the walk reads no ignore file, and in a
 /// Jujutsu-only repository it applies Git's rules where the scan does not.
-/// The source inventory makes the same check before it lists a checkout.
+/// `Inventory::from_checkout` (in `inspect::inventory`) makes the same check
+/// before it lists a checkout's sources.
 fn walk_uses_other_ignore_settings(root: &Path) -> bool {
     crate::context::confinement::active()
         || (root.ancestors().any(|path| path.join(".jj").exists())
