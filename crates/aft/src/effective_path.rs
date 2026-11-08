@@ -707,6 +707,16 @@ mod busy_retry_hook {
             }
         });
     }
+
+    /// Run `body` with `hook` called before each busy-file retry. Only the
+    /// Linux busy-executable test calls it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn with<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let value = body();
+        HOOK.with(|slot| *slot.borrow_mut() = None);
+        value
+    }
 }
 
 #[cfg(unix)]

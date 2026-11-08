@@ -92,7 +92,7 @@ fn synthetic_bound_roots() {
             }
             std::fs::write(root.join(format!("file_{file}.rs")), source).unwrap();
         }
-        let mut config = crate::config::Config {
+        let config = crate::config::Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             format_on_edit: false,
