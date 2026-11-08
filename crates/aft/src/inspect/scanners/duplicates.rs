@@ -1277,6 +1277,7 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::R
             | LangId::Groovy
             | LangId::ObjC
+            | LangId::Nix
     )
 }
 fn language_name(lang: LangId) -> &'static str {
@@ -1314,11 +1315,17 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nix_is_excluded_from_duplicate_scanning() {
+        assert!(!super::is_supported_language(crate::parser::LangId::Nix));
+    }
+
     use super::*;
     use crate::cache_freshness::FileFreshness;
     use serde_json::json;

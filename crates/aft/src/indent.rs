@@ -41,7 +41,8 @@ impl IndentStyle {
             | LangId::Lua
             | LangId::Scss
             | LangId::Yaml
-            | LangId::Toml => IndentStyle::Spaces(2),
+            | LangId::Toml
+            | LangId::Nix => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C
@@ -304,6 +305,14 @@ mod audit11_regressions {
         assert_eq!(
             std::fs::read(path).unwrap(),
             b"function helper() {\r\n    one();\r\n    two();\r\n}"
+        );
+    }
+
+    #[test]
+    fn nix_defaults_to_two_spaces() {
+        assert_eq!(
+            IndentStyle::default_for(LangId::Nix),
+            IndentStyle::Spaces(2)
         );
     }
 }

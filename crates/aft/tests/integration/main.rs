@@ -129,6 +129,7 @@ mod migrate_storage_test;
 mod migration_import_test;
 mod move_file_test;
 mod move_symbol_test;
+mod nix_test;
 mod objc_test;
 mod outline_files_mode_test;
 mod outline_languages_test;

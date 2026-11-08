@@ -2367,6 +2367,7 @@ fn language_id(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
@@ -4053,6 +4054,39 @@ mod tests {
     }
     use super::*;
     use crate::symbols::SymbolKind;
+
+    #[test]
+    fn same_named_siblings_nest_children_under_the_first_indexed_entry() {
+        let symbol = |name: &str, parent: Option<&str>, scope: &[&str], line: u32| Symbol {
+            name: name.into(),
+            kind: SymbolKind::Variable,
+            range: Range {
+                start_line: line,
+                start_col: 0,
+                end_line: line,
+                end_col: 3,
+            },
+            signature: None,
+            scope_chain: scope.iter().map(|part| (*part).to_string()).collect(),
+            exported: false,
+            parent: parent.map(str::to_string),
+        };
+
+        // The entry binding is indexed before the shadowed `let` binding, so the
+        // child attaches to the entry that actually contains it.
+        let tree = build_outline_tree(&[
+            symbol("enable", None, &[], 4),
+            symbol("y", Some("enable"), &["enable"], 5),
+            symbol("enable", None, &[], 1),
+        ]);
+
+        assert_eq!(tree.len(), 2, "{tree:?}");
+        assert_eq!(tree[0].name, "enable");
+        assert_eq!(tree[0].range.start_line, 4);
+        assert_eq!(tree[0].members.len(), 1, "{tree:?}");
+        assert_eq!(tree[0].members[0].name, "y");
+        assert!(tree[1].members.is_empty());
+    }
 
     #[test]
     fn outline_files_mode_refuses_raw_url_array_targets() {

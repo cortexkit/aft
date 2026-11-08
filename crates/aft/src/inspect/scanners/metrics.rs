@@ -283,6 +283,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Groovy) => "groovy",
         Some(LangId::ObjC) => "objc",
         Some(LangId::Toml) => "toml",
+        Some(LangId::Nix) => "nix",
         None => "unknown",
     }
 }

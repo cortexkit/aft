@@ -64,16 +64,17 @@ const SUPPORTED_LANGS = [
   "pascal",
   "r",
   "objc",
+  "nix",
 ] as const;
 
 export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
     description:
-      "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\n" +
+      "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\n" +
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
     args: {
       pattern: z
         .string()

@@ -807,6 +807,58 @@ if [ "$1" = "--write" ]; then printf 'const x = 1;\n' > "$2"; fi
 
 #[cfg(unix)]
 #[test]
+fn format_integration_nixfmt_config_runs_nixfmt() {
+    let dir = format_test_dir("nixfmt_config_runs");
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("nixfmt");
+    link_cached_executable(
+        &stub,
+        br#"#!/bin/sh
+file="$1"
+printf 'formatted = true;\n' > "$file"
+"#,
+    )
+    .unwrap();
+    warm_executable(&stub, &[]);
+
+    let target = dir.join("config.nix");
+    let _ = fs::remove_file(&target);
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.send(
+        &serde_json::json!({
+            "id": "cfg-nixfmt",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.display().to_string(),
+            "config": user_config(serde_json::json!({
+                "format_on_edit": true,
+                "formatter": { "nix": "nixfmt" }
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-nix","command":"write","file":{},"content":"{{ a = 1; }}\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "nixfmt should have formatted the file"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "formatted = true;\n");
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
     let dir = format_test_dir("oxfmt_ignored_path");
     fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();

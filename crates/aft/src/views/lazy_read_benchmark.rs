@@ -1775,5 +1775,6 @@ const fn lang_label(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }

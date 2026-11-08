@@ -1275,6 +1275,12 @@ fn language_label(language: u8) -> &'static str {
         30 => "Groovy",
         31 => "Objective-C",
         32 => "TOML",
+        33 => "Nix",
         other => panic!("unknown cached language code {other}"),
     }
+}
+
+#[test]
+fn language_label_covers_nix() {
+    assert_eq!(language_label(language_code(LangId::Nix)), "Nix");
 }

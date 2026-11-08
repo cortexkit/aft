@@ -93,6 +93,7 @@ export type Formatter =
   | "rustfmt"
   | "goimports"
   | "gofmt"
+  | "nixfmt"
   | "none";
 
 export type Checker =
@@ -714,6 +715,7 @@ const FormatterEnum = z.enum([
   "rustfmt",
   "goimports",
   "gofmt",
+  "nixfmt",
   "none",
 ]);
 
