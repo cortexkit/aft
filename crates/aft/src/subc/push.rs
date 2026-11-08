@@ -1912,7 +1912,10 @@ mod tests {
                 Instant::now() + Duration::from_secs(10),
             );
         }
-        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+        // Both waits below return as soon as their frame arrives. The 30 s
+        // bounds are for loaded Windows CI runners, where spawning the shell
+        // and its completion frame has taken over 10 s.
+        let done = tokio::time::timeout(Duration::from_secs(30), done_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1923,7 +1926,7 @@ mod tests {
             .expect("background task id")
             .to_string();
         let completion = loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), notice_rx.recv())
+            let frame = tokio::time::timeout(Duration::from_secs(30), notice_rx.recv())
                 .await
                 .unwrap()
                 .expect("background completion");
