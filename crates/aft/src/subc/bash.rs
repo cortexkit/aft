@@ -2068,6 +2068,11 @@ pub(super) fn submit_deferred_bash(
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
     let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
+    let task_identity = secret_identity
+        .as_ref()
+        .and_then(|identity| identity.run_owner.as_ref())
+        .and_then(|owner| owner.task_identity.clone())
+        .or_else(|| crate::bash_background::TaskIdentity::from_principal(&spawn_principal));
     let program_call = secret_identity
         .as_ref()
         .is_some_and(|identity| identity.run_owner.is_some());
@@ -2399,7 +2404,7 @@ pub(super) fn submit_deferred_bash(
             "bash",
             Box::new(move |ctx| {
                 let _task_identity = crate::bash_background::task_identity_scope(
-                    crate::bash_background::TaskIdentity::from_principal(&spawn_principal),
+                    task_identity,
                 );
                 let _progress = crate::context::progress_origin_guard(
                     &request_id_for_spawn, route.channel, route.epoch, corr,

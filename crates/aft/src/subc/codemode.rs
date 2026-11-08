@@ -51,6 +51,8 @@ pub(super) struct RunOwner {
     /// params) is read from it, never from the run route.
     pub(super) owner_route: RouteIdentity,
     pub(super) owner_route_channel: RouteChannel,
+    /// Catalog-attested worker ownership for shell tasks, not spawn authority.
+    pub(super) task_identity: Option<crate::bash_background::TaskIdentity>,
     /// The run route the call arrived on, for audit lines.
     pub(super) run_route: RouteChannel,
     /// The run route's own principal. It grants nothing: the call runs with
@@ -61,7 +63,7 @@ pub(super) struct RunOwner {
 }
 
 impl RunOwner {
-    /// The carrier this call's call-ledger rows and shell tasks are recorded
+    /// The carrier this call's call-ledger rows are recorded
     /// under: the run route's, never the owner route's.
     pub(super) fn ledger_carrier(&self) -> String {
         tool_provider::ledger_carrier(&self.run_principal)
@@ -143,6 +145,12 @@ fn tool_call_name(body: &Value) -> Option<&str> {
     (!tool_provider::recognized_operation(name)).then_some(name)
 }
 
+/// Shell calls can create tasks even without an explicit background request.
+pub(super) fn launches_shell_task(body: Option<&Value>) -> bool {
+    body.and_then(tool_call_name)
+        .is_some_and(|name| matches!(name, "bash" | "powershell"))
+}
+
 /// Decide how the request on `route` is admitted. Only codemode tool calls
 /// are affected. The order follows the contract: whether the tool serves
 /// codemode at all, then whether the run's stamp names a live owner route (the
@@ -165,7 +173,7 @@ pub(super) fn admit(
     if let Err(error) = tool_provider::admit_call_mode(name, &run.call_mode) {
         return Admission::Refused(error);
     }
-    match resolve_owner(routes, route, run, saved_policy) {
+    match resolve_owner(routes, route, run, launches_shell_task(body), saved_policy) {
         Ok(admission) => admission,
         Err(error) => {
             crate::slog_warn!(
@@ -196,6 +204,7 @@ fn resolve_owner(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
     run: &RouteIdentity,
+    launches_shell_task: bool,
     mut saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
 ) -> Result<Admission, subc_protocol::ErrorBody> {
     use subc_protocol::scope::{ParentState, ScopeKind};
@@ -395,13 +404,26 @@ fn resolve_owner(
         }
         policies.push(saved_policy(other));
     }
-    if owners.len() > 1 {
+    let mut task_identity = None;
+    if owners.len() > 1 || worker_run {
         let Some(policies) = policies.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(Admission::AwaitPolicies(
                 owners.iter().map(|(_, owner)| (*owner).clone()).collect(),
             ));
         };
-        let policies = policies.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let policies = if owners.len() > 1 || launches_shell_task {
+            policies.into_iter().collect::<Result<Vec<_>, _>>()?
+        } else {
+            // A sole owner's access needs no policy comparison. A non-shell
+            // call can keep its carrier identity if optional ownership cannot
+            // be read; ordinary per-tool access checks still apply.
+            policies.into_iter().filter_map(Result::ok).collect()
+        };
+        if worker_run {
+            task_identity = policies
+                .first()
+                .and_then(|policy| policy.task_identity.clone());
+        }
         // Keep comparing saved policies: genuinely different access settings
         // must refuse admission rather than select a more permissive route.
         for ((other_channel, _), policy) in owners.iter().zip(&policies) {
@@ -423,6 +445,7 @@ fn resolve_owner(
         run_id,
         route,
         **owner_channel,
+        task_identity,
     )))
 }
 
@@ -466,6 +489,7 @@ fn ambiguous_owner(
 pub(super) struct EffectiveSavedPolicy {
     confined: bool,
     params: Option<Value>,
+    task_identity: Option<crate::bash_background::TaskIdentity>,
 }
 
 #[cfg(test)]
@@ -475,6 +499,7 @@ impl EffectiveSavedPolicy {
         Self {
             confined: true,
             params: None,
+            task_identity: None,
         }
     }
 }
@@ -490,9 +515,39 @@ struct CandidatePolicy {
 
 pub(super) struct SavedPolicies(Vec<CandidatePolicy>);
 
+#[derive(Clone, Copy)]
+enum TaskIdentityRead {
+    Skip,
+    Optional,
+    Required,
+}
+
 impl SavedPolicies {
     /// Read each principal's own policy; never copy a saved row to another principal.
     pub(super) fn read(candidates: Vec<(RouteIdentity, Arc<AppContext>)>) -> Self {
+        Self::read_with_task_identity(candidates, TaskIdentityRead::Skip)
+    }
+
+    /// Let programs observe their own tasks when ownership resolves. Only a
+    /// shell launch requires that ownership to be available and unambiguous.
+    pub(super) fn read_for_call(
+        candidates: Vec<(RouteIdentity, Arc<AppContext>)>,
+        launches_shell_task: bool,
+    ) -> Self {
+        Self::read_with_task_identity(
+            candidates,
+            if launches_shell_task {
+                TaskIdentityRead::Required
+            } else {
+                TaskIdentityRead::Optional
+            },
+        )
+    }
+
+    fn read_with_task_identity(
+        candidates: Vec<(RouteIdentity, Arc<AppContext>)>,
+        task_identity_read: TaskIdentityRead,
+    ) -> Self {
         Self(
             candidates
                 .into_iter()
@@ -508,6 +563,16 @@ impl SavedPolicies {
                             .flatten();
                         Ok(EffectiveSavedPolicy {
                             confined,
+                            task_identity: match task_identity_read {
+                                TaskIdentityRead::Skip => None,
+                                TaskIdentityRead::Optional => {
+                                    remote_policy::worker_task_identity(&ctx, &identity)
+                                        .unwrap_or(None)
+                                }
+                                TaskIdentityRead::Required => {
+                                    remote_policy::worker_task_identity(&ctx, &identity)?
+                                }
+                            },
                             params: params.map(|params| {
                                 serde_json::to_value(params).expect("saved policy serializes")
                             }),
@@ -633,6 +698,7 @@ fn effective_identity(
     run_id: &str,
     route: RouteChannel,
     owner_route_channel: RouteChannel,
+    task_identity: Option<crate::bash_background::TaskIdentity>,
 ) -> RouteIdentity {
     let run_scope = OnceLock::new();
     if let Some(scope) = run.run_scope.get() {
@@ -668,6 +734,7 @@ fn effective_identity(
             run_id: run_id.to_owned(),
             owner_route: owner.clone(),
             owner_route_channel,
+            task_identity,
             run_route: route,
             run_principal: run.spawn_principal.clone(),
         })),

@@ -1491,6 +1491,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
                 }
             },
             run_id: run_id.into(),
+            task_identity: None,
             owner_route: parent.clone(),
             owner_route_channel: RouteChannel {
                 channel: 41,

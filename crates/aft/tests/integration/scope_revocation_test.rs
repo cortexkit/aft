@@ -2446,6 +2446,200 @@ fn worker_codemode_run_uses_the_workers_root_and_frozen_params_never_the_heads()
 
 #[cfg(unix)]
 #[test]
+fn worker_codemode_background_task_is_private_to_its_catalog_bound_route() {
+    const OUTPUT: &str = "worker-only-output-7e18d94c2ba6";
+    fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+        let configure = req.command == "configure";
+        let response = observing_dispatch(req, ctx);
+        if configure {
+            // Sandbox is off because this test proves identity isolation, not containment.
+            ctx.update_config(|config| {
+                config.sandbox.profile.head = aft::config::SandboxMode::Off;
+                config.sandbox.profile.worker = aft::config::SandboxMode::Off;
+            });
+        }
+        response
+    }
+    run_subc_bridge_test_with_dispatch(
+        "worker-run-task-owner",
+        Duration::from_secs(30),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            let _launcher = aft::sandbox_spawn::install_sandbox_launcher_for_test(
+                &daemon.root2,
+                std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")),
+            );
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            for (channel, principal) in [(2, "broca"), (3, PREFRONTAL)] {
+                bind_route_as(
+                    &mut daemon.stream,
+                    &daemon.root2,
+                    channel,
+                    Some(subc_protocol::call_mode::CallMode::Classic),
+                    Some(worker_stamp()),
+                    "worker-session",
+                    Principal::Reserved {
+                        module_id: principal.into(),
+                    },
+                    false,
+                )
+                .await;
+                provider_op(
+                    &mut daemon.stream,
+                    channel,
+                    100 + u64::from(channel),
+                    json!({"op":"tool.catalog", "preset":"worker",
+                        "params":{"remote_exec":{"enabled":true}}}),
+                )
+                .await;
+                let catalog = read_frame_timeout(&mut daemon.stream, "worker catalog").await;
+                assert_eq!(catalog.header.ty, FrameType::Response, "{catalog:?}");
+            }
+            // Closing Broca's route leaves its saved catalog binding available.
+            // Only the scope owner's route stays live, avoiding conflicting spawn authority.
+            send_route_goodbye(&mut daemon.stream, 2, 104).await;
+            no_extra_frames_until_pong(&mut daemon.stream, 105, "worker host detached").await;
+            bind_route_as(
+                &mut daemon.stream,
+                &daemon.root1,
+                4,
+                Some(subc_protocol::call_mode::CallMode::Codemode),
+                Some(worker_run_stamp()),
+                "program-session",
+                Principal::Reserved {
+                    module_id: PREFRONTAL.into(),
+                },
+                false,
+            )
+            .await;
+            let marker = daemon.root2.join("worker-route-task");
+            preset_call(
+                &mut daemon.stream,
+                4,
+                110,
+                "worker",
+                "bash",
+                json!({"command":format!("echo {OUTPUT} # {}", marker.display()),
+                    "background":true, "timeout":5000}),
+            )
+            .await;
+            answer_worker_run_live(&mut daemon.stream).await;
+            let launch = read_frame_timeout(&mut daemon.stream, "worker run launch").await;
+            assert_eq!(launch.header.ty, FrameType::Response, "{launch:?}");
+            assert_ne!(reply_json(&launch)["isError"], true, "{launch:?}");
+            let (registry, task) = observed_task(&marker).await;
+            let capture = registry
+                .status(&task, "worker-session", None, None, 0)
+                .expect("launched worker task")
+                .output_path
+                .expect("task capture path");
+            let not_found = format!(
+                "background task not found: {task}. This session has no record of it \
+                 (a record can be lost across an AFT restart). To run a command, use `bash`."
+            );
+
+            // Reconnect the host, plus routes with a different session or principal.
+            for (channel, session, principal) in [
+                (7, "worker-session", "broca"),
+                (8, "other-worker-session", "broca"),
+                (6, "worker-session", "aft"),
+            ] {
+                let mut scope = worker_stamp();
+                if channel != 7 {
+                    scope.scope_ref = format!("foreign-worker-{channel}");
+                }
+                bind_route_as(
+                    &mut daemon.stream,
+                    &daemon.root2,
+                    channel,
+                    Some(subc_protocol::call_mode::CallMode::Classic),
+                    Some(scope),
+                    session,
+                    Principal::Reserved {
+                        module_id: principal.into(),
+                    },
+                    false,
+                )
+                .await;
+            }
+            for channel in [7, 3, 8, 6] {
+                let own = channel == 7;
+                preset_call(
+                    &mut daemon.stream,
+                    channel,
+                    200 + u64::from(channel),
+                    "worker",
+                    "bash_status",
+                    json!({"taskId":task}),
+                )
+                .await;
+                let status = read_frame_timeout(&mut daemon.stream, "route task status").await;
+                assert_eq!(status.header.ty, FrameType::Response, "{status:?}");
+                preset_call(
+                    &mut daemon.stream,
+                    channel,
+                    400 + u64::from(channel),
+                    "worker",
+                    "bash_watch",
+                    json!({"taskId":task, "timeoutMs":10000}),
+                )
+                .await;
+                let watch = read_frame_timeout(&mut daemon.stream, "route task watch").await;
+                assert_eq!(watch.header.ty, FrameType::Response, "{watch:?}");
+                if own {
+                    assert_ne!(reply_json(&status)["isError"], true, "{status:?}");
+                    assert!(reply_text(&status).contains(&task), "{status:?}");
+                    assert_ne!(reply_json(&watch)["isError"], true, "{watch:?}");
+                    assert!(reply_text(&watch).contains(OUTPUT), "{watch:?}");
+                    // The launch can return before stdout is captured; watch it first.
+                    for reader in [7, 3, 8, 6] {
+                        preset_call(
+                            &mut daemon.stream,
+                            reader,
+                            300 + u64::from(reader),
+                            "worker",
+                            "read",
+                            json!({"path":capture}),
+                        )
+                        .await;
+                        let read =
+                            read_frame_timeout(&mut daemon.stream, "route capture read").await;
+                        assert_eq!(read.header.ty, FrameType::Response, "{read:?}");
+                        if reader == 7 {
+                            assert_ne!(reply_json(&read)["isError"], true, "{read:?}");
+                            assert!(reply_text(&read).contains(OUTPUT), "{read:?}");
+                        } else {
+                            assert_eq!(reply_json(&read)["isError"], true, "{read:?}");
+                            assert!(
+                                !String::from_utf8_lossy(&read.body).contains(OUTPUT),
+                                "{read:?}"
+                            );
+                        }
+                    }
+                } else {
+                    assert_eq!(reply_json(&status)["isError"], true, "{status:?}");
+                    assert!(reply_text(&status).contains(&not_found), "{status:?}");
+                    assert!(
+                        !String::from_utf8_lossy(&status.body).contains(OUTPUT),
+                        "{status:?}"
+                    );
+                    assert_eq!(reply_json(&watch)["isError"], true, "{watch:?}");
+                    assert!(reply_text(&watch).contains(&not_found), "{watch:?}");
+                    assert!(
+                        !String::from_utf8_lossy(&watch.body).contains(OUTPUT),
+                        "{watch:?}"
+                    );
+                }
+            }
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        dispatch,
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn worker_codemode_run_cannot_see_or_kill_the_heads_bash_tasks() {
     run_subc_bridge_test_with_dispatch(
         "worker-run-head-tasks",

@@ -1629,6 +1629,13 @@ enum ManagementAdmission {
 
 impl RouteIdentity {
     fn task_identity(&self) -> crate::bash_background::TaskIdentity {
+        if let Some(identity) = self
+            .run_owner
+            .as_ref()
+            .and_then(|owner| owner.task_identity.as_ref())
+        {
+            return identity.clone();
+        }
         let principal = match &self.spawn_principal {
             AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.clone(),
             AuthenticatedPrincipal::FirstParty => None,
@@ -6165,7 +6172,8 @@ where
                             let Some(ctx) = executor.actor_context(&identity.root) else {
                                 return Some(Err(remote_policy::policy_unavailable()));
                             };
-                            if remote_policy::key(identity, Some("worker")).is_none() || ctx.database_runtime_unconfigured() {
+                            if ctx.database_runtime_unconfigured() || (remote_policy::key(identity, Some("worker")).is_none()
+                                && !identity.scope.as_ref().is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)) {
                                 return Some(Ok(codemode::EffectiveSavedPolicy::default()));
                             }
                             match decoded.codemode_policies.as_ref()? {

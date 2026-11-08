@@ -157,6 +157,7 @@ fn bound(head: &RouteIdentity, run_stamp: ScopeStamp) -> RouteIdentity {
             agent_id: "agent-1".into(),
         },
         run_id: "run-1".into(),
+        task_identity: None,
         owner_route: head.clone(),
         owner_route_channel: RouteChannel {
             channel: 1,

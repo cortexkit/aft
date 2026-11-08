@@ -1568,13 +1568,21 @@ pub(super) fn process_lossy_push_envelope_batch(
 #[path = "runner_head_background_tests.rs"]
 mod runner_head_background_tests;
 
+#[cfg(all(test, unix))]
+#[path = "codemode_worker_task_tests.rs"]
+mod codemode_worker_task_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::protocol::{BashLongRunningFrame, BashPatternMatchFrame};
 
-    fn caller_route(root: &ProjectRootId, principal: &str, harness: &str) -> RouteIdentity {
+    pub(super) fn caller_route(
+        root: &ProjectRootId,
+        principal: &str,
+        harness: &str,
+    ) -> RouteIdentity {
         let mut route =
             route_identity_with_harness(root, "moved-session", BindTrust::FirstParty, harness);
         let data = Arc::get_mut(&mut route.0).unwrap();
