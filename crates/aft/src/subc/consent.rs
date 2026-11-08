@@ -226,6 +226,10 @@ pub(super) enum ConsentError {
     Unavailable(String),
     /// Cingulate answered with a named refusal.
     Refused { code: String, message: String },
+    /// The daemon refused the route because the asking scope has ended
+    /// (`scope_not_live`, `scope_ended`). Cingulate settles the asks of an
+    /// ended scope itself, so nothing sent under that scope can succeed.
+    ScopeGone(String),
 }
 
 pub(super) type ConsentFuture = Pin<Box<dyn Future<Output = Result<Value, ConsentError>> + Send>>;
@@ -573,6 +577,14 @@ impl SubcConsentTransport {
                     code: body.code,
                     message: body.message,
                 })
+            }
+            Err(error)
+                if error.route_open_refusal().is_some_and(|body| {
+                    body.code == subc_protocol::error_codes::SCOPE_NOT_LIVE
+                        || body.code == subc_protocol::error_codes::SCOPE_ENDED
+                }) =>
+            {
+                return Err(ConsentError::ScopeGone(error.to_string()));
             }
             Err(error) => {
                 drop(gate);
@@ -2933,7 +2945,7 @@ async fn hold(
 /// the held call ends with that same code.
 async fn failed(call: &HeldCall, prep: &Prepared, error: ConsentError) -> Hold {
     match error {
-        ConsentError::Unavailable(detail) => {
+        ConsentError::Unavailable(detail) | ConsentError::ScopeGone(detail) => {
             Hold::Answer(unavailable_answer(call, &prep.grant, &detail))
         }
         ConsentError::Refused { code, message } if code == "access_unavailable" => {
@@ -3540,11 +3552,12 @@ pub(super) async fn withdraw_macos_permission_cards(
     let mut withdrawn = 0;
     for (folder, program, scope, root, session, id) in rows {
         let had_id = id.is_some();
+        let mut left_to_cingulate = false;
         let result: Result<(), ConsentError> = async {
             if let Some(id) = id {
                 let scope = serde_json::from_str(&scope)
                     .map_err(|e| ConsentError::Unavailable(format!("invalid card scope: {e}")))?;
-                tokio::time::timeout(
+                let sent = tokio::time::timeout(
                     UNARY_TIMEOUT,
                     transport.call(ConsentCall {
                         scope,
@@ -3558,7 +3571,21 @@ pub(super) async fn withdraw_macos_permission_cards(
                 .await
                 .map_err(|_| {
                     ConsentError::Unavailable("macOS permission card withdrawal timed out".into())
-                })??;
+                })?;
+                match sent {
+                    Ok(_) => {}
+                    // The session that filed the card has ended, so the card
+                    // can never be withdrawn under its scope; Cingulate
+                    // settles the asks of an ended scope itself. Drop the
+                    // record instead of retrying it at every start.
+                    Err(ConsentError::ScopeGone(detail)) => {
+                        left_to_cingulate = true;
+                        log::info!(
+                            "macOS permission card for {folder} left to Cingulate: its scope ended ({detail})"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             db.lock()
                 .map_err(|e| ConsentError::Unavailable(e.to_string()))?
@@ -3571,7 +3598,7 @@ pub(super) async fn withdraw_macos_permission_cards(
         }
         .await;
         match result {
-            Ok(()) => withdrawn += usize::from(had_id),
+            Ok(()) => withdrawn += usize::from(had_id && !left_to_cingulate),
             Err(error) => {
                 log::warn!("macOS permission card withdrawal failed for {folder}: {error:?}")
             }

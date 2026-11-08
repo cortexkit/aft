@@ -359,6 +359,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "gh_shim_speech/start_view/sweep.rs",
+        enclosing_item: "sweep_entries",
+        location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
+        reason: "Internal crash-file housekeeping bounds directory iteration per detached pass, retaining its iterator for continuation; it never truncates an agent-visible result list.",
+    },
+    ExclusionEntry {
         file: "commands/semantic_search/memo.rs",
         enclosing_item: "DigestProofCache::insert",
         location_or_primitive: "MAX_DIGEST_PROOF_BYTES",

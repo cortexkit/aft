@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["gh-shim-start-views"],
+  "notes": "Bound start-view housekeeping and bind each view to its command lifetime without changing search routing or ranking."
+}

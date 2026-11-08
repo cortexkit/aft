@@ -337,6 +337,7 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                             start_cleanup_with(
                                 &cleaning,
                                 move || {
+                                    crate::gh_shim_speech::start_view::sweep_queued();
                                     for inner in registries
                                         .into_iter()
                                         .filter_map(|registry| registry.upgrade())
