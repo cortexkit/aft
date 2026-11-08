@@ -1023,11 +1023,24 @@ pub(crate) fn extract_with<'tree>(
         &queries,
         super::extraction_index::LookupWork::Dispatch,
     );
-    let namespace_imports = parse
+    let mut namespace_imports = parse
         .imports
         .iter()
         .filter_map(|i| i.namespace_import.as_deref())
         .collect::<HashSet<_>>();
+    // Python's `import pkg.mod` binds only `pkg`, yet `pkg.mod.f()` calls
+    // through the whole dotted module path: the receiver `pkg.mod` is the
+    // imported module, a static binding like a namespace import, not an
+    // object whose type is unknown.
+    if language == "python" {
+        namespace_imports.extend(parse.imports.iter().filter_map(|i| {
+            let namespace = i.namespace_import.as_deref()?;
+            i.module_path
+                .strip_prefix(namespace)?
+                .starts_with('.')
+                .then_some(i.module_path.as_str())
+        }));
+    }
     let local_rust_types = facts
         .types
         .iter()

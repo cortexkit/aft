@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use super::graph_rows::{EdgeRow, GraphRows, NodeRow, RefRow};
 use crate::callgraph_store::dead_code_projection::{
     is_method_dispatch_callee, is_resolved_edge, symbol_kind_from_label,
-    UNRESOLVED_VALUE_PATH_PROVENANCE,
+    UNKNOWN_RECEIVER_LIVE_PROVENANCE, UNRESOLVED_VALUE_PATH_PROVENANCE,
 };
 use crate::callgraph_store::{
     lang_from_label, PROVENANCE_TREESITTER, PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
@@ -175,13 +175,9 @@ fn entry_point_symbols(
             roots.insert(node.scoped_name.clone());
         }
     }
-    // Members an unknown receiver may reach are kept alive.
-    for (_, target_file, symbol) in &rows.unknown_live {
-        by_file
-            .entry(paths.resolve(target_file))
-            .or_default()
-            .insert(symbol.clone());
-    }
+    // Members an unknown receiver may reach are not roots here: they are
+    // listed with their call sites among the outbound calls, since a site in
+    // test code keeps them alive for tests only.
     by_file
 }
 
@@ -256,6 +252,30 @@ fn outbound_calls(rows: &GraphRows, paths: &mut Paths<'_>) -> Vec<CallgraphOutbo
                 calls.push(call);
             }
         }
+    }
+    // Members an unknown receiver may reach, at the line of its call site;
+    // the rollup keeps them alive as the data layer's graph does (see
+    // `UNKNOWN_RECEIVER_LIVE_PROVENANCE`). They sort with the caller file's
+    // top-level calls.
+    for (caller_file, target_file, symbol, line) in &rows.unknown_live {
+        let target_path = paths.resolve(target_file);
+        calls.push((
+            (
+                caller_file.clone(),
+                None,
+                *line,
+                0,
+                0,
+                format!("unknown:{target_file}:{symbol}"),
+            ),
+            CallgraphOutboundCall {
+                caller_file: paths.resolve(caller_file),
+                caller_symbol: TOP_LEVEL_SYMBOL.to_string(),
+                target: format!("{}::{symbol}", target_path.display()),
+                line: *line,
+                provenance: UNKNOWN_RECEIVER_LIVE_PROVENANCE.to_string(),
+            },
+        ));
     }
     // The projection sorts by caller file, caller symbol (none first), line,
     // byte range and reference id, then by the resolved caller file.

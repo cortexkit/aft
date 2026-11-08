@@ -9976,8 +9976,13 @@ mod dead_code_projection_tests {
         let projected_aggregate = dead_code_aggregate(&root, files, projected);
         assert_dead_item(&projected_aggregate, "src/dead.ts", "knownDead");
         assert_live_item(&projected_aggregate, "src/live.ts", "knownLive");
-        assert_live_item(&projected_aggregate, "src/render.ts", "render");
-        assert_live_item(&projected_aggregate, "src/other_render.ts", "render");
+        // `service.render()` has a known receiver, the object literal
+        // `service`, so the call reaches only that literal's `render`. The
+        // index store resolves it exactly and adds no name-based dispatch
+        // rescue, so the two exported `render` functions, which nothing
+        // calls, are reported dead.
+        assert_dead_item(&projected_aggregate, "src/render.ts", "render");
+        assert_dead_item(&projected_aggregate, "src/other_render.ts", "render");
     }
 
     #[test]

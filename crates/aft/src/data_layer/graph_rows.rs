@@ -103,8 +103,9 @@ pub(crate) struct GraphRows {
     pub(crate) edges: BTreeMap<String, EdgeRow>,
     pub(crate) sites: BTreeMap<(String, u32), SiteRow>,
     /// Members an unknown receiver keeps alive: caller file, target file,
-    /// target symbol.
-    pub(crate) unknown_live: BTreeSet<(String, String, String)>,
+    /// target symbol, and the line of the call site (a site in test code
+    /// keeps them alive for tests only).
+    pub(crate) unknown_live: BTreeSet<(String, String, String, u32)>,
 }
 
 /// The nodes table, with the rules a SQLite `INSERT OR REPLACE` applies: a
@@ -380,6 +381,7 @@ pub(crate) fn assemble(
                     path.clone(),
                     target_file.clone(),
                     target_symbol.clone(),
+                    site.line,
                 ));
             }
             let Some(caller) = site

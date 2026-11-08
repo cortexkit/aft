@@ -45,8 +45,10 @@ use crate::parser::LangId;
 /// slice as a record with its fragment, so publications written before it
 /// are built again with those records; 10 added the facts dead-code
 /// analysis reads from the syntax tree, so an analysis never parses a file
-/// again.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-10";
+/// again; 11 stopped recording a method-call site for a Python call through
+/// a dotted module import (`import pkg.mod` then `pkg.mod.f()`), whose
+/// unresolved site replaced the call's resolved module binding.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-11";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index

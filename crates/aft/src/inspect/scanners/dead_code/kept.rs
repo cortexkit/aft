@@ -33,9 +33,9 @@ use crate::data_layer::checkout::GraphIdentity;
 
 /// The first line of a base file. A change to what is kept or to how files
 /// are materialized changes it, so a file of another format is never read.
-pub(super) const BASE_HEADER: &str = "aft dead-code graph 7";
+pub(super) const BASE_HEADER: &str = "aft dead-code graph 8";
 /// The first line of an overlay file.
-pub(super) const OVERLAY_HEADER: &str = "aft dead-code overlay 7";
+pub(super) const OVERLAY_HEADER: &str = "aft dead-code overlay 8";
 /// The last bytes of a complete base file.
 const TRAILER_MAGIC: &[u8; 8] = b"AFTDCG07";
 /// A base file's trailer: the directory's offset and length, the blake3

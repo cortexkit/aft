@@ -8800,10 +8800,18 @@ mod tests {
     /// A free function in a module named like a type (`Config::production` in
     /// `mod Config`) is not that type's method, even when one impl in the file
     /// defines a method with the same name: a call to the free function keeps
-    /// the free function live, and the uncalled method stays dead together
-    /// with the helper only its body calls. The planted dead
-    /// `other::production` makes the short name ambiguous, so only the source
-    /// scan, which keeps the module path, links the call.
+    /// the free function live, and the planted dead `other::production` stays
+    /// dead. That short name is ambiguous, so only the source scan, which
+    /// keeps the module path, links the call.
+    ///
+    /// For now the index store roots every exported (pub or pub(crate))
+    /// method and type, so the uncalled method stays live as well. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported it dead, and the index store can return to that verdict once
+    /// member calls it cannot resolve keep their method name live (a
+    /// name-based dispatch rescue); without that rescue, dropping the
+    /// exported roots reports called methods dead.
+    /// The helper only the method's body calls stays live with it.
     #[test]
     fn review_module_qualified_free_function_is_not_the_same_named_method() {
         let aggregate = stored_rust_fixture_scan(&[(
@@ -8828,14 +8836,22 @@ mod types {
         )]);
         assert_eq!(
             headline_symbol_lines(&aggregate),
-            vec!["helper:15", "production:13", "production:8"],
+            vec!["production:8"],
             "{aggregate:#}"
         );
     }
 
     /// The same in a nested module (`settings::Config::production`): the call
-    /// from `main` keeps the free function live, and the uncalled method is
-    /// still reported dead.
+    /// from `main` keeps the free function live, and the planted dead
+    /// `other::production` stays dead.
+    ///
+    /// For now the index store roots every exported (pub or pub(crate))
+    /// method and type, so the uncalled method stays live as well. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported it dead, and the index store can return to that verdict once
+    /// member calls it cannot resolve keep their method name live (a
+    /// name-based dispatch rescue); without that rescue, dropping the
+    /// exported roots reports called methods dead.
     #[test]
     fn review_nested_module_free_function_called_from_main_stays_live() {
         let aggregate = stored_rust_fixture_scan(&[(
@@ -8861,7 +8877,7 @@ mod types {
         )]);
         assert_eq!(
             headline_symbol_lines(&aggregate),
-            vec!["production:15", "production:9"],
+            vec!["production:9"],
             "{aggregate:#}"
         );
     }
@@ -9894,6 +9910,15 @@ testOnly();
         assert_eq!(rolled_up["test_only_count"], 0, "{rolled_up:#}");
     }
 
+    /// A receiver call inside a macro in a `#[cfg(test)]` module, whose
+    /// receiver (`Index(1)`) the index store cannot type, never makes the
+    /// method production code: it is not in the dead-code headline. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported the method in the test-only bucket. For now the index store
+    /// roots every exported (pub or pub(crate)) method, so it is in neither
+    /// bucket; the test-only verdict returns once member calls the index
+    /// store cannot resolve keep their method name live (a name-based
+    /// dispatch rescue), which dropping the exported roots needs.
     #[test]
     fn rust_macro_receiver_call_in_cfg_test_module_is_test_only() {
         let (temp_dir, root, paths) = fixture_project(&[
@@ -9949,8 +9974,8 @@ mod tests {
         let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert!(
-            aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_some(),
-            "receiver method should be reported only in the test-only bucket: {aggregate:#}"
+            aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_none(),
+            "the exported receiver method is rooted until the name rescue lands: {aggregate:#}"
         );
         assert!(
             !aggregate_has_item(&aggregate, "src/index.rs", "shares_index_with"),

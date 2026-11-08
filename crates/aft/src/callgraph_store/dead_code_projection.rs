@@ -3,6 +3,10 @@ use crate::symbols::SymbolKind;
 use std::time::Duration;
 
 pub(crate) const UNRESOLVED_VALUE_PATH_PROVENANCE: &str = "unresolved_value_path";
+/// Provenance of a projected outbound call that is not a call: a member an
+/// unknown receiver at that line of the caller file may reach, which dead
+/// code keeps alive (for tests only when the line is test code).
+pub(crate) const UNKNOWN_RECEIVER_LIVE_PROVENANCE: &str = "unknown_receiver_live";
 pub(crate) const MAX_DELTA_BYTES: usize = 256 * 1024;
 
 /// How a dead-code snapshot was produced: by splicing the previous snapshot

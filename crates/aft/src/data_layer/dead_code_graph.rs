@@ -491,8 +491,10 @@ pub(crate) struct FileProjection {
     /// (in no particular order).
     pub(crate) outbound_calls: Vec<CallgraphOutboundCall>,
     /// Members an unknown receiver in this file keeps alive: target file
-    /// (absolute, as the snapshot names files) and symbol.
-    pub(crate) unknown_live: Vec<(PathBuf, String)>,
+    /// (absolute, as the snapshot names files), symbol, and the line of the
+    /// call site in this file (a site in test code keeps them alive for
+    /// tests only).
+    pub(crate) unknown_live: Vec<(PathBuf, String, u32)>,
     /// Its Go package initialization group, when it has callers.
     pub(crate) go_initializers: Option<GoInitializerGroup>,
 }
@@ -812,13 +814,14 @@ impl<'f> DeadCodeGraph<'f> {
     }
 
     /// Members unknown receivers in caller file `path` keep alive: target
-    /// file (absolute, as the snapshot names files) and symbol. Reads only
-    /// the file's method-call sites, not the rest of its rows.
+    /// file (absolute, as the snapshot names files), symbol and the line of
+    /// the call site. Reads only the file's method-call sites, not the rest
+    /// of its rows.
     ///
     /// # Errors
     ///
     /// When its resolution cannot be read.
-    pub(crate) fn unknown_live(&self, path: &str) -> Result<Vec<(PathBuf, String)>, String> {
+    pub(crate) fn unknown_live(&self, path: &str) -> Result<Vec<(PathBuf, String, u32)>, String> {
         if self.indexed(path).is_none() {
             return Ok(Vec::new());
         }
@@ -826,11 +829,16 @@ impl<'f> DeadCodeGraph<'f> {
         let live = resolution
             .sites
             .iter()
-            .flat_map(|kept| kept.resolution.protected.iter().cloned())
-            .collect::<BTreeSet<(String, String)>>();
+            .flat_map(|kept| {
+                kept.resolution
+                    .protected
+                    .iter()
+                    .map(|(file, symbol)| (file.clone(), symbol.clone(), kept.site.line))
+            })
+            .collect::<BTreeSet<(String, String, u32)>>();
         Ok(live
             .into_iter()
-            .map(|(file, symbol)| (self.resolve(&file), symbol))
+            .map(|(file, symbol, line)| (self.resolve(&file), symbol, line))
             .collect())
     }
 
@@ -847,10 +855,10 @@ impl<'f> DeadCodeGraph<'f> {
         let resolution = self.source.resolution(path)?;
         let rows = self.file_rows(path, &parse, &resolution);
         let mut projection = FileProjection::default();
-        for (_, target_file, symbol) in &rows.unknown_live {
+        for (_, target_file, symbol, line) in &rows.unknown_live {
             projection
                 .unknown_live
-                .push((self.resolve(target_file), symbol.clone()));
+                .push((self.resolve(target_file), symbol.clone(), *line));
         }
         projection.outbound_calls = self.outbound_calls(&rows);
         if &*file.language == "go" {
@@ -994,6 +1002,7 @@ impl<'f> DeadCodeGraph<'f> {
                     path.to_string(),
                     target_file.clone(),
                     target_symbol.clone(),
+                    site.line,
                 ));
             }
             let Some(caller) = site.caller.as_deref().and_then(|symbol| {
@@ -1241,7 +1250,9 @@ struct FileRows {
     /// reference to its edges reads them in this order.
     edges: BTreeMap<String, (u64, EdgeRow)>,
     next_edge: u64,
-    unknown_live: BTreeSet<(String, String, String)>,
+    /// Members unknown receivers keep alive: caller file, target file,
+    /// target symbol and the line of the call site.
+    unknown_live: BTreeSet<(String, String, String, u32)>,
 }
 
 impl FileRows {
