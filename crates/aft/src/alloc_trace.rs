@@ -625,8 +625,18 @@ pub struct LabelPeak {
 
 /// The `limit` labels with the highest live bytes since the previous call,
 /// highest first; each label's mark then restarts from its current count.
-/// Labels that never held a byte are left out.
+/// Labels that never held a byte are left out. Empty unless the logger runs,
+/// which only the `aft` binary starts: without the tracer installed nothing
+/// counts real allocations, and unit tests that drive the hooks by hand must
+/// not leak their labels into other tests' census.
 pub fn take_census_peaks(limit: usize) -> Vec<LabelPeak> {
+    if !report::logger_started() {
+        return Vec::new();
+    }
+    collect_census_peaks(limit)
+}
+
+fn collect_census_peaks(limit: usize) -> Vec<LabelPeak> {
     let mut peaks = Vec::new();
     for (id, state) in LABELS.iter().enumerate().skip(1) {
         let live = state.live.load(Ordering::Relaxed).max(0);

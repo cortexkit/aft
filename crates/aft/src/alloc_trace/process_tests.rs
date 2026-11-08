@@ -91,6 +91,9 @@ fn large_allocation_logs_one_event_with_its_label_and_caller() {
     };
     let lines = wait_for_line("op=test_large_allocation");
     drop(held);
+    for line in &lines {
+        eprintln!("{line}");
+    }
     assert_eq!(lines.len(), 1, "{lines:#?}");
     let line = &lines[0];
     assert!(line.starts_with("large allocation 100 MiB alloc"), "{line}");
@@ -162,6 +165,28 @@ fn label_carried_into_a_pool_task_is_attributed_to_it() {
         alloc_trace::live_bytes(uncarried)
     );
     drop(held);
+}
+
+#[test]
+fn the_census_names_the_operation_with_the_highest_mark() {
+    alloc_trace::set_line_sink(sink);
+    alloc_trace::start_logger();
+    let label = Label::custom("test_census_mark");
+    {
+        let _scope = alloc_trace::scope(label, None);
+        // Higher than any other test's label reaches, so it stays in the
+        // census's top five while those run alongside.
+        drop(black_box(Vec::<u8>::with_capacity(1 << 30)));
+    }
+    let census = aft::memory::MemorySnapshot::new_uncapped("ready", Default::default());
+    assert!(census.allocation_labels.len() <= 5, "{census:?}");
+    let mark = census
+        .allocation_labels
+        .iter()
+        .find(|peak| peak.label == "test_census_mark")
+        .unwrap_or_else(|| panic!("{:?}", census.allocation_labels));
+    assert!(mark.peak_bytes >= 1 << 30, "{mark:?}");
+    assert_eq!(mark.live_bytes, 0, "{mark:?}");
 }
 
 #[test]

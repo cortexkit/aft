@@ -65,6 +65,10 @@ pub fn set_line_sink(sink: fn(&str)) {
     let _ = SINK.set(sink);
 }
 
+pub(super) fn logger_started() -> bool {
+    LOGGER.get().is_some()
+}
+
 pub(super) fn wake() {
     if let Some(logger) = LOGGER.get() {
         logger.unpark();

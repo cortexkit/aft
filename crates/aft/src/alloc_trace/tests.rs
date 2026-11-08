@@ -41,12 +41,12 @@ fn census_peaks_report_the_high_water_since_the_last_census_highest_first() {
     let _scope = scope(label, None);
     account(300 * MIB);
     account(-200 * MIB);
-    let peaks = take_census_peaks(MAX_LABELS);
+    let peaks = collect_census_peaks(MAX_LABELS);
     let (_, peak) = find(&peaks, "unit_census_peak").expect("label reported");
     assert_eq!(peak.peak_bytes, 300 << 20);
     assert_eq!(peak.live_bytes, 100 << 20);
     // The next census starts from what is live now.
-    let peaks = take_census_peaks(MAX_LABELS);
+    let peaks = collect_census_peaks(MAX_LABELS);
     let (_, peak) = find(&peaks, "unit_census_peak").expect("label still live");
     assert_eq!(peak.peak_bytes, 100 << 20);
 
@@ -54,11 +54,11 @@ fn census_peaks_report_the_high_water_since_the_last_census_highest_first() {
     let bigger = Label::custom("unit_census_bigger");
     let _inner = scope(bigger, None);
     account(250 * MIB);
-    let peaks = take_census_peaks(MAX_LABELS);
+    let peaks = collect_census_peaks(MAX_LABELS);
     let (bigger_at, _) = find(&peaks, "unit_census_bigger").unwrap();
     let (smaller_at, _) = find(&peaks, "unit_census_peak").unwrap();
     assert!(bigger_at < smaller_at, "{peaks:?}");
-    assert!(take_census_peaks(1).len() <= 1);
+    assert!(collect_census_peaks(1).len() <= 1);
 }
 
 #[test]
