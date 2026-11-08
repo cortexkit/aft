@@ -972,7 +972,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     self.assertLess(steps.index(download), consumer)
 
     def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
-        probe = "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
+        probe = "cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
         archive = workflow_job("unit-macos-libtest-archive")
         shard = workflow_job("unit-macos-libtest-shard")
 

@@ -58,7 +58,7 @@ jobs:
       - name: Run original stress volumes
         shell: bash
         run: >-
-          cargo test -p agent-file-tools --lib --
+          cargo test -p agent-file-tools --features test-hooks --lib --
           views_incremental_random_sequences_equal_full_rebuild
           tool_result_fixtures_release_descriptors
           bash_changed_files_flush_native_no_false_complete_during_50k_activity

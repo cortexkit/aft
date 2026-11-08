@@ -468,10 +468,10 @@ jobs:
         run: cargo build -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test -p agent-file-tools --lib -- gh_shim --test-threads=1
-          binary_listing="$(cargo test -p agent-file-tools --bin aft -- --list)"
+          cargo test -p agent-file-tools --features test-hooks --lib -- gh_shim --test-threads=1
+          binary_listing="$(cargo test -p agent-file-tools --features test-hooks --bin aft -- --list)"
           [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
-          cargo test -p agent-file-tools --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
+          cargo test -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
       - name: Require worker-read test inventory and run the native gate
         shell: bash
         run: |
@@ -797,10 +797,10 @@ jobs:
           if-no-files-found: error
 
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
+        run: cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
+        run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
 
       - name: Report macOS libtest archive size
         run: |
@@ -856,7 +856,7 @@ jobs:
           MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
 
       - name: Capture bin source inventory
-        run: cargo nextest list --workspace --bins --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
+        run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
 
       - name: Report macOS bin archive size
         run: |

@@ -525,8 +525,8 @@ if phase_enabled lib; then
     && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "$(uname)" != "Darwin" ]]; then
     # Windows needs its local PDB for the child backtrace; the macOS archive job
     # runs this probe before upload while its linked debug objects are present.
-    run_phase "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
-      gate_cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
+    run_phase "cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
+      gate_cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
   fi
 
   # When lib-shard is selected, the archive-backed command below owns the rest
