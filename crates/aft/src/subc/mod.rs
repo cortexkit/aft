@@ -10463,7 +10463,7 @@ impl PlainToolRun {
                 for name in names.filter(|name| !name.contains("://") && !name.is_empty()) {
                     let root = tool_call_context
                         .project_root
-                        .join(crate::readonly_artifacts::expand_tilde(name));
+                        .join(crate::git_root_resolution::expand_tilde(name));
                     crate::bounded_io::name_walk_root(&root, Path::new(name));
                 }
             }
