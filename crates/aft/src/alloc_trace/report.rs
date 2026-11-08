@@ -254,6 +254,7 @@ pub(super) fn build_id() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc marks the dyld calls deprecated in favour of the mach2 crate, which AFT doesn't depend on
 fn read_build_id() -> Option<String> {
     const LC_UUID: u32 = 0x1b;
     // SAFETY: image 0 is the main executable, whose header and load commands
