@@ -251,7 +251,7 @@ fn sharing_off() -> bool {
 
 /// Runs `work` on this thread as if no table were shared: nothing is
 /// found here and nothing is listed, as before tables were shared.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn without_sharing<T>(work: impl FnOnce() -> T) -> T {
     SHARING_OFF.with(|off| off.set(true));
     let result = work();

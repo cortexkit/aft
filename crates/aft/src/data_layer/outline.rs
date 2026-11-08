@@ -308,7 +308,7 @@ pub(crate) fn note_record_read() {
     RECORD_READS.with(|reads| reads.set(reads.get() + 1));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn record_reads() -> u64 {
     RECORD_READS.with(std::cell::Cell::get)
 }
@@ -779,6 +779,7 @@ pub fn separator() -> char {
 
     /// Runs `git` in `dir` with an identity of its own, so a commit needs
     /// no configuration from the machine.
+    #[cfg(unix)]
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -802,6 +803,7 @@ pub fn separator() -> char {
     /// AFT's own sources for a checkout of real size: the store crate's
     /// Rust files and the bridge's TypeScript files, relative to `root`
     /// once copied there.
+    #[cfg(unix)]
     fn aft_sources(root: &Path) -> Vec<String> {
         fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -838,6 +840,7 @@ pub fn separator() -> char {
 
     /// `value` without the keys that time an answer, which differ between
     /// any two runs.
+    #[cfg(unix)]
     fn untimed(value: serde_json::Value) -> serde_json::Value {
         match value {
             serde_json::Value::Object(map) => map
@@ -854,6 +857,7 @@ pub fn separator() -> char {
     /// every file, a zoom on each of `symbols`, and a search for each of
     /// their names. Searches are asked again until two rounds agree, so an
     /// index still building in the background does not count as a change.
+    #[cfg(unix)]
     fn answers(
         ctx: &AppContext,
         root: &Path,
@@ -979,6 +983,30 @@ pub fn separator() -> char {
         }
         assert!(symbols.len() > 100, "{} symbols", symbols.len());
         let before = answers(&worktree_ctx, &worktree, &sources, &symbols);
+        // The answers compared are real ones: every outline and search
+        // succeeds, and nearly every zoom finds its symbol.
+        let succeeded = |answers: &[serde_json::Value]| {
+            answers
+                .iter()
+                .filter(|answer| answer["success"] == true)
+                .count()
+        };
+        let (outlines, rest) = before.split_at(sources.len());
+        let (zooms, searches) = rest.split_at(symbols.len());
+        assert_eq!(succeeded(outlines), outlines.len());
+        assert!(
+            succeeded(zooms) * 10 >= zooms.len() * 9,
+            "{} of {} zooms found their symbol",
+            succeeded(zooms),
+            zooms.len()
+        );
+        assert_eq!(
+            succeeded(searches),
+            searches.len(),
+            "{:?}",
+            searches.first()
+        );
+        eprintln!("TEMP first search answer: {}", searches[0]);
 
         // The main checkout's prewarm lists its tables for the process.
         let main_cache = main_ctx.symbol_cache();
