@@ -109,6 +109,13 @@ fn large_allocation_logs_one_event_with_its_label_and_caller() {
                 && (start..start + 512).contains(offset)),
         "no frame inside allocate_large_for_test ({image}+{start:#x}): {line}"
     );
+    // The macOS loader knows a test binary's local symbols, so the line
+    // names the function itself there; Linux's knows only exported ones.
+    #[cfg(target_os = "macos")]
+    assert!(
+        line.contains("[aft::alloc_trace_process_tests::allocate_large_for_test]"),
+        "{line}"
+    );
 }
 
 #[test]
