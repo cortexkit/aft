@@ -12366,10 +12366,12 @@ mod tests {
 #[cfg(test)]
 mod edit_latency_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::durability::EventKind;
     use crate::harness::Harness;
     use std::fs;
 
+    #[cfg(unix)]
     fn stack_dir(store: &BackupStore, session: &str, path: &Path) -> PathBuf {
         store
             .session_dir(session)
