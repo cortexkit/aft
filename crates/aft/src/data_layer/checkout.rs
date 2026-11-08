@@ -632,6 +632,12 @@ pub struct BuildReport {
     /// Another process published this checkout while the build ran, so
     /// nothing was published; the checkout serves that publication.
     pub superseded: bool,
+    /// When the build started from another checkout's publication, how
+    /// many paths differed from it; `None` for a build from scratch.
+    pub started_from_sibling: Option<usize>,
+    /// Content records the build's scan read from the store instead of
+    /// parsing their files again.
+    pub stored_records: usize,
     /// Files the reclamation after publishing removed, or why it could not
     /// run (the publication stands either way).
     pub reclaimed_files: usize,
@@ -1207,6 +1213,13 @@ impl Checkout {
             .published
             .is_none();
         checkpoint()?;
+        // A checkout another one of the family is close to starts from that
+        // one's publication rather than building cold.
+        if unpublished && self.planes.text && self.planes.callgraph {
+            if let Some(report) = self.start_from_sibling(build_started)? {
+                return Ok(report);
+            }
+        }
         if unpublished && self.planes.text {
             if !self.publish_text_first()? {
                 report.superseded = true;
@@ -1243,6 +1256,7 @@ impl Checkout {
         let started = Instant::now();
         let sink = BuildSink {
             skip_text: !self.planes.text,
+            stored: self.stored_records()?,
             ..BuildSink::default()
         };
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
@@ -1267,6 +1281,7 @@ impl Checkout {
         report.files = scanned.state.paths().len();
         report.text_units = collected.text.len();
         report.extract_failures = collected.failures;
+        report.stored_records = collected.reused;
         report.scan_ms = elapsed_ms(started);
 
         // The state, with each parsed path's language.
@@ -1438,6 +1453,182 @@ impl Checkout {
             .sum();
         self.serve_new(snapshot, covered)?;
         Ok(report)
+    }
+
+    /// Builds a checkout with nothing published from the publication of
+    /// another checkout of the family, the one whose files differ least
+    /// from this one's, the way an edit is processed. That checkout's state
+    /// is published for this one as it stands, naming this checkout's root;
+    /// the files that differ from it are read and recorded as changes, as a
+    /// bind records what changed while nothing watched; the call graph is
+    /// resolved again for them and every file their changes reach; and the
+    /// changes are published. A worktree made from another checkout differs
+    /// from it in a handful of files, and every new one used to read and
+    /// parse every file and resolve the whole call graph again (15 to 60 s
+    /// on 6 to 8 cores for a large repository), only for its build to find
+    /// nearly every unit already stored.
+    ///
+    /// Every input the call graph records is keyed by a path inside the
+    /// checkout: a symlink is recorded by its target's bytes, which differ
+    /// when a link leaves the checkout for another folder, and resolution
+    /// never follows a link out of the checkout. So two checkouts whose
+    /// files are the same resolve the same wherever their folders are, and
+    /// the paths that differ are all the changes there are.
+    ///
+    /// Every file is read once to learn its content, and none is parsed.
+    /// `None` when no other checkout has a call graph published, when more
+    /// than a quarter of the paths differ from the closest one (a cold
+    /// build then costs about as much), or when that checkout publishes
+    /// again first, since its new publication may retire what the state
+    /// read here names; the caller then builds cold.
+    fn start_from_sibling(&self, build_started: Instant) -> Result<Option<BuildReport>, DataError> {
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        if snapshot.manifest().checkout(self.checkout).is_some() {
+            return Ok(None);
+        }
+        let mut siblings = Vec::new();
+        for state_ref in snapshot.manifest().checkouts() {
+            if state_ref.checkout == self.checkout {
+                continue;
+            }
+            match snapshot.checkout_state(state_ref.checkout) {
+                Ok(Some(state))
+                    if state.has_fragments() && !state.root().is_some_and(folder_is_gone) =>
+                {
+                    siblings.push((*state_ref, state));
+                }
+                Ok(_) => {}
+                // One this build cannot read is no place to start from.
+                Err(error) if error.is_unusable_file() => {}
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        drop(snapshot);
+        if siblings.is_empty() {
+            return Ok(None);
+        }
+        checkpoint()?;
+        let started = Instant::now();
+        let scanned = scan(&self.root, &self.layer.policy, None, &ContentOnly)
+            .map_err(|error| DataError::Scan(error.to_string()))?;
+        let Some((sibling_ref, sibling, differing)) = siblings
+            .into_iter()
+            .map(|(state_ref, state)| {
+                let differing = changed_members(&state, &scanned.state).len();
+                (state_ref, state, differing)
+            })
+            .min_by_key(|(_, _, differing)| *differing)
+        else {
+            return Ok(None);
+        };
+        let paths = scanned.state.paths().len().max(sibling.paths().len());
+        if differing * 4 > paths {
+            return Ok(None);
+        }
+        // The sibling's records, with this checkout's stat for each path
+        // whose member is the same, so serving the state reads only the
+        // files that differ. Another file's stat never proves a file
+        // unchanged: it names another file id.
+        let records = sibling
+            .paths()
+            .iter()
+            .map(|record| match scanned.state.get(&record.path) {
+                Some(now) if same_member(record, now) => PathRecord {
+                    stat: now.stat,
+                    ..record.clone()
+                },
+                _ => record.clone(),
+            })
+            .collect::<Vec<_>>();
+        let fragments = (0..records.len())
+            .map(|index| sibling.fragment(index))
+            .collect();
+        let start =
+            CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
+                .map_err(DataError::store)?
+                .with_root_of(&scanned.state)
+                .with_fragments(fragments)
+                .map_err(DataError::store)?;
+        let scan_ms = elapsed_ms(started);
+        checkpoint()?;
+
+        let mut session = self.writer()?;
+        if session.base().checkout(self.checkout).is_some() {
+            // Another process published this checkout meanwhile: serve that.
+            drop(session);
+            self.adopt_newest()?;
+            return Ok(Some(BuildReport {
+                superseded: true,
+                ..BuildReport::default()
+            }));
+        }
+        if session.base().checkout(sibling_ref.checkout) != Some(&sibling_ref) {
+            return Ok(None);
+        }
+        let written = session
+            .write_checkout_state(self.checkout, &start)
+            .map_err(DataError::store)?;
+        session
+            .publish(&Publication {
+                states: vec![written],
+                ..Publication::default()
+            })
+            .map_err(DataError::store)?;
+        drop(session);
+        // Served as a bind serves a publication: what differs from it on
+        // disk is recorded as changes, and text queries read those at once.
+        self.adopt_newest()?;
+        let text_ready_ms = elapsed_ms(build_started);
+        checkpoint()?;
+        let started = Instant::now();
+        self.refresh_callgraph()?;
+        let resolve_ms = elapsed_ms(started);
+        let started = Instant::now();
+        let delta = self.publish_changes_as(true)?;
+        let publish_ms = elapsed_ms(started);
+        let segment_bytes = self
+            .family
+            .snapshot()
+            .map_err(DataError::store)?
+            .manifest()
+            .segments()
+            .iter()
+            .map(|entry| entry.len)
+            .sum();
+        Ok(Some(BuildReport {
+            files: start.paths().len(),
+            started_from_sibling: Some(differing),
+            shared: delta.as_ref().map(|delta| delta.shared).unwrap_or_default(),
+            text_units: delta.as_ref().map_or(0, |delta| delta.text_units),
+            scan_ms,
+            resolve_ms,
+            publish_ms,
+            text_ready_ms: Some(text_ready_ms),
+            segment_bytes,
+            retired_segments: delta.as_ref().map_or(0, |delta| delta.retired_segments),
+            retired_checkouts: delta.as_ref().map_or(0, |delta| delta.retired_checkouts),
+            ..BuildReport::default()
+        }))
+    }
+
+    /// The content records the family's newest generation stores, for a
+    /// build's scan to read instead of parsing those files again. A
+    /// segment this build cannot use is left out: its files are parsed.
+    fn stored_records(&self) -> Result<StoredRecords, DataError> {
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let known = known_sections();
+        let mut segments = Vec::new();
+        for entry in snapshot.manifest().segments() {
+            match snapshot.open_shared_segment(entry.id, &known, &self.layer.cache) {
+                Ok(segment) => segments.push(segment),
+                Err(error) if error.is_unusable_file() => {}
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        Ok(StoredRecords {
+            _snapshot: Some(snapshot),
+            segments,
+        })
     }
 
     /// Waits up to [`WRITER_WAIT`] for the store's writer, and refuses it
@@ -2229,13 +2420,20 @@ impl Checkout {
     ///
     /// When the store cannot be written; nothing is published then.
     pub fn publish_changes(&self) -> Result<Option<DeltaReport>, DataError> {
+        self.publish_changes_as(false)
+    }
+
+    /// [`Self::publish_changes`]; `by_build` when the build running now
+    /// publishes them itself, having started from another checkout's state
+    /// ([`Self::start_from_sibling`]).
+    fn publish_changes_as(&self, by_build: bool) -> Result<Option<DeltaReport>, DataError> {
         let started = Instant::now();
         let (published, changes, covered, text) = {
             let live = self.live.read().expect("no panics while holding it");
             let Some(published) = live.published.clone() else {
                 return Ok(None);
             };
-            if live.building || live.changes.is_empty() || !published.graph_built {
+            if (live.building && !by_build) || live.changes.is_empty() || !published.graph_built {
                 return Ok(None);
             }
             (
@@ -3638,9 +3836,7 @@ fn with_changes(base: &CheckoutState, changes: &BTreeMap<Vec<u8>, Change>) -> Ch
 /// Paths whose member differs between two states of one checkout: added,
 /// removed, or changed in content, kind, mode or link target.
 fn changed_members(before: &CheckoutState, after: &CheckoutState) -> Vec<Vec<u8>> {
-    let same = |a: &PathRecord, b: &PathRecord| {
-        a.kind == b.kind && a.content == b.content && a.mode == b.mode && a.link == b.link
-    };
+    let same = same_member;
     let mut changed = BTreeSet::new();
     for record in before.paths() {
         match after.get(&record.path) {
@@ -3656,6 +3852,20 @@ fn changed_members(before: &CheckoutState, after: &CheckoutState) -> Vec<Vec<u8>
         }
     }
     changed.into_iter().collect()
+}
+
+/// Whether two records of one path describe the same member: the same
+/// content, kind, mode and link target, whatever their stat says.
+fn same_member(a: &PathRecord, b: &PathRecord) -> bool {
+    a.kind == b.kind && a.content == b.content && a.mode == b.mode && a.link == b.link
+}
+
+/// A scan's sink that keeps nothing: the scan records each file's content
+/// key, and nothing else is needed from the bytes it reads.
+struct ContentOnly;
+
+impl ContentSink for ContentOnly {
+    fn read(&self, _path: &[u8], _key: ContentKey, _kind: ContentKind, _bytes: &[u8]) {}
 }
 
 /// Whether `record` is a text file in a parsed language that has no
@@ -3868,6 +4078,34 @@ struct BuildSink {
     /// Each extracted record, by the parse key the resolver uses.
     records: Mutex<HashMap<String, (RecordKey, Arc<ContentRecord>)>>,
     failures: std::sync::atomic::AtomicUsize,
+    /// The records the family already stores, read instead of parsing a
+    /// file again, and how many were.
+    stored: StoredRecords,
+    reused: std::sync::atomic::AtomicUsize,
+}
+
+/// The content records the family stores, which a build reads instead of
+/// parsing a file again: a record's key names its content, language and
+/// extractor version, so the stored one is what extraction would give.
+#[derive(Default)]
+struct StoredRecords {
+    /// Held so the segments' files stay on disk while the build reads them.
+    _snapshot: Option<Snapshot>,
+    /// Newest last.
+    segments: Vec<Arc<Segment>>,
+}
+
+impl StoredRecords {
+    /// The stored record with `key`, from the newest segment holding it. A
+    /// segment that fails to read counts as not holding it, so the file is
+    /// parsed instead.
+    fn record(&self, key: RecordKey) -> Option<ContentRecord> {
+        self.segments.iter().rev().find_map(|segment| {
+            let content = ContentSegment::open(segment).ok().flatten()?;
+            let ordinal = content.find(key).ok().flatten()?;
+            content.record(ordinal).ok()
+        })
+    }
 }
 
 /// A build sink's results, after the scan.
@@ -3877,6 +4115,8 @@ struct Collected {
     languages: HashMap<Vec<u8>, String>,
     records: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     failures: usize,
+    /// Records read from the store rather than parsed.
+    reused: usize,
 }
 
 impl BuildSink {
@@ -3903,6 +4143,7 @@ impl BuildSink {
                 .into_inner()
                 .expect("no panics while holding it"),
             failures: self.failures.into_inner(),
+            reused: self.reused.into_inner(),
         }
     }
 }
@@ -3960,7 +4201,15 @@ impl ContentSink for BuildSink {
         {
             return;
         }
-        match extract(bytes, &language) {
+        let extracted = match self.stored.record(record_key) {
+            Some(record) => {
+                self.reused
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(record)
+            }
+            None => extract(bytes, &language),
+        };
+        match extracted {
             Ok(record) => {
                 self.records
                     .lock()
@@ -5227,8 +5476,10 @@ pub fn other() { callee(); }
         assert_eq!(view.status().unparsed, 0, "a bundle is not a gap");
     }
 
-    /// A second worktree of a repository stores only what the first one's
-    /// segment does not already hold, and answers as a cold build does.
+    /// A second worktree of a repository, built whole, stores only what the
+    /// first one's segment does not already hold, and answers as a cold
+    /// build does. It differs from the first in half its files, so it is
+    /// built whole rather than started from the first one's publication.
     /// Once the first worktree's folder is gone, the second one's next build
     /// stores everything again and retires the first one's segments.
     #[test]
@@ -5243,6 +5494,7 @@ pub fn other() { callee(); }
             "src/util.rs",
             "pub fn callee() {}\npub fn helper() { callee(); }\n",
         );
+        write(b.path(), "notes.txt", "something to see\n");
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
         let first = Checkout::bind(Arc::clone(&layer), store.path(), family(), a.path()).unwrap();
         let built_first = first.build().unwrap();
@@ -5254,10 +5506,11 @@ pub fn other() { callee(); }
 
         let second = Checkout::bind(Arc::clone(&layer), store.path(), family(), b.path()).unwrap();
         let built = second.build().unwrap();
-        // `Cargo.toml`, `src/lib.rs` and `notes.txt` are the same in both
-        // worktrees, and so is how `src/lib.rs` resolves; `src/util.rs`
-        // differs.
-        assert_eq!(built.shared.text_units, 3, "{built:?}");
+        assert_eq!(built.started_from_sibling, None, "{built:?}");
+        // `Cargo.toml` and `src/lib.rs` are the same in both worktrees, and
+        // so is how `src/lib.rs` resolves; `src/util.rs` and `notes.txt`
+        // differ.
+        assert_eq!(built.shared.text_units, 2, "{built:?}");
         assert_eq!(built.shared.records, 2, "{built:?}");
         assert_eq!(built.shared.fragments, 1, "{built:?}");
         let view = second.view().unwrap();
@@ -5266,7 +5519,7 @@ pub fn other() { callee(); }
             callers.contains("caller") && callers.contains("helper"),
             "{callers}"
         );
-        assert_eq!(candidates_for(&view, "nothing to see"), ["notes.txt"]);
+        assert_eq!(candidates_for(&view, "something to see"), ["notes.txt"]);
         drop(view);
 
         // As a cold build of the same folder answers.
@@ -5416,6 +5669,7 @@ pub fn other() { callee(); }
         dir: tempfile::TempDir,
         files: BTreeMap<String, String>,
         checkout: Checkout,
+        built: BuildReport,
     }
 
     impl Worktree {
@@ -5424,12 +5678,23 @@ pub fn other() { callee(); }
             for (path, text) in &files {
                 write(dir.path(), path, text);
             }
+            Self::bind(layer, store, dir, files)
+        }
+
+        /// Binds and builds the checkout at `dir`, which holds `files`.
+        fn bind(
+            layer: &Arc<DataLayer>,
+            store: &Path,
+            dir: tempfile::TempDir,
+            files: BTreeMap<String, String>,
+        ) -> Self {
             let checkout = Checkout::bind(Arc::clone(layer), store, family(), dir.path()).unwrap();
-            checkout.build().unwrap();
+            let built = checkout.build().unwrap();
             Self {
                 dir,
                 files,
                 checkout,
+                built,
             }
         }
 
@@ -5590,6 +5855,180 @@ pub fn other() { callee(); }
         assert!(
             callers.contains("g59w0") || callers.contains("g58w1"),
             "{callers}"
+        );
+    }
+
+    /// Every caller of the functions the sibling tests' repository declares,
+    /// and a few text searches, as `view` answers them.
+    fn sibling_answers(view: &CheckoutView) -> Vec<String> {
+        let mut answers = Vec::new();
+        for (file, symbol) in [
+            ("packages/lib/index.ts", "helper"),
+            ("src/util.ts", "util"),
+            ("src/f3.ts", "f3"),
+            ("src/extra.ts", "extra"),
+        ] {
+            answers.push(format!(
+                "{file} {symbol}: {}",
+                callers_of(view, file, symbol)
+            ));
+        }
+        for pattern in ["helper", "util", "extra", "nothing to see"] {
+            answers.push(format!("{pattern}: {:?}", candidates_for(view, pattern)));
+        }
+        answers
+    }
+
+    /// A cold build's answers for the checkout at `root`.
+    fn cold_sibling_answers(layer: &Arc<DataLayer>, root: &Path) -> Vec<String> {
+        let store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(layer), store.path(), family(), root).unwrap();
+        let built = cold.build().unwrap();
+        assert_eq!(built.started_from_sibling, None);
+        sibling_answers(&cold.view().unwrap())
+    }
+
+    /// A new worktree starts from the published checkout its files differ
+    /// from least and resolves only what differs, instead of parsing and
+    /// resolving everything: a worktree with the same files differs in
+    /// nothing; one whose workspace package was renamed, with a file added,
+    /// a file removed and a link that now leaves the checkout, differs in
+    /// those four paths. Each answers as a cold build of its files does,
+    /// and keeps doing so after an edit. One that differs in more than a
+    /// quarter of its paths is built whole, reading the records the store
+    /// already holds instead of parsing those files again.
+    #[test]
+    fn a_new_worktree_starts_from_its_closest_sibling() {
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        let mut add = |path: &str, text: &str| {
+            files.insert(path.to_string(), text.to_string());
+        };
+        add(
+            "package.json",
+            "{ \"name\": \"demo\", \"private\": true, \"workspaces\": [\"packages/*\"] }\n",
+        );
+        add(
+            "packages/lib/package.json",
+            "{ \"name\": \"lib-a\", \"main\": \"index.ts\" }\n",
+        );
+        add("packages/lib/index.ts", "export function helper() {}\n");
+        add(
+            "src/main.ts",
+            "import { helper } from 'lib-a';\nimport { util } from './util';\nexport function main() { helper(); util(); }\n",
+        );
+        add("src/util.ts", "export function util() {}\n");
+        add(
+            "src/via_link.ts",
+            "import { util } from './linked';\nexport function viaLink() { util(); }\n",
+        );
+        add("notes.txt", "nothing to see\n");
+        for index in 0..24 {
+            add(
+                &format!("src/f{index}.ts"),
+                &format!(
+                    "import {{ util }} from './util';\nexport function f{index}() {{ util(); }}\n"
+                ),
+            );
+        }
+        let main_dir = tempfile::tempdir().unwrap();
+        for (path, text) in &files {
+            write(main_dir.path(), path, text);
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("util.ts", main_dir.path().join("src/linked.ts")).unwrap();
+        let main = Worktree::bind(&layer, store.path(), main_dir, files.clone());
+        assert_eq!(
+            main.built.started_from_sibling, None,
+            "nothing to start from"
+        );
+        assert!(callers_of(
+            &main.checkout.view().unwrap(),
+            "packages/lib/index.ts",
+            "helper"
+        )
+        .contains("main"));
+
+        let same_dir = tempfile::tempdir().unwrap();
+        for (path, text) in &files {
+            write(same_dir.path(), path, text);
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("util.ts", same_dir.path().join("src/linked.ts")).unwrap();
+        let same = Worktree::bind(&layer, store.path(), same_dir, files.clone());
+        assert_eq!(same.built.started_from_sibling, Some(0), "{:?}", same.built);
+        assert_eq!(
+            sibling_answers(&same.checkout.view().unwrap()),
+            cold_sibling_answers(&layer, same.dir.path())
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "util.ts", "export function util() {}\n");
+        let mut changed = files.clone();
+        changed.insert(
+            "packages/lib/package.json".to_string(),
+            "{ \"name\": \"lib-b\", \"main\": \"index.ts\" }\n".to_string(),
+        );
+        changed.insert(
+            "src/extra.ts".to_string(),
+            "import { util } from './util';\nexport function extra() { util(); }\n".to_string(),
+        );
+        changed.remove("notes.txt");
+        let changed_dir = tempfile::tempdir().unwrap();
+        for (path, text) in &changed {
+            write(changed_dir.path(), path, text);
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path().join("util.ts"),
+            changed_dir.path().join("src/linked.ts"),
+        )
+        .unwrap();
+        let mut worktree = Worktree::bind(&layer, store.path(), changed_dir, changed);
+        let differing = if cfg!(unix) { 4 } else { 3 };
+        assert_eq!(
+            worktree.built.started_from_sibling,
+            Some(differing),
+            "{:?}",
+            worktree.built
+        );
+        let ours = sibling_answers(&worktree.checkout.view().unwrap());
+        assert_eq!(ours, cold_sibling_answers(&layer, worktree.dir.path()));
+        assert!(
+            !ours[0].contains("main"),
+            "the renamed package no longer serves main.ts's import: {ours:?}"
+        );
+        assert_ne!(
+            ours,
+            sibling_answers(&main.checkout.view().unwrap()),
+            "the worktree answers for its own files"
+        );
+        // An edit then goes through as in any checkout.
+        worktree.edit(&[(
+            "src/extra.ts".to_string(),
+            "export function extra() {}\n".to_string(),
+        )]);
+        assert_eq!(
+            sibling_answers(&worktree.checkout.view().unwrap()),
+            cold_sibling_answers(&layer, worktree.dir.path())
+        );
+
+        // Most files differ: built whole, reading the stored records of
+        // the files that do not.
+        let mut far = files.clone();
+        for index in 0..10 {
+            far.insert(
+                format!("src/f{index}.ts"),
+                format!("export function f{index}() {{}}\n"),
+            );
+        }
+        let far = Worktree::new(&layer, store.path(), far);
+        assert_eq!(far.built.started_from_sibling, None, "{:?}", far.built);
+        assert!(far.built.stored_records > 0, "{:?}", far.built);
+        assert_eq!(
+            sibling_answers(&far.checkout.view().unwrap()),
+            cold_sibling_answers(&layer, far.dir.path())
         );
     }
 
