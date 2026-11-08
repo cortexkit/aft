@@ -79,6 +79,14 @@ fn take_from(repo: &Path, rev: &str, other: &str, files: usize, dir: &Path) -> V
 }
 
 /// User and system CPU seconds this process has spent, its threads included.
+/// Windows has no getrusage; the probe reports 0 there and wall time only.
+#[cfg(not(unix))]
+fn cpu_seconds() -> f64 {
+    0.0
+}
+
+/// User and system CPU seconds this process has spent, its threads included.
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     // SAFETY: getrusage only fills the struct it is given.
     let usage = unsafe {
