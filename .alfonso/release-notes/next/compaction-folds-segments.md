@@ -1,0 +1,1 @@
+- A busy worktree that piles up index changes no longer rebuilds its whole index to tidy them up: AFT now combines the stored pieces into one without rereading or reparsing any file. Restarts with many active worktrees use far less memory and CPU.

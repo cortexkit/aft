@@ -9,8 +9,8 @@
 //! edit is then written to disk, recorded and resolved, as a reader that
 //! asks for the call graph after every edit would have it. The changes are
 //! published once more than 64 paths changed and at every commit end (the
-//! checkout going quiet), and the checkout is built again whole once it
-//! reads from too many segments (`DeltaReport::wants_build`), as the runtime
+//! checkout going quiet), and the checkout's segments are folded once it
+//! reads from too many (`DeltaReport::wants_fold`), as the runtime
 //! does. At every
 //! commit end the allocator's free pages are handed back to the system, as
 //! the daemon's allocator relief does.
@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aft::data_layer::checkout::{Checkout, DataLayer};
+use aft::data_layer::checkout::{Checkout, DataLayer, Folded};
 use aft_store::ids::{Digest128, FamilyId};
 
 /// Paths changed past which the runtime publishes the changes at once.
@@ -285,14 +285,22 @@ fn sample(
     })
 }
 
-/// Publishes the checkout's changes, and builds it again whole once it
-/// reads from too many segments, as the runtime does. Returns what it did.
+/// Publishes the checkout's changes, and folds its segments once it reads
+/// from too many, as the runtime does (building it again whole when the
+/// fold cannot run). Returns what it did.
 fn publish(checkout: &Checkout) -> Option<String> {
     let report = checkout.publish_changes().unwrap()?;
-    if report.wants_build() {
-        checkout.build().unwrap();
+    if report.wants_fold() {
+        let folded = match checkout.fold().unwrap() {
+            Folded::Done(_) => "folded",
+            Folded::Superseded => "stood down",
+            Folded::NeedsBuild(_) => {
+                checkout.build().unwrap();
+                "built again"
+            }
+        };
         return Some(format!(
-            "published and built again ({} segments)",
+            "published and {folded} ({} segments)",
             report.segments
         ));
     }
