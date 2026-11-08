@@ -100,8 +100,7 @@ impl DeadCodeSources {
     /// once the view is published and its call graph has no changes
     /// pending.
     pub(crate) fn snapshot(&self, project_root: &Path) -> DeadCodeSnapshot {
-        let Some(checkout) = self.checkout(project_root)
-        else {
+        let Some(checkout) = self.checkout(project_root) else {
             return DeadCodeSnapshot::Building;
         };
         // The call graph is refreshed lazily, so ask for the edits recorded

@@ -431,7 +431,9 @@ mod tests {
         let output = text(output);
         for name in ["semantic/key-1", "semantic/key-2", "views"] {
             // Joined part by part, so Windows gets its own separators.
-            let path = name.split('/').fold(storage.clone(), |path, part| path.join(part));
+            let path = name
+                .split('/')
+                .fold(storage.clone(), |path, part| path.join(part));
             assert!(
                 output.contains(&format!("Deleted {}.", path.display())),
                 "{output}"
