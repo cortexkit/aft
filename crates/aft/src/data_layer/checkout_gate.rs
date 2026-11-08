@@ -41,7 +41,11 @@
 //! (paths, parses, configuration), every file's answers, recorded reads and
 //! fragment bytes, and [`LiveCheckout::stale_recordings`]. At a commit end
 //! that publishes, A is compared before and after publishing, and a second
-//! handle bound fresh over the same store is compared too. Runs from
+//! handle bound fresh over the same store is compared too; then a new
+//! worktree is made from A's folder with the next commit's edits, as a
+//! worker branched from A, and its first build, which starts from the
+//! closest publication of the family, is compared as well (Unix only: the
+//! copy keeps the probe's symlinks). Runs from
 //! `examples/checkout_gate.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -953,6 +957,93 @@ fn read_pack(
     Ok((base, commits))
 }
 
+/// Copies the folder `from` into `to`, symlinks as symlinks, leaving out
+/// Git's own folder.
+#[cfg(unix)]
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|error| error.to_string())?;
+    for entry in std::fs::read_dir(from).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_symlink() {
+            let link = std::fs::read_link(&source).map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink(link, &target).map_err(|error| error.to_string())?;
+        } else if kind.is_dir() {
+            if entry.file_name() != ".git" {
+                copy_tree(&source, &target)?;
+            }
+        } else {
+            std::fs::copy(&source, &target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes a new worktree from the folder at `from` holding `files`, with
+/// `edits` made in it, as a worker branched from that checkout and a commit
+/// ahead of it; binds and builds it, which starts from the closest
+/// publication of the family, and compares it with a cold build of its
+/// folder. `probe` is the probe's state as `Cold::build` takes it.
+#[cfg(unix)]
+fn new_worktree(
+    layer: &Arc<DataLayer>,
+    family: FamilyId,
+    bind: &dyn Fn(&Path) -> Result<Checkout, String>,
+    (from, from_files): (&Path, &Files),
+    edits: &[Edit],
+    probe: (bool, bool),
+    commit: usize,
+) -> Result<CommitRecord, String> {
+    let scratch = Scratch::new(&format!("worktree-{commit}"))?;
+    let root = scratch.path().join("w");
+    copy_tree(from, &root)?;
+    git_repository(&root)?;
+    let root = std::fs::canonicalize(&root).map_err(|error| error.to_string())?;
+    // The gate's account of the new worktree's files: A's, read from the
+    // copy, then the edits.
+    let mut files = Files::default();
+    for record in from_files.inputs().state.paths() {
+        let Ok(path) = std::str::from_utf8(&record.path) else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(root.join(path)) {
+            files.set(path, &text)?;
+        }
+    }
+    for edit in edits {
+        edit.apply(&root, &mut files)?;
+    }
+    let checkout = bind(&root)?;
+    let started = Instant::now();
+    let built = checkout.build().map_err(|error| error.to_string())?;
+    let build_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut record = CommitRecord {
+        commit,
+        checkout: "new worktree".to_string(),
+        serving: "its first build".to_string(),
+        events: vec![format!(
+            "made from A's folder with the next commit's {} edits; built in {build_ms:.0} ms, \
+             {:?} paths differing from the publication it started from",
+            edits.len(),
+            built.started_from_sibling
+        )],
+        ..CommitRecord::default()
+    };
+    let cold = Cold::build(
+        layer,
+        family,
+        &root,
+        &format!("cold-worktree-{commit}"),
+        probe,
+    )?;
+    cold.compare(&checkout, &files, &mut record)?;
+    if built.started_from_sibling.is_none() {
+        record.failure = Some("the new worktree did not start from a sibling".to_string());
+    }
+    Ok(record)
+}
+
 /// The segment files in the family store at `family_dir`.
 fn segment_files(family_dir: &Path) -> usize {
     std::fs::read_dir(family_dir.join("segments"))
@@ -1182,6 +1273,9 @@ pub struct Summary {
     /// The most segments the family store held after a publication of A's
     /// changes.
     pub most_store_segments: usize,
+    /// New worktrees whose first build started from another checkout's
+    /// publication, each compared with a cold build.
+    pub sibling_starts: usize,
 }
 
 impl Summary {
@@ -1492,6 +1586,25 @@ pub fn run(pack: &Path, threads: usize, out: &mut dyn std::io::Write) -> Result<
             record.segment_files = segment_files(&family_dir);
             summary.emit(out, &record)?;
             sample!("a published and bound again, compared", commit, "cold" => &cold.checkout, "a bound again" => &fresh);
+            // A new worktree made from A's folder and at the commit after
+            // A's, as a worker branched from A: its first build starts
+            // from the closest publication and must answer as a cold build
+            // of its own folder does.
+            #[cfg(unix)]
+            if let Some((_, next)) = commits.get(index + 1) {
+                let record = new_worktree(
+                    &layer,
+                    family,
+                    &bind,
+                    (&a_root, &a_files),
+                    next,
+                    (index >= 1, index > restart_at),
+                    commit,
+                )?;
+                summary.sibling_starts += 1;
+                summary.emit(out, &record)?;
+                release_free_memory();
+            }
         }
         drop(cold);
         release_free_memory();

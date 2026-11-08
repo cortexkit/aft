@@ -29,14 +29,15 @@ fn main() {
     eprintln!(
         "compared checkouts with cold builds {} times; {} differed; {} publications of changes, \
          {} builds that folded A's segments (at most {} segments only A read, {} in all, {} in \
-         the store)",
+         the store); {} new worktrees started from a sibling",
         summary.comparisons,
         summary.failed,
         summary.publications,
         summary.compactions,
         summary.most_segments,
         summary.most_read_segments,
-        summary.most_store_segments
+        summary.most_store_segments,
+        summary.sibling_starts
     );
     assert!(summary.comparisons > 0, "nothing was compared");
     assert_eq!(summary.failed, 0, "a checkout differs from a cold build");
