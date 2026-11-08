@@ -96,6 +96,24 @@ impl DeadCodeSources {
             .is_none_or(|view| !view.status().callgraph_published)
     }
 
+    /// Drops the dead-code snapshot every bound checkout's current view keeps
+    /// between requests; the next request builds it again. Returns how many
+    /// were held.
+    pub(crate) fn release_dead_code_snapshots(&self) -> usize {
+        let checkouts = self
+            .checkouts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        checkouts
+            .iter()
+            .filter_map(|checkout| checkout.view())
+            .filter(|view| view.release_dead_code_snapshot())
+            .count()
+    }
+
     /// The dead-code snapshot of `project_root` from its checkout's view,
     /// once the view is published and its call graph has no changes
     /// pending.

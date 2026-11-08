@@ -1105,6 +1105,17 @@ fn handle_inspect_payload(
             crate::inspect::job::attach_dead_code_language_coverage(payload, &files);
         }
     }
+    // Dead code and unused exports read the dead-code graph, which this
+    // request built or reused. It is released once no request has read it
+    // for a while.
+    if [InspectCategory::DeadCode, InspectCategory::UnusedExports]
+        .iter()
+        .any(|category| {
+            snapshot.config.inspect.category_enabled(*category) && outcomes.contains_key(category)
+        })
+    {
+        manager.note_dead_code_request(Instant::now());
+    }
     // Truthful fleet-status values update from whatever this collection proved,
     // even when the freshness gate below refuses the payload: a verified count
     // stays verified, and pending or failed categories remain absent rather

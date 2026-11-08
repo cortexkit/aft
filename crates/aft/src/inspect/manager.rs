@@ -43,6 +43,24 @@ fn inspect_category_is_off(
     category.is_active() && !config.category_enabled(category)
 }
 
+/// How long the dead-code graph a request builds stays in memory without
+/// another dead-code request. Dead code and unused exports read it; it holds
+/// hundreds of MB on a large repository, and nothing else uses it, so an
+/// agent that stopped asking for dead code does not keep paying for it. The
+/// next request builds it again.
+pub(crate) const DEAD_CODE_GRAPH_IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
+
+/// What [`InspectManager::release_idle_dead_code_graph`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadCodeGraphRelease {
+    /// No dead-code request is outstanding: nothing to release.
+    NotHeld,
+    /// The graph was released.
+    Released,
+    /// The graph stays; check again after this long.
+    KeepFor(Duration),
+}
+
 type WaiterTx = Sender<JobOutcome>;
 type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 
@@ -683,6 +701,11 @@ pub struct InspectManager {
     /// The data-layer checkouts dead code reads its call graph from while
     /// they are ready; empty unless the process runs the data layer.
     data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
+    /// When an `aft_inspect` that read the dead-code graph last finished;
+    /// `None` once the graph was released, or before any such request.
+    last_dead_code_request: Mutex<Option<Instant>>,
+    /// Set while a thread is waiting to release the dead-code graph.
+    dead_code_release_armed: AtomicBool,
     /// How many dead-code passes are waiting for their call graph right now:
     /// for it to be published, or to catch up with recorded edits. A pass
     /// that is building but not waiting is working out dead code itself.
@@ -850,6 +873,8 @@ impl InspectManager {
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
             data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
+            last_dead_code_request: Mutex::new(None),
+            dead_code_release_armed: AtomicBool::new(false),
             dead_code_callgraph_waits: AtomicUsize::new(0),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
@@ -1743,6 +1768,104 @@ impl InspectManager {
         checkout: &Arc<crate::data_layer::runtime::DataCheckout>,
     ) {
         self.data_layer_dead_code.bind(project_root, checkout);
+    }
+
+    /// Note that an `aft_inspect` which read the dead-code graph finished at
+    /// `now`, and make sure a thread will release the graph once it has gone
+    /// [`DEAD_CODE_GRAPH_IDLE_RELEASE`] without another such request.
+    pub(crate) fn note_dead_code_request(self: &Arc<Self>, now: Instant) {
+        self.record_dead_code_request(now);
+        if self.dead_code_release_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let manager = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("aft-dead-code-release".into())
+            .spawn(move || loop {
+                // Hold the manager only while checking, so a dropped root
+                // ends the thread at its next wake-up.
+                let Some(current) = manager.upgrade() else {
+                    return;
+                };
+                match current.release_idle_dead_code_graph(Instant::now()) {
+                    DeadCodeGraphRelease::KeepFor(wait) => {
+                        drop(current);
+                        std::thread::sleep(wait);
+                    }
+                    DeadCodeGraphRelease::Released | DeadCodeGraphRelease::NotHeld => {
+                        current
+                            .dead_code_release_armed
+                            .store(false, Ordering::SeqCst);
+                        // A request noted while this thread was deciding found
+                        // it armed and started none; keep watching for it.
+                        let pending = current
+                            .last_dead_code_request
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some();
+                        if !pending || current.dead_code_release_armed.swap(true, Ordering::SeqCst)
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.dead_code_release_armed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Record a dead-code request at `now` without arming the release thread.
+    pub(crate) fn record_dead_code_request(&self, now: Instant) {
+        *self
+            .last_dead_code_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+    }
+
+    /// Release the dead-code graph once [`DEAD_CODE_GRAPH_IDLE_RELEASE`] has
+    /// passed since the last dead-code request, as of `now`: the call-graph
+    /// projection, the Oxc facts and the dead-code snapshot each bound
+    /// checkout's view keeps. A dead-code or unused-exports run still in
+    /// flight keeps the graph until it finishes.
+    pub(crate) fn release_idle_dead_code_graph(&self, now: Instant) -> DeadCodeGraphRelease {
+        let mut last = self
+            .last_dead_code_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(requested_at) = *last else {
+            return DeadCodeGraphRelease::NotHeld;
+        };
+        let idle = now.saturating_duration_since(requested_at);
+        if idle < DEAD_CODE_GRAPH_IDLE_RELEASE {
+            return DeadCodeGraphRelease::KeepFor(DEAD_CODE_GRAPH_IDLE_RELEASE - idle);
+        }
+        let reading_graph = self.in_flight.lock().is_ok_and(|in_flight| {
+            in_flight.keys().any(|key| {
+                matches!(
+                    key.category,
+                    InspectCategory::DeadCode | InspectCategory::UnusedExports
+                )
+            })
+        });
+        if reading_graph {
+            return DeadCodeGraphRelease::KeepFor(Duration::from_secs(60));
+        }
+        *last = None;
+        drop(last);
+        self.clear_callgraph_projection();
+        if let Ok(mut facts) = self.oxc_facts_cache.lock() {
+            *facts = OxcFactsCache::new();
+        }
+        let snapshots = self.data_layer_dead_code.release_dead_code_snapshots();
+        crate::slog_info!(
+            "dead-code graph released after {} idle minutes: checkout snapshots={snapshots}",
+            DEAD_CODE_GRAPH_IDLE_RELEASE.as_secs() / 60
+        );
+        // Return what the graph held to the system rather than leaving it as
+        // free allocator space.
+        crate::memory::spawn_allocator_slack_relief_if_due(Instant::now());
+        DeadCodeGraphRelease::Released
     }
 
     /// Build the dead-code snapshot and report how it was produced, so the
@@ -6120,6 +6243,73 @@ mod guard_tests {
                 .any(|export| export.symbol == "neverCalled"),
             "dead-code inputs must include the decodable files"
         );
+    }
+
+    /// The dead-code graph a request builds stays in memory for
+    /// `DEAD_CODE_GRAPH_IDLE_RELEASE` after the last dead-code request, is
+    /// released then, and is built again by the next request. The clock is
+    /// passed in, so the test does not wait out the period.
+    #[test]
+    fn dead_code_graph_is_released_after_ten_idle_minutes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canonicalize_for_snapshot(dir.path());
+        write_projection_cache_file(
+            &root.join("src/main.ts"),
+            "import { used } from './target';\nexport function main() { used(); }\n",
+        );
+        write_projection_cache_file(
+            &root.join("src/target.ts"),
+            "export function used() {}\nexport function neverCalled() {}\n",
+        );
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let storage = tempfile::tempdir().expect("storage");
+        let manager = InspectManager::new();
+        let checkout = bind_published_call_graph(&manager, &root, storage.path());
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let build = || {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+                .expect("dead-code snapshot")
+        };
+        let held = || {
+            checkout
+                .view()
+                .expect("published view")
+                .dead_code_snapshot_held()
+        };
+        assert_eq!(
+            manager.release_idle_dead_code_graph(Instant::now()),
+            DeadCodeGraphRelease::NotHeld
+        );
+
+        drop(build());
+        assert!(held(), "a request keeps the graph for the next one");
+        let requested_at = Instant::now();
+        manager.record_dead_code_request(requested_at);
+        let almost = requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE - Duration::from_secs(1);
+        assert_eq!(
+            manager.release_idle_dead_code_graph(almost),
+            DeadCodeGraphRelease::KeepFor(Duration::from_secs(1))
+        );
+        assert!(held(), "the graph stays until ten idle minutes have passed");
+
+        assert_eq!(
+            manager.release_idle_dead_code_graph(requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE),
+            DeadCodeGraphRelease::Released
+        );
+        assert!(!held(), "ten idle minutes release the graph");
+        assert_eq!(
+            manager.release_idle_dead_code_graph(requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE * 2),
+            DeadCodeGraphRelease::NotHeld
+        );
+
+        assert!(
+            data_layer_snapshot_exports(&build(), &root)
+                .iter()
+                .any(|export| export.symbol == "neverCalled"),
+            "the next request builds the graph again"
+        );
+        assert!(held());
     }
 
     /// The exports a data-layer dead-code snapshot gives for its files: it

@@ -416,6 +416,16 @@ impl DeadCodeMemo {
         *slot = Some(Arc::clone(&snapshot));
         Ok(snapshot)
     }
+
+    /// Drops the built snapshot, if any, so the next request builds it
+    /// again. True when one was held.
+    fn release(&self) -> bool {
+        self.0
+            .lock()
+            .expect("no panics while holding it")
+            .take()
+            .is_some()
+    }
 }
 
 /// How long a build waits for another process to release the store's
@@ -3452,11 +3462,9 @@ impl CheckoutView {
         &self,
         section_dir: Option<PathBuf>,
     ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
-        let memo = match &self.refreshed {
-            Some(refreshed) => &refreshed.dead_code,
-            None => &self.published.dead_code,
-        };
-        let parts = memo.get_or_build(|| self.build_dead_code_snapshot())?;
+        let parts = self
+            .dead_code_memo()
+            .get_or_build(|| self.build_dead_code_snapshot())?;
         // The memo holds no view: a view holds its publication, which holds
         // the memo.
         Ok(Arc::new(crate::inspect::job::CallgraphSnapshot {
@@ -3466,6 +3474,27 @@ impl CheckoutView {
             )),
             ..crate::inspect::job::CallgraphSnapshot::clone(&parts)
         }))
+    }
+
+    /// The memo of the dead-code snapshot this view's call graph serves.
+    fn dead_code_memo(&self) -> &DeadCodeMemo {
+        match &self.refreshed {
+            Some(refreshed) => &refreshed.dead_code,
+            None => &self.published.dead_code,
+        }
+    }
+
+    /// Drops the dead-code snapshot this view's call graph keeps for later
+    /// requests (see [`Self::dead_code_snapshot_in`]); the next request
+    /// builds it again. True when one was held.
+    pub(crate) fn release_dead_code_snapshot(&self) -> bool {
+        self.dead_code_memo().release()
+    }
+
+    /// Whether this view's call graph holds a built dead-code snapshot.
+    #[cfg(test)]
+    pub(crate) fn dead_code_snapshot_held(&self) -> bool {
+        self.dead_code_memo().try_files().is_some()
     }
 
     fn build_dead_code_snapshot(
