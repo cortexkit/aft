@@ -221,7 +221,7 @@ fn load(
     let content = if source.len() as u64 > crate::cache_freshness::CONTENT_HASH_SIZE_CAP {
         ContentKey::of(source.as_bytes())
     } else {
-        ContentKey::from_hash(&content_hash)
+        ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&content_hash))
     };
     if content != record.content {
         return Ok(Outcome::Left);
