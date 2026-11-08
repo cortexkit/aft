@@ -2696,11 +2696,22 @@ impl InspectManager {
             return result;
         }
 
+        // A root whose first call graph isn't published yet has nothing to
+        // analyse; wait for that build as any exact reader does (the inspect
+        // call's own deadline may still answer pending first, naming the call
+        // graph), and answer pending only if the graph is still missing.
         if job.category == InspectCategory::DeadCode
             && job.config.indexes.callgraph
             && self.data_layer_dead_code.callgraph_busy(&job.project_root)
         {
-            return callgraph_pending_result(&job, started.elapsed());
+            let still_missing = {
+                let _waiting = CountedWait::start(&self.dead_code_callgraph_waits);
+                self.data_layer_dead_code
+                    .wait_for_first_callgraph(&job.project_root)
+            };
+            if still_missing {
+                return callgraph_pending_result(&job, started.elapsed());
+            }
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());

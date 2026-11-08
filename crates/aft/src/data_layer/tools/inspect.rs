@@ -96,6 +96,21 @@ impl DeadCodeSources {
             .is_none_or(|view| !view.status().callgraph_published)
     }
 
+    /// Waits up to [`SNAPSHOT_WAIT`] for `project_root`'s first call graph to
+    /// be published, asking for its build first, as an exact reader waits for
+    /// pending edits. Returns whether the root still has no graph: no checkout
+    /// is bound, the wait ran out, or the build failed.
+    pub(crate) fn wait_for_first_callgraph(&self, project_root: &Path) -> bool {
+        let Some(checkout) = self.checkout(project_root) else {
+            return true;
+        };
+        match checkout.fresh_view(SNAPSHOT_WAIT) {
+            crate::data_layer::runtime::Fresh::Ready(_) => false,
+            crate::data_layer::runtime::Fresh::Building
+            | crate::data_layer::runtime::Fresh::Failed(_) => self.callgraph_busy(project_root),
+        }
+    }
+
     /// Drops the dead-code snapshot every bound checkout's current view keeps
     /// between requests; the next request builds it again. Returns how many
     /// were held.
