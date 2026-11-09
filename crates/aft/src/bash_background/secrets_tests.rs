@@ -200,7 +200,12 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
     let storage = tempfile::tempdir().unwrap();
     let _launcher = native_launcher(root.path());
     let ctx = context(root.path(), storage.path());
-    ctx.update_config(|config| config.sandbox = Default::default());
+    let operator_binary = storage.path().join("operator-aft");
+    std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+    ctx.update_config(|config| {
+        config.sandbox = Default::default();
+        config.gh_shim.binary_path = Some(operator_binary);
+    });
     let requirement = SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap();
     for worker in [false, true] {
         crate::sandbox_spawn::with_worker_jail(worker, || {
