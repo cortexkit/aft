@@ -6,8 +6,9 @@ use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
 pub(crate) mod flush;
 
-// Inotify reports per-directory gaps. Recursive-handle backends currently
-// report only successful or unproved registration at construction.
+// Directories inotify could not watch when it started. Recursive-handle
+// backends (FSEvents, Windows) watch the whole tree with one handle and have
+// no per-directory gaps.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CoverageGapKind {
@@ -22,14 +23,6 @@ pub(crate) enum CoverageGapKind {
 pub(crate) struct CoverageGap {
     pub path: PathBuf,
     pub kind: CoverageGapKind,
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InitialCoverage {
-    Complete,
-    Incomplete(Vec<CoverageGap>),
-    Unproved,
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -30,7 +30,6 @@ pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     watched_directory_count: Arc<AtomicUsize>,
-    initial_coverage: super::InitialCoverage,
 }
 
 impl ProjectWatcher {
@@ -175,6 +174,17 @@ impl ProjectWatcher {
                     git_watched = watched;
                 }
             }
+        }
+        // Edits in a directory inotify couldn't watch reach the index only at
+        // the next rescan, so name the gaps where an operator will look.
+        if let Some(first) = gaps.first() {
+            crate::slog_warn!(
+                "watcher could not watch {} path(s) under {}; first: {} ({:?})",
+                gaps.len(),
+                root.display(),
+                first.path.display(),
+                first.kind
+            );
         }
         counters.bash_flush.set_marker_directory(
             if git_watched
@@ -500,11 +510,6 @@ impl ProjectWatcher {
             shutdown,
             join: Some(join),
             watched_directory_count,
-            initial_coverage: if gaps.is_empty() {
-                super::InitialCoverage::Complete
-            } else {
-                super::InitialCoverage::Incomplete(gaps)
-            },
         })
     }
 
@@ -1068,6 +1073,33 @@ pub(super) mod tests {
                 .iter()
                 .any(|gap| gap.path == root.join("child")));
         }
+    }
+
+    #[test]
+    fn initial_subscription_reports_a_directory_it_could_not_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("locked/inner")).unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        let _denied = deny_initial_listing(root.join("locked"));
+        let registration =
+            register_initial_tree(&boundary, &Arc::new(RwLock::new(None)), &[], &mut |_| {
+                Ok(true)
+            })
+            .unwrap();
+        // The directory itself is watched, but nothing under it could be
+        // found, so the gap names it and its child stays unwatched.
+        assert!(registration.watched.contains(&root.join("locked")));
+        assert!(!registration.watched.contains(&root.join("locked/inner")));
+        assert_eq!(
+            registration.gaps,
+            vec![super::super::CoverageGap {
+                path: root.join("locked"),
+                kind: super::super::CoverageGapKind::ListingFailed(
+                    std::io::ErrorKind::PermissionDenied
+                ),
+            }]
+        );
     }
 
     #[test]

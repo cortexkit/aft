@@ -161,14 +161,6 @@ pub(crate) fn boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn boot_id() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-}
-
 /// The root of the mounted filesystem holding `root`, with that
 /// filesystem's device number.
 pub(crate) fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
