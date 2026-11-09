@@ -131,24 +131,47 @@ pub(crate) enum Fresh {
     Failed(String),
 }
 
-/// When the changes since a publication are published on their own, after
-/// a refresh resolves them: at once past this many changed paths, and
-/// otherwise when the checkout goes quiet.
+/// How many changed paths warrant a publication after edits settle,
+/// rather than waiting for the longer quiet period.
 const PUBLISH_AT: usize = 64;
 
-/// A refresh also publishes once the call graph has resolved this many files
-/// again since the publication. An edit to a widely used type re-resolves
+/// Also schedule a publication once the call graph has resolved this many
+/// files again since the publication. An edit to a widely used type re-resolves
 /// hundreds of files whose callers' method calls it reaches, and the engine
 /// holds each resolution, about half a megabyte in a large repository, until
 /// the changes are published.
 const PUBLISH_AT_REFRESHED: usize = 256;
 
+/// Let the next edit's fresh-view request finish before starting a potentially
+/// expensive publication. Each recorded change restarts this window.
+const PUBLISH_SETTLE: Duration = Duration::from_secs(3);
+
+/// Bound unpublished memory even when an agent keeps editing without a
+/// settle window, measured from when a publication threshold was first met.
+const PUBLISH_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Bound resolution memory immediately when it grows too quickly to wait
+/// for either the settle window or the time cap.
+const PUBLISH_MAX_REFRESHED: usize = 4 * PUBLISH_AT_REFRESHED;
+
+fn settle_period() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("AFT_TEST_DATA_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    PUBLISH_SETTLE
+}
+
 /// Whether a refresh publishes the changes it resolved.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Publish {
-    /// Only past [`PUBLISH_AT`] changed paths, or [`PUBLISH_AT_REFRESHED`]
-    /// files resolved again.
+    /// Defer past either publication threshold, unless a memory cap is met.
     WhenMany,
+    /// Publish past either threshold once the recorded changes have settled.
+    Settled,
     /// Whenever any path changed: the checkout went quiet.
     Always,
 }
@@ -320,6 +343,14 @@ struct Work {
     folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
+    /// Timer requests survive a refresh already running when they arrive.
+    publish_requested: parking_lot::Mutex<Publish>,
+    settle: Arc<QuietTimer>,
+    many_since: parking_lot::Mutex<Option<Instant>>,
+    #[cfg(test)]
+    publication_delay: parking_lot::Mutex<Duration>,
+    #[cfg(test)]
+    publications_started: std::sync::atomic::AtomicUsize,
     /// A rescan is queued or running.
     rescanning: Arc<AtomicBool>,
     retry: std::sync::Mutex<BuildRetry>,
@@ -473,9 +504,15 @@ impl Work {
             }
             return;
         }
-        let unpublished = publish == Publish::Always && self.checkout.changed_paths() > 0;
-        if !(pending(&self.checkout) || unpublished) || self.refreshing.swap(true, Ordering::AcqRel)
+        let unpublished = publish != Publish::WhenMany && self.checkout.changed_paths() > 0;
+        if !(pending(&self.checkout) || unpublished) {
+            return;
+        }
         {
+            let mut requested = self.publish_requested.lock();
+            *requested = (*requested).max(publish);
+        }
+        if self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
         let flag = ClearOnDrop(Arc::clone(&self.refreshing));
@@ -499,7 +536,18 @@ impl Work {
                         "data layer call-graph refresh failed for {}: {error}",
                         work.checkout.root().display()
                     ),
-                    Ok(_) => work.maybe_publish(publish),
+                    Ok(_) => {
+                        let publish = std::mem::replace(
+                            &mut *work.publish_requested.lock(),
+                            Publish::WhenMany,
+                        );
+                        if pending(&work.checkout) {
+                            let mut requested = work.publish_requested.lock();
+                            *requested = (*requested).max(publish);
+                            continue;
+                        }
+                        work.maybe_publish(publish);
+                    }
                 }
                 drop(flag.take());
                 match result {
@@ -512,7 +560,9 @@ impl Work {
                     Err(_) => return,
                     Ok(_) => {}
                 }
-                if !pending(&work.checkout) || work.refreshing.swap(true, Ordering::AcqRel) {
+                if !(pending(&work.checkout) || *work.publish_requested.lock() != Publish::WhenMany)
+                    || work.refreshing.swap(true, Ordering::AcqRel)
+                {
                     return;
                 }
                 flag = Some(ClearOnDrop(Arc::clone(&work.refreshing)));
@@ -525,12 +575,44 @@ impl Work {
     /// piled up.
     fn maybe_publish(self: &Arc<Self>, publish: Publish) {
         let changed = self.checkout.changed_paths();
-        let many = changed >= PUBLISH_AT || self.checkout.refreshed_files() >= PUBLISH_AT_REFRESHED;
-        if changed == 0 || (publish == Publish::WhenMany && !many) {
+        let refreshed = self.checkout.refreshed_files();
+        let many = changed >= PUBLISH_AT || refreshed >= PUBLISH_AT_REFRESHED;
+        let capped = {
+            let mut since = self.many_since.lock();
+            if many {
+                since.get_or_insert_with(Instant::now).elapsed() >= PUBLISH_MAX_WAIT
+                    || refreshed >= PUBLISH_MAX_REFRESHED
+            } else {
+                *since = None;
+                false
+            }
+        };
+        if changed == 0 || (publish != Publish::Always && !many) {
             return;
+        }
+        if publish != Publish::Always
+            && !capped
+            && (publish == Publish::WhenMany || !self.settle.due())
+        {
+            self.settle.arm();
+            return;
+        }
+        // A change can arrive after the worker's final refresh, including
+        // while a timer request is being handled. Never start with it pending.
+        if pending(&self.checkout) {
+            let mut requested = self.publish_requested.lock();
+            *requested = (*requested).max(publish);
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.publications_started.fetch_add(1, Ordering::SeqCst);
+            let delay = *self.publication_delay.lock();
+            std::thread::sleep(delay);
         }
         match self.checkout.publish_changes() {
             Ok(Some(report)) => {
+                *self.many_since.lock() = None;
                 crate::slog_info!(
                     "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments ({} read in all, {} retired), {:.0} ms",
                     self.checkout.root().display(),
@@ -733,6 +815,7 @@ impl Work {
                 }
             }
             drop(ended);
+            work.settle.note_change();
             work.catch_up(Publish::WhenMany);
         });
     }
@@ -858,6 +941,7 @@ impl Drop for DataCheckout {
     // up to `QUIET`: its refresh would find nothing to refresh anyway.
     fn drop(&mut self) {
         self.quiet.stop();
+        self.work.settle.stop();
     }
 }
 
@@ -887,6 +971,24 @@ impl DataCheckout {
         storage: &Path,
         executor: Option<RootMaintenanceExecutor>,
         planes: Planes,
+    ) -> Result<Arc<Self>, DataError> {
+        Self::open_with_periods(
+            root,
+            storage,
+            executor,
+            planes,
+            quiet_period(),
+            settle_period(),
+        )
+    }
+
+    fn open_with_periods(
+        root: &Path,
+        storage: &Path,
+        executor: Option<RootMaintenanceExecutor>,
+        planes: Planes,
+        quiet_period: Duration,
+        settle_period: Duration,
     ) -> Result<Arc<Self>, DataError> {
         {
             let failures = bind_failures()
@@ -926,7 +1028,7 @@ impl DataCheckout {
                 return Err(error);
             }
         };
-        let work = Arc::new(Work {
+        let work = Arc::new_cyclic(|weak: &Weak<Work>| Work {
             runner: Runner {
                 root: checkout.root().to_path_buf(),
                 executor: parking_lot::Mutex::new(executor),
@@ -935,6 +1037,20 @@ impl DataCheckout {
             building: Arc::new(AtomicBool::new(false)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
+            publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
+            settle: Arc::new(QuietTimer::new(settle_period, {
+                let work = weak.clone();
+                move || {
+                    if let Some(work) = work.upgrade() {
+                        work.start_refresh(Publish::Settled);
+                    }
+                }
+            })),
+            many_since: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            publication_delay: parking_lot::Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            publications_started: std::sync::atomic::AtomicUsize::new(0),
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
@@ -944,7 +1060,7 @@ impl DataCheckout {
         });
         let quiet = {
             let work = Arc::downgrade(&work);
-            Arc::new(QuietTimer::new(quiet_period(), move || {
+            Arc::new(QuietTimer::new(quiet_period, move || {
                 if let Some(work) = work.upgrade() {
                     work.start_refresh(Publish::Always);
                     // Edited files wait for vectors of their new content.
@@ -956,6 +1072,7 @@ impl DataCheckout {
             checkout: Arc::downgrade(&work.checkout),
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
             quiet: Arc::clone(&quiet),
+            settle: Arc::clone(&work.settle),
         });
         crate::write_intent::register_listener(&listener);
         // A bind may have recorded what changed while nothing watched.
@@ -1003,6 +1120,7 @@ impl DataCheckout {
     pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
         let root = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().to_path_buf());
         record(&self.work.checkout, &root, paths);
+        self.work.settle.note_change();
         self.quiet.changed();
     }
 
@@ -1102,7 +1220,24 @@ impl QuietTimer {
     /// Notes a recorded change, and starts the timer thread unless one is
     /// waiting already.
     fn changed(self: &Arc<Self>) {
+        self.note_change();
+        self.arm();
+    }
+
+    /// Move an existing deadline without arming an idle timer. Publications
+    /// only need a settle timer once enough unpublished work has accumulated.
+    fn note_change(&self) {
         self.last_change_ms.store(self.now_ms(), Ordering::Release);
+    }
+
+    fn due(&self) -> bool {
+        self.now_ms()
+            .saturating_sub(self.last_change_ms.load(Ordering::Acquire))
+            >= u64::try_from(self.quiet.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Wait from the last recorded change, not from the end of its refresh.
+    fn arm(self: &Arc<Self>) {
         if self.sleep(Duration::ZERO) || self.armed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1238,6 +1373,7 @@ struct EditListener {
     checkout: Weak<Checkout>,
     root: PathBuf,
     quiet: Arc<QuietTimer>,
+    settle: Arc<QuietTimer>,
 }
 
 impl WriteIntentListener for EditListener {
@@ -1257,6 +1393,7 @@ impl WriteIntentListener for EditListener {
                 record(&checkout, &self.root, std::slice::from_ref(path))
             }
         }
+        self.settle.note_change();
         self.quiet.changed();
     }
 }
@@ -1483,6 +1620,234 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    struct PublicationFixture {
+        handle: Arc<DataCheckout>,
+        _root: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+    }
+
+    impl PublicationFixture {
+        fn new(settle: Duration, quiet: Duration) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let path = std::fs::canonicalize(root.path()).unwrap();
+            std::fs::create_dir_all(path.join("src")).unwrap();
+            std::fs::write(path.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+            std::fs::write(path.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+            let handle = DataCheckout::open_with_periods(
+                &path,
+                storage.path(),
+                None,
+                Planes::ALL,
+                quiet,
+                settle,
+            )
+            .unwrap();
+            assert!(matches!(
+                handle.fresh_view(Duration::from_secs(60)),
+                Fresh::Ready(_)
+            ));
+            wait_until(|| !handle.work.running());
+            Self {
+                handle,
+                _root: root,
+                _storage: storage,
+            }
+        }
+
+        fn add(&self, stem: &str, count: usize) {
+            let paths = (0..count)
+                .map(|i| {
+                    let path = self.handle.root().join(format!("src/{stem}{i}.rs"));
+                    std::fs::write(&path, format!("pub fn {stem}{i}() {{}}\n")).unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+            self.handle.note_paths(&paths);
+        }
+
+        fn refresh(&self) {
+            assert!(matches!(
+                self.handle.fresh_view(Duration::from_secs(60)),
+                Fresh::Ready(_)
+            ));
+            wait_until(|| !self.handle.work.refreshing.load(Ordering::Acquire));
+        }
+
+        fn publications(&self) -> usize {
+            self.handle.work.publications_started.load(Ordering::SeqCst)
+        }
+    }
+
+    fn wait_until(ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready() {
+            assert!(Instant::now() < deadline, "background work did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_next_edit_gets_a_fresh_view_before_a_slow_publication() {
+        let fixture = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        *fixture.handle.work.publication_delay.lock() = Duration::from_secs(2);
+        fixture.add("threshold", PUBLISH_AT);
+        fixture.handle.request_refresh();
+        // On the old inline path the publication starts and keeps the flag;
+        // the deferred path lets go of it without starting a publication.
+        wait_until(|| {
+            fixture.publications() > 0 || !fixture.handle.work.refreshing.load(Ordering::Acquire)
+        });
+        fixture.add("next_edit", 1);
+        assert!(
+            matches!(
+                fixture.handle.fresh_view(Duration::from_secs(1)),
+                Fresh::Ready(_)
+            ),
+            "the next edit waited behind the previous edit's publication"
+        );
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 0);
+        assert_eq!(fixture.handle.checkout().changed_paths(), PUBLISH_AT + 1);
+    }
+
+    #[test]
+    fn a_threshold_publication_waits_for_the_last_change_to_settle() {
+        let settle = Duration::from_millis(400);
+        let fixture = PublicationFixture::new(settle, QUIET);
+        fixture.add("threshold", PUBLISH_AT);
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 0);
+        // Keep moving the deadline past its original due time, without
+        // asking for another refresh. The timer must refresh this edit too.
+        for i in 0..3 {
+            std::thread::sleep(Duration::from_millis(150));
+            fixture.add(&format!("later{i}"), 1);
+            assert_eq!(fixture.publications(), 0);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            fixture.publications(),
+            0,
+            "published before the last change settled"
+        );
+        wait_until(|| fixture.handle.checkout().changed_paths() == 0);
+        assert_eq!(fixture.publications(), 1);
+        assert!(!pending(fixture.handle.checkout()));
+        let view = fixture.handle.view().unwrap();
+        assert_eq!(
+            view.probe_query("callers", "src/later20.rs", "later20"),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn continuous_edits_publish_at_the_time_cap() {
+        let fixture = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        fixture.add("threshold", PUBLISH_AT);
+        fixture.refresh();
+        let since = fixture.handle.work.many_since.lock().unwrap();
+        for i in 0..3 {
+            fixture.add(&format!("continued{i}"), 1);
+            fixture.refresh();
+            assert_eq!(*fixture.handle.work.many_since.lock(), Some(since));
+            assert_eq!(fixture.publications(), 0);
+        }
+        // Advance only the accumulated-memory age, not the settle deadline.
+        *fixture.handle.work.many_since.lock() = Some(Instant::now() - PUBLISH_MAX_WAIT);
+        fixture.add("after_cap", 1);
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 1);
+        assert_eq!(fixture.handle.checkout().changed_paths(), 0);
+        assert!(fixture.handle.work.many_since.lock().is_none());
+    }
+
+    #[test]
+    fn resolution_memory_publishes_at_the_file_cap() {
+        let fixture = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        fixture.add("resolved", PUBLISH_MAX_REFRESHED);
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 1);
+        assert_eq!(fixture.handle.checkout().changed_paths(), 0);
+        assert_eq!(fixture.handle.checkout().refreshed_files(), 0);
+    }
+
+    #[test]
+    fn quiet_changes_still_refresh_and_publish_below_the_threshold() {
+        let fixture = PublicationFixture::new(Duration::from_secs(60), Duration::from_millis(200));
+        fixture.add("quiet_edit", 1);
+        assert_eq!(fixture.publications(), 0);
+        wait_until(|| fixture.handle.checkout().changed_paths() == 0);
+        assert_eq!(fixture.publications(), 1);
+        assert!(matches!(
+            fixture.handle.fresh_view(Duration::ZERO),
+            Fresh::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_settled_request_during_a_refresh_is_not_lost() {
+        let fixture = PublicationFixture::new(Duration::from_millis(100), QUIET);
+        fixture.add("threshold", PUBLISH_AT);
+        // Own the refresh flag as a worker would while resolving changes.
+        fixture
+            .handle
+            .work
+            .refreshing
+            .store(true, Ordering::Release);
+        fixture.handle.work.settle.arm();
+        wait_until(|| *fixture.handle.work.publish_requested.lock() == Publish::Settled);
+        fixture
+            .handle
+            .work
+            .refreshing
+            .store(false, Ordering::Release);
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 1);
+        assert_eq!(fixture.handle.checkout().changed_paths(), 0);
+    }
+
+    #[test]
+    fn a_new_edit_postpones_a_settled_request_already_waiting_for_refresh() {
+        let fixture = PublicationFixture::new(Duration::from_millis(400), QUIET);
+        fixture.add("threshold", PUBLISH_AT);
+        fixture
+            .handle
+            .work
+            .refreshing
+            .store(true, Ordering::Release);
+        fixture.handle.work.settle.arm();
+        wait_until(|| *fixture.handle.work.publish_requested.lock() == Publish::Settled);
+        fixture.add("after_timer", 1);
+        fixture
+            .handle
+            .work
+            .refreshing
+            .store(false, Ordering::Release);
+        fixture.refresh();
+        assert_eq!(
+            fixture.publications(),
+            0,
+            "a stale settle request published a new edit"
+        );
+        wait_until(|| fixture.handle.checkout().changed_paths() == 0);
+        assert_eq!(fixture.publications(), 1);
+    }
+
+    #[test]
+    fn publication_refreshes_pending_changes_before_it_starts() {
+        let fixture = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        fixture.add("threshold", PUBLISH_AT);
+        fixture.refresh();
+        fixture.add("pending_edit", 1);
+        fixture.handle.work.maybe_publish(Publish::Always);
+        assert_eq!(fixture.publications(), 0);
+        assert!(pending(fixture.handle.checkout()));
+        fixture.refresh();
+        assert_eq!(fixture.publications(), 1);
+        assert_eq!(fixture.handle.checkout().changed_paths(), 0);
+    }
 
     /// A process published a checkout's text index and stopped before its
     /// call graph. The next process to bind it builds the call graph, and
