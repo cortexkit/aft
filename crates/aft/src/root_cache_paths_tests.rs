@@ -74,7 +74,7 @@ fn cache_root_unavailable_refuses_inspect_lane_before_open() {
     let key = crate::path_identity::project_scope_key(&project);
     configure_artifact_access(
         &project,
-        &crate::search_index::artifact_cache_key(&project),
+        &crate::root_identity::key::artifact_cache_key(&project),
         false,
     );
     let result = crate::inspect::cache::InspectCache::open(

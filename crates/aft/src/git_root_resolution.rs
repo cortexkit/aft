@@ -190,7 +190,7 @@ mod tests {
             let standing = crate::scoped_key::resolve_standing_root(
                 &base.join("requested").display().to_string(),
             );
-            let cache = crate::search_index::artifact_cache_key_with_memo(
+            let cache = crate::root_identity::key::artifact_cache_key_with_memo(
                 &base.join("requested"),
                 &base.join("requested"),
                 &base.join("storage"),
@@ -201,10 +201,14 @@ mod tests {
                 matches!(probe, Err(crate::git_probe::ProbeError::Spawn(_))),
                 standing.is_ok_and(|root| {
                     root.artifact_key
-                        == crate::search_index::artifact_path_identity_key(&base.join("requested"))
+                        == crate::root_identity::key::artifact_path_identity_key(
+                            &base.join("requested"),
+                        )
                 }),
                 cache.is_ok_and(|key| {
-                    key == crate::search_index::artifact_path_identity_key(&base.join("requested"))
+                    key == crate::root_identity::key::artifact_path_identity_key(
+                        &base.join("requested"),
+                    )
                 }),
                 !base.join("launched").exists(),
             ];

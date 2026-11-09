@@ -2059,7 +2059,7 @@ fn log_slow_configure_prefix(ctx: &AppContext, started_at: Instant) {
 struct CacheKeyResolveProfile<'a> {
     root: &'a Path,
     started: Instant,
-    key: crate::search_index::ArtifactCacheKeyTimings,
+    key: crate::root_identity::key::ArtifactCacheKeyTimings,
     retention_bind: Duration,
     format_preflight: Duration,
 }
@@ -3057,7 +3057,8 @@ fn handle_configure_inner(
         Some(Ok(Some(key))) => Some(key),
         Some(Ok(None)) => {
             identity_provisional = true;
-            degraded_reasons.push(crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string());
+            degraded_reasons
+                .push(crate::root_identity::key::PROVISIONAL_IDENTITY_REASON.to_string());
             None
         }
         Some(Err(error)) => {
@@ -7216,7 +7217,7 @@ mod tests {
 
     #[test]
     fn configure_cancellation_stops_the_git_probe_retry_ladder() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -7226,7 +7227,7 @@ mod tests {
         let probe_attempts = Arc::new(AtomicUsize::new(0));
         let (release_probe, probe_release) = mpsc::channel();
         let _probe_guard =
-            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
+            crate::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Arc::clone(&probe_attempts),
                 probe_release,
@@ -7333,14 +7334,14 @@ mod tests {
 
     #[test]
     fn handle_configure_keeps_unreadable_git_unindexed_without_saving_a_path_identity() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).expect("create git marker");
         let storage = temp.path().join("storage");
         let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
         let _override =
-            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+            crate::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
                 vec![root.clone(), canonical_root.clone()],
                 "spawn failed: Too many open files (os error 24)",
             );
@@ -7370,7 +7371,7 @@ mod tests {
         assert!(reason.contains("Too many open files"), "{reason}");
         assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
         assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
-        let path_key = crate::search_index::artifact_path_identity_key_for_test(&root);
+        let path_key = crate::root_identity::key::artifact_path_identity_key_for_test(&root);
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
@@ -7412,7 +7413,7 @@ mod tests {
     fn has_busy_provisional_reason(ctx: &AppContext) -> bool {
         ctx.degraded_reasons()
             .iter()
-            .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_REASON)
+            .any(|reason| reason == crate::root_identity::key::PROVISIONAL_IDENTITY_REASON)
     }
 
     #[test]
@@ -7535,7 +7536,7 @@ mod tests {
                     .expect("the settled bind publishes its key");
                 assert_eq!(
                     settled,
-                    crate::search_index::artifact_path_identity_key_for_test(&root)
+                    crate::root_identity::key::artifact_path_identity_key_for_test(&root)
                 );
                 assert_ne!(
                     settled, git_key,
@@ -7672,7 +7673,8 @@ mod tests {
         assert!(
             reasons
                 .iter()
-                .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
+                .any(|reason| reason
+                    == crate::root_identity::key::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
             "{reasons:?}"
         );
         assert!(!has_busy_provisional_reason(&ctx), "{reasons:?}");
@@ -7730,14 +7732,14 @@ mod tests {
 
     #[test]
     fn dubious_ownership_identity_does_not_retry_in_the_background() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
         std::fs::create_dir_all(root.join(".git")).expect("create git marker");
         let storage = temp.path().join("storage");
         let _override =
-            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+            crate::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
                 vec![root.clone()],
                 "fatal: detected dubious ownership in repository",
             );
@@ -9477,12 +9479,12 @@ mod tests {
 
     #[test]
     fn cache_key_resolve_profile_counts_cold_and_unchanged_configure_probes() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(root.path());
         let ctx = test_context();
-        let mut cold = crate::search_index::ArtifactCacheKeyTimings::default();
+        let mut cold = crate::root_identity::key::ArtifactCacheKeyTimings::default();
         let key = ctx
             .memoized_artifact_cache_key_for_configure_profiled(
                 root.path(),
@@ -9501,7 +9503,7 @@ mod tests {
         assert!(!cold.legacy_memo.is_zero());
         assert!(cold.memo_hold >= cold.memo_load + cold.memo_prune + cold.memo_write);
         for _ in 0..8 {
-            let mut warm = crate::search_index::ArtifactCacheKeyTimings::default();
+            let mut warm = crate::root_identity::key::ArtifactCacheKeyTimings::default();
             let again = ctx
                 .memoized_artifact_cache_key_for_configure_profiled(
                     root.path(),
@@ -9523,7 +9525,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shares_only_verified_unchanged_repository_history() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -9531,7 +9533,7 @@ mod tests {
         let initial = git_stdout(&main, &["rev-parse", "HEAD"]);
         let bind = |root: &Path| {
             let root = root.canonicalize().unwrap();
-            let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+            let mut timings = crate::root_identity::key::ArtifactCacheKeyTimings::default();
             let key = test_context()
                 .memoized_artifact_cache_key_for_configure_profiled(
                     &root,
@@ -9549,7 +9551,7 @@ mod tests {
         assert_eq!(walks, 1);
         assert_eq!(
             key,
-            crate::search_index::artifact_key_from_git_identity(&initial)
+            crate::root_identity::key::artifact_key_from_git_identity(&initial)
         );
         for name in ["first", "second", "third"] {
             let linked = temp.path().join(name);
@@ -9606,7 +9608,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shared_history_survives_sibling_commits() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -9627,7 +9629,7 @@ mod tests {
                 ],
             );
         }
-        let mut seed = crate::search_index::ArtifactCacheKeyTimings::default();
+        let mut seed = crate::root_identity::key::ArtifactCacheKeyTimings::default();
         let key = test_context()
             .memoized_artifact_cache_key_for_configure_profiled(
                 &first,
@@ -9674,7 +9676,7 @@ mod tests {
                 &initial,
             ],
         );
-        let mut again = crate::search_index::ArtifactCacheKeyTimings::default();
+        let mut again = crate::root_identity::key::ArtifactCacheKeyTimings::default();
         let shared = test_context()
             .memoized_artifact_cache_key_for_configure_profiled(
                 &fresh,
@@ -9699,7 +9701,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shared_history_requires_readable_head() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -9726,7 +9728,7 @@ mod tests {
         permissions.set_readonly(false);
         std::fs::set_permissions(&object, permissions).unwrap();
         std::fs::write(&object, b"broken").unwrap();
-        let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+        let mut timings = crate::root_identity::key::ArtifactCacheKeyTimings::default();
         assert!(test_context()
             .memoized_artifact_cache_key_for_configure_profiled(
                 &linked,

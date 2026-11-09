@@ -2132,8 +2132,8 @@ const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefi
 /// persisted observation becomes the next bind's ranking for every sibling.
 fn watcher_observation_state_key(root: &Path) -> String {
     let repository_key = crate::root_cache::configured_artifact_key(root)
-        .or_else(|| crate::search_index::artifact_cache_key_memoized_only(root))
-        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(root));
+        .or_else(|| crate::root_identity::key::artifact_cache_key_memoized_only(root))
+        .unwrap_or_else(|| crate::root_identity::key::artifact_cache_key_for_build(root));
     format!("{WATCHER_OBSERVATION_STATE_PREFIX}:{repository_key}")
 }
 
@@ -5627,8 +5627,8 @@ mod tests {
             crate::path_identity::project_scope_key(&sibling)
         );
         assert_eq!(
-            crate::search_index::artifact_cache_key(&main),
-            crate::search_index::artifact_cache_key(&sibling)
+            crate::root_identity::key::artifact_cache_key(&main),
+            crate::root_identity::key::artifact_cache_key(&sibling)
         );
 
         let db = Arc::new(Mutex::new(

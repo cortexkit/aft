@@ -4311,7 +4311,7 @@ mod tests {
     #[test]
     fn semantic_cold_build_emits_started_progress_ready() {
         let (_temp, root) = tiny_project("sem", "lib.rs", "pub fn hello() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
+        let key = crate::root_identity::key::artifact_cache_key(&root);
         let files = vec![root.join("lib.rs")];
         let mut embed = |texts: Vec<String>| {
             Ok(texts
@@ -4329,7 +4329,7 @@ mod tests {
     #[test]
     fn tier2_category_emits_started_ready() {
         let (_temp, root) = tiny_project("t2", "mod0.ts", "export function f0() { return 0; }\n");
-        let key = crate::search_index::artifact_cache_key(&root);
+        let key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &key, false);
         let inspect_dir = _temp.path().join("inspect");
         let manager = std::sync::Arc::new(crate::inspect::InspectManager::new());

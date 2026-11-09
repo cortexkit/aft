@@ -21,7 +21,7 @@ mod aft {
     }
 }
 
-use aft::search_index::artifact_cache_key;
+use aft::root_identity::key::artifact_cache_key;
 use serde_json::{json, Value};
 
 use crate::helpers::{user_config, AftProcess};

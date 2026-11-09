@@ -3969,7 +3969,7 @@ impl Tier2PhaseTimings {
         if worked < TIER2_WORK_LOG_THRESHOLD {
             return;
         }
-        let key = crate::search_index::artifact_cache_key_for_build(project_root);
+        let key = crate::root_identity::key::artifact_cache_key_for_build(project_root);
         crate::slog_info!("{}", self.render(category, project_root, &key));
     }
 
@@ -4244,7 +4244,7 @@ thread_local! {
 }
 
 fn log_tier2_benchmark_category_start(job: &InspectJob) {
-    let key = crate::search_index::artifact_cache_key_for_build(&job.project_root);
+    let key = crate::root_identity::key::artifact_cache_key_for_build(&job.project_root);
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Tier2,
         &job.project_root,
@@ -6422,7 +6422,7 @@ mod guard_tests {
             .expect("write fixture");
         }
         let canonical_root = std::fs::canonicalize(root).expect("canonical fixture root");
-        let project_key = crate::search_index::artifact_cache_key(&canonical_root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&canonical_root);
         crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
         dir
     }
@@ -6797,7 +6797,7 @@ mod guard_tests {
 
     fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        crate::search_index::artifact_cache_key(project_root)
+        crate::root_identity::key::artifact_cache_key(project_root)
     }
 
     #[test]
@@ -7343,7 +7343,7 @@ mod guard_tests {
             "export function plantedDead() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -7464,7 +7464,7 @@ mod guard_tests {
             "export function plantedDead() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -7637,7 +7637,7 @@ mod guard_tests {
             "export function planted() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -7987,7 +7987,7 @@ export function bannerUnused() {}
             if name != "aft-packages" {
                 assert!(!excluded.is_empty(), "no generated/minified inputs: {name}");
             }
-            let project_key = crate::search_index::artifact_cache_key(&root);
+            let project_key = crate::root_identity::key::artifact_cache_key(&root);
             crate::root_cache::configure_artifact_access(&root, &project_key, false);
             let snapshot =
                 Arc::new(crate::callgraph_store::dead_code_projection::snapshot_for_test(&root));
@@ -10010,7 +10010,7 @@ mod tier2_unreadable_source_tests {
             b"export const label = \"\xb9\xe6\xce\";\n",
         )
         .expect("bad ts");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let snapshot = InspectSnapshot::new_with_capabilities(
             root.clone(),

@@ -713,7 +713,7 @@ impl OldSnapshot {
 ///
 /// When the root's identity cannot be worked out.
 pub fn snapshot_path(storage: &Path, root: &Path) -> Result<PathBuf, String> {
-    let key = crate::search_index::artifact_cache_key_read_only(root, storage)
+    let key = crate::root_identity::key::artifact_cache_key_read_only(root, storage)
         .map_err(|error| error.to_string())?;
     if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("{key:?} is not a project key the old index wrote"));

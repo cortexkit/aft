@@ -228,7 +228,7 @@ impl SubcBridgeTestRoots {
         // Register the fixture's writer capability before transport timing begins.
         aft::root_cache::configure_artifact_access(
             &canonical_callgraph_root,
-            &aft::search_index::artifact_cache_key(&canonical_callgraph_root),
+            &aft::root_identity::key::artifact_cache_key(&canonical_callgraph_root),
             false,
         );
         let callgraph_src = callgraph_root.path().join("src");

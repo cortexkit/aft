@@ -126,7 +126,7 @@ fn profile_rollup_root_loop_calls_over_eighty_roots() {
             std::hint::black_box(ctx.memory_root_snapshot_and_rollup());
             timed("root: memory_root_snapshot_and_rollup", t);
             let t = cpu_ns();
-            std::hint::black_box(crate::search_index::artifact_cache_key_memoized_only(
+            std::hint::black_box(crate::root_identity::key::artifact_cache_key_memoized_only(
                 root_id.as_path(),
             ));
             timed("root: artifact_cache_key_memoized_only", t);

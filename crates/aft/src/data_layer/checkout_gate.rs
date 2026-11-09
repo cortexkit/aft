@@ -840,7 +840,7 @@ fn git_repository(root: &Path) -> Result<(), String> {
 /// The family the runtime puts the checkout at `root` in: its
 /// repository's root commits.
 fn family_of(root: &Path) -> Result<FamilyId, String> {
-    let identity = crate::search_index::canonical_git_root_commit_identity(root)
+    let identity = crate::root_identity::key::canonical_git_root_commit_identity(root)
         .map_err(|error| format!("{}: {error}", root.display()))?;
     Ok(FamilyId::from_digest(Digest128::of(identity.as_bytes())))
 }

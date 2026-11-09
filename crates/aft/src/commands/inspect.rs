@@ -9119,7 +9119,7 @@ mod deferred_terminal_tests {
             Arc::new(config),
             ctx.symbol_cache(),
         );
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let manager = ctx.inspect_manager();
         manager.read_dead_code_from_data_layer(

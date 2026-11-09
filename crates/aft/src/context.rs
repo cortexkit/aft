@@ -6197,7 +6197,7 @@ impl AppContext {
         if let Some(key) = keys.get(canonical_root).cloned() {
             return key;
         }
-        let key = crate::search_index::artifact_cache_key_for_build(canonical_root);
+        let key = crate::root_identity::key::artifact_cache_key_for_build(canonical_root);
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
         // Status reports the artifact key used by builds without probing Git.
@@ -6264,14 +6264,14 @@ impl AppContext {
         &self,
         canonical_root: &Path,
         storage: &Path,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<String, crate::root_identity::key::ArtifactCacheKeyProbeError> {
         // Readers name the root they open artifacts from. A `storage.cache_dir`
         // cache root resolves to its durable owner here, so this memo entry and
         // the identity record it checks are the ones configure uses for that
         // durable root.
         let storage: &Path = &crate::root_cache::identity_storage_root(storage);
         self.memoized_readonly_artifact_cache_key_with(canonical_root, storage, || {
-            crate::search_index::artifact_cache_key_read_only(canonical_root, storage)
+            crate::root_identity::key::artifact_cache_key_read_only(canonical_root, storage)
         })
     }
 
@@ -6279,8 +6279,8 @@ impl AppContext {
         &self,
         canonical_root: &Path,
         storage: &Path,
-        derive: impl FnOnce() -> Result<String, crate::search_index::ArtifactCacheKeyProbeError>,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        derive: impl FnOnce() -> Result<String, crate::root_identity::key::ArtifactCacheKeyProbeError>,
+    ) -> Result<String, crate::root_identity::key::ArtifactCacheKeyProbeError> {
         let cache_key = (canonical_root.to_path_buf(), storage.to_path_buf());
         let before = crate::root_identity::record_stamp(canonical_root, storage);
         if let Ok(record) = &before {
@@ -6314,20 +6314,20 @@ impl AppContext {
     }
 
     /// `Ok(None)` means the root's identity is provisional for this bind; see
-    /// [`crate::search_index::artifact_cache_key_for_bind_profiled`].
+    /// [`crate::root_identity::key::artifact_cache_key_for_bind_profiled`].
     pub fn memoized_artifact_cache_key_for_configure(
         &self,
         raw_root: &Path,
         canonical_root: &Path,
         storage_root: &Path,
         git_common_dir: Option<&Path>,
-    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<Option<String>, crate::root_identity::key::ArtifactCacheKeyProbeError> {
         self.memoized_artifact_cache_key_for_configure_profiled(
             raw_root,
             canonical_root,
             storage_root,
             git_common_dir,
-            &mut crate::search_index::ArtifactCacheKeyTimings::default(),
+            &mut crate::root_identity::key::ArtifactCacheKeyTimings::default(),
         )
     }
 
@@ -6337,8 +6337,8 @@ impl AppContext {
         canonical_root: &Path,
         storage_root: &Path,
         git_common_dir: Option<&Path>,
-        timings: &mut crate::search_index::ArtifactCacheKeyTimings,
-    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
+        timings: &mut crate::root_identity::key::ArtifactCacheKeyTimings,
+    ) -> Result<Option<String>, crate::root_identity::key::ArtifactCacheKeyProbeError> {
         {
             let waiting = Instant::now();
             let keys = self.configure_artifact_cache_keys.lock();
@@ -6363,7 +6363,7 @@ impl AppContext {
 
         // A provisional key is never memoized, so the next bind resolves the
         // identity again and can finalize it.
-        let Some(key) = crate::search_index::artifact_cache_key_for_bind_profiled(
+        let Some(key) = crate::root_identity::key::artifact_cache_key_for_bind_profiled(
             canonical_root,
             raw_root,
             storage_root,
@@ -8313,9 +8313,11 @@ impl AppContext {
             .lock()
             .iter()
             .find(|reason| {
-                reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_REASON
-                    || reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON
-                    || reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON)
+                reason.as_str() == crate::root_identity::key::PROVISIONAL_IDENTITY_REASON
+                    || reason.as_str()
+                        == crate::root_identity::key::PROVISIONAL_IDENTITY_EXHAUSTED_REASON
+                    || reason
+                        .starts_with(crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON)
             })
             .cloned()
     }
@@ -12833,7 +12835,7 @@ mod readonly_artifact_cache_key_tests {
             slow_ctx.memoized_readonly_artifact_cache_key_with(&slow_root, &slow_storage, || {
                 entered_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                crate::search_index::artifact_cache_key_read_only(&slow_root, &slow_storage)
+                crate::root_identity::key::artifact_cache_key_read_only(&slow_root, &slow_storage)
             })
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();

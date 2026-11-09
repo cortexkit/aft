@@ -42,7 +42,7 @@ impl Fixture {
         .expect("write source");
         let project = fs::canonicalize(project_dir.path()).expect("canonical project");
         let storage = storage_dir.path().to_path_buf();
-        let key = aft::search_index::artifact_cache_key(&project);
+        let key = aft::root_identity::key::artifact_cache_key(&project);
         Self {
             _project_dir: project_dir,
             _storage_dir: storage_dir,

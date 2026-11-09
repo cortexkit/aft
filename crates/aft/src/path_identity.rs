@@ -909,8 +909,8 @@ mod tests {
             &main,
         );
 
-        let main_artifact = crate::search_index::artifact_cache_key(&main);
-        let wt_artifact = crate::search_index::artifact_cache_key(&worktree);
+        let main_artifact = crate::root_identity::key::artifact_cache_key(&main);
+        let wt_artifact = crate::root_identity::key::artifact_cache_key(&worktree);
         let main_scope = project_scope_key(&main);
         let wt_scope = project_scope_key(&worktree);
 

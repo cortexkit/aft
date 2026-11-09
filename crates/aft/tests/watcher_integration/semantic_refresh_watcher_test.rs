@@ -1075,7 +1075,7 @@ fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries(
     let canonical_root = fs::canonicalize(&real_root).expect("canonicalize real root");
     let canonical_file = fs::canonicalize(&source_file).expect("canonicalize source file");
     let alias_file = alias_root.join("src/lib.rs");
-    let project_key = aft::search_index::artifact_cache_key(&canonical_root);
+    let project_key = aft::root_identity::key::artifact_cache_key(&canonical_root);
     aft::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
 
     let mut search_index = SearchIndex::build(&canonical_root);

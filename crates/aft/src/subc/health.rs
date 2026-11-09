@@ -3504,7 +3504,8 @@ fn build_health_diagnostic_rollup_from_actors(
         let attributed_bytes = memory.attributed_bytes;
         memory_roots.insert(memory_key, memory);
 
-        let project_key = crate::search_index::artifact_cache_key_memoized_only(root_id.as_path());
+        let project_key =
+            crate::root_identity::key::artifact_cache_key_memoized_only(root_id.as_path());
         let artifact_key = standing
             .as_ref()
             .and_then(|entry| entry.artifact_key.as_deref())
@@ -7637,7 +7638,7 @@ mod tests {
         ));
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let key = crate::search_index::artifact_cache_key(root.as_path());
+        let key = crate::root_identity::key::artifact_cache_key(root.as_path());
         let path = ctx
             .storage_dir()
             .join("callgraph")
@@ -9047,7 +9048,7 @@ mod tests {
         assert_eq!(watcher["last_rescan_cost_ms"].as_u64(), Some(42));
         assert_eq!(watcher["last_rescan_rss_delta_bytes"].as_i64(), Some(-4096));
 
-        let _project_key = crate::search_index::artifact_cache_key(root.as_path());
+        let _project_key = crate::root_identity::key::artifact_cache_key(root.as_path());
         refresh_until_root_count(&cache, &executor, &app, 1);
         let measured_zero = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
             .metrics
@@ -9168,7 +9169,7 @@ mod tests {
         std::fs::write(
             &memo,
             serde_json::to_vec(&json!({ (memo_root.to_string_lossy().to_string()): {
-                "key": crate::search_index::artifact_key_from_git_identity(&commit),
+                "key": crate::root_identity::key::artifact_key_from_git_identity(&commit),
                 "git_root_commit": commit, "recorded_at_ms": 0
             }}))
             .unwrap(),

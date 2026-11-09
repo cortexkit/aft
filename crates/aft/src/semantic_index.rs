@@ -926,7 +926,7 @@ fn begin_semantic_index_build_with_key(
     }
     let key = project_key
         .map(str::to_owned)
-        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(project_root));
+        .unwrap_or_else(|| crate::root_identity::key::artifact_cache_key_for_build(project_root));
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Semantic,
         project_root,
@@ -6616,7 +6616,7 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
-        let project_key = crate::search_index::artifact_cache_key_for_build(project_root);
+        let project_key = crate::root_identity::key::artifact_cache_key_for_build(project_root);
         Self::build_with_caps_for_key(
             project_root,
             files,

@@ -20885,7 +20885,7 @@ mod tests {
     /// retry sleeps, and it delays maintenance of the other folder.
     #[test]
     fn standing_ticks_over_an_unreadable_git_session_ask_git_nothing() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
         let configured = ConfiguredRoot::unconfigured(&executor);
@@ -20898,7 +20898,7 @@ mod tests {
         // Its sender is dropped at once, so no probe attempt is held.
         let (_, release) = std::sync::mpsc::channel();
         let _probe =
-            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
+            crate::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Arc::clone(&attempts),
                 release,
@@ -20927,7 +20927,7 @@ mod tests {
             .artifact_identity_provisional_reason()
             .expect("an unreadable Git identity leaves the bind provisional");
         assert!(
-            reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON),
+            reason.starts_with(crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON),
             "{reason}"
         );
         assert!(!ctx.provisional_identity_retry().is_armed());

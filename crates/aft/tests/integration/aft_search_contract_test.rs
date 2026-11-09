@@ -13,7 +13,7 @@ use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
 use aft::context::{AppContext, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
-use aft::search_index::artifact_cache_key;
+use aft::root_identity::key::artifact_cache_key;
 use aft::semantic_index::SemanticIndex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};

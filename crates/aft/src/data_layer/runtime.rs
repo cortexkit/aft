@@ -51,7 +51,7 @@ fn layer() -> Arc<DataLayer> {
 /// a store of its own that the repository's checkouts never share, so the
 /// bind waits and tries again instead.
 fn family_of(root: &Path) -> Result<FamilyId, DataError> {
-    let identity = crate::search_index::root_commit_identity_or_folder(root)
+    let identity = crate::root_identity::key::root_commit_identity_or_folder(root)
         .map_err(DataError::Identity)?
         .unwrap_or_else(|| format!("folder:{}", root.display()));
     Ok(FamilyId::from_digest(Digest128::of(identity.as_bytes())))
