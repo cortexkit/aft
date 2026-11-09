@@ -1,14 +1,13 @@
 //! Parent folders on the data layer.
 //!
 //! A session bound to a folder of repositories that is not a repository
-//! itself builds nothing of its own (see [`crate::data_layer::parent_session`]). When
-//! the process runs the data layer, each child repository that session
-//! found gets a checkout of its own, bound the first time a query reaches
-//! it, and grep, glob and the call-graph commands answer from the
-//! children's views, as does `aft_search`, which reads each child's stored
-//! vectors for semantic search without filling its meaning plane
-//! ([`search_children`]). The parent folder's
-//! own root binds no checkout.
+//! itself builds nothing of its own (see [`crate::data_layer::parent_session`]).
+//! Each child repository that session found gets a checkout of its own,
+//! bound the first time a query reaches it, and grep, glob and the
+//! call-graph commands answer from the children's views. So does
+//! `aft_search` ([`search_children`]): for meaning search it reads the
+//! embeddings each child has already stored, and never embeds a child's
+//! missing files itself. The parent folder's own root binds no checkout.
 //!
 //! The children are bound with the parent root's executor, so each child's
 //! builds and refreshes run as the parent root's maintenance, as jobs of
