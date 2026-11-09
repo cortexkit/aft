@@ -1586,13 +1586,7 @@ impl ConfigureWarningWork {
         }
         boundary(WarningBoundary::Walking);
         signal_configure_deferred_walk_start_for_test();
-        let flag = self.generation_flag.clone();
-        let generation = self.generation;
-        let source_files: Vec<PathBuf> =
-            crate::callgraph::walk_project_files_while(&self.root, move || {
-                flag.load(Ordering::SeqCst) == generation
-            })
-            .collect();
+        let source_files = self.source_files();
         boundary(WarningBoundary::Tools);
         if !current() {
             return;
@@ -1624,6 +1618,35 @@ impl ConfigureWarningWork {
             warnings,
         );
         let _ = self.tx.send((self.generation, frame));
+    }
+
+    /// The root's source files, which the warnings need by path only (their
+    /// language and the folders above them). The root's bound index-store
+    /// checkout lists them without touching the disk once it has published;
+    /// otherwise the root is walked, until a newer configure supersedes this
+    /// one. Configure can run before the checkout publishes, so the first
+    /// configure of a new root usually walks.
+    fn source_files(&self) -> Vec<PathBuf> {
+        let miss = match crate::data_layer::tools::inspect::bound_inventory(&self.root) {
+            Ok(inventory) => return inventory.sources,
+            Err(miss) => miss,
+        };
+        let started = Instant::now();
+        let flag = self.generation_flag.clone();
+        let generation = self.generation;
+        let files: Vec<PathBuf> =
+            crate::callgraph::walk_project_files_while(&self.root, move || {
+                flag.load(Ordering::SeqCst) == generation
+            })
+            .collect();
+        slog_info!(
+            "configure warning files walked: reason={} files={} ms={} root={}",
+            miss.as_str(),
+            files.len(),
+            started.elapsed().as_millis(),
+            crate::logging::normalize_index_root(&self.root)
+        );
+        files
     }
 }
 
@@ -1707,6 +1730,76 @@ fn audit01_warning_current_generation_publishes() {
     }
     .run(|_| {});
     assert_eq!(rx.try_recv().unwrap().0, 2);
+}
+
+/// Once the root's index-store checkout has published, the warning pass
+/// takes the source files from it and walks nothing, and it warns exactly as
+/// the walk did before the checkout was bound.
+#[cfg(test)]
+#[test]
+fn configure_warnings_list_files_from_the_published_index_store_without_walking() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    for (path, contents) in [
+        ("src/main.rs", "fn main() {}\n"),
+        ("web/app.ts", "export const app = 1;\n"),
+        ("node_modules/dep/index.js", "module.exports = 1;\n"),
+        ("notes.txt", "notes\n"),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    // A TypeScript formatter that is almost never installed, so the warnings
+    // depend on the TypeScript file being listed.
+    let config = Arc::new(Config {
+        project_root: Some(root.clone()),
+        formatter: HashMap::from([("typescript".to_string(), "oxfmt".to_string())]),
+        ..Default::default()
+    });
+    let warn = || {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let entries = || crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get);
+        let before = entries();
+        ConfigureWarningWork {
+            root: root.clone(),
+            config: Arc::clone(&config),
+            generation_flag: Arc::new(AtomicU64::new(1)),
+            generation: 1,
+            tx,
+            session_id: None,
+        }
+        .run(|_| {});
+        let warnings = rx.try_recv().expect("the pass publishes").1.warnings;
+        (warnings, entries() - before)
+    };
+
+    // No checkout is bound yet: the pass walks, as it always has.
+    assert_eq!(
+        crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+        Some(crate::inspect::inventory::StoreListMiss::NotBound)
+    );
+    let (walked, walk_entries) = warn();
+    assert!(walk_entries > 0, "the unbound root is walked");
+    let oxfmt_missing = !crate::format::tool_available_for_missing_warning("oxfmt", Some(&root));
+    assert_eq!(
+        walked.iter().any(|warning| warning["tool"] == "oxfmt"),
+        oxfmt_missing,
+        "{walked:?}"
+    );
+
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            ..Default::default()
+        },
+    );
+    crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+    assert!(crate::data_layer::tools::inspect::bound_inventory(&root).is_ok());
+    let (listed, store_entries) = warn();
+    assert_eq!(store_entries, 0, "a published checkout lists the files");
+    assert_eq!(listed, walked);
 }
 
 #[cfg(test)]
