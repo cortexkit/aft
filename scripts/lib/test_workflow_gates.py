@@ -741,7 +741,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
 
     def test_macos_jobs_use_free_github_runners(self) -> None:
         # AFT's repository is public, where GitHub's macOS runners are free;
-        # no job may name a paid runner provider.
+        # no job may name a paid runner provider. The macOS release jobs run
+        # on CortexKit's rented Mac until its rental ends on 21 November 2026
+        # (see the note on build-darwin-arm64 in release.yml).
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
         jobs = suite["jobs"]
@@ -750,7 +752,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         for name in ("unit-macos-libtest-archive", "unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
             self.assertEqual(jobs[name]["runs-on"], "macos-26", name)
         for name in ("build-darwin-arm64", "build-darwin-x64"):
-            self.assertEqual(release["jobs"][name]["runs-on"], "macos-26", name)
+            self.assertEqual(release["jobs"][name]["runs-on"], ["self-hosted", "rented-mac"], name)
+        self.assertEqual(release["jobs"]["e2e-darwin-arm64"]["runs-on"], "macos-26")
         for workflow in (suite, release):
             self.assertEqual(
                 [name for name, job in workflow["jobs"].items() if "blacksmith" in str(job.get("runs-on", "")).lower()],
