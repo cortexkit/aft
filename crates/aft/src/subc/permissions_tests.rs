@@ -403,3 +403,216 @@ fn permissions_list_matches_the_published_sample() {
         .for_each(assert_contract_row);
     assert_eq!(reply, sample["reply"]);
 }
+
+/// Cingulate is not a first-party AFT principal, so its management route is
+/// admitted for the `permissions/v1` operations alone. A first-party route
+/// that is not the operator's is refused by name.
+#[tokio::test]
+async fn permissions_cingulate_route_serves_only_permissions_operations() {
+    use super::super::{
+        control_flags, read_frame, run_module_loop, write_frame, App, Executor, Frame, FrameType,
+        ModuleControlRequest, QuiescedLsp, RouteTarget, HELLO_CORR,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = read_frame(daemon).await.unwrap().unwrap();
+                if frame.header.channel == channel && frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("permissions route response timed out")
+    }
+
+    async fn request(
+        daemon: &mut tokio::io::DuplexStream,
+        channel: u16,
+        corr: u64,
+        body: Value,
+    ) -> Frame {
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            channel,
+            u32::from(channel != 0),
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        write_frame(daemon, &frame).await.unwrap();
+        receive(daemon, channel, corr).await
+    }
+
+    fn error(frame: &Frame) -> ErrorBody {
+        assert_eq!(frame.header.ty, FrameType::Error, "{frame:?}");
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    fn result(frame: &Frame) -> Value {
+        assert_eq!(frame.header.ty, FrameType::Response, "{frame:?}");
+        serde_json::from_slice::<Value>(&frame.body).unwrap()["result"].clone()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("module-storage");
+    let app = App::default_shared();
+    let executor = Arc::new(Executor::new());
+    let module_app = app.clone();
+    let module_executor = executor.clone();
+    let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+    let module_storage = storage.clone();
+    let module_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (read, write) = tokio::io::split(module);
+        runtime.block_on(run_module_loop(
+            read,
+            write,
+            &module_storage.join("absent-connection.json"),
+            module_app,
+            module_executor,
+            |_, _| panic!("permissions routes must not execute commands"),
+            None,
+            false,
+            usize::MAX,
+            None,
+            &module_storage,
+            QuiescedLsp::ReapInBackground,
+            None,
+            None,
+        ))
+    });
+    assert_eq!(
+        receive(&mut daemon, 0, HELLO_CORR).await.header.ty,
+        FrameType::Hello
+    );
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            HELLO_CORR,
+            b"{}".to_vec(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    if app.db().is_none() {
+        app.set_db(Arc::new(Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+    }
+    let db = app.db().unwrap();
+    let folder = crate::access_policy::policy_path(dir.path()).join("notes");
+    {
+        let conn = db.lock().unwrap();
+        store::register_scope(&conn, &head(), None, &Config::default()).unwrap();
+        store::register_agent(&conn, &head(), "agent-alf", true).unwrap();
+        store::insert_from_card(
+            &conn,
+            &head(),
+            &grant(&folder, GrantKind::Subtree, AccessOperation::Read),
+            Some("acc_1"),
+        )
+        .unwrap();
+    }
+
+    let bind = |channel: u16, principal: Option<Principal>| {
+        serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                "cingulate",
+                format!("permissions:{channel}"),
+            ),
+            principal,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap()
+    };
+
+    let ack = request(&mut daemon, 0, 41, bind(41, cingulate())).await;
+    assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+    let listed = result(
+        &request(
+            &mut daemon,
+            41,
+            1,
+            json!({"method": LIST_OPERATION, "params": {}}),
+        )
+        .await,
+    );
+    let rows = listed["grants"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_contract_row(&rows[0]);
+    let id = rows[0]["id"].clone();
+
+    // The route admits nothing else, not even another management operation.
+    for body in [
+        json!({"op": "memory.census"}),
+        json!({"method": "diagnostics.findings", "params": {}}),
+        json!({"op": "tool.call", "name": "read", "arguments": {"path": "x"}}),
+        json!({"method": "permissions.list_all", "params": {}}),
+    ] {
+        assert_eq!(
+            error(&request(&mut daemon, 41, 2, body).await).code,
+            "route_not_admitted"
+        );
+    }
+
+    // A first-party route that is not the operator's is refused by name.
+    let ack = request(
+        &mut daemon,
+        0,
+        42,
+        bind(
+            42,
+            Some(Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(ack.header.ty, FrameType::Response, "{ack:?}");
+    let refused = request(
+        &mut daemon,
+        42,
+        3,
+        json!({"method": REVOKE_OPERATION, "params": {"id": id}}),
+    )
+    .await;
+    assert_eq!(error(&refused).code, "permissions_operator_required");
+
+    let revoke_body = json!({"method": REVOKE_OPERATION, "params": {"id": id}});
+    assert_eq!(
+        result(&request(&mut daemon, 41, 4, revoke_body.clone()).await),
+        json!({"outcome": "revoked"})
+    );
+    assert_eq!(
+        result(&request(&mut daemon, 41, 5, revoke_body).await),
+        json!({"outcome": "not_found"})
+    );
+    assert!(store::list(&db.lock().unwrap(), &head())
+        .unwrap()
+        .is_empty());
+
+    drop(daemon);
+    module_thread.join().unwrap().unwrap();
+}
