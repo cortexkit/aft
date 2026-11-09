@@ -123,7 +123,7 @@ fn bash_background_bookkeeping_day_probe() {
             for (consumer, sink) in consumers.iter_mut().zip(&mut sinks) {
                 consumer
                     .consume(
-                        StreamRecord::Output(OutputRecord::new(
+                        StreamRecord::Output(Output::new(
                             seq,
                             if seq % 2 == 0 {
                                 OutputStream::Stdout
