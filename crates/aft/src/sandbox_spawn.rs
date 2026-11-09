@@ -774,7 +774,9 @@ fn secret_ptrace_scope_value() -> std::io::Result<String> {
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
-    // Unset uses the kernel; an explicit None models an unreadable Yama setting.
+    // Tests' stand-in for /proc/sys/kernel/yama/ptrace_scope, the Linux setting
+    // that stops other processes from reading this one's memory. Unset reads
+    // the real file; Some(None) acts as if the file could not be read.
     static TEST_SECRET_PTRACE_SCOPE: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
 }
 
