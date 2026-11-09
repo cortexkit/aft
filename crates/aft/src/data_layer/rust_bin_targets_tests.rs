@@ -1,7 +1,5 @@
-use aft::callgraph_store::join::{
-    CallgraphBlob, ManifestBlobReader, ManifestJoinError, ResolutionStatus,
-};
-use aft::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+use super::callgraph::{resolve_checkout, CheckoutInputs};
+use crate::callgraph_store::join::{CallgraphBlob, DerivedRow, ResolutionStatus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,17 +7,22 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 struct MemoryBlobs(BTreeMap<String, Vec<u8>>);
 
-impl ManifestBlobReader for MemoryBlobs {
-    fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
-        Ok(self.0.get(key).cloned())
-    }
+struct ResolvedRows {
+    rows: BTreeSet<DerivedRow>,
 }
 
 #[test]
 fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
-    let root = crate::helpers::fixture_path("callgraph/rust_bin_targets");
-    let (manifest, blobs) = manifest_fixture(&root);
-    let joined = aft::callgraph_store::join::JoinResult::from_manifest(&manifest, &blobs).unwrap();
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph/rust_bin_targets");
+    let (inputs, blobs) = checkout_fixture(&root);
+    let joined = ResolvedRows {
+        rows: resolve_checkout(&inputs, 1)
+            .unwrap()
+            .into_values()
+            .flat_map(|file| file.rows)
+            .collect(),
+    };
 
     let exact_tool_sites = BTreeSet::from([
         (
@@ -161,7 +164,7 @@ fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
 }
 
 fn assert_target_site(
-    joined: &aft::callgraph_store::join::JoinResult,
+    joined: &ResolvedRows,
     blobs: &MemoryBlobs,
     target_file: &str,
     target_symbol: &str,
@@ -177,7 +180,7 @@ fn assert_target_site(
 }
 
 fn assert_unresolved_site(
-    joined: &aft::callgraph_store::join::JoinResult,
+    joined: &ResolvedRows,
     blobs: &MemoryBlobs,
     caller_file: &str,
     line: i64,
@@ -206,7 +209,7 @@ fn assert_unresolved_site(
 }
 
 fn resolved_sites(
-    joined: &aft::callgraph_store::join::JoinResult,
+    joined: &ResolvedRows,
     blobs: &MemoryBlobs,
     target_file: &str,
     target_symbol: &str,
@@ -254,39 +257,36 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn manifest_fixture(root: &Path) -> (Manifest, MemoryBlobs) {
+fn checkout_fixture(root: &Path) -> (CheckoutInputs, MemoryBlobs) {
     let mut paths = rust_files(root);
     paths.push(root.join("Cargo.toml"));
     paths.sort();
-    let mut blobs = MemoryBlobs::default();
-    let mut entries = Vec::new();
-    for path in paths {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let source = fs::read_to_string(&path).unwrap();
-        let blob = if rel == "Cargo.toml" {
-            CallgraphBlob::config(source, "rust-bin-target-test")
-        } else {
-            CallgraphBlob::extract(&source, "rust", "rust-bin-target-test").unwrap()
-        };
-        let bytes = blob.to_bytes().unwrap();
-        let key = blake3::hash(&bytes).to_hex().to_string();
-        blobs.0.insert(key.clone(), bytes);
-        entries.push((
-            RelPath::new(rel.into_bytes()).unwrap(),
-            ManifestEntry::Regular {
-                mode: 0o100644,
-                planes: RegularPlanes {
-                    semantic: None,
-                    callgraph: Some(key),
-                },
-                resolution_input: path.file_name().and_then(|name| name.to_str())
-                    == Some("Cargo.toml"),
-            },
-        ));
-    }
-    (Manifest::new(entries).unwrap(), blobs)
+    let files = paths
+        .iter()
+        .map(|path| {
+            (
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read_to_string(path).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let inputs = super::incremental_tests::checkout(&files, &[]);
+    let blobs = inputs
+        .parses
+        .values()
+        .map(|(key, parse)| {
+            (
+                key.clone(),
+                CallgraphBlob::Parse((**parse).clone()).to_bytes().unwrap(),
+            )
+        })
+        .collect();
+    (inputs, MemoryBlobs(blobs))
 }

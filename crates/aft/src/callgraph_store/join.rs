@@ -1,11 +1,8 @@
-//! Manifest-only callgraph joining.
+//! Path-free callgraph extraction and checkout-backed reference resolution.
 //!
-//! This module deliberately accepts a manifest plus immutable blob payloads rather
-//! than a checkout root.  Extraction is content-addressed and path-free; binding a
-//! blob to a manifest path and resolving its cross-file references happens here.
-//! The existing resolver uses String file identities. Non-UTF-8 source members
-//! remain in byte-addressed facts but are reported as unbound rather than being
-//! converted lossily; supporting them requires a separate resolver identity change.
+//! The index store keeps immutable parse payloads. Binding a payload to its
+//! checkout path and resolving cross-file references uses the checkout's
+//! [`ProjectFacts`], not a separate manifest or artifact store.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,12 +40,11 @@ pub(crate) mod single_walk;
 #[path = "syntax_index.rs"]
 pub(crate) mod syntax_index;
 
-use super::facts::{BlobKey, FactPaths, ManifestFacts, NoProjectFacts, ProjectFacts};
+use super::facts::{BlobKey, FactPaths, NoProjectFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
 use crate::symbols::SymbolKind;
-use crate::views::{Manifest, ManifestEntry, RelPath};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -95,43 +91,6 @@ impl fmt::Display for ManifestJoinError {
 }
 
 impl std::error::Error for ManifestJoinError {}
-
-/// Reads immutable payloads by the full key recorded in a manifest entry.
-///
-/// Implementations may be backed by the family blob store, but this interface
-/// intentionally exposes no checkout path or directory operation to the join.
-pub trait ManifestBlobReader {
-    fn read_callgraph_blob(&self, full_key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError>;
-
-    fn read_callgraph_blob_decoded(
-        &self,
-        full_key: &str,
-    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
-        self.read_callgraph_blob(full_key)?
-            .map(|payload| CallgraphBlob::from_bytes(&payload).map(Arc::new))
-            .transpose()
-    }
-
-    /// Decoded blobs for `full_keys`, in order, stopping after the first
-    /// missing blob (its `None` is the last element) or at the first error,
-    /// exactly like reading them one by one. Readers that can verify and
-    /// decode in parallel override this.
-    fn read_callgraph_blobs_decoded(
-        &self,
-        full_keys: &[&str],
-    ) -> Result<Vec<Option<Arc<CallgraphBlob>>>, ManifestJoinError> {
-        let mut blobs = Vec::with_capacity(full_keys.len());
-        for key in full_keys {
-            let blob = self.read_callgraph_blob_decoded(key)?;
-            let missing = blob.is_none();
-            blobs.push(blob);
-            if missing {
-                break;
-            }
-        }
-        Ok(blobs)
-    }
-}
 
 /// Tree-sitter node position in canonical pre-order traversal order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -515,104 +474,6 @@ impl DerivedRow {
             ref_ordinal: self.ref_ordinal,
             caller_path: self.caller_path.clone(),
         }
-    }
-}
-
-/// The result of resolving one manifest.  `resolution_order` exposes the exact
-/// canonical order consumed by the resolver for deterministic test coverage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JoinResult {
-    pub rows: BTreeSet<DerivedRow>,
-    pub resolution_order: Vec<CallerRefKey>,
-    pub unbound_non_utf8_paths: Vec<Vec<u8>>,
-}
-
-impl JoinResult {
-    /// Serializes logical rows in canonical order.  This is the comparison form
-    /// for equal manifests; callers must not compare SQLite file bytes.
-    pub fn canonical_serialization(&self) -> Vec<u8> {
-        let mut output = Vec::new();
-        for row in &self.rows {
-            append_field(&mut output, row.caller_blob_key.as_bytes());
-            append_field(&mut output, &row.ref_ordinal.to_be_bytes());
-            append_field(&mut output, &row.caller_path);
-            append_field(&mut output, &[row.kind as u8]);
-            append_field(
-                &mut output,
-                &[match row.status {
-                    ResolutionStatus::Resolved => 1,
-                    ResolutionStatus::Unresolved => 0,
-                }],
-            );
-            append_optional_field(&mut output, row.target_path.as_deref());
-            append_optional_field(&mut output, row.target_symbol.as_deref().map(str::as_bytes));
-        }
-        output
-    }
-}
-
-/// Incremental assembly details used to verify precise invalidation behavior.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IncrementalJoinResult {
-    pub result: JoinResult,
-    pub re_resolved: BTreeSet<CallerRefKey>,
-    pub full_re_resolve: bool,
-}
-
-fn changed_manifest_paths(previous: &Manifest, current: &Manifest) -> BTreeSet<Vec<u8>> {
-    let previous_entries = previous
-        .entries()
-        .map(|(path, entry)| (path.as_bytes().to_vec(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let current_entries = current
-        .entries()
-        .map(|(path, entry)| (path.as_bytes().to_vec(), entry))
-        .collect::<BTreeMap<_, _>>();
-    previous_entries
-        .keys()
-        .chain(current_entries.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| previous_entries.get(*path) != current_entries.get(*path))
-        .cloned()
-        .collect()
-}
-
-fn manifest_resolution_input(manifest: &Manifest, path: &[u8]) -> bool {
-    let lookup = if path.first() == Some(&0) {
-        return manifest
-            .entries()
-            .find(|(candidate, _)| candidate.as_bytes() == path)
-            .is_some_and(|(_, entry)| matches!(entry, ManifestEntry::Synthetic { .. }));
-    } else {
-        RelPath::new(path.to_vec()).ok()
-    };
-    lookup
-        .as_ref()
-        .and_then(|path| manifest.get(path))
-        .is_some_and(|entry| {
-            matches!(
-                entry,
-                ManifestEntry::Regular {
-                    resolution_input: true,
-                    ..
-                }
-            )
-        })
-}
-
-fn append_field(output: &mut Vec<u8>, value: &[u8]) {
-    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    output.extend_from_slice(value);
-}
-
-fn append_optional_field(output: &mut Vec<u8>, value: Option<&[u8]>) {
-    match value {
-        Some(value) => {
-            output.push(1);
-            append_field(output, value);
-        }
-        None => output.push(0),
     }
 }
 
@@ -1340,14 +1201,6 @@ impl ParseBlob {
         })
     }
 
-    fn bind(
-        &self,
-        path: &str,
-        facts: &FactPaths<'_>,
-    ) -> Result<super::FileExtract, ManifestJoinError> {
-        self.bind_with_dependencies(path, facts, None)
-    }
-
     fn bind_with_dependencies(
         &self,
         path: &str,
@@ -1464,236 +1317,6 @@ impl ParseBlob {
             raw_refs,
         })
     }
-}
-
-/// A manifest-backed index is the ordinary resolver index with different facts.
-type ManifestProjectIndex<'a> = super::ProjectIndex<'a>;
-
-impl JoinResult {
-    pub fn from_manifest(
-        manifest: &Manifest,
-        blobs: &impl ManifestBlobReader,
-    ) -> Result<Self, ManifestJoinError> {
-        let loaded = manifest_payloads(manifest, blobs)?;
-        let reader = |key: &BlobKey| loaded.get(key).cloned();
-        let facts = Rc::new(ManifestFacts {
-            manifest,
-            blobs: &reader,
-        });
-        Self::from_facts(manifest, &loaded, Path::new("/"), facts, None)
-    }
-
-    fn from_facts<'a>(
-        manifest: &'a Manifest,
-        loaded: &BTreeMap<String, Arc<[u8]>>,
-        root: &Path,
-        facts: Rc<dyn ProjectFacts + 'a>,
-        selected: Option<&BTreeSet<CallerRefKey>>,
-    ) -> Result<Self, ManifestJoinError> {
-        let paths = FactPaths {
-            root,
-            facts: facts.as_ref(),
-        };
-        let mut receiver_sites = BTreeSet::new();
-        let mut extracts = HashMap::new();
-        let mut work = Vec::new();
-        let mut unbound_non_utf8_paths = Vec::new();
-        for (path, entry) in manifest.entries() {
-            let ManifestEntry::Regular { planes, .. } = entry else {
-                continue;
-            };
-            let Some(key) = &planes.callgraph else {
-                continue;
-            };
-            let bytes = loaded
-                .get(key)
-                .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
-            let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(bytes)? else {
-                continue;
-            };
-            let Ok(rel) = std::str::from_utf8(path.as_bytes()) else {
-                unbound_non_utf8_paths.push(path.as_bytes().to_vec());
-                continue;
-            };
-            receiver_sites.extend(
-                blob.bound_dispatch_sites()
-                    .into_iter()
-                    .map(|site| (path.as_bytes().to_vec(), site.ordinal)),
-            );
-            let extract = blob.bind(rel, &paths)?;
-            for ((raw, bound), reference_key) in blob
-                .refs
-                .iter()
-                .zip(&extract.raw_refs)
-                .zip(blob.reference_keys())
-            {
-                let ref_key = CallerRefKey {
-                    caller_blob_key: key.clone(),
-                    ref_ordinal: reference_key,
-                    caller_path: path.as_bytes().to_vec(),
-                };
-                if selected.is_none_or(|set| set.contains(&ref_key)) {
-                    work.push((ref_key, (raw.kind, bound.clone())));
-                }
-            }
-            extracts.insert(rel.to_string(), extract);
-        }
-        let files = extracts
-            .iter()
-            .map(|(path, extract)| {
-                (
-                    path.clone(),
-                    super::DbFileIndex::from_extract(root, extract, &paths),
-                )
-            })
-            .collect();
-        let caller_data = extracts
-            .iter()
-            .map(|(path, extract)| (path.clone(), &extract.data))
-            .collect();
-        let mut index = ManifestProjectIndex::from_parts(
-            root,
-            files,
-            caller_data,
-            super::WorkspaceCratePrefixCache::default(),
-            facts,
-        );
-        index.unbound_non_utf8_paths = unbound_non_utf8_paths;
-        if !index.unbound_non_utf8_paths.is_empty() {
-            log::warn!(
-                "callgraph index left {} non-UTF-8 source paths unbound",
-                index.unbound_non_utf8_paths.len()
-            );
-        }
-        let mut result = Self {
-            rows: BTreeSet::new(),
-            resolution_order: Vec::new(),
-            unbound_non_utf8_paths: index.unbound_non_utf8_paths.clone(),
-        };
-        work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
-        for (key, (kind, raw)) in work {
-            let mut resolved = super::resolve_ref(raw, &index)
-                .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-            if receiver_sites.contains(&(key.caller_path.clone(), key.ref_ordinal)) {
-                // Receiver sites are resolved only by the ruled hint resolver.
-                // Ordinary name binding must not invent an object-method edge.
-                resolved.target_file = None;
-                resolved.target_symbol = None;
-            }
-            result.rows.insert(DerivedRow {
-                caller_blob_key: key.caller_blob_key.clone(),
-                ref_ordinal: key.ref_ordinal,
-                caller_path: key.caller_path.clone(),
-                kind,
-                status: if resolved.target_file.is_some() {
-                    ResolutionStatus::Resolved
-                } else {
-                    ResolutionStatus::Unresolved
-                },
-                target_path: resolved.target_file.map(String::into_bytes),
-                target_symbol: resolved.target_symbol,
-            });
-            result.resolution_order.push(key);
-        }
-        Ok(result)
-    }
-
-    pub fn update(
-        &self,
-        previous_manifest: &Manifest,
-        manifest: &Manifest,
-        blobs: &impl ManifestBlobReader,
-    ) -> Result<IncrementalJoinResult, ManifestJoinError> {
-        let changed = changed_manifest_paths(previous_manifest, manifest);
-        let full_re_resolve = changed.iter().any(|path| {
-            manifest_resolution_input(previous_manifest, path)
-                || manifest_resolution_input(manifest, path)
-        });
-        let loaded = manifest_payloads(manifest, blobs)?;
-        let reader = |key: &BlobKey| loaded.get(key).cloned();
-        let mut current_keys = BTreeSet::new();
-        for (path, entry) in manifest.entries() {
-            if std::str::from_utf8(path.as_bytes()).is_err() {
-                continue;
-            }
-            let ManifestEntry::Regular { planes, .. } = entry else {
-                continue;
-            };
-            let Some(key) = &planes.callgraph else {
-                continue;
-            };
-            if let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&loaded[key])? {
-                current_keys.extend(blob.reference_keys().into_iter().map(|reference_key| {
-                    CallerRefKey {
-                        caller_blob_key: key.clone(),
-                        ref_ordinal: reference_key,
-                        caller_path: path.as_bytes().to_vec(),
-                    }
-                }));
-            }
-        }
-        let previous_rows = self
-            .rows
-            .iter()
-            .map(|row| (row.ref_key(), row))
-            .collect::<BTreeMap<_, _>>();
-        let selected = current_keys
-            .iter()
-            .filter(|key| {
-                full_re_resolve
-                    || changed.contains(&key.caller_path)
-                    || previous_rows.get(*key).is_none_or(|row| {
-                        row.target_path
-                            .as_ref()
-                            .is_some_and(|path| changed.contains(path))
-                    })
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let facts = Rc::new(ManifestFacts {
-            manifest,
-            blobs: &reader,
-        });
-        let mut result =
-            Self::from_facts(manifest, &loaded, Path::new("/"), facts, Some(&selected))?;
-        result.rows.extend(
-            self.rows
-                .iter()
-                .filter(|row| {
-                    current_keys.contains(&row.ref_key()) && !selected.contains(&row.ref_key())
-                })
-                .cloned(),
-        );
-        result.resolution_order = result.rows.iter().map(DerivedRow::ref_key).collect();
-        result.resolution_order.sort();
-        Ok(IncrementalJoinResult {
-            result,
-            re_resolved: selected,
-            full_re_resolve,
-        })
-    }
-}
-
-fn manifest_payloads(
-    manifest: &Manifest,
-    blobs: &impl ManifestBlobReader,
-) -> Result<BTreeMap<String, Arc<[u8]>>, ManifestJoinError> {
-    let mut loaded = BTreeMap::new();
-    for (_, entry) in manifest.entries() {
-        let ManifestEntry::Regular { planes, .. } = entry else {
-            continue;
-        };
-        let Some(key) = &planes.callgraph else {
-            continue;
-        };
-        if !loaded.contains_key(key) {
-            let bytes = blobs
-                .read_callgraph_blob(key)?
-                .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
-            loaded.insert(key.clone(), Arc::from(bytes));
-        }
-    }
-    Ok(loaded)
 }
 
 /// The receiver type names of one file that method-call resolution may
@@ -1940,7 +1563,7 @@ pub(crate) struct DispatchTypeTargets {
 
 #[cfg(test)]
 #[path = "../../tests/integration/join_manifest_test.rs"]
-mod manifest_integration_tests;
+mod disk_facts_tests;
 
 /// Bound reference dependencies and resolver probes are generation-specific, unlike
 /// parse blobs. The owner must invalidate these whenever a probed path changes.
@@ -2618,7 +2241,7 @@ pub(crate) fn resolve_file(
     key: &BlobKey,
     blob: &ParseBlob,
     binding: &mut ViewBindingDependencies,
-    index: &ManifestProjectIndex<'_>,
+    index: &super::ProjectIndex<'_>,
     facts: &ViewBindingFacts<'_>,
     mut resolution_order: Option<&mut Vec<CallerRefKey>>,
     rows: &mut BTreeSet<DerivedRow>,
@@ -2771,7 +2394,7 @@ pub(crate) fn finish_binding(binding: &mut ViewBindingDependencies) {
 pub(crate) fn dispatch_type_targets_for(
     file: &str,
     blob: &ParseBlob,
-    index: &ManifestProjectIndex<'_>,
+    index: &super::ProjectIndex<'_>,
     facts: &ViewBindingFacts<'_>,
 ) -> Result<DispatchTypeTargets, ManifestJoinError> {
     // The caller data is the file's own parse; binding consults path facts
@@ -3258,27 +2881,11 @@ mod consultation_tests {
 
     #[test]
     fn opaque_config_read_is_unattributed_even_after_a_known_field_read() {
-        let manifest = Manifest::new([(
-            RelPath::new(b"package.json".to_vec()).unwrap(),
-            ManifestEntry::Regular {
-                mode: 0o100644,
-                planes: crate::views::RegularPlanes {
-                    callgraph: Some("config".into()),
-                    semantic: None,
-                },
-                resolution_input: true,
-            },
-        )])
-        .unwrap();
-        let bytes: Arc<[u8]> = CallgraphBlob::config(b"{}".to_vec(), "fixture")
-            .to_bytes()
-            .unwrap()
-            .into();
-        let reader = |_: &BlobKey| Some(bytes.clone());
-        let facts = ViewBindingFacts::new(Rc::new(ManifestFacts {
-            manifest: &manifest,
-            blobs: &reader,
-        }));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), b"{}").unwrap();
+        let facts = ViewBindingFacts::new(Rc::new(super::super::disk_facts::DiskFacts::new(
+            root.path(),
+        )));
         facts.config_fact(b"package.json", "name");
         assert!(facts.attributed_config_bytes(b"package.json").is_some());
         assert!(!facts.consultations.borrow().unattributed());

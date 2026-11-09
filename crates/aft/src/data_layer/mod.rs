@@ -29,6 +29,8 @@ mod publication_tests;
 pub(crate) mod query;
 pub mod reuse;
 pub(crate) mod runtime;
+#[cfg(test)]
+mod rust_bin_targets_tests;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
 pub mod standing;

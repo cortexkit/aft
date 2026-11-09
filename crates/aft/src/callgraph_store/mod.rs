@@ -860,7 +860,6 @@ aft_store::heap_bytes_of_fields!(ReexportIndex {
 #[derive(Clone)]
 pub(crate) struct ProjectIndex<'a> {
     facts: Rc<dyn ProjectFacts + 'a>,
-    unbound_non_utf8_paths: Vec<Vec<u8>>,
     project_root: PathBuf,
     /// Shared, so several resolver threads can each wrap the same bound
     /// surfaces in their own index with their own memos.
@@ -4433,7 +4432,6 @@ impl<'a> ProjectIndex<'a> {
     ) -> Self {
         Self {
             facts,
-            unbound_non_utf8_paths: Vec::new(),
             project_root: project_root.to_path_buf(),
             files,
             caller_data,
@@ -6250,7 +6248,6 @@ mod reexport_resolution_tests {
     fn barrel_index(files: Vec<(String, DbFileIndex)>) -> ProjectIndex<'static> {
         ProjectIndex {
             facts: Rc::new(DiskFacts::new(Path::new("/fixture"))),
-            unbound_non_utf8_paths: Vec::new(),
             project_root: PathBuf::from("/fixture"),
             files: Arc::new(files.into_iter().collect()),
             caller_data: HashMap::new(),

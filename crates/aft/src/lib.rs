@@ -214,7 +214,6 @@ pub(crate) mod tool_output;
 pub mod tool_path;
 pub mod url_fetch;
 mod view_storage_reserve;
-pub mod views;
 pub(crate) mod volume;
 pub(crate) mod walk_boundary;
 pub mod watcher;

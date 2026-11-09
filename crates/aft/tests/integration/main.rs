@@ -35,7 +35,6 @@ mod bash_token_count_test;
 mod bash_watch_test;
 mod cache_root_doctor_test;
 mod callgraph_restart_reuse_test;
-mod callgraph_rust_bin_targets_test;
 mod callgraph_test;
 mod checkpoint_metadata_test;
 mod commands_test;
