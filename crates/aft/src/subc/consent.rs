@@ -3203,11 +3203,19 @@ fn apply_allow(
                     let card_ref = audit
                         .as_ref()
                         .and_then(|record| record.elicitation_id.as_deref());
-                    crate::db::access_grants::insert_from_card(
+                    let source = access_grants::answer_source(
+                        conn,
+                        identity,
+                        by_user,
+                        head.as_ref(),
+                        grant.file().expect("only file scopes persist"),
+                    )?;
+                    crate::db::access_grants::insert_with_source(
                         conn,
                         &access_grants::policy_scope_key(identity),
                         grant.file().expect("only file scopes persist"),
                         card_ref,
+                        source,
                     )?;
                     if let Some(record) = audit {
                         log_consent(

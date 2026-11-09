@@ -324,6 +324,39 @@ pub fn insert(conn: &Connection, key: &ScopeKey, grant: &AccessGrant) -> rusqlit
     insert_from_card(conn, key, grant, None)
 }
 
+/// Person-given authority only; legacy rows cannot establish provenance.
+pub(crate) fn person_grant_covers(
+    conn: &Connection,
+    key: &ScopeKey,
+    requested: &AccessGrant,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("SELECT path,kind,mode FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND source='person'")?;
+    let rows = stmt.query_map(
+        params![key.owner, key.scope_ref, key.epoch.to_string()],
+        |row| {
+            Ok(AccessGrant {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                kind: if row.get::<_, String>(1)? == "subtree" {
+                    GrantKind::Subtree
+                } else {
+                    GrantKind::File
+                },
+                operation: if row.get::<_, String>(2)? == "write" {
+                    AccessOperation::Write
+                } else {
+                    AccessOperation::Read
+                },
+            })
+        },
+    )?;
+    for row in rows {
+        if row?.covers_kind(requested.operation, &requested.path, requested.kind) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Save a grant, recording the consent card whose answer granted it. A new
 /// row gets a fresh grant id and the current time. A read grant widened to
 /// write keeps its row and id, and takes the new time and card, because its
@@ -334,18 +367,30 @@ pub fn insert_from_card(
     grant: &AccessGrant,
     card_ref: Option<&str>,
 ) -> rusqlite::Result<()> {
+    insert_with_source(conn, key, grant, card_ref, None)
+}
+
+/// Record provenance with the same row identity and widening rules as grants.
+pub fn insert_with_source(
+    conn: &Connection,
+    key: &ScopeKey,
+    grant: &AccessGrant,
+    card_ref: Option<&str>,
+    source: Option<super::access_grant_rows::GrantSource>,
+) -> rusqlite::Result<()> {
     if !grant.path.is_absolute() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let canonical = crate::access_policy::policy_path(&grant.path);
-    conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref)
-        SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
+    conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref,source)
+        SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
         ON CONFLICT(owner,scope_ref,epoch,path,kind) DO UPDATE SET
          granted_at_ms=CASE WHEN (excluded.mode='write' AND access_grants.mode<>'write') OR access_grants.granted_at_ms IS NULL THEN excluded.granted_at_ms ELSE access_grants.granted_at_ms END,
-         card_ref=CASE WHEN excluded.mode='write' AND access_grants.mode<>'write' THEN excluded.card_ref ELSE access_grants.card_ref END,
+          card_ref=CASE WHEN excluded.mode='write' AND access_grants.mode<>'write' THEN excluded.card_ref ELSE access_grants.card_ref END,
+          source=CASE WHEN excluded.mode='write' AND access_grants.mode<>'write' THEN excluded.source ELSE access_grants.source END,
          grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
          mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
-        params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref])?;
+        params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
     Ok(())
 }
 
@@ -403,6 +448,60 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
     crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
     tx.commit()
+}
+
+/// Keyset pagination bounds housekeeping work, not a tool's result list.
+pub(crate) fn saved_scope_batch(
+    conn: &Connection,
+    after: Option<&ScopeKey>,
+    limit: usize,
+) -> rusqlite::Result<Vec<ScopeKey>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT owner,scope_ref,epoch FROM access_grants
+        WHERE (owner,scope_ref,epoch) > (?1,?2,?3)
+        ORDER BY owner,scope_ref,epoch LIMIT ?4",
+    )?;
+    let epoch = after.map(|key| key.epoch.to_string()).unwrap_or_default();
+    let rows = stmt
+        .query_map(
+            params![
+                after.map_or("", |key| key.owner.as_str()),
+                after.map_or("", |key| key.scope_ref.as_str()),
+                epoch,
+                limit as i64
+            ],
+            |row| {
+                let epoch: String = row.get(2)?;
+                Ok(ScopeKey {
+                    owner: row.get(0)?,
+                    scope_ref: row.get(1)?,
+                    epoch: epoch.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                })
+            },
+        )?
+        .collect();
+    rows
+}
+
+/// A definite daemon end and its saved-grant deletion commit together.
+pub(crate) fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+        params![key.owner, key.scope_ref, key.epoch.to_string()],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+        params![key.owner, key.scope_ref, key.epoch.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 pub fn launch_params(

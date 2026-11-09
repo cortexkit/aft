@@ -401,6 +401,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "tool-provider protocol feed pagination uses entries, cursor and more, not an AFT ListEnvelope; the existing 256-entry limit and encoded reply-byte bound retain continuation through the shared cursor",
     },
     ExclusionEntry {
+        file: "db/access_grants.rs",
+        enclosing_item: "saved_scope_batch",
+        location_or_primitive: "SQL LIMIT, PER_TICK (4)",
+        reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
+    },
+    ExclusionEntry {
         file: "db/call_ledger.rs",
         enclosing_item: "enforce_retention_bounds",
         location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",

@@ -75,6 +75,58 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     .unwrap();
     result
 }
+
+#[test]
+fn grants_answer_source_does_not_change_head_authority() {
+    use crate::access_policy::HeadPolicy;
+    use crate::db::access_grant_rows::GrantSource;
+    let (dir, ctx, head, worker) = fixture();
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let inside = AccessGrant {
+        path: head.project_root.clone(),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
+    assert_eq!(
+        answer_source(&conn, &worker, false, Some(&policy), &inside).unwrap(),
+        Some(GrantSource::HeadPolicy)
+    );
+    assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let grant = AccessGrant {
+        path: policy_path(&outside),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    for source in [Some(GrantSource::Person), None] {
+        store::revoke(&conn, &scope_key(&head), &grant.path).unwrap();
+        store::insert_with_source(&conn, &scope_key(&head), &grant, Some("acc_head"), source)
+            .unwrap();
+        let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
+        assert_eq!(
+            answer_source(&conn, &worker, false, Some(&policy), &grant).unwrap(),
+            source.map(|_| GrantSource::HeadGrant)
+        );
+        assert_eq!(
+            policy.head_policy(&grant),
+            HeadPolicy::Allow,
+            "classification cannot mutate the approval policy"
+        );
+    }
+    assert_eq!(
+        answer_source(&conn, &worker, true, None, &grant).unwrap(),
+        Some(GrantSource::Person)
+    );
+}
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }

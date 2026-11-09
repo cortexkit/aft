@@ -183,7 +183,7 @@ fn grant_rows_migration_backfills_and_reruns() {
     .unwrap();
     let before = now_ms();
     assert_eq!(
-        crate::db::run_migrations(&mut conn).unwrap(),
+        crate::db::run_migrations_supported(&mut conn, SCHEMA_VERSION).unwrap(),
         SCHEMA_VERSION
     );
     let (id, at): (String, i64) = conn
@@ -205,7 +205,7 @@ fn grant_rows_migration_backfills_and_reruns() {
     )
     .unwrap();
     assert_eq!(
-        crate::db::run_migrations(&mut conn).unwrap(),
+        crate::db::run_migrations_supported(&mut conn, SCHEMA_VERSION).unwrap(),
         SCHEMA_VERSION
     );
     let missing: i64 = conn
@@ -224,4 +224,93 @@ fn grant_rows_migration_backfills_and_reruns() {
         )
         .unwrap();
     assert_eq!(unchanged, id);
+}
+
+#[test]
+fn grant_sources_schema28_preserves_rows_and_refuses_schema27_reader() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    crate::db::run_migrations_supported(&mut conn, 27).unwrap();
+    conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref) VALUES ('o','s','1','/a','subtree','read','preserved',123,'acc_old')", []).unwrap();
+    assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 28);
+    let row = || {
+        conn.query_row(
+            "SELECT grant_id,granted_at_ms,card_ref,source FROM access_grants",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(row(), ("preserved".into(), 123, "acc_old".into(), None));
+    assert!(matches!(
+        crate::db::run_migrations_supported(&mut conn, 27),
+        Err(crate::db::OpenError::DowngradeRefused {
+            db_version: 28,
+            supported: 27
+        })
+    ));
+    assert_eq!(
+        crate::db::run_migrations(&mut conn).unwrap(),
+        28,
+        "a supported retry remains readable"
+    );
+    let row = conn
+        .query_row(
+            "SELECT grant_id,granted_at_ms,card_ref,source FROM access_grants",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("preserved".into(), 123, "acc_old".into(), None));
+    conn.execute("UPDATE schema_version SET version=27", [])
+        .unwrap();
+    assert_eq!(
+        crate::db::run_migrations(&mut conn).unwrap(),
+        28,
+        "migration tolerates an additive-column rollback"
+    );
+    assert!(conn
+        .execute("UPDATE access_grants SET source='invented'", [])
+        .is_err());
+}
+
+#[test]
+fn grant_sources_reader_floor_refusal_then_retry() {
+    use crate::persisted_format::{self, PersistedStore};
+    let dir = tempfile::tempdir().unwrap();
+    let floor = crate::reader_floor::floor_path(dir.path());
+    std::fs::write(&floor, r#"{"floor_schema":1,"stores":{"aft.db":29}}"#).unwrap();
+    assert_eq!(crate::reader_floor::prepare(dir.path()).len(), 1);
+    let path = dir.path().join("aft.db");
+    assert!(persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(28)).is_err());
+    std::fs::write(&floor, r#"{"floor_schema":1,"stores":{"aft.db":28}}"#).unwrap();
+    filetime::set_file_mtime(
+        &floor,
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+        ),
+    )
+    .unwrap();
+    crate::reader_floor::refresh_refused(dir.path()).unwrap();
+    assert!(persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(28)).is_ok());
+    let conn = crate::db::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT version FROM schema_version", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        28
+    );
 }

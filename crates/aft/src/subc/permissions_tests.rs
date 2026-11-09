@@ -70,7 +70,7 @@ fn revoke(db: &Mutex<crate::db::TrackedConnection>, id: &str, stopped: usize) ->
 }
 
 /// The fields a `permissions/v1` row may carry, and those it must.
-const ROW_FIELDS: [&str; 12] = [
+const ROW_FIELDS: [&str; 14] = [
     "id",
     "agent_id",
     "holder",
@@ -83,6 +83,8 @@ const ROW_FIELDS: [&str; 12] = [
     "expires_at_ms",
     "granted_at_ms",
     "card_ref",
+    "source",
+    "granted_at_bound",
 ];
 const REQUIRED_ROW_FIELDS: [&str; 7] = [
     "id",
@@ -217,6 +219,79 @@ fn permissions_list_drops_grants_whose_scope_ended() {
     store::end_scope_grants(&db.lock().unwrap(), &worker()).unwrap();
     assert!(list_all(&db).is_empty());
     assert_eq!(revoke(&db, &id, 0), json!({"outcome": "not_found"}));
+}
+
+#[test]
+fn permissions_list_all_live_sources_have_times_and_remain_revocable() {
+    use crate::db::access_grant_rows::GrantSource;
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    for (index, source) in [
+        Some(GrantSource::Person),
+        Some(GrantSource::HeadGrant),
+        Some(GrantSource::HeadPolicy),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store::insert_with_source(
+            &db.lock().unwrap(),
+            &worker(),
+            &grant(
+                &dir.path().join(format!("source-{index}")),
+                GrantKind::Subtree,
+                AccessOperation::Read,
+            ),
+            source.map(|_| "acc_source"),
+            source,
+        )
+        .unwrap();
+    }
+    let rows = list_all(&db);
+    assert_eq!(rows.len(), 4);
+    for (row, source) in rows
+        .iter()
+        .zip(["person", "head_grant", "head_policy", "unknown"])
+    {
+        assert_contract_row(row);
+        assert_eq!(row["source"], source);
+        assert!(
+            row["granted_at_ms"].is_i64(),
+            "every listed grant needs its time"
+        );
+        if source == "unknown" {
+            assert_eq!(row["granted_at_bound"], "at_or_before");
+        } else {
+            assert!(row.get("granted_at_bound").is_none());
+        }
+        assert_eq!(
+            revoke(&db, row["id"].as_str().unwrap(), 0),
+            json!({"outcome":"revoked"})
+        );
+    }
+    assert!(list_all(&db).is_empty());
+}
+
+#[test]
+fn permissions_legacy_card_time_is_exact_despite_unknown_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    store::insert_from_card(
+        &db.lock().unwrap(),
+        &worker(),
+        &grant(
+            &dir.path().join("card"),
+            GrantKind::Subtree,
+            AccessOperation::Read,
+        ),
+        Some("acc_legacy"),
+    )
+    .unwrap();
+    let rows = list_all(&db);
+    assert_eq!(rows[0]["source"], "unknown");
+    assert!(rows[0]["granted_at_ms"].is_i64());
+    assert!(rows[0].get("granted_at_bound").is_none());
 }
 
 #[test]
@@ -411,12 +486,18 @@ fn permissions_list_matches_the_published_sample() {
     }
     assert_eq!(sample["method"], LIST_OPERATION);
     assert_eq!(sample["route"]["principal"], "reserved:cingulate");
-    let reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
+    let mut reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
     reply["grants"]
         .as_array()
         .unwrap()
         .iter()
         .for_each(assert_contract_row);
+    // The older pinned sample predates additive provenance fields. Keep its
+    // original row contract pinned; the sources sample pins the new fields.
+    for row in reply["grants"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("source");
+        row.as_object_mut().unwrap().remove("granted_at_bound");
+    }
     assert_eq!(reply, sample["reply"]);
 }
 

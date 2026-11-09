@@ -1549,6 +1549,16 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
         )
         .unwrap()
         .contains(&grant));
+        let source: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM access_grants WHERE path=?1",
+                [grant.path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "person");
     }
 }
 
@@ -3454,6 +3464,22 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
     let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
     assert_eq!(f.worker_grants(), vec![grant]);
+    let source: Option<String> = f
+        .ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM access_grants WHERE scope_ref=?1",
+            [&f.worker.scope.as_ref().unwrap().scope_ref],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source, None,
+        "a legacy head grant cannot establish person-given authority"
+    );
     let sibling = f.dir.path().join("sibling.txt");
     std::fs::write(&sibling, "sibling contents").unwrap();
     assert_eq!(
@@ -3492,6 +3518,19 @@ async fn consent_scope_head_directory_still_delegates_directory() {
             operation: AccessOperation::Read,
         }]
     );
+    let source: String = f
+        .ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM access_grants WHERE scope_ref=?1",
+            [&f.worker.scope.as_ref().unwrap().scope_ref],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, "head_policy");
 }
 
 #[cfg(unix)]

@@ -210,6 +210,15 @@ pub(super) fn row_json(row: &GrantRow, homes: &[PathBuf]) -> Value {
         "granted_at_ms": row.granted_at_ms,
     });
     let object = value.as_object_mut().expect("row is an object");
+    const SOURCE_FIELD: &str = "source";
+    const TIME_BOUND_FIELD: &str = "granted_at_bound";
+    object.insert(
+        SOURCE_FIELD.into(),
+        json!(row.source.map_or("unknown", |source| source.as_str())),
+    );
+    if row.source.is_none() && row.card_ref.is_none() {
+        object.insert(TIME_BOUND_FIELD.into(), json!("at_or_before"));
+    }
     if let Some(agent_id) = row.holder.agent_id() {
         object.insert("agent_id".into(), json!(agent_id));
     }

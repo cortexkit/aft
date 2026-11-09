@@ -20,6 +20,41 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
 pub(crate) const SCHEMA_VERSION: u32 = 27;
+pub(crate) const SOURCE_SCHEMA_VERSION: u32 = 28;
+
+/// Schema 28 is additive: existing grants keep unknown provenance. To roll
+/// back, stop AFT, drop `access_grants.source` (or leave it for schema 27),
+/// set schema_version to 27 and lower the `aft.db` minimum reader version in
+/// the storage root's `reader-floor.json` to 27.
+pub(crate) fn migrate_source(conn: &Connection) -> rusqlite::Result<()> {
+    let exists = conn
+        .prepare("PRAGMA table_info(access_grants)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|column| column == "source");
+    if !exists {
+        conn.execute_batch("ALTER TABLE access_grants ADD COLUMN source TEXT CHECK(source IN ('person','head_grant','head_policy'))")?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantSource {
+    Person,
+    HeadGrant,
+    HeadPolicy,
+}
+
+impl GrantSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::HeadGrant => "head_grant",
+            Self::HeadPolicy => "head_policy",
+        }
+    }
+}
 
 const COLUMNS: [(&str, &str); 3] = [
     ("grant_id", "TEXT"),
@@ -115,6 +150,7 @@ pub struct GrantRow {
     pub operation: AccessOperation,
     pub granted_at_ms: i64,
     pub card_ref: Option<String>,
+    pub source: Option<GrantSource>,
 }
 
 /// A grant counts as live while its scope row is the newest epoch recorded
@@ -131,7 +167,7 @@ const LIVE: &str = "FROM access_grants g
  AND NOT EXISTS (SELECT 1 FROM access_scopes n WHERE n.owner=g.owner AND n.scope_ref=g.scope_ref
    AND (length(n.epoch)>length(g.epoch) OR (length(n.epoch)=length(g.epoch) AND n.epoch>g.epoch)))";
 
-const ROW: &str = "g.grant_id,g.owner,g.scope_ref,g.epoch,g.path,g.kind,g.mode,g.granted_at_ms,g.card_ref,a.kind,a.agent_id,s.parent_owner,s.parent,s.parent_epoch";
+const ROW: &str = "g.grant_id,g.owner,g.scope_ref,g.epoch,g.path,g.kind,g.mode,g.granted_at_ms,g.card_ref,a.kind,a.agent_id,s.parent_owner,s.parent,s.parent_epoch,g.source";
 
 struct RawRow {
     row: GrantRow,
@@ -179,6 +215,12 @@ fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
             },
             granted_at_ms: r.get(7)?,
             card_ref: r.get(8)?,
+            source: match r.get::<_, Option<String>>(14)?.as_deref() {
+                Some("person") => Some(GrantSource::Person),
+                Some("head_grant") => Some(GrantSource::HeadGrant),
+                Some("head_policy") => Some(GrantSource::HeadPolicy),
+                _ => None,
+            },
         },
         role: r.get(9)?,
         parent,

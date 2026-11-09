@@ -1,5 +1,36 @@
 //! Grant operations and launch validation use daemon-attested route ancestry.
 use super::*;
+
+pub(super) mod sweep;
+
+/// Classify an already-approved answer without changing its authority. Policy
+/// that allows the path without saved grants takes precedence; otherwise only
+/// a recorded person-given head grant establishes person-derived delegation.
+pub(super) fn answer_source(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    by_user: bool,
+    head: Option<&AccessPolicy>,
+    grant: &AccessGrant,
+) -> rusqlite::Result<Option<crate::db::access_grant_rows::GrantSource>> {
+    use crate::db::access_grant_rows::GrantSource;
+    if by_user {
+        return Ok(Some(GrantSource::Person));
+    }
+    if let Some(head) = head {
+        let mut policy_only = head.clone();
+        policy_only.grants.clear();
+        if policy_only.head_policy(grant) == crate::access_policy::HeadPolicy::Allow {
+            return Ok(Some(GrantSource::HeadPolicy));
+        }
+    }
+    if let Some(key) = consent_head(conn, identity)? {
+        if store::person_grant_covers(conn, &key, grant)? {
+            return Ok(Some(GrantSource::HeadGrant));
+        }
+    }
+    Ok(None)
+}
 use crate::access_policy::{
     policy_path, AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
 };
