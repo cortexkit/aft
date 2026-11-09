@@ -2907,14 +2907,23 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    // The version is read before the full shape, so metadata written by a
-    // newer build is refused by name (and kept out of quarantine) instead of
-    // failing as an unparseable task.
+    // Ordinary records need only the typed decode, not an allocated Value
+    // tree followed by the same parse again. On decode failure, still check
+    // the version before returning that error: future formats may have a
+    // different shape and must be refused, not quarantined as corrupt tasks.
     #[cfg(test)]
     work_counts::record_parse();
-    let version = serde_json::from_str::<serde_json::Value>(&content)
-        .ok()
-        .and_then(|value| value.get("schema_version")?.as_u64());
+    let decoded = serde_json::from_str::<PersistedTask>(&content);
+    let version = match &decoded {
+        Ok(task) => Some(u64::from(task.schema_version)),
+        Err(_) => {
+            #[cfg(test)]
+            work_counts::record_parse();
+            serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|value| value.get("schema_version")?.as_u64())
+        }
+    };
     crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::BashTask,
         path,
@@ -2922,10 +2931,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
         version,
     )
     .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
-    #[cfg(test)]
-    work_counts::record_parse();
-    let task: PersistedTask = serde_json::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let task = decoded.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
