@@ -129,8 +129,8 @@ fn permissions_list_rows_for_agent_and_worker_grants() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());
     let home = crate::access_policy::policy_path(dir.path()).join("home");
-    let site = home.join("Work/site");
-    let notes = home.join("Work/notes");
+    let site = home.join("Work").join("site");
+    let notes = home.join("Work").join("notes");
     {
         let conn = db.lock().unwrap();
         store::insert_from_card(
@@ -160,14 +160,26 @@ fn permissions_list_rows_for_agent_and_worker_grants() {
     let rows = rows["grants"].as_array().unwrap().clone();
     assert_eq!(rows.len(), 2, "{rows:?}");
     rows.iter().for_each(assert_contract_row);
+    // The label shows the folder the way the person's system writes it:
+    // `~/Work/site` on macOS and Linux, `~\Work\site` on Windows.
+    let label = |folder: &str| {
+        if cfg!(windows) {
+            format!(r"~\Work\{folder}")
+        } else {
+            format!("~/Work/{folder}")
+        }
+    };
     let agent = &rows[0];
     assert_eq!(
         agent["holder"],
         json!({"kind": "agent", "agent_id": "agent-alf"})
     );
-    assert_eq!(agent["subject_label"], "~/Work/site");
+    assert_eq!(agent["subject_label"], label("site"));
     assert_eq!(agent["scope"], "read_write");
-    assert_eq!(agent["scope_label"], "read and change files in ~/Work/site");
+    assert_eq!(
+        agent["scope_label"],
+        format!("read and change files in {}", label("site"))
+    );
     assert_eq!(agent["card_ref"], "acc_3");
     let worker_row = &rows[1];
     assert_eq!(
@@ -175,7 +187,10 @@ fn permissions_list_rows_for_agent_and_worker_grants() {
         json!({"kind": "worker", "agent_id": "agent-alf", "scope_ref": "scope:wkr-7f3a"})
     );
     assert_eq!(worker_row["agent_id"], "agent-alf");
-    assert_eq!(worker_row["scope_label"], "read files in ~/Work/notes");
+    assert_eq!(
+        worker_row["scope_label"],
+        format!("read files in {}", label("notes"))
+    );
     assert_ne!(agent["id"], worker_row["id"]);
 
     // The agent filter keeps the head's own grants and its workers'.

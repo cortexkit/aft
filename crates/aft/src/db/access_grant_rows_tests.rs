@@ -11,12 +11,22 @@ fn key(name: &str, epoch: u64) -> ScopeKey {
     }
 }
 
-fn folder(path: &str, operation: AccessOperation) -> AccessGrant {
+fn folder(path: &std::path::Path, operation: AccessOperation) -> AccessGrant {
     AccessGrant {
-        path: PathBuf::from(path),
+        path: path.to_path_buf(),
         kind: GrantKind::Subtree,
         operation,
     }
+}
+
+/// The folder `work/<name>` under the test's temporary directory, in the
+/// form aft.db stores grant paths. Saving a grant refuses a relative path,
+/// and a fixed Unix path such as `/work/x` is relative on Windows because it
+/// names no drive.
+fn work(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+    crate::access_policy::policy_path(dir.path())
+        .join("work")
+        .join(name)
 }
 
 /// A head `head` (agent `agent-alf`) at epoch 7 and its worker `worker`.
@@ -33,18 +43,18 @@ fn fixture() -> (tempfile::TempDir, crate::db::TrackedConnection) {
 
 #[test]
 fn grant_rows_name_agent_and_worker_holders() {
-    let (_dir, conn) = fixture();
+    let (dir, conn) = fixture();
     store::insert_from_card(
         &conn,
         &key("head", 7),
-        &folder("/work/x", AccessOperation::Write),
+        &folder(&work(&dir, "x"), AccessOperation::Write),
         Some("acc_1"),
     )
     .unwrap();
     store::insert_from_card(
         &conn,
         &key("worker", 3),
-        &folder("/work/y", AccessOperation::Read),
+        &folder(&work(&dir, "y"), AccessOperation::Read),
         Some("acc_2"),
     )
     .unwrap();
@@ -79,12 +89,13 @@ fn grant_rows_name_agent_and_worker_holders() {
 
 #[test]
 fn grant_rows_widening_keeps_the_id_and_refreshes_time_and_card() {
-    let (_dir, conn) = fixture();
+    let (dir, conn) = fixture();
     let head = key("head", 7);
+    let x = work(&dir, "x");
     store::insert_from_card(
         &conn,
         &head,
-        &folder("/work/x", AccessOperation::Read),
+        &folder(&x, AccessOperation::Read),
         Some("acc_1"),
     )
     .unwrap();
@@ -95,7 +106,7 @@ fn grant_rows_widening_keeps_the_id_and_refreshes_time_and_card() {
     store::insert_from_card(
         &conn,
         &head,
-        &folder("/work/x", AccessOperation::Read),
+        &folder(&x, AccessOperation::Read),
         Some("acc_9"),
     )
     .unwrap();
@@ -103,7 +114,7 @@ fn grant_rows_widening_keeps_the_id_and_refreshes_time_and_card() {
     store::insert_from_card(
         &conn,
         &head,
-        &folder("/work/x", AccessOperation::Write),
+        &folder(&x, AccessOperation::Write),
         Some("acc_2"),
     )
     .unwrap();
@@ -117,17 +128,17 @@ fn grant_rows_widening_keeps_the_id_and_refreshes_time_and_card() {
 
 #[test]
 fn grant_rows_leave_out_ended_and_superseded_scopes() {
-    let (_dir, conn) = fixture();
+    let (dir, conn) = fixture();
     store::insert(
         &conn,
         &key("head", 7),
-        &folder("/work/x", AccessOperation::Read),
+        &folder(&work(&dir, "x"), AccessOperation::Read),
     )
     .unwrap();
     store::insert(
         &conn,
         &key("worker", 3),
-        &folder("/work/y", AccessOperation::Read),
+        &folder(&work(&dir, "y"), AccessOperation::Read),
     )
     .unwrap();
     let worker_id = live_rows(&conn)
@@ -146,16 +157,12 @@ fn grant_rows_leave_out_ended_and_superseded_scopes() {
 
 #[test]
 fn grant_rows_revoke_deletes_once() {
-    let (_dir, conn) = fixture();
-    store::insert(
-        &conn,
-        &key("worker", 3),
-        &folder("/work/y", AccessOperation::Read),
-    )
-    .unwrap();
+    let (dir, conn) = fixture();
+    let y = work(&dir, "y");
+    store::insert(&conn, &key("worker", 3), &folder(&y, AccessOperation::Read)).unwrap();
     let id = live_rows(&conn).unwrap().remove(0).grant_id;
     let revoked = revoke_live(&conn, &id).unwrap().expect("live grant");
-    assert_eq!(revoked.path, PathBuf::from("/work/y"));
+    assert_eq!(revoked.path, y);
     assert!(store::list(&conn, &key("worker", 3)).unwrap().is_empty());
     assert_eq!(revoke_live(&conn, &id).unwrap(), None);
     assert_eq!(revoke_live(&conn, "aftg_unknown").unwrap(), None);
