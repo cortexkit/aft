@@ -483,9 +483,11 @@ impl LiveCheckout {
         let facts = CheckoutFacts { inputs };
         let mut now = HashMap::<FactQuestion, FactAnswer>::new();
         let mut stale = StaleAnswers::default();
-        let mut held = Vec::new();
+        let mut changed_reads = BTreeSet::new();
         for path in &files {
-            let Some(file) = self.resolved.get(path) else {
+            // Most of these files keep their resolution, so each is read
+            // without keeping it decoded ([`Resolutions::read`]).
+            let Some(file) = self.resolved.read(path) else {
                 continue;
             };
             let mut any = false;
@@ -508,29 +510,22 @@ impl LiveCheckout {
                     any = true;
                 }
             }
-            if !any {
-                held.push(path.clone());
-            }
-        }
-        stale.checked = now.len();
-        stale.changed = files
-            .iter()
-            .filter_map(|path| self.resolved.get(path))
-            .flat_map(|file| {
+            // Every read of this file is in `now` by here.
+            changed_reads.extend(
                 file.binding
                     .answers()
                     .chain(file.dispatch.iter().flat_map(|d| d.trace.answers.iter()))
-            })
-            .filter(|(question, recorded)| {
-                now.get(*question).is_some_and(|answer| answer != *recorded)
-            })
-            .map(|(question, _)| question)
-            .collect::<BTreeSet<_>>()
-            .len();
-        for path in held {
-            let file = &self.resolved[&path];
-            self.reverse.note_subjects(&path, file, &facts);
+                    .filter(|(question, recorded)| {
+                        now.get(*question).is_some_and(|answer| answer != *recorded)
+                    })
+                    .map(|(question, _)| question.clone()),
+            );
+            if !any {
+                self.reverse.note_subjects(path, &file, &facts);
+            }
         }
+        stale.checked = now.len();
+        stale.changed = changed_reads.len();
         stale
     }
 
@@ -542,7 +537,7 @@ impl LiveCheckout {
     pub(crate) fn cold(inputs: CheckoutInputs) -> Result<Self, ManifestJoinError> {
         let pool = super::callgraph::engine_pool()?;
         let bound = BindCache::default();
-        let (resolved, calls) = pool.install(|| {
+        let (resolved, calls) = crate::alloc_trace::install(&pool, || {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
             bound.bind_missing(&inputs, &paths)?;
             let mut resolved = resolve_files(&inputs, &bound, &paths)?;
@@ -616,7 +611,7 @@ impl LiveCheckout {
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
-        let mut stats = pool.install(|| {
+        let mut stats = crate::alloc_trace::install(&pool, || {
             let stats = self.update_in_pool(next, changed)?;
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
@@ -631,7 +626,7 @@ impl LiveCheckout {
     /// Runs `op` on the engine's thread pool, which every engine of the
     /// process shares (see `callgraph::engine_pool`).
     pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(op)
+        crate::alloc_trace::install(&self.pool, op)
     }
 
     /// Whether this engine and `other` resolve on the same thread pool.
@@ -961,25 +956,68 @@ impl LiveCheckout {
         {
             self.bound.bind_module_declaring(inputs)?;
         }
+        // Most files a change reaches here keep their resolution: each file
+        // whose surface answers (pass 2) or dispatch trace (pass 3) depend on
+        // something that changed is replayed. Each is read once for both,
+        // in path order, without keeping it decoded ([`Resolutions::read`]).
+        // Decoding them in parallel instead took a fifth more CPU, more
+        // still with several checkouts refreshing at once. A file's trace
+        // is replayed only if its own surface replay keeps its resolution;
+        // nothing else the two passes do in between changes what a trace
+        // reads (see pass 3 below).
+        let mut trace_keys = changed_keys.clone();
+        trace_keys.extend(membership.iter().cloned());
+        let replaying = self
+            .reverse
+            .resolution_of(&changed_keys)
+            .into_iter()
+            .filter(|path| !resolve.contains(path))
+            .collect::<BTreeSet<_>>();
+        let tracing = self
+            .reverse
+            .dispatch_of(&trace_keys)
+            .into_iter()
+            .filter(|path| !resolve.contains(path))
+            .collect::<BTreeSet<_>>();
         let mut answers = BTreeMap::new();
-        for path in self.reverse.resolution_of(&changed_keys) {
-            if resolve.contains(&path) {
-                continue;
-            }
-            let Some(old) = self.resolved.get(&path) else {
+        let mut trace_answers = BTreeMap::new();
+        let mut traces_changed = BTreeSet::new();
+        for path in replaying.union(&tracing) {
+            let Some(file) = self.resolved.read(path) else {
                 continue;
             };
-            stats.replayed += 1;
-            if old
-                .binding
-                .surface_replays(&index, &changed_keys, &mut answers)
+            if replaying.contains(path) {
+                stats.replayed += 1;
+                if file
+                    .binding
+                    .surface_replays(&index, &changed_keys, &mut answers)
+                {
+                    stats.kept_after_replay += 1;
+                } else {
+                    resolve.insert(path.clone());
+                    continue;
+                }
+            }
+            if !tracing.contains(path) {
+                continue;
+            }
+            let Some(dispatch) = &file.dispatch else {
+                continue;
+            };
+            stats.dispatch_replayed += 1;
+            // A file whose recorded reads changed is traced again anyway.
+            if stale.dispatch.contains(path) {
+                continue;
+            }
+            let trace = &dispatch.trace;
+            if trace.probes_any(&membership)
+                || !trace.replays(&index, &changed_keys, &mut trace_answers)
             {
-                stats.kept_after_replay += 1;
-            } else {
-                resolve.insert(path);
+                traces_changed.insert(path.clone());
             }
         }
         drop(answers);
+        drop(trace_answers);
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {
@@ -1021,12 +1059,12 @@ impl LiveCheckout {
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-        // Pass 3, for files whose rows were kept: replay each trace.
+        // Pass 3, for files whose rows were kept: each trace was replayed
+        // with its file's surface answers above. Resolving files again
+        // changes no surface a trace reads, since every file whose binding
+        // could change was bound again in pass 1.
         let started = Instant::now();
-        let mut trace_answers = BTreeMap::new();
         let mut recompute = Vec::new();
-        let mut trace_keys = changed_keys.clone();
-        trace_keys.extend(membership.iter().cloned());
         // Stale answers were asked before this update removed files; a
         // removed file has nothing left to recompute.
         for path in &stale.dispatch {
@@ -1037,29 +1075,7 @@ impl LiveCheckout {
                 recompute.push(path.clone());
             }
         }
-        for path in self.reverse.dispatch_of(&trace_keys) {
-            if resolve.contains(&path) {
-                continue;
-            }
-            let Some(dispatch) = self
-                .resolved
-                .get(&path)
-                .and_then(|file| file.dispatch.as_ref())
-            else {
-                continue;
-            };
-            let trace = &dispatch.trace;
-            stats.dispatch_replayed += 1;
-            if recompute.contains(&path) {
-                continue;
-            }
-            if trace.probes_any(&membership)
-                || !trace.replays(&index, &changed_keys, &mut trace_answers)
-            {
-                recompute.push(path);
-            }
-        }
-        drop(trace_answers);
+        recompute.extend(traces_changed);
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;

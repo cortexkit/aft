@@ -922,7 +922,8 @@ pub(crate) fn checkout_estimate(
 /// allocation and the cache's two lookup tables. `resident_bytes` is the
 /// block data alone, which the cache keeps within `budget_bytes`. While
 /// another thread holds the cache's lock the tables are left out and the
-/// figure is partial.
+/// figure is partial. The other caches every checkout shares, of decoded
+/// call-graph files and of symbol tables, are counted with it.
 pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
     let (stats, measured) = super::runtime::block_cache_memory()?;
     let resident = u64::try_from(stats.resident_bytes).unwrap_or(u64::MAX);
@@ -959,6 +960,27 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
             .count_u64("slice_hits", slices.hits)
             .count_u64("slice_misses", slices.misses)
             .count_u64("slice_evictions", slices.evictions);
+    }
+    // The symbol tables the checkouts' symbol caches share are counted here
+    // too, once, rather than by each cache that holds one; their counters
+    // are named `symbol_table_*`.
+    match super::outline::tables::shared().stats() {
+        Some(tables) => {
+            estimate.estimated_bytes = estimate
+                .estimated_bytes
+                .map(|bytes| bytes.saturating_add(tables.bytes));
+            estimate = estimate
+                .count_u64("symbol_table_bytes", tables.bytes)
+                .count_u64("symbol_tables", tables.tables)
+                .count_u64("symbol_table_kept_bytes", tables.kept_bytes)
+                .count_u64("symbol_table_budget_bytes", tables.budget_bytes)
+                .count_u64("symbol_table_hits", tables.hits)
+                .count_u64("symbol_table_misses", tables.misses);
+        }
+        None => {
+            estimate = estimate.gap("symbol_tables_busy");
+            estimate.bytes_status = "partial";
+        }
     }
     Some(estimate)
 }

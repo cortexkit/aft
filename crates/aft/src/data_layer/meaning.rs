@@ -414,6 +414,10 @@ impl Meaning {
     /// round of this fill has, makes the plane if no round under this
     /// configuration has, and fills one round of files.
     pub(crate) fn round(&self, checkout: &Arc<Checkout>) -> Round {
+        let _alloc_label = crate::alloc_trace::scope(
+            crate::alloc_trace::Label::MEANING_FILL,
+            Some(checkout.root()),
+        );
         let Some(config) = self.config() else {
             return Round::Idle;
         };

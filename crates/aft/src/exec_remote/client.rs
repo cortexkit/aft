@@ -139,6 +139,21 @@ impl ExecRemoteClient {
     pub(crate) async fn run_with_diagnostics(
         &self,
         request: &RunRequest,
+        diagnostics: Option<RunDiagnostics<'_>>,
+    ) -> Result<RemoteStream, Error> {
+        // Submitting is when the job's inputs are captured, so the
+        // allocation tracer names that step for whatever it allocates.
+        crate::alloc_trace::future(
+            crate::alloc_trace::Label::REMOTE_INPUT_CAPTURE,
+            None,
+            self.submit_run(request, diagnostics),
+        )
+        .await
+    }
+
+    async fn submit_run(
+        &self,
+        request: &RunRequest,
         mut diagnostics: Option<RunDiagnostics<'_>>,
     ) -> Result<RemoteStream, Error> {
         if request.submission_key().is_some() || request.resume_from_seq().is_some() {

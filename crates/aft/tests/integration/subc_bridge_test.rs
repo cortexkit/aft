@@ -13308,6 +13308,8 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "page.read",
             "page.release",
             "diagnostics.findings",
+            "permissions.list",
+            "permissions.revoke",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(

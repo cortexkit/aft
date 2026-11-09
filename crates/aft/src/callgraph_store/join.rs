@@ -1856,19 +1856,20 @@ impl DispatchTypeTargetTrace {
     /// unchanged in `index`. An answer depending on nothing in `changed` reads
     /// only index entries that are the same as when it was recorded. Traces
     /// share queries (a crate's module parents, for one), so answers are kept
-    /// in `answers` for the next trace checked against the same index.
-    pub(crate) fn replays<'q>(
-        &'q self,
+    /// in `answers` for the next trace checked against the same index. The
+    /// memo owns its queries, so the traces checked need not outlive it.
+    pub(crate) fn replays(
+        &self,
         index: &impl super::ResolverIndex,
         changed: &BTreeSet<String>,
-        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+        answers: &mut BTreeMap<ViewSurfaceQuery, String>,
     ) -> bool {
         self.queries.iter().all(|(query, expected)| {
             !query
                 .dependencies()
                 .iter()
                 .any(|dependency| changed.contains(dependency))
-                || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+                || answer_is(query, expected, index, answers)
         })
     }
 
@@ -1952,19 +1953,20 @@ impl ViewBindingDependencies {
     /// one of `changed` still has the answer it recorded in `index`. A query
     /// depending on nothing in `changed` reads only index entries that are
     /// unchanged. Answers are kept in `answers` for the next file replayed
-    /// against the same index.
-    pub(crate) fn surface_replays<'q>(
-        &'q self,
+    /// against the same index. The memo owns its queries, so the resolutions
+    /// replayed need not outlive it.
+    pub(crate) fn surface_replays(
+        &self,
         index: &impl super::ResolverIndex,
         changed: &BTreeSet<String>,
-        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+        answers: &mut BTreeMap<ViewSurfaceQuery, String>,
     ) -> bool {
         self.surface_queries.iter().all(|(query, expected)| {
             !query
                 .dependencies()
                 .iter()
                 .any(|dependency| changed.contains(dependency))
-                || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+                || answer_is(query, expected, index, answers)
         })
     }
 
@@ -2949,6 +2951,24 @@ impl ViewSurfaceQuery {
             }
         }
     }
+}
+
+/// Whether `query`'s answer in `index` is `expected`, asking `index` once
+/// per memo: the memo keeps a copy of each query it answers, made only the
+/// first time.
+fn answer_is(
+    query: &ViewSurfaceQuery,
+    expected: &str,
+    index: &impl super::ResolverIndex,
+    answers: &mut BTreeMap<ViewSurfaceQuery, String>,
+) -> bool {
+    if let Some(answer) = answers.get(query) {
+        return answer == expected;
+    }
+    let answer = query.answer(index);
+    let same = answer == expected;
+    answers.insert(query.clone(), answer);
+    same
 }
 
 /// A resolver index over one file's resolution that records each surface

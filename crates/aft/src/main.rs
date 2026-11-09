@@ -1,6 +1,17 @@
 mod cli;
 mod standalone_input;
 
+/// Every heap allocation of the binary passes through the tracer, which
+/// names the operation behind a large allocation or a burst of many.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: aft::alloc_trace::TracingAllocator = aft::alloc_trace::TracingAllocator;
+
+// The tests read frames back through the unix loader, and only unix
+// targets record frames at all.
+#[cfg(all(test, unix))]
+#[path = "alloc_trace/process_tests.rs"]
+mod alloc_trace_process_tests;
+
 #[cfg(test)]
 #[path = "../tests/helpers/context_storage.rs"]
 mod context_storage;
@@ -445,6 +456,10 @@ fn main() {
             }
         }
     }
+
+    // Writes the large allocations and bursts the global allocator records;
+    // until it runs they wait in a fixed queue.
+    aft::alloc_trace::start_logger();
 
     // subc daemon attach: `aft --subc <connection-file>` swaps the
     // standalone NDJSON-over-stdin transport for the subc loopback-TCP client.

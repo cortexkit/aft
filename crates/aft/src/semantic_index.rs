@@ -1728,6 +1728,12 @@ struct LocalQueryEmbedRequest {
 struct LocalQueryEmbedWorker {
     requests: crossbeam_channel::Sender<LocalQueryEmbedRequest>,
     busy: Arc<AtomicBool>,
+    /// Held by a query from its submission until its reply or its timeout.
+    /// Query embeddings run outside the context's model mutex, so this is
+    /// what still makes a second query wait for the worker instead of being
+    /// refused as busy while an earlier inference it could have waited for
+    /// finishes.
+    submissions: Mutex<()>,
 }
 
 impl LocalQueryEmbedWorker {
@@ -1760,7 +1766,11 @@ impl LocalQueryEmbedWorker {
                 }
             })
             .map_err(|error| format!("failed to start local query embed worker: {error}"))?;
-        Ok(Self { requests, busy })
+        Ok(Self {
+            requests,
+            busy,
+            submissions: Mutex::new(()),
+        })
     }
 
     fn try_submit(
@@ -1794,7 +1804,7 @@ impl LocalQueryEmbedWorker {
 
 struct LocalEmbeddingEngine {
     model: SharedLocalEmbeddingProvider,
-    query_worker: LocalQueryEmbedWorker,
+    query_worker: Arc<LocalQueryEmbedWorker>,
 }
 
 impl LocalEmbeddingEngine {
@@ -1807,11 +1817,61 @@ impl LocalEmbeddingEngine {
         let query_model = query_model
             .map(|provider| Arc::new(Mutex::new(provider)))
             .unwrap_or_else(|| Arc::clone(&model));
-        let query_worker = LocalQueryEmbedWorker::start(query_model, query_cache)?;
+        let query_worker = Arc::new(LocalQueryEmbedWorker::start(query_model, query_cache)?);
         Ok(Self {
             model,
             query_worker,
         })
+    }
+}
+
+/// Query texts some request is embedding right now, so a second request for
+/// the same text waits for that embedding and then reads it from the query
+/// cache instead of asking the backend again. Requests for other texts do not
+/// wait here.
+#[derive(Default)]
+struct QueryEmbedFlights {
+    in_flight: Mutex<HashSet<String>>,
+    finished: std::sync::Condvar,
+}
+
+impl QueryEmbedFlights {
+    /// Waits while another request embeds `text`, then marks it as this
+    /// request's until the returned guard drops. A request that finds the
+    /// earlier one failed tries itself, as it did when the context's model
+    /// mutex serialized every query.
+    fn lead(self: &Arc<Self>, text: &str) -> QueryEmbedFlight {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while in_flight.contains(text) {
+            in_flight = self
+                .finished
+                .wait(in_flight)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        in_flight.insert(text.to_string());
+        QueryEmbedFlight {
+            flights: Arc::clone(self),
+            text: text.to_string(),
+        }
+    }
+}
+
+struct QueryEmbedFlight {
+    flights: Arc<QueryEmbedFlights>,
+    text: String,
+}
+
+impl Drop for QueryEmbedFlight {
+    fn drop(&mut self) {
+        self.flights
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.text);
+        self.flights.finished.notify_all();
     }
 }
 
@@ -1892,7 +1952,44 @@ enum SemanticEmbeddingEngine {
         model: String,
         base_url: String,
     },
-    Synapse(SynapseEmbeddingClient),
+    /// Shared with the query handles [`SemanticEmbeddingModel::share_for_query`]
+    /// makes. The client keeps circuit-breaker state across calls, so its
+    /// calls take turns on this mutex.
+    Synapse(Arc<Mutex<SynapseEmbeddingClient>>),
+}
+
+impl SemanticEmbeddingEngine {
+    /// The same backend for a query handle: the local query worker, the
+    /// Synapse client and the HTTP connection pool are shared, not rebuilt.
+    fn share(&self) -> Self {
+        match self {
+            Self::Local(engine) => Self::Local(LocalEmbeddingEngine {
+                model: Arc::clone(&engine.model),
+                query_worker: Arc::clone(&engine.query_worker),
+            }),
+            Self::OpenAiCompatible {
+                client,
+                model,
+                base_url,
+                api_key,
+            } => Self::OpenAiCompatible {
+                client: client.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+            },
+            Self::Ollama {
+                client,
+                model,
+                base_url,
+            } => Self::Ollama {
+                client: client.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+            },
+            Self::Synapse(client) => Self::Synapse(Arc::clone(client)),
+        }
+    }
 }
 
 pub struct SemanticEmbeddingModel {
@@ -1907,7 +2004,8 @@ pub struct SemanticEmbeddingModel {
     dimension: Option<usize>,
     engine: SemanticEmbeddingEngine,
     query_embedding_cache: Arc<Mutex<QueryEmbeddingCache>>,
-    local_query_last_ok_log: Option<Instant>,
+    query_flights: Arc<QueryEmbedFlights>,
+    local_query_last_ok_log: Arc<Mutex<Option<Instant>>>,
     query_instruction: Option<String>,
     query_instruction_logged: bool,
     query_instruction_root: Option<PathBuf>,
@@ -3031,12 +3129,18 @@ impl SemanticEmbeddingModel {
                     base_url,
                 }
             }
-            SemanticBackend::Synapse => SemanticEmbeddingEngine::Synapse(
+            SemanticBackend::Synapse => SemanticEmbeddingEngine::Synapse(Arc::new(Mutex::new(
                 SynapseEmbeddingClient::from_config(config).map_err(|error| error.to_string())?,
-            ),
+            ))),
         };
         let max_batch_size = match &engine {
-            SemanticEmbeddingEngine::Synapse(client) => client.metadata().recommended_rows,
+            SemanticEmbeddingEngine::Synapse(client) => {
+                client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .metadata()
+                    .recommended_rows
+            }
             _ => max_batch_size,
         };
 
@@ -3052,7 +3156,8 @@ impl SemanticEmbeddingModel {
             dimension: None,
             engine,
             query_embedding_cache,
-            local_query_last_ok_log: None,
+            query_flights: Arc::default(),
+            local_query_last_ok_log: Arc::default(),
             query_instruction: config.resolved_query_instruction().map(str::to_string),
             query_instruction_logged: false,
             query_instruction_root: config.route_project_root.clone(),
@@ -3081,7 +3186,8 @@ impl SemanticEmbeddingModel {
             dimension: None,
             engine,
             query_embedding_cache,
-            local_query_last_ok_log: None,
+            query_flights: Arc::default(),
+            local_query_last_ok_log: Arc::default(),
             query_instruction: None,
             query_instruction_logged: false,
             query_instruction_root: Some(project_root),
@@ -3115,6 +3221,9 @@ impl SemanticEmbeddingModel {
         let dimension = self.dimension()?;
         let mut fingerprint = SemanticIndexFingerprint::from_config(config, dimension);
         if let SemanticEmbeddingEngine::Synapse(client) = &self.engine {
+            let client = client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let identity = client.identity();
             fingerprint.synapse_fingerprint = Some(identity.fingerprint.clone());
             fingerprint.synapse_table_epoch = Some(identity.table_epoch);
@@ -3437,6 +3546,8 @@ impl SemanticEmbeddingModel {
                         .ok_or_else(|| "embedding backend returned no vectors".to_string())?
                 }
                 SemanticEmbeddingEngine::Synapse(client) => client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .probe_dimension(Duration::from_millis(self.timeout_ms))
                     .map_err(|error| error.to_string())?,
                 SemanticEmbeddingEngine::OpenAiCompatible { .. }
@@ -3470,11 +3581,58 @@ impl SemanticEmbeddingModel {
         }
     }
 
-    pub fn embed_query_cached(
-        &mut self,
-        query: &str,
-        budget: QueryBudget,
-    ) -> Result<Vec<f32>, String> {
+    /// A handle that embeds queries with this model's backend, query cache and
+    /// in-flight queries, so a caller can let go of the mutex that holds this
+    /// model before the backend round trip. A query whose vector is cached
+    /// then never waits behind another query's round trip.
+    ///
+    /// The handle shares what must stay single: the query cache, the
+    /// texts being embedded, the local query worker (whose calls still take
+    /// turns) and the Synapse client (whose calls take turns on its mutex).
+    /// An HTTP backend's calls run side by side, each with its own budget.
+    /// What a query learns about the backend (its dimension) stays on the
+    /// handle until [`Self::adopt_query_dimension`] copies it back.
+    pub(crate) fn share_for_query(&mut self) -> Self {
+        self.log_query_instruction_once();
+        Self {
+            backend: self.backend,
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            timeout_ms: self.timeout_ms,
+            max_batch_size: self.max_batch_size,
+            adaptive_build_batch_size: self.adaptive_build_batch_size,
+            successful_build_batches_at_size: self.successful_build_batches_at_size,
+            per_item_ema_ms: self.per_item_ema_ms,
+            dimension: self.dimension,
+            engine: self.engine.share(),
+            query_embedding_cache: Arc::clone(&self.query_embedding_cache),
+            query_flights: Arc::clone(&self.query_flights),
+            local_query_last_ok_log: Arc::clone(&self.local_query_last_ok_log),
+            query_instruction: self.query_instruction.clone(),
+            query_instruction_logged: true,
+            query_instruction_root: self.query_instruction_root.clone(),
+        }
+    }
+
+    /// The embedding dimension this model has learned from its backend so
+    /// far, without asking it.
+    pub(crate) fn known_dimension(&self) -> Option<usize> {
+        self.dimension
+    }
+
+    /// Copies the dimension a query on a handle from
+    /// [`Self::share_for_query`] learned back onto this model, so it need not
+    /// ask the backend for it again (see [`Self::dimension`]). A handle of
+    /// another model changes nothing.
+    pub(crate) fn adopt_query_dimension(&mut self, handle: &Self) {
+        if Arc::ptr_eq(&self.query_embedding_cache, &handle.query_embedding_cache)
+            && handle.dimension.is_some()
+        {
+            self.dimension = handle.dimension;
+        }
+    }
+
+    fn log_query_instruction_once(&mut self) {
         if !self.query_instruction_logged {
             let root = self
                 .query_instruction_root
@@ -3496,7 +3654,18 @@ impl SemanticEmbeddingModel {
             }
             self.query_instruction_logged = true;
         }
+    }
+
+    pub fn embed_query_cached(
+        &mut self,
+        query: &str,
+        budget: QueryBudget,
+    ) -> Result<Vec<f32>, String> {
+        self.log_query_instruction_once();
         let query_text = query_embedding_text(query, self.query_instruction.as_deref());
+        // Another request embedding the same text finishes first; this one
+        // then finds its vector in the query cache.
+        let _flight = self.query_flights.lead(&query_text);
         self.embed_rows_resilient(
             vec![query_text],
             Some(EmbeddingRequestPolicy::Query(budget)),
@@ -3525,16 +3694,20 @@ impl SemanticEmbeddingModel {
             );
         }
         let should_log = if outcome == "ok" {
-            self.local_query_last_ok_log
-                .is_none_or(|last| last.elapsed() >= QUERY_EMBED_OK_LOG_INTERVAL)
+            let mut last_ok_log = self
+                .local_query_last_ok_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = last_ok_log.is_none_or(|last| last.elapsed() >= QUERY_EMBED_OK_LOG_INTERVAL);
+            if due {
+                *last_ok_log = Some(Instant::now());
+            }
+            due
         } else {
             true
         };
         if !should_log {
             return;
-        }
-        if outcome == "ok" {
-            self.local_query_last_ok_log = Some(Instant::now());
         }
         slog_info!(
             "semantic query embed: backend=fastembed model={} elapsed_ms={} budget_ms={} outcome={}",
@@ -3551,13 +3724,20 @@ impl SemanticEmbeddingModel {
         cache_key: String,
         budget: QueryBudget,
     ) -> Result<Vec<Vec<f32>>, String> {
-        let started = Instant::now();
-        let receiver = match &self.engine {
-            SemanticEmbeddingEngine::Local(engine) => {
-                engine.query_worker.try_submit(texts, cache_key)
-            }
+        let worker = match &self.engine {
+            SemanticEmbeddingEngine::Local(engine) => Arc::clone(&engine.query_worker),
             _ => unreachable!("local query path requires the local embedding engine"),
         };
+        // Queries take turns from submission to reply, as they did under the
+        // context's model mutex. A query that gave up on its reply releases
+        // its turn while the worker may still be busy with that inference;
+        // the next query is then refused as busy below.
+        let _turn = worker
+            .submissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = Instant::now();
+        let receiver = worker.try_submit(texts, cache_key);
         let Some(receiver) = receiver else {
             self.log_local_query_embed(started.elapsed(), budget, "busy");
             return Err(format!(
@@ -3621,15 +3801,18 @@ impl SemanticEmbeddingModel {
                 EmbeddingRequestPolicy::Query(budget)
                     if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
                 {
-                    Some(
-                        self.embed_local_query(
-                            texts.clone(),
-                            query_cache_key
-                                .clone()
-                                .expect("query policy has a cache key"),
-                            budget,
-                        ),
-                    )
+                    Some(crate::commands::semantic_search::waits::timed(
+                        crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+                        || {
+                            self.embed_local_query(
+                                texts.clone(),
+                                query_cache_key
+                                    .clone()
+                                    .expect("query policy has a cache key"),
+                                budget,
+                            )
+                        },
+                    ))
                 }
                 _ => None,
             }
@@ -3662,6 +3845,11 @@ impl SemanticEmbeddingModel {
             return result;
         }
 
+        // A query that missed the cache waits here for its remote backend
+        // (Synapse or HTTP) or the in-process model.
+        let backend_wait = crate::commands::semantic_search::waits::time(
+            crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+        );
         let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model
@@ -3815,6 +4003,9 @@ impl SemanticEmbeddingModel {
                 Ok(vectors)
             }
             SemanticEmbeddingEngine::Synapse(client) => {
+                let mut client = client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let vectors = match policy {
                     EmbeddingRequestPolicy::Build(_) => client
                         .embed_batch(&texts)
@@ -3828,10 +4019,12 @@ impl SemanticEmbeddingModel {
                             .map_err(|error| error.to_string())?
                     }
                 };
+                drop(client);
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
         })();
+        drop(backend_wait);
 
         record_embedding_call(
             self.backend,

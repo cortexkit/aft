@@ -18,12 +18,14 @@ pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
+pub mod request_files;
 pub(crate) mod rerank;
 pub mod scoring;
 pub(crate) mod snippet_bounds;
 pub mod split_query;
 pub mod telemetry;
 pub mod trailer;
+pub mod waits;
 
 pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
 pub use evidence_descriptor::{
@@ -126,8 +128,8 @@ use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
-    GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
+    sort_grep_matches_by_mtime_desc, walk_project_files_from_matching, GrepMatch,
+    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
     INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
@@ -138,6 +140,18 @@ use crate::semantic_index::{
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
+
+/// [`crate::search_index::try_read_with_budget`], timed as a readiness wait:
+/// every artifact read the search makes through it retries a contended lock
+/// in 1 ms sleeps until its budget runs out.
+fn try_read_with_budget<T>(
+    lock: &std::sync::RwLock<T>,
+    budget: Duration,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    waits::timed(waits::SearchWait::Readiness, || {
+        crate::search_index::try_read_with_budget(lock, budget)
+    })
+}
 /// Semantic candidate admission is ranking policy, not a public response-size limit.
 /// Keeping it fixed prevents page-cap changes from rewriting the fused list.
 pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
@@ -548,6 +562,9 @@ fn handle_semantic_search_with_disk_fallback(
 ) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
+    // Every phase of this request reads its candidate files through one set,
+    // so each file is read from disk once (see `request_files`).
+    let _request_files = request_files::install();
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
@@ -1097,7 +1114,9 @@ fn collect_pattern_list(
         path_exclusion: grep_path_exclusion(include_tests),
     };
     Ok(split_query::PatternList::from_bounded_scan(
-        grep_executor::execute(ctx, compiled, &scope, &params),
+        waits::timed(waits::SearchWait::Grep, || {
+            grep_executor::execute(ctx, compiled, &scope, &params)
+        }),
         project_root,
         pattern,
     ))
@@ -1220,8 +1239,10 @@ fn split_semantic_results(
             Some(index) => index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -2430,7 +2451,9 @@ fn handle_external_bounded_lexical_fallback(
         max_results: top_k,
         path_exclusion: grep_path_exclusion(params.include_tests),
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &grep_params);
+    let result = waits::timed(waits::SearchWait::Grep, || {
+        grep_executor::execute(ctx, &compiled, &scope, &grep_params)
+    });
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
@@ -2611,14 +2634,15 @@ fn lexical_candidate_exactness(
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
     let _cost = telemetry::CostPhase::start("lexical_exactness");
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    let Ok(bytes) = fs::read(file) else {
+    let files = request_files::current();
+    let Ok(fetched) = waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), file, read_whole_source_file)
+    }) else {
         return (false, 0, None);
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = fetched.file.lossy_text();
     let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
-    let prepared = exact_lane::prepare_exact_text(&text, blake3::hash(&bytes));
+    let prepared = exact_lane::prepare_exact_text(text, fetched.file.digest());
     let normalized_text = prepared.normalized();
     drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
@@ -2641,10 +2665,20 @@ fn lexical_candidate_exactness(
         return (false, 0, None);
     }
 
-    if let Some(width) = query_shape::minimum_content_token_window(&text, content_tokens) {
+    if let Some(width) = query_shape::minimum_content_token_window(text, content_tokens) {
         return (true, 0, Some(width));
     }
     (false, 0, None)
+}
+
+/// Read a whole source file as `std::fs::read` does, for a phase whose
+/// file the request's set does not hold yet.
+fn read_whole_source_file(
+    path: &Path,
+) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(path);
+    request_files::read_whole_file(path)
 }
 
 fn exact_phrase(query: &str) -> &str {
@@ -2829,7 +2863,9 @@ fn handle_grep_search(
             path_exclusion: grep_path_exclusion(include_tests),
         };
         (
-            grep_executor::execute(ctx, &compiled, &scope, &params),
+            waits::timed(waits::SearchWait::Grep, || {
+                grep_executor::execute(ctx, &compiled, &scope, &params)
+            }),
             None,
             None,
         )
@@ -3050,7 +3086,9 @@ fn regex_route_collection(
         #[cfg(test)]
         regex_route_lock_hook(false);
         // The checkout's text index names the candidate files, when ready.
-        match data_layer_regex_candidates(ctx, compiled)? {
+        match waits::timed(waits::SearchWait::TextSearch, || {
+            data_layer_regex_candidates(ctx, compiled)
+        })? {
             Ok(snapshot) => snapshot,
             Err(error) => return Some(Err(error)),
         }
@@ -3059,15 +3097,19 @@ fn regex_route_collection(
     if !scope.use_index {
         return None;
     }
-    let collection = snapshot.collect_grep_matches_by_file(
-        compiled,
-        &PathFilters::default(),
-        &scope.root,
-        grep_path_exclusion(include_tests),
-        regex_route::limits(),
-        &regex_route::examine_priority,
-        &regex_route::keep_past_line_limit,
-    );
+    // Candidate files are verified on the global Rayon pool; the searching
+    // thread waits for that whole parallel section.
+    let collection = waits::timed(waits::SearchWait::Rayon, || {
+        snapshot.collect_grep_matches_by_file(
+            compiled,
+            &PathFilters::default(),
+            &scope.root,
+            grep_path_exclusion(include_tests),
+            regex_route::limits(),
+            &regex_route::examine_priority,
+            &regex_route::keep_past_line_limit,
+        )
+    });
     Some(collection)
 }
 
@@ -3434,10 +3476,9 @@ impl PresenceReads {
         }
         #[cfg(test)]
         LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
-        let stamp = file_stamp(path);
-        let text = crate::search_index::read_searchable_text(path)?;
+        let (stamp, holds) = presence_check(path, &self.normalized)?;
         self.read.push((path.to_path_buf(), stamp));
-        Some(exact_lane::normalize_exact_phrase(&text).contains(&self.normalized))
+        Some(holds)
     }
 
     fn entry(
@@ -3457,6 +3498,51 @@ impl PresenceReads {
             candidates,
         }
     }
+}
+
+/// Whether `path`'s text holds `normalized`, with the file's stamp from
+/// before its bytes were read; `None` when the file cannot be read or is
+/// binary or not UTF-8 (as `read_searchable_text`).
+///
+/// The request's set serves bytes an earlier phase read only when that
+/// phase stamped them first. Bytes kept without a stamp are read again: a
+/// stamp taken now could be newer than those bytes, and the memo would then
+/// keep an answer about older text as if it described the current file.
+fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, bool)> {
+    let files = request_files::current();
+    let kept = files.as_ref().and_then(|files| files.kept(path));
+    let file = match kept {
+        Some(file) if file.stat().is_some() => file,
+        Some(_) => {
+            #[cfg(test)]
+            request_files::record_disk_read(path);
+            let stamp = file_stamp(path);
+            let text = crate::search_index::read_searchable_text(path)?;
+            return Some((
+                stamp,
+                exact_lane::normalize_exact_phrase(&text).contains(normalized),
+            ));
+        }
+        None => {
+            request_files::read_through(files.as_deref(), path, |path| {
+                let stat = fs::metadata(path)
+                    .ok()
+                    .map(|metadata| request_files::FileStat::of(&metadata));
+                Ok((crate::bounded_io::read(path, None)?, stat))
+            })
+            .ok()?
+            .file
+        }
+    };
+    let stamp = file.stat().map(|stat| (stat.size, stat.modified));
+    if crate::search_index::is_binary_bytes(file.bytes()) {
+        return None;
+    }
+    let text = file.utf8()?;
+    Some((
+        stamp,
+        exact_lane::normalize_exact_phrase(text).contains(normalized),
+    ))
 }
 
 /// Settle whether some file holds the literal, reading as little as
@@ -3600,12 +3686,33 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
-    let read_cost = telemetry::CostPhase::start("matching_read");
-    let source = std::fs::read_to_string(file).ok()?;
-    drop(read_cost);
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    matching_line_in_text(&source, query, symbol_range)
+    let Some(files) = request_files::current() else {
+        let read_cost = telemetry::CostPhase::start("matching_read");
+        let source = waits::timed(waits::SearchWait::FileRead, || {
+            request_files::read_through(None, file, read_whole_source_file)
+        })
+        .ok()?;
+        drop(read_cost);
+        return matching_line_in_text(source.file.utf8()?, query, symbol_range);
+    };
+    // The reranker's candidate text asks for the same line of the same file;
+    // the request's set answers both from one search of the text.
+    files.matching_line(
+        file,
+        query,
+        symbol_range.map(|range| (range.start, range.end)),
+        || {
+            let read_cost = telemetry::CostPhase::start("matching_read");
+            let fetched = waits::timed(waits::SearchWait::FileRead, || {
+                files.read(file, read_whole_source_file)
+            })?;
+            drop(read_cost);
+            Ok(fetched
+                .file
+                .utf8()
+                .and_then(|source| matching_line_in_text(source, query, symbol_range)))
+        },
+    )
 }
 
 /// Preparation is addressed by the bytes just read, not a path or watcher
@@ -3841,8 +3948,10 @@ impl MatchingSourceCache {
 
     fn prepare(&self, source: &str) -> Arc<MatchingSource> {
         let digest = blake3::hash(source.as_bytes());
-        let cell = {
-            let mut state = self.state.lock();
+        // As the exact preparation cache: an unfilled placeholder found here
+        // means another request is preparing the same source.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
@@ -3850,7 +3959,7 @@ impl MatchingSourceCache {
                 if let Some(prepared) = entry.source.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.source)
+                (Arc::clone(&entry.source), true)
             } else {
                 // Bound in-flight placeholders as well as completed entries;
                 // normalization and trigram work never hold the map lock.
@@ -3866,17 +3975,19 @@ impl MatchingSourceCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(waits::SearchWait::PrepareCache));
         let prepared = cell.get_or_init(|| {
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Arc::new(MatchingSource::new(source))
         });
+        drop(other_wait);
         let retained_bytes = prepared.retained_bytes();
-        let mut state = self.state.lock();
+        let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.source, &cell) && entry.bytes == 0 {
                 entry.bytes = retained_bytes;
@@ -3929,10 +4040,18 @@ fn definition_line_from_source(
     file: &Path,
     symbol_range: SymbolOffsetRange,
 ) -> Option<(u32, String)> {
-    let source = std::fs::read_to_string(file).ok()?;
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    line_at_offset(&source, symbol_range.start)
+    let source = request_source_file(file).ok()?;
+    line_at_offset(source.utf8()?, symbol_range.start)
+}
+
+/// `path`'s bytes from the current request's set, read whole (as
+/// `std::fs::read` does) when the set does not hold them yet.
+fn request_source_file(path: &Path) -> std::io::Result<Arc<request_files::RequestFile>> {
+    let files = request_files::current();
+    waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), path, read_whole_source_file)
+    })
+    .map(|fetched| fetched.file)
 }
 
 pub(crate) fn definition_matches_identifier_token(
@@ -3942,12 +4061,10 @@ pub(crate) fn definition_matches_identifier_token(
     let Some(range) = candidate.symbol_range else {
         return false;
     };
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(&candidate.path);
-    let Ok(source) = std::fs::read(&candidate.path) else {
+    let Ok(source) = request_source_file(&candidate.path) else {
         return false;
     };
-    let Some(symbol) = source.get(range.start..range.end) else {
+    let Some(symbol) = source.bytes().get(range.start..range.end) else {
         return false;
     };
     definition_identifier_tokens(query)
@@ -3981,12 +4098,17 @@ fn identifier_has_code_reference(
     identifier: &str,
     parser: &mut crate::parser::FileParser,
 ) -> bool {
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(path);
-    let Ok(source) = std::fs::read_to_string(path) else {
+    let Ok(file) = request_source_file(path) else {
         return false;
     };
-    let Ok((tree, _)) = parser.parse(path) else {
+    let Some(source) = file.utf8() else {
+        return false;
+    };
+    // Parse the bytes just checked, not a fresh read of the path, so the tree
+    // and the text agree even if the file changes meanwhile.
+    let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || {
+        parser.parse_source_text(path, source)
+    }) else {
         return false;
     };
     source.match_indices(identifier).any(|(start, _)| {
@@ -4067,6 +4189,96 @@ fn take_windows_semantic_preview(
         .min()
         .cloned()?;
     metadata.remove(&semantic_path)
+}
+
+/// The path-lookup lane's files: those under `project_root` that
+/// `candidate_filter` admits and whose name, or `/`-separated path relative
+/// to the root, ends with one of `tokens`, newest first.
+///
+/// With the data layer's view of the root, while this context's file
+/// watcher keeps that view current, the files come from the view's path
+/// list, which holds every path the project walk would reach; otherwise (no
+/// view yet, no watcher, or a view that cannot stand in for the walk) from
+/// that walk. Both apply the same test to each file and the same order, so
+/// the lane's answer does not depend on which one ran.
+fn path_lookup_paths(
+    ctx: &AppContext,
+    data_text: Option<&crate::data_layer::tools::search::DataText>,
+    project_root: &Path,
+    tokens: &[&str],
+    candidate_filter: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let tokens = tokens
+        .iter()
+        .map(|token| token.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    let matches = |path: &Path| {
+        if !candidate_filter(path) {
+            return false;
+        }
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        tokens.iter().any(|normalized| {
+            file_name == Some(normalized.as_str()) || relative.ends_with(normalized.as_str())
+        })
+    };
+    if let Some(text) = data_text.filter(|_| watcher_keeps_view_current(ctx)) {
+        // A file `matches` keeps has a relative path ending with a token (a
+        // file name equal to the token ends it too), so only those members
+        // need spelling out.
+        let ends_with_token = |relative: &[u8]| {
+            tokens
+                .iter()
+                .any(|token| relative.ends_with(token.as_bytes()))
+        };
+        if let Some(files) = waits::timed(waits::SearchWait::TextSearch, || {
+            text.files_matching(project_root, ends_with_token, matches)
+        }) {
+            return files;
+        }
+    }
+    // Reject unrelated filenames before the walker builds metadata and
+    // canonical display keys for sorting; the surviving order is unchanged.
+    let _walk = waits::time(waits::SearchWait::Walk);
+    walk_project_files_from_matching(project_root, project_root, &PathFilters::default(), matches)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for [`AppContext::watcher_runtime_active`] on this thread.
+    static WATCHER_LIVE_FOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with this thread's path lookups treating the file watcher as
+/// running (`live`) or not, whatever the context's watcher does.
+#[cfg(test)]
+fn with_watcher_live_for_test<R>(live: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCHER_LIVE_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(WATCHER_LIVE_FOR_TEST.with(|slot| slot.replace(Some(live))));
+    run()
+}
+
+/// Whether this context's file watcher is running. Only then does the data
+/// layer's view learn of a file created outside AFT soon after it appears
+/// (a change still in the watcher's hands is disclosed on the reply as a
+/// pending-change gap); without a watcher the view keeps missing it, and a
+/// lookup by file name must walk the folder to find it.
+fn watcher_keeps_view_current(ctx: &AppContext) -> bool {
+    #[cfg(test)]
+    if let Some(live) = WATCHER_LIVE_FOR_TEST.with(std::cell::Cell::get) {
+        return live;
+    }
+    ctx.watcher_runtime_active()
 }
 
 fn run_engine_ranking(
@@ -4457,27 +4669,12 @@ fn run_engine_ranking(
             })
             .filter(|token| token.contains('.'))
             .collect::<Vec<_>>();
-        // Reject unrelated filenames before the walker builds metadata and
-        // canonical display keys for sorting; the surviving order is unchanged.
-        walk_project_files_from_matching(
+        path_lookup_paths(
+            ctx,
+            data_text.as_ref(),
             project_root,
-            project_root,
-            &PathFilters::default(),
-            |path| {
-                if !candidate_filter(path) {
-                    return false;
-                }
-                let relative = path
-                    .strip_prefix(project_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let file_name = path.file_name().and_then(|name| name.to_str());
-                query_path_tokens.iter().any(|token| {
-                    let normalized = token.replace('\\', "/");
-                    file_name == Some(normalized.as_str()) || relative.ends_with(&normalized)
-                })
-            },
+            &query_path_tokens,
+            &candidate_filter,
         )
         .into_iter()
         .map(|path| {
@@ -4899,19 +5096,21 @@ fn run_engine_ranking(
     // the page.
     drop(fusion_cost);
     let rerank_cost = telemetry::CostPhase::start("rerank");
-    let rerank_note = rerank::rerank_canonical_head(
-        &mut page.reply,
-        page_request.offset(),
-        page_request.top_k(),
-        rerank::RerankRequest {
-            search: &ctx.config().search,
-            backend: rerank::installed_backend(ctx),
-            project_root,
-            prose: Some(query),
-            public_query,
-            path_scope: path_scope.as_ref(),
-        },
-    )?;
+    let rerank_note = waits::timed(waits::SearchWait::Rerank, || {
+        rerank::rerank_canonical_head(
+            &mut page.reply,
+            page_request.offset(),
+            page_request.top_k(),
+            rerank::RerankRequest {
+                search: &ctx.config().search,
+                backend: rerank::installed_backend(ctx),
+                project_root,
+                prose: Some(query),
+                public_query,
+                path_scope: path_scope.as_ref(),
+            },
+        )
+    })?;
     drop(rerank_cost);
     let fusion_cost = telemetry::CostPhase::start("fusion");
     // A split request then reorders the first block, which every request
@@ -5637,8 +5836,10 @@ fn handle_semantic_or_hybrid_search(
             Some(semantic_index) => semantic_index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, params.include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, params.include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -6483,7 +6684,9 @@ fn execute_degraded_grep_fallback(
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
     let started = Instant::now();
     let (files, file_cap_reached, walk_budget_reached, skipped_foreign_mounts) =
-        collect_degraded_grep_files(project_root, include_tests, started);
+        waits::timed(waits::SearchWait::Walk, || {
+            collect_degraded_grep_files(project_root, include_tests, started)
+        });
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -6497,6 +6700,7 @@ fn execute_degraded_grep_fallback(
 
     let read_budget_reached = AtomicBool::new(walk_budget_reached);
     let cancellation = crate::executor::current_job_cancellation();
+    let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let mut readable_files = files
         .par_iter()
         .enumerate()
@@ -6515,6 +6719,7 @@ fn execute_degraded_grep_fallback(
                 .map(|content| (index, file.clone(), content))
         })
         .collect::<Vec<_>>();
+    drop(rayon_wait);
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -6993,7 +7198,9 @@ fn embed_query_for_dimension(
     }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
-    let mut model_ref = ctx.semantic_embedding_model().lock();
+    let mut model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+        ctx.semantic_embedding_model().lock()
+    });
     #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
     crate::semantic_index::observe_query_embedding_phase("model_mutex_first_acquired");
 
@@ -7002,12 +7209,18 @@ fn embed_query_for_dimension(
 
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_start");
-        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config);
+        // Building the query model (loading it, or reaching the backend) is
+        // part of the first query's embedding wait.
+        let constructed_model = waits::timed(waits::SearchWait::Embed, || {
+            EmbeddingModel::from_config_for_query(&semantic_config)
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_end");
         let constructed_model = constructed_model?;
 
-        model_ref = ctx.semantic_embedding_model().lock();
+        model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_mutex_second_acquired");
         if model_ref.is_none() {
@@ -7017,7 +7230,9 @@ fn embed_query_for_dimension(
             {
                 let _discarded_model = constructed_model;
             }
-            model_ref = ctx.semantic_embedding_model().lock();
+            model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+                ctx.semantic_embedding_model().lock()
+            });
             #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
             crate::semantic_index::observe_query_embedding_phase("model_mutex_reacquired");
         }
@@ -7026,13 +7241,31 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
+    // Embed through a handle on the installed model rather than under its
+    // mutex: the backend round trip of one query must not hold up another
+    // query whose vector is already cached. The handle keeps the
+    // serialization the backend itself needs (see `share_for_query`).
+    let mut query_model = model.share_for_query();
+    drop(model_ref);
+    let known_dimension = query_model.known_dimension();
     // Preserve the raw error so the timeout marker injected by
     // `send_embedding_request` survives — `classify_embed_query_error` reads it
     // to decide whether the configured query budget fired.
-    let query_vector = model
-        .embed_query_cached(query, query_budget)
-        .map_err(|error| format!("failed to embed query: {error}"))?;
-    drop(model_ref);
+    let query_vector = waits::timed(waits::SearchWait::Embed, || {
+        query_model.embed_query_cached(query, query_budget)
+    })
+    .map_err(|error| format!("failed to embed query: {error}"))?;
+    // A backend that reported its dimension with this query tells the
+    // installed model too, as it did when the query ran on that model.
+    if query_model.known_dimension() != known_dimension {
+        if let Some(model) = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        })
+        .as_mut()
+        {
+            model.adopt_query_dimension(&query_model);
+        }
+    }
 
     check_query_dimension(query_vector, index_dimension)
 }
@@ -8037,13 +8270,27 @@ fn snippet_read_plans(
 }
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+    // A file an earlier phase of this request read is cut into lines from
+    // those bytes; otherwise only the lines the plan needs are read.
+    if let Some(file) = request_files::current().and_then(|files| files.kept(path)) {
+        return bounded_snippet_lines_from(&mut file.bytes(), plan);
+    }
+    let _read = waits::time(waits::SearchWait::FileRead);
     let file = fs::File::open(path).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    let mut reader = std::io::BufReader::new(file);
+    #[cfg(test)]
+    request_files::record_disk_read(path);
+    bounded_snippet_lines_from(&mut std::io::BufReader::new(file), plan)
+}
+
+fn bounded_snippet_lines_from(
+    reader: &mut impl std::io::BufRead,
+    plan: SnippetReadPlan,
+) -> Option<Vec<String>> {
     let mut lines = Vec::new();
     let mut nonempty_lines = 0usize;
-    while let Some((line, nonempty)) = read_bounded_snippet_line(&mut reader).ok()? {
+    while let Some((line, nonempty)) = read_bounded_snippet_line(reader).ok()? {
         nonempty_lines += usize::from(nonempty);
         lines.push(line);
         if plan.is_satisfied(lines.len() - 1, nonempty_lines) {
@@ -8317,9 +8564,11 @@ fn enrich_snippets_from_source_reference(
         }
 
         let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
-            fs::read_to_string(&result.file)
-                .ok()
-                .map(|content| content.lines().map(str::to_string).collect())
+            waits::timed(waits::SearchWait::FileRead, || {
+                fs::read_to_string(&result.file)
+            })
+            .ok()
+            .map(|content| content.lines().map(str::to_string).collect())
         });
 
         if matches!(result.kind, SymbolKind::FileSummary) {
@@ -9758,6 +10007,248 @@ mod tests {
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn set_embedding_gate(gate: &(Mutex<bool>, Condvar), open: bool) {
+        let (released, wake) = gate;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = open;
+        wake.notify_all();
+    }
+
+    /// A context whose query model is a local provider that blocks while the
+    /// gate is closed, with its call count and a channel that hears each call
+    /// start.
+    fn context_with_gated_local_model(
+        project: &Path,
+        gate: &Arc<(Mutex<bool>, Condvar)>,
+    ) -> (AppContext, Arc<AtomicUsize>, std::sync::mpsc::Receiver<()>) {
+        let ctx = test_context(project);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(BlockingLocalProvider {
+                    calls: Arc::clone(&calls),
+                    started: started_tx,
+                    gate: Arc::clone(gate),
+                }),
+                project.to_path_buf(),
+            ));
+        (ctx, calls, started_rx)
+    }
+
+    /// A query whose vector is cached answers while another query's
+    /// embedding is still running: the backend round trip does not hold the
+    /// context's model mutex.
+    #[test]
+    fn cached_query_vector_returns_while_another_query_embeds() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let cached = embed_query("where cached vectors live", &ctx).expect("warm the cache");
+        started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("warming embedding ran");
+        set_embedding_gate(&gate, false);
+
+        let (hit, slow) = thread::scope(|scope| {
+            let slow = scope.spawn(|| {
+                with_query_budget_for_test(60_000, || {
+                    embed_query("how slow embeddings are handled", &ctx)
+                })
+            });
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second embedding started");
+            let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let _ = hit_tx.send(embed_query("where cached vectors live", ctx));
+            });
+            // The gate is still closed: the slow query is inside the provider.
+            let hit = hit_rx.recv_timeout(Duration::from_secs(5));
+            set_embedding_gate(&gate, true);
+            (hit, slow.join().expect("slow query thread"))
+        });
+
+        let hit = hit.expect("a cached query must not wait for another query's embedding");
+        assert_eq!(hit.expect("cached query vector"), cached);
+        slow.expect("slow query embeds once the gate opens");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Two searches that miss the cache with the same query text ask the
+    /// backend once: the second waits for the first and reads its vector.
+    #[test]
+    fn concurrent_misses_for_one_query_text_embed_once() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let query = "how one query text is embedded once";
+
+        let (first, second) = thread::scope(|scope| {
+            let first =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first embedding started");
+            let second =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            // Let the second request reach its wait before the first ends;
+            // arriving later would only make it a plain cache hit.
+            thread::sleep(Duration::from_millis(200));
+            set_embedding_gate(&gate, true);
+            (
+                first.join().expect("first query thread"),
+                second.join().expect("second query thread"),
+            )
+        });
+
+        let first = first.expect("first query vector");
+        assert_eq!(second.expect("second query vector"), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A folder for the path-lookup lane: files a token names at several
+    /// depths, beside copies the project walk never lists (ignored by
+    /// `.gitignore` or `.aftignore`, in skipped folders, OS metadata files,
+    /// symlinks), test files, and hidden folders the walk does list. Returns
+    /// the folder and a context whose index-store checkout of it serves text.
+    fn path_lookup_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
+        let project = tempfile::tempdir().expect("create project dir");
+        let root = std::fs::canonicalize(project.path()).expect("canonical root");
+        let files = [
+            (".gitignore", "ignored/\n*.log\n"),
+            (".aftignore", "secret/\n"),
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("notes.md", "# notes\n"),
+            ("subc_format.rs", "pub fn top() {}\n"),
+            ("src/a/subc_format.rs", "pub fn a() {}\n"),
+            ("src/b/subc_format.rs", "pub fn b() {}\n"),
+            ("src/b/deep/nested/subc_format.rs", "pub fn nested() {}\n"),
+            ("src/b/my_subc_format.rs", "pub fn suffix() {}\n"),
+            ("src/subc_format_test.rs", "#[test] fn t() {}\n"),
+            ("tests/subc_format.rs", "#[test] fn t() {}\n"),
+            (".config/subc_format.rs", "pub fn hidden() {}\n"),
+            ("ignored/subc_format.rs", "pub fn ignored() {}\n"),
+            ("secret/subc_format.rs", "pub fn secret() {}\n"),
+            ("node_modules/pkg/subc_format.rs", "pub fn dep() {}\n"),
+            ("target/debug/subc_format.rs", "pub fn built() {}\n"),
+            ("dist/subc_format.rs", "pub fn dist() {}\n"),
+            ("src/._subc_format.rs", "resource fork\n"),
+            ("src/ehthumbs.db", "thumbs\n"),
+            ("build.log", "log line\n"),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write fixture file");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("src/a/subc_format.rs"),
+            root.join("src/linked_subc_format.rs"),
+        )
+        .expect("symlink fixture file");
+        let ctx = test_context(&root);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        (project, root, ctx)
+    }
+
+    /// The path-lookup lane answered from the index store's path list lists
+    /// the same files, in the same order, as the project walk it replaces:
+    /// names and suffixes at any depth, with the walk's ignore rules, skipped
+    /// folders, exclusions and the test-file filter applied.
+    #[test]
+    fn path_lookup_from_the_view_matches_the_project_walk() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let token_sets: [&[&str]; 9] = [
+            &["subc_format.rs"],
+            &["b/subc_format.rs"],
+            &["format.rs"],
+            &["subc_format_test.rs"],
+            &["build.log"],
+            &["._subc_format.rs", "ehthumbs.db"],
+            &["linked_subc_format.rs"],
+            &["Cargo.toml", "notes.md", ".gitignore"],
+            &["src\\b\\deep\\nested\\subc_format.rs"],
+        ];
+        for include_tests in [false, true] {
+            let filter = |path: &Path| path_allowed_by_include_tests(path, &root, include_tests);
+            for tokens in token_sets {
+                let walked = path_lookup_paths(&ctx, None, &root, tokens, &filter);
+                let listed = with_watcher_live_for_test(true, || {
+                    path_lookup_paths(&ctx, Some(&text), &root, tokens, &filter)
+                });
+                assert_eq!(
+                    listed, walked,
+                    "tokens {tokens:?}, include_tests {include_tests}"
+                );
+            }
+        }
+        // The comparison above is not vacuous: the walk found nested files
+        // and left out every ignored, skipped and excluded copy.
+        let all = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let mut found = with_watcher_live_for_test(true, || {
+            path_lookup_paths(&ctx, Some(&text), &root, &["subc_format.rs"], &all)
+        })
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .expect("under the root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ".config/subc_format.rs",
+                "src/a/subc_format.rs",
+                "src/b/deep/nested/subc_format.rs",
+                "src/b/my_subc_format.rs",
+                "src/b/subc_format.rs",
+                "subc_format.rs",
+                "tests/subc_format.rs",
+            ]
+        );
+    }
+
+    /// With a current view of the root (its file watcher running), the
+    /// path-lookup lane reads the view's path list and walks no folder.
+    /// Without a watcher, or without a view, it walks.
+    #[test]
+    fn path_lookup_walks_no_folder_when_a_current_view_exists() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let filter = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let lookup = |live: bool, text: Option<&crate::data_layer::tools::search::DataText>| {
+            crate::search_hot_path_measurements::reset();
+            let found = with_watcher_live_for_test(live, || {
+                path_lookup_paths(&ctx, text, &root, &["subc_format.rs"], &filter)
+            });
+            (
+                found,
+                crate::search_hot_path_measurements::counts().project_walks,
+            )
+        };
+
+        let (listed, walks) = lookup(true, Some(&text));
+        assert_eq!(walks, 0);
+        assert!(!listed.is_empty());
+        let (without_watcher, walks) = lookup(false, Some(&text));
+        assert_eq!(walks, 1);
+        assert_eq!(without_watcher, listed);
+        let (without_view, walks) = lookup(true, None);
+        assert_eq!(walks, 1);
+        assert_eq!(without_view, listed);
     }
 
     #[test]

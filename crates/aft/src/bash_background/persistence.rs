@@ -1920,6 +1920,10 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
+    /// The saved folder grants this command's sandbox allowed, so revoking
+    /// one can stop it. Persisted so a restarted AFT still knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) folder_grants: Option<super::registry::folder_grants::TaskFolderGrants>,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -2014,6 +2018,7 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
         metadata
@@ -2185,6 +2190,7 @@ impl From<BashTaskRow> for PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            folder_grants: None,
         }
     }
 }

@@ -208,16 +208,22 @@ pub(crate) const OWNER_PAUSED_REASON: &str = "paused_by_owner";
 pub const RUN_ENDED_REASON: &str = "run_ended";
 
 /// How an owner-directed stop is labelled to the agent: a run or scope end,
-/// or a cancellation that leaves the scope usable.
+/// a cancellation that leaves the scope usable, or the person revoking a
+/// folder the command's sandbox allowed.
 /// `None` for any other status reason.
 pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
         Some(OWNER_PAUSED_REASON) => Some("cancelled by owner"),
+        Some(folder_grants::FOLDER_ACCESS_REVOKED_REASON) => {
+            Some(folder_grants::FOLDER_ACCESS_REVOKED_LABEL)
+        }
         _ => None,
     }
 }
+#[path = "folder_grants.rs"]
+pub(crate) mod folder_grants;
 #[path = "remote.rs"]
 pub(crate) mod remote;
 #[path = "return_files.rs"]
@@ -7867,6 +7873,12 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_pending))
         .then(|| metadata.task_id.clone());
+        // A saved folder grant this command's sandbox holds may have been
+        // revoked while AFT was down, when no revoke could see the command.
+        let folder_check = metadata
+            .folder_grants
+            .is_some()
+            .then(|| (metadata.task_id.clone(), metadata.session_id.clone()));
         let (marker, process_alive) = if matches!(
             metadata.status,
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
@@ -8016,6 +8028,9 @@ impl BgTaskRegistry {
             if !self.hold_remote_worker(&task_id) {
                 self.resume_remote_task(&task_id)?;
             }
+        }
+        if let Some((task_id, session)) = folder_check {
+            self.stop_if_folder_grant_revoked(&task_id, &session, self.grant_db());
         }
         Ok(())
     }

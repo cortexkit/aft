@@ -637,6 +637,9 @@ impl ProcessMemorySnapshot {
 /// `memory.roots` map pushes later sections past the cut).
 pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
 
+/// Operations the census names by their allocation high-water mark.
+const CENSUS_ALLOCATION_LABELS: usize = 5;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
     pub roots_status: &'static str,
@@ -661,6 +664,12 @@ pub struct MemorySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_layer_block_cache: Option<MemoryEstimate>,
     pub process: ProcessMemorySnapshot,
+    /// The operations whose live heap bytes peaked highest since the
+    /// previous census, highest first, as the `aft` binary's allocation
+    /// tracer counts them. Only the uncapped census carries them, and only
+    /// when an operation allocated since the last one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allocation_labels: Vec<crate::alloc_trace::LabelPeak>,
 }
 
 /// Memory attributed once for the whole process rather than to any root:
@@ -804,6 +813,12 @@ impl MemorySnapshot {
         } else {
             (roots, 0, 0)
         };
+        // Reading the marks restarts them, so only the census reads them.
+        let allocation_labels = if cap_detail {
+            Vec::new()
+        } else {
+            crate::alloc_trace::take_census_peaks(CENSUS_ALLOCATION_LABELS)
+        };
         Self {
             roots_status,
             roots,
@@ -813,6 +828,7 @@ impl MemorySnapshot {
             shared_semantic_bases,
             data_layer_block_cache,
             process,
+            allocation_labels,
         }
     }
 }
@@ -1097,7 +1113,15 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
             .expect("allocator snapshot test thread log")
             .push(name);
     }
-    allocator_memory_snapshot_impl()
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let started = std::time::Instant::now();
+    let snapshot = allocator_memory_snapshot_impl();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    LAST_ALLOCATOR_WALK_MS.store(
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    snapshot
 }
 
 fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, Option<u64>) {
@@ -1159,12 +1183,39 @@ pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
 
+/// Periodic allocator readers wait at least this many times the last walk's
+/// own duration before walking again, so walks take at most 0.5% of the time.
+/// A walk is cheap on macOS (tens of milliseconds on a multi-GiB heap), but
+/// glibc's `mallinfo2` visits every free chunk while holding that arena's
+/// lock, which on a fragmented heap takes seconds.
+const ALLOCATOR_WALK_COST_FACTOR: u64 = 200;
+
+/// The longest an expensive walk can stretch a periodic reader's reuse window,
+/// so a slow allocator still gets a fresh reading every ten minutes.
+const ALLOCATOR_WALK_MAX_REUSE_MS: u64 = 10 * 60 * 1000;
+
+/// How long a periodic reader may reuse an allocator observation whose walk
+/// took `walk_ms`: `floor_ms` for a cheap walk, stretched to
+/// `ALLOCATOR_WALK_COST_FACTOR` times the walk's duration for an expensive
+/// one, and never past `ALLOCATOR_WALK_MAX_REUSE_MS` (or `floor_ms`, if that
+/// is larger).
+pub(crate) fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
+    walk_ms
+        .saturating_mul(ALLOCATOR_WALK_COST_FACTOR)
+        .clamp(floor_ms, ALLOCATOR_WALK_MAX_REUSE_MS.max(floor_ms))
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 /// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
-/// take allocator-zone locks, so cache a process-wide observation for 60s.
+/// take allocator-zone locks, so cache a process-wide observation for at least
+/// 60s, longer when walks are expensive (see `allocator_reuse_window_ms`).
 /// This bounds allocator statistics walks to one per idle minute, or two for a
 /// relief pass that uses its before/after snapshots.
 const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Wall-clock duration of the most recent allocator statistics walk, on any
+/// thread, in milliseconds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_WALK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const UNKNOWN_ALLOCATOR_SLACK: u64 = u64::MAX;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1398,9 +1449,23 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sample_is_stale(now_ms: u64) -> bool {
-    let sampled_at = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    sample_is_stale_after(
+        LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire),
+        now_ms,
+        LAST_ALLOCATOR_WALK_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Whether a sample taken at `sampled_at` is due for replacement at `now_ms`
+/// when the last walk took `walk_ms`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
     sampled_at == UNSAMPLED_AT_MS
-        || now_ms.saturating_sub(sampled_at) >= ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64
+        || now_ms.saturating_sub(sampled_at)
+            >= allocator_reuse_window_ms(
+                ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64,
+                walk_ms,
+            )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1765,6 +1830,36 @@ mod tests {
     #[test]
     fn process_snapshot_preserves_negative_residuals() {
         assert_eq!(signed_difference(5, 8), -3);
+    }
+
+    #[test]
+    fn allocator_reuse_window_stretches_with_walk_cost() {
+        // A cheap walk keeps the floor.
+        assert_eq!(allocator_reuse_window_ms(30_000, 0), 30_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, 150), 30_000);
+        // An expensive walk waits 200 times its own duration...
+        assert_eq!(allocator_reuse_window_ms(30_000, 1_000), 200_000);
+        // ...but never more than ten minutes.
+        assert_eq!(allocator_reuse_window_ms(30_000, 6_500), 600_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, u64::MAX), 600_000);
+        // A floor above the cap still wins.
+        assert_eq!(allocator_reuse_window_ms(900_000, 6_500), 900_000);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn slack_sample_waits_longer_after_an_expensive_walk() {
+        assert!(sample_is_stale_after(UNSAMPLED_AT_MS, 0, 0));
+        // A cheap walk: due once a minute.
+        assert!(!sample_is_stale_after(0, 59_999, 20));
+        assert!(sample_is_stale_after(0, 60_000, 20));
+        // A one-second walk: due after 200 seconds, not after one minute.
+        assert!(!sample_is_stale_after(0, 60_000, 1_000));
+        assert!(!sample_is_stale_after(0, 199_999, 1_000));
+        assert!(sample_is_stale_after(0, 200_000, 1_000));
+        // A multi-second glibc walk: capped at ten minutes.
+        assert!(!sample_is_stale_after(0, 599_999, 6_500));
+        assert!(sample_is_stale_after(0, 600_000, 6_500));
     }
 
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]

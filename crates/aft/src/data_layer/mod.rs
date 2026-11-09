@@ -33,6 +33,7 @@ pub(crate) mod slice_cache;
 pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;
+pub mod symbol_prewarm_measure;
 pub(crate) mod tools;
 pub mod trace_measure;
 pub mod vectors;

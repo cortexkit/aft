@@ -570,7 +570,15 @@ fn short_reason(reason: &str) -> String {
 /// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
     let _cost = super::telemetry::CostPhase::start("candidate_text");
-    let bytes = std::fs::read(&result.path).unwrap_or_default();
+    let files = super::request_files::current();
+    let file = super::request_files::read_through(files.as_deref(), &result.path, |path| {
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record_file_read_path(path);
+        super::request_files::read_whole_file(path)
+    })
+    .ok()
+    .map(|fetched| fetched.file);
+    let bytes = file.as_ref().map_or(&[][..], |file| file.bytes());
     let (raw_line, selected) = if let Some(range) = result.symbol_range {
         let start = floor_raw_boundary(&bytes, range.start.min(bytes.len()));
         let end = floor_raw_boundary(&bytes, range.end.min(bytes.len())).max(start);
@@ -579,7 +587,7 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
             &bytes[start..end],
         )
     } else {
-        (0, bytes.as_slice())
+        (0, bytes)
     };
     // Stored ranges address raw bytes; decoding and newline normalization
     // must happen after slicing, including when earlier bytes are invalid UTF-8.
@@ -593,10 +601,20 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
         None => {
             // Match against the same raw bytes used for the body, preserving
             // strict UTF-8 admission without reopening every whole-file entry.
-            let matched = std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|source| super::matching_line_in_text(source, prose, None))
-                .map(|(line, _)| line as usize);
+            // The ranking picked this file's line for the same prose from the
+            // same bytes; the request's set hands that answer over.
+            let find = || {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|source| super::matching_line_in_text(source, prose, None))
+            };
+            let matched = match (&files, &file) {
+                (Some(files), Some(_)) => {
+                    files.matching_line(&result.path, prose, None, || Ok(find()))
+                }
+                _ => find(),
+            }
+            .map(|(line, _)| line as usize);
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =
                 matched_identifier(prose, &source).unwrap_or_else(|| file_stem(&result.path));

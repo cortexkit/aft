@@ -18,6 +18,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::commands::semantic_search::waits::{self, SearchWait};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::data_layer::meaning::{self, FillFailure, MeaningState};
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
@@ -145,7 +146,11 @@ impl DataSemantic {
         if !ctx.config().indexes.semantic {
             return None;
         }
-        let checkout = ctx.data_checkout()?;
+        // The context's checkout slot is held while a checkout binds (a bind
+        // scans the folder); the meaning plane's snapshot can wait for a
+        // generation reload or a member-cache build.
+        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
+        let _wait = waits::time(SearchWait::MeaningView);
         Self::from_state(checkout.meaning(|| ctx.data_meaning_config()))
     }
 
@@ -263,11 +268,13 @@ impl MeaningIndex<'_> {
         include: &dyn Fn(&Path) -> bool,
     ) -> io::Result<Vec<SemanticResult>> {
         match self {
-            Self::Snapshot(index) => Ok(index.search_filtered(query, top_k, include)),
-            Self::Data(meaning) => meaning
-                .snapshot
-                .search(query, top_k, include)
-                .map_err(|error| io::Error::other(error.to_string())),
+            Self::Snapshot(index) => Ok(waits::timed(SearchWait::VectorSearch, || {
+                index.search_filtered(query, top_k, include)
+            })),
+            Self::Data(meaning) => waits::timed(SearchWait::VectorSearch, || {
+                meaning.snapshot.search(query, top_k, include)
+            })
+            .map_err(|error| io::Error::other(error.to_string())),
         }
     }
 

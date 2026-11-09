@@ -17,6 +17,9 @@ use regex_syntax::hir::{Hir, HirKind};
 use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::commands::semantic_search::request_files::{
+    Fetched, FileStat, RequestFile, RequestFiles,
+};
 use crate::fs_lock;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
@@ -1166,6 +1169,7 @@ impl SearchIndexSnapshot {
         let mut files_hashed = 0usize;
         let mut matches = Vec::new();
         let search_root_canon = canonicalize_for_search_membership(search_root);
+        let request_files = crate::commands::semantic_search::request_files::current();
 
         for file_id in candidate_file_ids {
             let Some(file_entry) = self.files.get(file_id as usize) else {
@@ -1194,28 +1198,43 @@ impl SearchIndexSnapshot {
             }
 
             files_read += 1;
-            let SearchCorpusEligibility::Eligible(file) =
-                read_search_corpus_file(&file_entry.path, self.max_file_size)
+            let RequestCorpusFile::Eligible {
+                file,
+                generated,
+                fresh,
+            } = read_request_corpus_file(
+                request_files.as_deref(),
+                &file_entry.path,
+                self.max_file_size,
+            )
             else {
                 continue;
             };
-            bytes_read += file.bytes.len();
-            let text = String::from_utf8_lossy(&file.bytes);
-            let digest = blake3::hash(&file.bytes);
+            bytes_read += file.bytes().len();
+            let text = file.lossy_text();
+            let digest = file.digest();
             files_hashed += 1;
 
-            if let Some(candidates) = exact_lane::verify_cached_exact_matches_in_text_with_member(
+            let verified = exact_lane::verify_cached_exact_matches_in_text_with_member(
                 &file_entry.path,
-                &text,
+                text,
                 digest,
                 &norm_phrase,
                 &content_tokens,
                 member.as_ref().map(|member| member.member.as_str()),
-            ) {
+            );
+            if verified.is_none() && fresh {
+                // Read only for this check, and it found nothing: later
+                // phases are not expected to want the file.
+                if let Some(files) = &request_files {
+                    files.release(&file_entry.path);
+                }
+            }
+            if let Some(candidates) = verified {
                 // The same digest addresses prepared text and backs memo checks.
                 let digest = digest.to_hex().to_string();
                 for mut cand in candidates {
-                    cand.evidence.generated = file.generated;
+                    cand.evidence.generated = generated;
                     matches.push(ExactPassMatch {
                         path: cand.path,
                         symbol_range: cand.symbol_range,
@@ -3470,6 +3489,10 @@ impl SearchIndexSnapshot {
         let io_budget = crate::bounded_io::current();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
+        // Rayon tasks run on other threads, where the request's file set is
+        // not current: take it here and hand it to them.
+        let request_files = crate::commands::semantic_search::request_files::current();
+        let request_files = request_files.as_deref();
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
             .map_init(
@@ -3483,11 +3506,14 @@ impl SearchIndexSnapshot {
                         stopped_early.store(true, Ordering::Relaxed);
                         return None;
                     }
-                    let content = match read_indexed_file_bytes(
+                    let deadline = started.checked_add(limits.budget);
+                    let fetched = crate::commands::semantic_search::request_files::read_through(
+                        request_files,
                         &file.path,
-                        started.checked_add(limits.budget),
-                    ) {
-                        Ok(content) => content,
+                        |path| Ok((read_indexed_file_bytes(path, deadline)?, None)),
+                    );
+                    let fetched = match fetched {
+                        Ok(fetched) => fetched,
                         Err(error) => {
                             if error.kind() == std::io::ErrorKind::TimedOut {
                                 stopped_early.store(true, Ordering::Relaxed);
@@ -3500,16 +3526,28 @@ impl SearchIndexSnapshot {
                         }
                     };
                     files_examined.fetch_add(1, Ordering::Relaxed);
-                    if is_binary_bytes(&content) {
+                    let content = fetched.file.bytes();
+                    let release = || {
+                        // Read only for this check, and it found nothing:
+                        // later phases are not expected to want the file.
+                        if let (Some(files), true) = (request_files, fetched.fresh) {
+                            files.release(&file.path);
+                        }
+                    };
+                    if is_binary_bytes(content) {
+                        release();
                         return None;
                     }
                     let (matches, matched_lines) = matching_lines_in_content(
                         &file.path,
-                        &content,
+                        content,
                         &matcher,
                         limits.max_lines_per_file,
                         keep_past_limit,
                     );
+                    if matched_lines == 0 {
+                        release();
+                    }
                     (matched_lines > 0).then(|| GrepFileMatches {
                         path: file.path.clone(),
                         modified: file.modified,
@@ -4175,6 +4213,117 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
 
 pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
     read_search_corpus_file_inner(path, max_file_size, true)
+}
+
+/// The read error of a corpus file that held more than the size bound: the
+/// file is unindexed, and its cut bytes are not kept.
+#[derive(Debug)]
+struct CutAtSizeBound;
+
+impl std::fmt::Display for CutAtSizeBound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("file larger than the corpus size bound")
+    }
+}
+
+impl std::error::Error for CutAtSizeBound {}
+
+/// A corpus file one search request's exact pass may verify, read through
+/// the request's file set.
+pub(crate) enum RequestCorpusFile {
+    Eligible {
+        file: Arc<RequestFile>,
+        generated: bool,
+        /// The pass read the disk for it; see [`Fetched::fresh`].
+        fresh: bool,
+    },
+    /// Too large or binary, as [`SearchCorpusEligibility::Unindexed`].
+    Unindexed,
+    Skipped,
+}
+
+/// [`read_search_corpus_file`] through a request's file set, with the same
+/// admission: excluded paths and non-files are skipped; files over
+/// `max_file_size` bytes, or binary, are unindexed. A file an earlier phase
+/// of the request kept is judged from those bytes. Otherwise the file is
+/// stat'ed and read as [`read_search_corpus_file`] reads it, and the set keeps
+/// the bytes unless they were cut at the size bound.
+pub(crate) fn read_request_corpus_file(
+    files: Option<&RequestFiles>,
+    path: &Path,
+    max_file_size: u64,
+) -> RequestCorpusFile {
+    if crate::project_content::is_excluded(path) {
+        return RequestCorpusFile::Skipped;
+    }
+    let Some(files) = files else {
+        #[cfg(test)]
+        crate::commands::semantic_search::request_files::record_disk_read(path);
+        return match read_search_corpus_file(path, max_file_size) {
+            SearchCorpusEligibility::Eligible(file) => RequestCorpusFile::Eligible {
+                generated: file.generated,
+                file: Arc::new(RequestFile::unshared(file.bytes, None)),
+                fresh: true,
+            },
+            SearchCorpusEligibility::Unindexed(_) => RequestCorpusFile::Unindexed,
+            SearchCorpusEligibility::Skipped => RequestCorpusFile::Skipped,
+        };
+    };
+    let fetched = match files.kept(path) {
+        Some(file) => Fetched { file, fresh: false },
+        None => {
+            let metadata = match fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                _ => return RequestCorpusFile::Skipped,
+            };
+            if metadata.len() > max_file_size {
+                return RequestCorpusFile::Unindexed;
+            }
+            let read = files.read(path, |path| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record_file_read_path(path);
+                // Bound the read itself as well as admission: the file can
+                // grow after stat. Bytes cut at the bound are not kept.
+                let mut bytes = Vec::with_capacity(
+                    usize::try_from(metadata.len().min(max_file_size)).unwrap_or(0),
+                );
+                crate::project_content::open(path)?
+                    .take(max_file_size.saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > max_file_size {
+                    return Err(std::io::Error::other(CutAtSizeBound));
+                }
+                Ok((bytes, Some(FileStat::of(&metadata))))
+            });
+            match read {
+                Ok(fetched) => fetched,
+                Err(error)
+                    if error
+                        .get_ref()
+                        .is_some_and(|inner| inner.is::<CutAtSizeBound>()) =>
+                {
+                    return RequestCorpusFile::Unindexed
+                }
+                Err(_) => return RequestCorpusFile::Skipped,
+            }
+        }
+    };
+    let bytes = fetched.file.bytes();
+    if bytes.len() as u64 > max_file_size || is_binary_bytes(bytes) {
+        if fetched.fresh {
+            files.release(path);
+        }
+        return RequestCorpusFile::Unindexed;
+    }
+    // As `crate::inspect::is_generated_file(path, path)`, from the bytes in
+    // hand rather than a second read of the file's head.
+    let generated = crate::file_kind::relative_shape_is_generated(path, path)
+        || crate::file_kind::head_has_generated_marker(bytes);
+    RequestCorpusFile::Eligible {
+        file: fetched.file,
+        generated,
+        fresh: fetched.fresh,
+    }
 }
 
 fn read_search_corpus_file_inner(

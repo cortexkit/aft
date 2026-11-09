@@ -252,6 +252,7 @@ pub use self::health::SubcTestHealthRollupProbe;
 mod keepalive;
 mod manifest;
 mod page_collect;
+mod permissions;
 mod persistence;
 #[cfg(test)]
 mod prepared_bind_tests;
@@ -1620,6 +1621,8 @@ enum ManagementAdmission {
     #[default]
     FirstParty,
     FlowOnly,
+    /// Cingulate's route: the `permissions/v1` operations and nothing else.
+    PermissionsOnly,
     /// Tool-provider metadata without a project root; grants no management authority.
     ProjectFree {
         workdir: Option<String>,
@@ -6042,6 +6045,13 @@ where
                                 }
                                 continue;
                             }
+                            if permissions::is_request(body) {
+                                spawn_permissions_request(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.principal.as_ref(), body, &shared_app, &executor,
+                                );
+                                continue;
+                            }
                         }
                         // A codemode program's tool call runs with its owner route's
                         // access (the head agent's, or a worker run's own worker's):
@@ -8479,6 +8489,7 @@ async fn handle_control_request(
                 if !project_free
                     && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                    && !permissions::is_cingulate(principal.as_ref())
                 {
                     return send_route_bind_error(
                         tx,
@@ -8499,6 +8510,12 @@ async fn handle_control_request(
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
                     ManagementAdmission::FlowOnly
+                } else if !matches!(bind_trust, BindTrust::FirstParty)
+                    && permissions::is_cingulate(principal.as_ref())
+                {
+                    // Cingulate is not a first-party AFT principal: it binds
+                    // only to list and revoke the person's saved grants.
+                    ManagementAdmission::PermissionsOnly
                 } else {
                     ManagementAdmission::FirstParty
                 };
@@ -9552,6 +9569,69 @@ fn spawn_gh_relay(
 /// (`Flags::is_binary`). subc-protocol does not export the constant.
 const FRAME_FLAG_BINARY: u8 = 0b0000_0001;
 
+/// Answer a `permissions/v1` request off the frame loop: listing reads
+/// aft.db, and a revoke may stop running commands.
+#[allow(clippy::too_many_arguments)]
+fn spawn_permissions_request(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    principal: Option<&Principal>,
+    body: &Value,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+) {
+    let admitted = permissions::admit(principal, body);
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let metrics = Arc::clone(metrics);
+    let db = shared_app.db();
+    let executor = Arc::clone(executor);
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = match admitted {
+            Err(error) => Err(error),
+            Ok(request) => tokio::task::spawn_blocking(move || {
+                let registries = executor
+                    .actor_contexts()
+                    .iter()
+                    .map(|ctx| ctx.bash_background().clone())
+                    .collect::<Vec<_>>();
+                permissions::answer(db.as_deref(), &request, |row| {
+                    permissions::stop_folder_tasks(&registries, row)
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(ErrorBody::new("internal_error", error.to_string()))),
+        };
+        let sent = match result {
+            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+            Ok(answer) => match serde_json::to_vec(&json!({ "result": answer }))
+                .map_err(SubcError::Json)
+                .and_then(|body| {
+                    Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Response,
+                        frame.header.flags,
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .map_err(SubcError::FrameBuild)
+                }) {
+                Ok(response) => {
+                    send_reliable_writer_frame(&tx, &metrics, response, "permissions reply").await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = sent {
+            log::warn!("permissions/v1: could not queue the reply: {error}");
+        }
+    });
+}
+
 /// Run a page-bundle operation off the frame loop: a collection reads files
 /// and checks policy, and every operation touches the snapshot folder.
 #[allow(clippy::too_many_arguments)]
@@ -10039,6 +10119,16 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::PermissionsOnly {
+        return if body.is_some_and(permissions::is_request) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "Cingulate's AFT management route serves only permissions.list and permissions.revoke",
+            ))
+        };
+    }
     if identity.admission != ManagementAdmission::FlowOnly {
         return Ok(());
     }

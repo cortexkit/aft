@@ -325,6 +325,33 @@ impl Family {
             .map(|(manifest, _)| manifest.generation())
     }
 
+    /// Whether the family's directory holds a manifest numbered above
+    /// `generation`, valid or not: the cheap first test for a reader that
+    /// already holds `generation`. It lists the directory and opens no
+    /// file, takes no lock and writes nothing. `false` means
+    /// [`newest_generation`](Self::newest_generation) would answer
+    /// `generation` or an older one now; `true` means it may answer a newer
+    /// one, which only it can tell, because the newer manifest may be torn.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be listed.
+    pub fn has_manifest_above(&self, generation: Generation) -> Result<bool, FamilyError> {
+        let dir = &self.layout.dir;
+        for entry in std::fs::read_dir(dir).map_err(FamilyError::io(dir))? {
+            let name = entry.map_err(FamilyError::io(dir))?.file_name();
+            if name
+                .to_str()
+                .and_then(|name| name.strip_prefix(MANIFEST_PREFIX))
+                .and_then(canonical_number)
+                .is_some_and(|number| number > generation.get())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Starts writing the family, if no other process is writing it.
     /// Returns `None` while another process holds the writer lock.
     ///

@@ -966,8 +966,26 @@ pub(crate) fn powershell_missing_message(shell_tool: &str) -> String {
 /// Whether a PowerShell command could run on this host right now: the same
 /// `pwsh` lookup the executor performs before spawning. The subc manifest uses
 /// it to advertise the `powershell` tool only where it can actually run.
+///
+/// Tool admission asks on every call, on the subc runtime thread, and the
+/// lookup stats each `PATH` directory. So the answer is kept for as long as
+/// this process's `PATH` is unchanged; a changed `PATH` (for example after
+/// startup fills it from the login shell) looks again.
 pub(crate) fn powershell_available() -> bool {
-    resolve_powershell_path_with(|candidate| which::which(candidate).ok()).is_ok()
+    static LAST: std::sync::Mutex<Option<(Option<std::ffi::OsString>, bool)>> =
+        std::sync::Mutex::new(None);
+    let path = std::env::var_os("PATH");
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((seen, available)) = last.as_ref() {
+        if *seen == path {
+            return *available;
+        }
+    }
+    let available = resolve_powershell_path_with(|candidate| which::which(candidate).ok()).is_ok();
+    *last = Some((path, available));
+    available
 }
 
 pub(crate) fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
@@ -1418,6 +1436,17 @@ pub(crate) fn spawn_with_secrets(
     }
 
     let cleanup_plan = spawn_plan.clone();
+    // Record which saved folder grants this command's sandbox allows, so
+    // revoking one of them can stop it. A build-server job runs under no
+    // local sandbox and records none.
+    let recorded_folder_grants = if remote.is_none() {
+        registry::folder_grants::for_plan(ctx, &spawn_plan)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    registry::folder_grants::run_after_record_hook();
+    let _folder_grants = registry::folder_grants::spawn_guard(recorded_folder_grants.clone());
     // The watchdog compresses this task's output through the shared filter
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.
@@ -1507,6 +1536,14 @@ pub(crate) fn spawn_with_secrets(
 
     match spawn_result {
         Ok(task_id) => {
+            // A revoke scans the running commands right after it deletes the
+            // grant. One whose sandbox was built before that delete but which
+            // registered after the scan was missed, so check the grants again
+            // now that it is registered.
+            if recorded_folder_grants.is_some() {
+                ctx.bash_background()
+                    .stop_if_folder_grant_revoked(&task_id, session_id, ctx.db());
+            }
             ctx.bash_background().bind_start_view(&task_id, start_view);
             gh_shim_ticket.bind_task(&task_id);
             // A command that finishes very quickly can be terminal before the

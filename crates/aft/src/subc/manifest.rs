@@ -470,6 +470,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // runs such a call with only its worker's own access (see `codemode`) and
     // treats `on_behalf_of_agent` as attribution: it never acts as, asks for,
     // or hands out the tasks or handles of the attributed agent.
+    //
+    // `permissions/v1` lets the permissions pages list the person's saved
+    // folder-access answers and revoke them, through Cingulate's
+    // `permissions.list` and `permissions.revoke` calls (see `permissions`).
     // Nothing goes in `requires`.
     //
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
@@ -502,6 +506,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
+                super::permissions::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -633,6 +638,18 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     },
                     ManagementOperation {
                         name: crate::page_collect::RELEASE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    // `permissions/v1`: the operator's permissions page lists
+                    // saved folder-access answers and revokes them.
+                    ManagementOperation {
+                        name: super::permissions::LIST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: super::permissions::REVOKE_OPERATION.to_string(),
                         kind: ManagementOperationKind::Mutate,
                         description: None,
                     },
@@ -886,6 +903,7 @@ mod tests {
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
                 "page-collect/v1".to_string(),
+                "permissions/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -902,7 +920,8 @@ mod tests {
                 "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
-                "page-collect/v1"
+                "page-collect/v1",
+                "permissions/v1"
             ]))
         );
     }
@@ -983,6 +1002,14 @@ mod tests {
                 ),
                 (
                     crate::page_collect::RELEASE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    super::super::permissions::LIST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    super::super::permissions::REVOKE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
             ]
@@ -1198,7 +1225,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1240,6 +1267,8 @@ mod tests {
             json!({"name": crate::page_collect::COLLECT_OPERATION, "kind": "mutate"}),
             json!({"name": crate::page_collect::READ_OPERATION, "kind": "query"}),
             json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
+            json!({"name": super::super::permissions::LIST_OPERATION, "kind": "query"}),
+            json!({"name": super::super::permissions::REVOKE_OPERATION, "kind": "mutate"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.

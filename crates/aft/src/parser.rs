@@ -1253,6 +1253,11 @@ struct CachedSymbols {
     /// multi-file outline derived from the same tree. They share this entry's
     /// freshness key and are dropped with it when the file's content changes.
     outline_facts: Option<Arc<crate::commands::outline::OutlineParseFacts>>,
+    /// The symbols are a table shared with other checkouts' caches, whose
+    /// memory the process-wide table cache counts once (see
+    /// [`SymbolCache::insert_shared_table`]); this cache leaves them out of
+    /// its own estimate.
+    shared_table: bool,
 }
 
 /// A fresh cache entry with everything a multi-file outline needs to render
@@ -1336,7 +1341,7 @@ pub struct SymbolCache {
 
 pub type SharedSymbolCache = Arc<RwLock<SymbolCache>>;
 
-fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
+pub(crate) fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
     symbols.iter().fold(0u64, |bytes, symbol| {
         let scope_bytes = symbol.scope_chain.iter().fold(0u64, |scope_bytes, scope| {
             scope_bytes
@@ -1375,11 +1380,17 @@ fn module_bytes(modules: &[RustModule]) -> u64 {
         .sum()
 }
 
+/// The bytes `cached` holds for this cache alone: a shared symbol table is
+/// counted where it is shared, once for the process.
 fn cached_symbols_estimated_bytes(path: &Path, cached: &CachedSymbols) -> u64 {
     (std::mem::size_of::<PathBuf>() as u64)
         .saturating_add(crate::memory::path_bytes(path))
         .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
-        .saturating_add(symbols_estimated_bytes(&cached.symbols))
+        .saturating_add(if cached.shared_table {
+            0
+        } else {
+            symbols_estimated_bytes(&cached.symbols)
+        })
         .saturating_add(
             cached
                 .modules
@@ -1454,6 +1465,21 @@ impl SymbolCache {
         )
     }
 
+    /// Insert pre-warmed symbols for a file as a table other checkouts'
+    /// caches may hold too. The caller keeps the table where the process
+    /// counts its memory once, for as long as any cache holds it, so this
+    /// cache's estimate leaves the table out.
+    pub(crate) fn insert_shared_table(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Arc<Vec<Symbol>>,
+    ) -> bool {
+        self.insert_entry(path, mtime, size, content_hash, symbols, None, None, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_shared(
         &mut self,
@@ -1464,6 +1490,30 @@ impl SymbolCache {
         symbols: Arc<Vec<Symbol>>,
         modules: Option<Arc<Vec<RustModule>>>,
         has_error: Option<bool>,
+    ) -> bool {
+        self.insert_entry(
+            path,
+            mtime,
+            size,
+            content_hash,
+            symbols,
+            modules,
+            has_error,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Arc<Vec<Symbol>>,
+        modules: Option<Arc<Vec<RustModule>>>,
+        has_error: Option<bool>,
+        shared_table: bool,
     ) -> bool {
         if let Some(cached) = self.entries.get_mut(&path) {
             if cached.mtime == mtime
@@ -1504,6 +1554,7 @@ impl SymbolCache {
             modules,
             has_error,
             outline_facts: None,
+            shared_table,
         };
         let next_bytes = if let Some((stored_path, previous)) = self.entries.get_key_value(&path) {
             self.entry_bytes = self
@@ -1667,7 +1718,11 @@ impl SymbolCache {
                 .saturating_add(std::mem::size_of::<PathBuf>() as u64)
                 .saturating_add(crate::memory::path_bytes(path))
                 .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
-                .saturating_add(symbols_estimated_bytes(&cached.symbols))
+                .saturating_add(if cached.shared_table {
+                    0
+                } else {
+                    symbols_estimated_bytes(&cached.symbols)
+                })
                 .saturating_add(
                     cached
                         .modules
@@ -1851,6 +1906,58 @@ impl FileParser {
         }
 
         let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
+            message: format!("parser cache missing entry for {}", path.display()),
+        })?;
+        Ok((&cached.tree, cached.lang))
+    }
+
+    /// Parse `source`, the text a caller already read from `path`, without
+    /// reading the file again. The tree cache is shared with
+    /// [`FileParser::parse`]: a cached tree is reused only when it was parsed
+    /// from the same text (same size and content hash), so the tree always
+    /// describes `source`.
+    pub(crate) fn parse_source_text(
+        &mut self,
+        path: &Path,
+        source: &str,
+    ) -> Result<(&Tree, LangId), AftError> {
+        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
+            message: format!(
+                "unsupported file extension: {}",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("<none>")
+            ),
+        })?;
+        let size = source.len() as u64;
+        let content_hash = content_hash_for_source(source);
+        let reusable = size <= cache_freshness::CONTENT_HASH_SIZE_CAP
+            && self
+                .cache
+                .get(path)
+                .is_some_and(|cached| cached.size == size && cached.content_hash == content_hash);
+        if !reusable {
+            let (tree, lang) = parse_resolved_source(path, source, lang)?;
+            #[cfg(test)]
+            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
+            self.cache.insert(
+                path.to_path_buf(),
+                CachedTree {
+                    // No stat was taken for this text. The epoch never equals
+                    // a real mtime, so a later `parse` of the path checks the
+                    // content hash before reusing this tree.
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size,
+                    content_hash,
+                    tree,
+                    lang,
+                    source: self
+                        .capture_source
+                        .then(|| captured_source(source.to_string())),
+                },
+            );
+        }
+        let cached = self.cache.get(path).ok_or_else(|| AftError::ParseError {
             message: format!("parser cache missing entry for {}", path.display()),
         })?;
         Ok((&cached.tree, cached.lang))

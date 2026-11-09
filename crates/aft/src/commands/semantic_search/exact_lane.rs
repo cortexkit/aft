@@ -802,22 +802,28 @@ impl PreparedExactCache {
     }
 
     fn prepare(&self, digest: blake3::Hash, text: &str) -> Arc<PreparedExactText> {
-        let cell = {
-            let mut state = self.state.lock();
+        use super::waits::{self, SearchWait};
+        // A placeholder found unfilled means another request is preparing the
+        // same content: waiting for it is a wait, preparing it ourselves is not.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
                 entry.last_used = clock;
+                waits::record_prepared_text(|counts| counts.hits += 1);
                 if let Some(prepared) = entry.text.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.text)
+                (Arc::clone(&entry.text), true)
             } else {
+                waits::record_prepared_text(|counts| counts.misses += 1);
                 // Bound placeholders as well as prepared bytes. A placeholder
                 // single-flights parallel queries without holding the map lock
                 // during normalization and symbol scanning.
                 if state.entries.len() >= 1024 {
                     state.evict_oldest();
+                    waits::record_prepared_text(|counts| counts.evicted_by_count += 1);
                 }
                 let cell = Arc::new(OnceLock::new());
                 state.entries.insert(
@@ -828,9 +834,10 @@ impl PreparedExactCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(SearchWait::PrepareCache));
         let prepared = cell.get_or_init(|| {
             #[cfg(test)]
             self.preparations
@@ -839,7 +846,8 @@ impl PreparedExactCache {
             crate::search_hot_path_measurements::record(|counts| counts.exact_preparations += 1);
             Arc::new(PreparedExactText::new(text))
         });
-        let mut state = self.state.lock();
+        drop(other_wait);
+        let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == 0 {
                 entry.bytes = prepared.retained_bytes();
@@ -848,6 +856,7 @@ impl PreparedExactCache {
         }
         while state.bytes > self.max_bytes {
             state.evict_oldest();
+            waits::record_prepared_text(|counts| counts.evicted_by_bytes += 1);
         }
         Arc::clone(prepared)
     }
@@ -875,14 +884,20 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
     )
 }
 
-/// Lexical verification and the exact lane normalize the same freshly read
-/// bytes. Share their existing bounded preparation, not their phrase, window or
-/// definition match decisions. Keep both disk reads so intervening edits remain
-/// visible to the lane that reads the changed bytes.
+/// Lexical verification and the exact lane normalize the same bytes, which
+/// one search request reads once (see `request_files`). Share their existing
+/// bounded preparation, keyed by the bytes' digest, not their phrase, window
+/// or definition match decisions; a later request that reads changed bytes
+/// gets a new digest and prepares them afresh.
 pub(super) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
     static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
+    // Prepared text runs about twice the size of its source (the normalized
+    // copy plus the symbol list). On AFT's own tree, about 18 MB of text,
+    // that is 36-40 MB, and a 32 MiB cap evicted an entry on every miss
+    // (hit rate 66-80% under eight concurrent searches). The cache is
+    // process-wide, so this cap is its whole memory cost.
     CACHE
-        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
+        .get_or_init(|| PreparedExactCache::new(64 * 1024 * 1024))
         .prepare(digest, text)
 }
 

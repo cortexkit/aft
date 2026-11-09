@@ -3198,10 +3198,16 @@ fn apply_allow(
                     return Ok(Applied::NotClaimed);
                 };
                 if scope {
-                    crate::db::access_grants::insert(
+                    // The card whose answer saved this grant, so the
+                    // permissions page can name it.
+                    let card_ref = audit
+                        .as_ref()
+                        .and_then(|record| record.elicitation_id.as_deref());
+                    crate::db::access_grants::insert_from_card(
                         conn,
                         &access_grants::policy_scope_key(identity),
                         grant.file().expect("only file scopes persist"),
+                        card_ref,
                     )?;
                     if let Some(record) = audit {
                         log_consent(

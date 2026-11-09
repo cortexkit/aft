@@ -170,10 +170,14 @@ fn checkouts(
         .iter()
         .map(|child| ctx.data_children().slot(parent, child))
         .collect::<Vec<_>>();
+    let carry = crate::alloc_trace::carry();
     slots
         .par_iter()
         .zip(children.par_iter())
-        .map(|(slot, child)| bind(slot, child, &storage, executor.clone(), planes))
+        .map(|(slot, child)| {
+            let _label = carry.enter();
+            bind(slot, child, &storage, executor.clone(), planes)
+        })
         .collect()
 }
 

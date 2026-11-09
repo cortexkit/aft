@@ -252,6 +252,41 @@ fn root_kind(root: &Path) -> RootKind {
         .map_or(RootKind::Own, |(_, kind)| *kind)
 }
 
+/// The inventory of `project_root` from the newest checkout of that folder
+/// this process has bound, when its view can stand in for a walk of the
+/// folder (see [`InspectInventory::from_checkout`]); otherwise why it
+/// cannot, and the caller walks. Unlike [`DeadCodeSources::inventory`] it
+/// needs no `aft_inspect` request to have bound the checkout for dead code
+/// first, so background work such as the status bar's TODO refresh lists
+/// files from it too.
+pub(crate) fn bound_inventory(
+    project_root: &Path,
+) -> Result<crate::inspect::inventory::InspectInventory, crate::inspect::inventory::StoreListMiss> {
+    use crate::inspect::inventory::{InspectInventory, StoreListMiss};
+    let root = canonicalize_normalized(project_root);
+    // Upgraded under the lock, compared after it: comparing resolves each
+    // checkout's root on disk.
+    let bound = BOUND
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .rev()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    let Some(checkout) = bound
+        .into_iter()
+        .find(|checkout| canonicalize_normalized(checkout.root()) == root)
+    else {
+        return Err(match root_kind(&root) {
+            RootKind::Repositories => StoreListMiss::FolderOfRepositories,
+            RootKind::Withheld => StoreListMiss::Withheld,
+            RootKind::Own => StoreListMiss::NotBound,
+        });
+    };
+    let view = checkout.view().ok_or(StoreListMiss::NotPublished)?;
+    InspectInventory::from_view(project_root, &view)
+}
+
 /// How long the TODO count waits for a bound checkout that is building or
 /// catching up before it reports itself pending, as dead code waits for its
 /// call graph.

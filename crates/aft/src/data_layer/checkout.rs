@@ -78,6 +78,11 @@ pub(crate) struct SourceWork {
     pub(crate) scans: usize,
     /// Call-graph resolutions: a build's, or a refresh's update.
     pub(crate) resolutions: usize,
+    /// The most stored parses, and separately resolutions, a refresh's
+    /// update held decoded when it finished: everything it decoded and
+    /// kept, since nothing is let go before then.
+    pub(crate) decoded_parses: usize,
+    pub(crate) decoded_resolutions: usize,
 }
 
 #[cfg(test)]
@@ -1268,6 +1273,8 @@ impl Checkout {
     }
 
     fn build_as(&self, measure: bool) -> Result<BuildReport, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
         self.write_live().building = true;
         let result = self.build_inner(measure);
         self.write_live().building = false;
@@ -2216,6 +2223,10 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        let _alloc_label = crate::alloc_trace::scope(
+            crate::alloc_trace::Label::CALLGRAPH_REFRESH,
+            Some(&self.root),
+        );
         checkpoint()?;
         let result = self.refresh_inner();
         self.touch_memory();
@@ -2376,7 +2387,9 @@ impl Checkout {
                 .collect::<Vec<_>>();
             engine.live.install(|| {
                 use rayon::prelude::*;
+                let carry = crate::alloc_trace::carry();
                 extracting.par_iter().for_each(|change| {
+                    let _label = carry.enter();
                     change.content.get();
                 });
             });
@@ -2415,9 +2428,11 @@ impl Checkout {
             let graph = &published.graph;
             let made = engine.live.install(|| {
                 use rayon::prelude::*;
+                let carry = crate::alloc_trace::carry();
                 files
                     .par_iter()
                     .map(|file| {
+                        let _label = carry.enter();
                         let resolution = resolved.get(file)?;
                         let (key, parse) = parses.get(file)?;
                         let slice = FileSlice::build(file, key, parse, resolution);
@@ -2463,6 +2478,12 @@ impl Checkout {
                 }
             }
             stats = Some(update);
+            note_source_work(&self.root, |work| {
+                let live = &engine.live;
+                work.decoded_parses = work.decoded_parses.max(live.inputs.parses.decoded_count());
+                work.decoded_resolutions =
+                    work.decoded_resolutions.max(live.resolved.decoded_count());
+            });
             // An update keeps every parse and resolution it decoded. A broad
             // one reads thousands (every file declaring a method named `new`,
             // say), and resolves a thousand again after a widely read change,
@@ -2815,6 +2836,8 @@ impl Checkout {
     /// The incremental state for `published`: every stored resolution, and
     /// the parses and configuration the publication was built from.
     fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::CALLGRAPH_START, Some(&self.root));
         let mut timings = Vec::new();
         let engine = self.start_engine_timed(published, &mut timings)?;
         crate::slog_info!(
@@ -4828,9 +4851,23 @@ impl CheckoutView {
 
 /// Outline's symbols for one file, from its stored content record.
 impl CheckoutView {
+    /// The record of the file at `path` (relative to the root,
+    /// `/`-separated) in the view's current state, when the file has not
+    /// changed since the publication and is in a parsed language: the files
+    /// whose published records [`outline_symbols`](Self::outline_symbols)
+    /// reads.
+    pub(crate) fn unchanged_record(&self, path: &[u8]) -> Option<&aft_store::checkout::PathRecord> {
+        let published = self.published.state.get(path)?;
+        let current = self.current_state().get(path)?;
+        (current.content == published.content
+            && current.language == published.language
+            && super::content::is_parsed_language(&published.language))
+        .then_some(current)
+    }
+
     /// The symbols outline lists for the file at `path` (relative to the
     /// root, `/`-separated), as the record of its published content holds
-    /// them, with that content's key and language. `None` when the path
+    /// them, with that content's key. `None` when the path
     /// changed since the publication, is not parsed, or its record holds no
     /// outline. The file on disk may still have moved on: compare its bytes
     /// with the key before using the symbols.
@@ -4842,15 +4879,9 @@ impl CheckoutView {
         &self,
         path: &[u8],
     ) -> Result<Option<super::outline::StoredOutline>, DataError> {
-        let Some(published) = self.published.state.get(path) else {
+        let Some(published) = self.unchanged_record(path) else {
             return Ok(None);
         };
-        let unchanged = self.current_state().get(path).is_some_and(|current| {
-            current.content == published.content && current.language == published.language
-        });
-        if !unchanged || !super::content::is_parsed_language(&published.language) {
-            return Ok(None);
-        }
         let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
         for segment in self.published.segments.iter().rev() {
             let Some(content) = ContentSegment::open(segment).map_err(DataError::store)? else {
@@ -4859,13 +4890,14 @@ impl CheckoutView {
             let Some(ordinal) = content.find(key).map_err(DataError::store)? else {
                 continue;
             };
+            #[cfg(test)]
+            super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
             let RecordBody::Parsed { body, .. } = record.data else {
                 return Ok(None);
             };
             return Ok(body.outline.map(|symbols| super::outline::StoredOutline {
                 content: published.content,
-                language: published.language.clone(),
                 symbols,
             }));
         }
@@ -6572,6 +6604,90 @@ pub fn other() { callee(); }
             sibling_answers(&far.checkout.view().unwrap()),
             cold_sibling_answers(&layer, far.dir.path())
         );
+    }
+
+    /// A new worktree started from a sibling with the same files, edited in
+    /// the crate root every module reads, keeps decoded only what the edit
+    /// resolved again. The update still lists and binds the module-declaring
+    /// files and checks the recorded answers of every module that reads the
+    /// root, but keeps none of the stored parses and resolutions it reads
+    /// decoded; keeping them decoded took over a gigabyte on AFT's own
+    /// checkout. Answers stay a cold build's.
+    #[test]
+    fn a_fresh_worktree_keeps_decoded_only_what_its_first_edit_resolves_again() {
+        const MODULES: usize = 24;
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+        );
+        let mut lib = String::from("pub fn shared() {}\n");
+        for index in 0..MODULES {
+            lib.push_str(&format!("pub mod m{index};\n"));
+            files.insert(
+                format!("src/m{index}.rs"),
+                format!("use crate::shared;\npub fn f{index}() {{ shared(); }}\n"),
+            );
+        }
+        files.insert("src/lib.rs".to_string(), lib.clone());
+        let sibling = Worktree::new(&layer, store.path(), files.clone());
+        assert_eq!(sibling.built.started_from_sibling, None);
+        let worktree = Worktree::new(&layer, store.path(), files);
+        assert_eq!(
+            worktree.built.started_from_sibling,
+            Some(0),
+            "{:?}",
+            worktree.built
+        );
+        let root = worktree.dir.path();
+        let before = source_work_for_test(root);
+
+        write(root, "src/lib.rs", &format!("{lib}fn added() {{}}\n"));
+        worktree
+            .checkout
+            .record_paths(&[b"src/lib.rs".to_vec()])
+            .unwrap();
+        let stats = worktree
+            .checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("the edit was resolved");
+        let work = source_work_for_test(root);
+        assert_eq!(work.resolutions, before.resolutions + 1);
+        // The update reached every module through the root, and resolved
+        // again only what the edit changed.
+        assert!(stats.replayed >= MODULES, "{stats:?}");
+        assert!(stats.resolved <= 1, "{stats:?}");
+        let touched = stats.touched.len();
+        assert!(touched <= 2, "{stats:?}");
+        assert!(
+            work.decoded_parses <= touched && work.decoded_resolutions <= touched,
+            "an update touching {touched} files kept {} parses and {} resolutions decoded \
+             of {} files",
+            work.decoded_parses,
+            work.decoded_resolutions,
+            MODULES + 1
+        );
+
+        let answers = |view: &CheckoutView| {
+            [
+                ("src/lib.rs", "shared"),
+                ("src/lib.rs", "added"),
+                ("src/m7.rs", "f7"),
+            ]
+            .map(|(file, symbol)| format!("{file} {symbol}: {}", callers_of(view, file, symbol)))
+        };
+        let ours = answers(&worktree.checkout.view().unwrap());
+        assert!(
+            ours[0].contains(&format!("total_callers: {MODULES},")),
+            "{ours:?}"
+        );
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
+        cold.build().unwrap();
+        assert_eq!(ours, answers(&cold.view().unwrap()));
     }
 
     #[test]

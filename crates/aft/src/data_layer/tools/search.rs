@@ -25,9 +25,10 @@ pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex};
 use aft_store::text::{plan_pattern, PathText, Query, Scope};
 
 use crate::commands::semantic_search::exact_lane::{self, ExactEvidenceScope};
+use crate::commands::semantic_search::waits::{self, SearchWait};
 use crate::data_layer::checkout::{CheckoutView, DataError, PlaneStatus};
 use crate::search_index::{
-    read_search_corpus_file, ExactPassMatch, SearchCorpusEligibility, SearchIndexSnapshot,
+    read_request_corpus_file, ExactPassMatch, RequestCorpusFile, SearchIndexSnapshot,
 };
 
 /// A data-layer view whose text plane covers every path of the checkout,
@@ -55,7 +56,12 @@ impl DataText {
     /// and the view's text plane is ready; `None` otherwise, and the caller
     /// keeps reading the legacy index.
     pub(crate) fn ready(ctx: &crate::context::AppContext) -> Option<Self> {
-        let view = ctx.data_view()?;
+        // `AppContext::data_view`, with its two waits timed apart: the
+        // context's checkout slot, held while a checkout binds (a bind scans
+        // the folder), and the view, cloned under the checkout's `live` lock.
+        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
+        let view = waits::timed(SearchWait::TextView, || checkout.view())
+            .filter(|view| view.planes().text)?;
         if view.status().text != PlaneStatus::Ready {
             return None;
         }
@@ -122,6 +128,54 @@ impl DataText {
     /// Every path a text query can return: the legacy index's active files.
     fn every_path(&self) -> io::Result<BTreeSet<Vec<u8>>> {
         self.candidates_for(&Query::All)
+    }
+
+    /// The files the project walk over `root` would list and keep with
+    /// `matches`, newest first as that walk orders them, read from this
+    /// view's path list instead of the folder. `admit_relative` is a cheap
+    /// test of a member's `/`-separated relative path that every path
+    /// `matches` keeps must pass; only those members are spelled out and
+    /// tested with `matches`.
+    ///
+    /// The index store's scan applies the walk's ignore files, skipped
+    /// folders, hidden-path and nested-worktree rules; the walk's other
+    /// exclusions (AFT's storage, watcher markers, OS metadata files,
+    /// database files) are applied here per path, and a member that is not
+    /// a regular file on disk now is left out, as the walk would not reach
+    /// it. Symlinks are never listed, as the walk does not follow them.
+    ///
+    /// `None` when the view cannot stand in for the walk: it is of another
+    /// folder, a rescan against the disk is still pending, or the walk at
+    /// `root` uses other ignore settings than the store's scan.
+    pub(crate) fn files_matching(
+        &self,
+        root: &Path,
+        admit_relative: impl Fn(&[u8]) -> bool,
+        matches: impl Fn(&Path) -> bool,
+    ) -> Option<Vec<PathBuf>> {
+        use crate::inspect::job::canonicalize_normalized;
+        if self.view.rescanning()
+            || canonicalize_normalized(&self.root) != canonicalize_normalized(root)
+            || walk_uses_other_ignore_settings(root)
+        {
+            return None;
+        }
+        let mut files = self
+            .view
+            .current_state()
+            .paths()
+            .iter()
+            .filter(|record| record.kind != aft_store::checkout::PathKind::Symlink)
+            .filter(|record| admit_relative(&record.path))
+            .map(|record| absolute(root, &record.path))
+            .filter(|path| {
+                !crate::project_content::is_excluded_file_by_path(path)
+                    && matches(path)
+                    && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+            })
+            .collect::<Vec<_>>();
+        crate::search_index::sort_paths_by_mtime_desc(&mut files, root);
+        Some(files)
     }
 
     /// The paths whose indexed content holds each of `trigrams`, read once
@@ -294,6 +348,18 @@ fn store_error(error: DataError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+/// Whether the project walk at `root` reads ignore files differently from
+/// the index store's scan, so the view's members cannot stand in for the
+/// walk's files: under confinement the walk reads no ignore file, and in a
+/// Jujutsu-only repository it applies Git's rules where the scan does not.
+/// `Inventory::from_checkout` (in `inspect::inventory`) makes the same check
+/// before it lists a checkout's sources.
+fn walk_uses_other_ignore_settings(root: &Path) -> bool {
+    crate::context::confinement::active()
+        || (root.ancestors().any(|path| path.join(".jj").exists())
+            && !root.ancestors().any(|path| path.join(".git").exists()))
+}
+
 /// The absolute path of the view's `relative` path under `root`.
 fn absolute(root: &Path, relative: &[u8]) -> PathBuf {
     #[cfg(unix)]
@@ -355,9 +421,9 @@ impl TextIndex<'_> {
             Self::Snapshot(snapshot) => {
                 snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
             }
-            Self::Data(text) => {
+            Self::Data(text) => waits::timed(SearchWait::TextSearch, || {
                 selected_pool(text, query_trigrams, candidate_filter, paths_holding)
-            }
+            }),
         }
     }
 
@@ -383,6 +449,7 @@ impl TextIndex<'_> {
         if query_trigrams.is_empty() || depth == 0 {
             return Ok(Vec::new());
         }
+        let _wait = waits::time(SearchWait::TextSearch);
         let postings = text.postings(query_trigrams)?;
         let mut non_zero = query_trigrams
             .iter()
@@ -554,6 +621,7 @@ impl TextIndex<'_> {
             }
             Self::Data(text) => text,
         };
+        let _wait = waits::time(SearchWait::TextSearch);
         let mut found: Option<BTreeSet<Vec<u8>>> = None;
         for piece in phrase.split_whitespace().filter(|piece| piece.len() >= 3) {
             let holders = text.candidates(&regex::escape(piece))?;
@@ -597,6 +665,7 @@ fn exact_pass(
     let member = exact_lane::qualified_member_name(query);
     let mut holders = LiteralHolders::new();
     let mut candidates = BTreeSet::new();
+    let candidate_wait = waits::time(SearchWait::TextSearch);
 
     // The verbatim phrase's trigrams.
     if phrase.len() >= 3 {
@@ -633,8 +702,10 @@ fn exact_pass(
                     .is_some_and(|paths| paths.contains(path))
         });
     }
+    drop(candidate_wait);
 
     let search_root_canon = canonicalize_for_search_membership(search_root);
+    let request_files = crate::commands::semantic_search::request_files::current();
     let mut matches = Vec::new();
     for relative in candidates {
         let path = text.absolute(&relative);
@@ -647,26 +718,38 @@ fn exact_pass(
         if !in_scope || candidate_filter.is_some_and(|include| !include(&path)) {
             continue;
         }
-        let SearchCorpusEligibility::Eligible(file) =
-            read_search_corpus_file(&path, text.max_file_size)
+        let RequestCorpusFile::Eligible {
+            file,
+            generated,
+            fresh,
+        } = waits::timed(SearchWait::FileRead, || {
+            read_request_corpus_file(request_files.as_deref(), &path, text.max_file_size)
+        })
         else {
             continue;
         };
-        let content = String::from_utf8_lossy(&file.bytes);
-        let digest = blake3::hash(&file.bytes);
-        let Some(found) = exact_lane::verify_cached_exact_matches_in_text_with_member(
+        let digest = file.digest();
+        let found = exact_lane::verify_cached_exact_matches_in_text_with_member(
             &path,
-            &content,
+            file.lossy_text(),
             digest,
             &norm_phrase,
             &content_tokens,
             member.as_ref().map(|member| member.member.as_str()),
-        ) else {
+        );
+        let Some(found) = found else {
+            if fresh {
+                // Read only for this check, and it found nothing: later
+                // phases are not expected to want the file.
+                if let Some(files) = &request_files {
+                    files.release(&path);
+                }
+            }
             continue;
         };
         let digest = digest.to_hex().to_string();
         for mut candidate in found {
-            candidate.evidence.generated = file.generated;
+            candidate.evidence.generated = generated;
             matches.push(ExactPassMatch {
                 path: candidate.path,
                 symbol_range: candidate.symbol_range,

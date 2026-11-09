@@ -1021,9 +1021,21 @@ impl VectorPlane {
     }
 
     /// The family's newest generation, read again only when a newer one
-    /// has been published.
+    /// has been published. Finding that nothing newer was published costs
+    /// one listing of the family's directory: no store file is opened, no
+    /// lock taken and no lease written. Only a manifest numbered above the
+    /// loaded generation is opened and checked, and only a valid newer one
+    /// is read through a snapshot.
     fn load(&self) -> Result<Arc<Loaded>, DataError> {
         let parts = self.checkout.vector_parts();
+        let held = Arc::clone(&self.loaded.lock().expect("no panics while holding it"));
+        if !parts
+            .family
+            .has_manifest_above(held.generation)
+            .map_err(store_error)?
+        {
+            return Ok(held);
+        }
         let newest = parts.family.newest_generation().map_err(store_error)?;
         let mut loaded = self.loaded.lock().expect("no panics while holding it");
         if loaded.generation >= newest {
@@ -1061,11 +1073,10 @@ impl VectorPlane {
     }
 
     /// `view`'s meaning search over the generation of the family's vectors
-    /// this plane read last, without looking for a newer one: reading the
-    /// family's manifest on every search would cost a directory listing and
-    /// a file read per call. A fill reads the newest generation as it starts
-    /// and after each round it publishes; [`Self::refresh`] reads it on
-    /// demand.
+    /// this plane read last, without looking for a newer one: looking costs
+    /// a listing of the family's directory per call. A fill reads the newest
+    /// generation as it starts and after each round it publishes;
+    /// [`Self::refresh`] reads it on demand.
     ///
     /// # Errors
     ///
@@ -1082,7 +1093,8 @@ impl VectorPlane {
     }
 
     /// Reads the family's newest generation, if it is newer than the one
-    /// the plane read last.
+    /// the plane read last. When nothing newer was published this lists the
+    /// family's directory and does nothing else (see [`Self::load`]).
     ///
     /// # Errors
     ///
@@ -2392,5 +2404,96 @@ mod tests {
         let view = checkout.view().unwrap();
         assert!(plane.coverage(&view).unwrap().complete());
         assert!(names(&view).contains("renamed_after_edit"));
+    }
+
+    /// A refresh or search after nothing new was published opens no store
+    /// file. The test swaps the newest manifest for a directory of the same
+    /// name, which any attempt to read it as a record fails on, while the
+    /// directory listing still shows the name.
+    #[test]
+    fn a_refresh_with_nothing_published_opens_no_store_file() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        project(&root);
+        let checkout = bind(store.path(), &root);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        fill(&plane, &mut Recorder::default(), 10);
+        plane.refresh().unwrap();
+        let generation = plane.loaded.lock().unwrap().generation;
+        assert!(generation > Generation::EMPTY);
+        let family_dir = checkout.vector_parts().family.dir().to_path_buf();
+        let manifest = family_dir.join(format!("MANIFEST-{}", generation.get()));
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        let view = checkout.view().unwrap();
+        for _ in 0..3 {
+            plane.refresh().unwrap();
+            plane
+                .search(&view, &[0.0; DIMENSIONS], 5, &|_| true)
+                .unwrap();
+        }
+        assert_eq!(plane.loaded.lock().unwrap().generation, generation);
+
+        // A newer manifest is still noticed: one numbered above the loaded
+        // generation is opened, and a torn one is skipped as before.
+        std::fs::write(
+            family_dir.join(format!("MANIFEST-{}", generation.get() + 1)),
+            b"torn",
+        )
+        .unwrap();
+        assert!(checkout
+            .vector_parts()
+            .family
+            .has_manifest_above(generation)
+            .unwrap());
+        assert!(
+            plane.refresh().is_err(),
+            "the newest valid manifest is now unreadable"
+        );
+    }
+
+    /// What a refresh with nothing new published costs, before and after it
+    /// stopped reading the newest manifest: the old check
+    /// (`newest_generation`: a listing plus a read, checksum and decode of
+    /// the manifest) against the new one (`has_manifest_above`: a listing).
+    /// Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement"]
+    fn refresh_with_nothing_published_timing() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        project(&root);
+        let checkout = bind(store.path(), &root);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        // One file per round: one segment per file, a longer manifest.
+        fill(&plane, &mut Recorder::default(), 1);
+        plane.refresh().unwrap();
+        let generation = plane.loaded.lock().unwrap().generation;
+        let parts = checkout.vector_parts();
+        let rounds = 2_000;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert_eq!(parts.family.newest_generation().unwrap(), generation);
+        }
+        let old = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(!parts.family.has_manifest_above(generation).unwrap());
+        }
+        let new = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..rounds {
+            plane.refresh().unwrap();
+        }
+        let refresh = started.elapsed();
+        let per = |total: Duration| total.as_secs_f64() * 1e6 / f64::from(rounds);
+        println!(
+            "no-change refresh check: newest_generation {:.1} us, has_manifest_above {:.1} us, refresh {:.1} us",
+            per(old),
+            per(new),
+            per(refresh)
+        );
     }
 }

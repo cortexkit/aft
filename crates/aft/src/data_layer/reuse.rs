@@ -64,7 +64,7 @@ pub(crate) fn resolve_reusing(
     threads: usize,
 ) -> Result<(BTreeMap<String, FileResolution>, ReuseStats), ManifestJoinError> {
     let started = Instant::now();
-    super::callgraph::pool(threads)?.install(|| {
+    crate::alloc_trace::install(&super::callgraph::pool(threads)?, || {
         let mut stats = ReuseStats {
             files: inputs.parses.len(),
             ..ReuseStats::default()
@@ -76,10 +76,12 @@ pub(crate) fn resolve_reusing(
         stats.bind_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
+        let carry = crate::alloc_trace::carry();
         let checked = paths
             .par_iter()
             .map_init(
                 || {
+                    let _label = carry.enter();
                     let facts = Rc::new(thread_facts(inputs));
                     let (index, _files) = resolver_index(inputs, &bound, &facts);
                     (
@@ -91,6 +93,7 @@ pub(crate) fn resolve_reusing(
                     )
                 },
                 |(_, index, reads, surface, traced), path| {
+                    let _label = carry.enter();
                     let key = inputs.parses[path.as_str()].0.as_str();
                     let Some(variants) = pool.get(&(key, path.as_str())) else {
                         return ((*path).clone(), None, Vec::new());
