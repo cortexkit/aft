@@ -116,7 +116,7 @@ fn folder_revoke_stops_only_commands_whose_sandbox_held_the_folder() {
         Some(FOLDER_ACCESS_REVOKED_REASON)
     );
     assert_eq!(
-        super::scope_end_label(stopped.info.status_reason.as_deref()),
+        crate::bash_background::registry::scope_end_label(stopped.info.status_reason.as_deref()),
         Some("folder access revoked")
     );
     assert!(registry

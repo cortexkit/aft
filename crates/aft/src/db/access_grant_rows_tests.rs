@@ -20,7 +20,7 @@ fn folder(path: &str, operation: AccessOperation) -> AccessGrant {
 }
 
 /// A head `head` (agent `agent-alf`) at epoch 7 and its worker `worker`.
-fn fixture() -> (tempfile::TempDir, Connection) {
+fn fixture() -> (tempfile::TempDir, crate::db::TrackedConnection) {
     let dir = tempfile::tempdir().unwrap();
     let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
     let config = Config::default();
