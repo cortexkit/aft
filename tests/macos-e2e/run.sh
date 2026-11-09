@@ -67,20 +67,50 @@ echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 # `timeout` is GNU coreutils — it ships with Linux but NOT with macOS by
 # default, and a vanilla macOS GH Actions runner without coreutils returns
 # exit 127 ("command not found") the moment the harness tries to invoke it.
-# Install coreutils via Homebrew (pre-installed on macOS-latest images) and
-# put its `gnubin` directory ahead of $PATH so `timeout` resolves to the GNU
-# version. We do NOT use `gtimeout` because the harness is shared with Linux
-# and Linux has no `gtimeout` — keeping the binary name `timeout` on both
-# platforms means the shared script needs zero platform branches.
-echo "── Installing GNU coreutils (for \`timeout\`) ──"
-brew install coreutils >/dev/null
-COREUTILS_GNUBIN="$(brew --prefix coreutils)/libexec/gnubin"
-if [ ! -x "$COREUTILS_GNUBIN/timeout" ]; then
-    echo "Failed to locate GNU timeout under $COREUTILS_GNUBIN" >&2
-    exit 2
+# With Homebrew (GitHub's macOS images), install coreutils and put its
+# `gnubin` directory ahead of $PATH so `timeout` resolves to the GNU version.
+# Without Homebrew (the self-hosted release Mac), put a small Perl stand-in
+# named `timeout` on $PATH; it covers the one form the harness uses,
+# `timeout --signal=KILL <secs> <command...>`, and exits 124 on expiry like
+# GNU timeout. We do NOT use `gtimeout` because the harness is shared with
+# Linux and Linux has no `gtimeout` — keeping the binary name `timeout` on
+# both platforms means the shared script needs zero platform branches.
+echo "── Providing \`timeout\` ──"
+if command -v brew >/dev/null 2>&1; then
+    brew install coreutils >/dev/null
+    COREUTILS_GNUBIN="$(brew --prefix coreutils)/libexec/gnubin"
+    if [ ! -x "$COREUTILS_GNUBIN/timeout" ]; then
+        echo "Failed to locate GNU timeout under $COREUTILS_GNUBIN" >&2
+        exit 2
+    fi
+    export PATH="$COREUTILS_GNUBIN:$PATH"
+else
+    TIMEOUT_SHIM_DIR="$(mktemp -d)"
+    cat > "$TIMEOUT_SHIM_DIR/timeout" <<'PERL'
+#!/usr/bin/perl
+# timeout [--signal=SIG] SECONDS COMMAND [ARGS...]
+use strict;
+use warnings;
+my $signal = 'TERM';
+if (@ARGV && $ARGV[0] =~ /^--signal=(\w+)$/) { $signal = $1; shift @ARGV; }
+my $secs = shift @ARGV;
+die "timeout: invalid duration\n" unless defined $secs && $secs =~ /^(\d+)s?$/;
+$secs = $1;
+my $pid = fork();
+die "timeout: fork failed: $!\n" unless defined $pid;
+if ($pid == 0) { exec { $ARGV[0] } @ARGV or exit 127; }
+my $timed_out = 0;
+local $SIG{ALRM} = sub { $timed_out = 1; kill $signal, $pid; };
+alarm $secs;
+waitpid($pid, 0);
+alarm 0;
+exit 124 if $timed_out;
+exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+PERL
+    chmod +x "$TIMEOUT_SHIM_DIR/timeout"
+    export PATH="$TIMEOUT_SHIM_DIR:$PATH"
 fi
-export PATH="$COREUTILS_GNUBIN:$PATH"
-echo "  GNU timeout: $(command -v timeout)"
+echo "  timeout: $(command -v timeout)"
 
 # ---- Install OpenCode ------------------------------------------------------
 # Single source of truth: .github/opencode-version.txt. All three E2E

@@ -607,6 +607,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      # The rented Mac has no Node; the E2E suite installs its mock model
+      # server with npm, into setup-node's own writable prefix.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
       - name: Sync versions from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag
