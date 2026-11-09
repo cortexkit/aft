@@ -4850,6 +4850,8 @@ pub(crate) mod record_writes {
 
     /// Record writes started for `task_id`, including writes whose content
     /// was unchanged (those still sync the record).
+    // Read only by the Unix-only remote task tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn get(task_id: &str) -> usize {
         counts()
             .lock()
