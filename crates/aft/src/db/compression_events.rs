@@ -1108,6 +1108,11 @@ pub fn maybe_spawn_retention(
                 }
                 Err(error) => crate::slog_warn!("retention failed: {}", error),
             }
+            // Revoked bot-write authorities: bounded by its own time budget.
+            crate::db::gh_speech::retention::run_tick(
+                &db,
+                i64::try_from(now).unwrap_or(i64::MAX),
+            );
             IN_FLIGHT.store(false, Ordering::Release);
         })
     {

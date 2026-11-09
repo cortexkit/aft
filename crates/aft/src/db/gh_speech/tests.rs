@@ -808,3 +808,83 @@ fn legacy_cancel_after_enqueue_keeps_the_unsettled_dispatch_visible() {
         0
     );
 }
+
+fn record_bytes(store: &Store, incarnation: &str) -> i64 {
+    store
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT length(record_json) FROM gh_speech_authorities WHERE incarnation=?1",
+            [incarnation],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn revocation_drops_the_start_policy_copy_and_keeps_what_refusals_read() {
+    let (_dir, store, mut record) = fixture();
+    // A manifest-sized envelope. The record stores each byte as a JSON number,
+    // so 20 KiB of envelope becomes most of the record.
+    record.policy = Some(policy(20, &vec![0xA5; 20 * 1024]));
+    let active = activate(&store, &record);
+    assert!(record_bytes(&store, &record.incarnation) > 60 * 1024);
+
+    store.revoke(&record.incarnation, "terminal").unwrap();
+
+    let stripped = record_bytes(&store, &record.incarnation);
+    assert!(stripped < 2 * 1024, "revoked record is {stripped} bytes");
+    let conn = store.connect().unwrap();
+    // The digest and the identity columns still verify.
+    let revoked = load(&conn, &record.incarnation).unwrap();
+    assert_eq!(revoked.phase, "revoked");
+    assert_eq!(revoked.generation, active.generation + 1);
+    assert_eq!(revoked.ticket_digest, active.ticket_digest);
+    let mut expected = active.record.clone();
+    expected.policy = None;
+    assert_eq!(revoked.record, expected, "only the policy copy is dropped");
+    assert_eq!(
+        store.get(&record.incarnation).unwrap_err().reason,
+        "revoked"
+    );
+    assert_eq!(
+        store.find_digest(&[7; 32], "run-b").unwrap_err().reason,
+        "revoked"
+    );
+    // The manifest itself is still held once, in the policy ledger.
+    assert_eq!(
+        store.latest_policy().unwrap(),
+        active.record.policy.clone()
+    );
+    store.revoke(&record.incarnation, "terminal").unwrap();
+    assert_eq!(
+        load(&conn, &record.incarnation).unwrap().generation,
+        revoked.generation,
+        "revoking twice changes nothing"
+    );
+}
+
+#[test]
+fn revocation_of_an_unreadable_record_still_marks_it_revoked() {
+    let (_dir, store, record) = fixture();
+    store.capture(&record).unwrap();
+    store
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE gh_speech_authorities SET record_json='not-json'",
+            [],
+        )
+        .unwrap();
+    store.revoke(&record.incarnation, "cancelled").unwrap();
+    let (phase, text): (String, String) = store
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT phase,record_json FROM gh_speech_authorities WHERE incarnation=?1",
+            [&record.incarnation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((phase.as_str(), text.as_str()), ("revoked", "not-json"));
+}

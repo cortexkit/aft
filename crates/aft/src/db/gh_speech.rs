@@ -15,6 +15,7 @@ use super::{SqliteStore, TrackedConnection};
 use crate::gh_shim_speech::scope::ValidatedEnd;
 
 mod legacy_dispatch;
+pub(crate) mod retention;
 #[cfg(test)]
 pub(crate) use legacy_dispatch::LegacyDispatchStatus;
 pub(crate) use legacy_dispatch::MIGRATION as LEGACY_DISPATCH_MIGRATION;
@@ -167,6 +168,43 @@ fn load(conn: &rusqlite::Connection, incarnation: &str) -> Result<StoredAuthorit
         phase,
         generation,
     })
+}
+
+/// The stored record of a row about to be revoked, re-encoded without its start
+/// policy. The policy holds a full copy of the signed routing manifest, most of
+/// the record's size, and only the send gate of a live row reads it. A revoked
+/// row is refused before any policy check, and the manifest itself stays in
+/// `gh_speech_policy_versions`. Every field a refused lookup still verifies
+/// (identity columns, launch scopes, seal) is kept.
+///
+/// `None` leaves the record as it is: the row is absent or already revoked, or
+/// its record has no policy or does not verify. Revocation must still succeed
+/// for a row this cannot read.
+fn without_start_policy(
+    conn: &rusqlite::Connection,
+    incarnation: &str,
+) -> Result<Option<(String, Vec<u8>)>, Refusal> {
+    let row: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT record_json,record_digest FROM gh_speech_authorities WHERE incarnation=?1 AND phase!='revoked'",
+            [incarnation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((text, digest)) = row else {
+        return Ok(None);
+    };
+    if digest.as_slice() != blake3::hash(text.as_bytes()).as_bytes() {
+        return Ok(None);
+    }
+    let Ok(mut record) = serde_json::from_str::<AuthorityRecord>(&text) else {
+        return Ok(None);
+    };
+    if record.policy.take().is_none() {
+        return Ok(None);
+    }
+    Ok(encoded(&record).ok())
 }
 
 fn check_not_revoked(conn: &rusqlite::Connection, incarnation: &str) -> Result<(), Refusal> {
@@ -505,8 +543,12 @@ impl Store {
             .map_err(db_error)?;
         tx.execute("INSERT OR IGNORE INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES(?1,?2,?3)",
             params![incarnation,reason,super::call_ledger::now_ms()]).map_err(db_error)?;
-        tx.execute("UPDATE gh_speech_authorities SET phase='revoked',generation=generation+1 WHERE incarnation=?1 AND phase!='revoked'",
-            [incarnation]).map_err(db_error)?;
+        match without_start_policy(&tx, incarnation)? {
+            Some((text, digest)) => tx.execute("UPDATE gh_speech_authorities SET phase='revoked',record_json=?2,record_digest=?3,generation=generation+1 WHERE incarnation=?1 AND phase!='revoked'",
+                params![incarnation,text,digest]).map_err(db_error)?,
+            None => tx.execute("UPDATE gh_speech_authorities SET phase='revoked',generation=generation+1 WHERE incarnation=?1 AND phase!='revoked'",
+                [incarnation]).map_err(db_error)?,
+        };
         tx.commit().map_err(db_error)
     }
 
