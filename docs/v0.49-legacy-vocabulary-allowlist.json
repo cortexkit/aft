@@ -1547,7 +1547,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/views/parent/query.rs",
+      "path": "crates/aft/src/data_layer/parent_session/query.rs",
       "line": 510,
       "column": 52,
       "token": "toFile",
