@@ -83,7 +83,15 @@ pub(crate) struct ParseSlot {
 }
 
 impl ParseSlot {
+    /// The parse, decoded from its encoded record or the publication; its
+    /// kinds are noted in [`parse_kinds`] on the way.
     fn decode(&self, path: &str) -> (BlobKey, Arc<ParseBlob>) {
+        let decoded = self.decode_only(path);
+        note_parse_kinds(&decoded.0, &decoded.1);
+        decoded
+    }
+
+    fn decode_only(&self, path: &str) -> (BlobKey, Arc<ParseBlob>) {
         if let Some((key, record)) = &self.encoded {
             // The build checked that the record converts before keeping it
             // encoded (see `Parses::encoded`), so a failure here is a defect
@@ -102,6 +110,46 @@ impl ParseSlot {
             .and_then(|stored| stored.parse_of(path))
             .unwrap_or_else(empty_parse)
     }
+}
+
+/// Above this many parses the memo of [`parse_kinds`] starts over, so it
+/// never holds more than a few megabytes; one large repository's parses
+/// take a tenth of it.
+const PARSE_KINDS_LIMIT: usize = 1 << 16;
+
+/// [`FileLists::kinds`] of every parse this process decoded, by its parse
+/// key: whether it is Rust and whether it declares modules. Both follow
+/// from the parsed content alone, which the key names, so they hold for
+/// every checkout and engine of the process. An engine started from a
+/// publication lists the module-declaring files from here rather than
+/// decoding every stored parse; builds and engines fill it as they decode.
+fn parse_kinds() -> &'static Mutex<HashMap<u128, (bool, bool)>> {
+    static KINDS: std::sync::OnceLock<Mutex<HashMap<u128, (bool, bool)>>> =
+        std::sync::OnceLock::new();
+    KINDS.get_or_init(Default::default)
+}
+
+/// A parse key as [`parse_kinds`] files it: the record key digest it
+/// spells in hex. `None` for anything else, such as the empty key of a
+/// parse whose read failed.
+fn parse_kinds_key(key: &str) -> Option<u128> {
+    (key.len() == 32)
+        .then(|| u128::from_str_radix(key, 16).ok())
+        .flatten()
+}
+
+fn note_parse_kinds(key: &str, parse: &ParseBlob) {
+    let Some(key) = parse_kinds_key(key) else {
+        return;
+    };
+    let kinds = FileLists::kinds(parse);
+    let mut memo = parse_kinds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if memo.len() >= PARSE_KINDS_LIMIT && !memo.contains_key(&key) {
+        memo.clear();
+    }
+    memo.insert(key, kinds);
 }
 
 /// A parse with nothing in it, for an entry whose stored read failed.
@@ -207,9 +255,30 @@ impl Parses {
         Some(slot.value.get_or_init(|| slot.decode(path)))
     }
 
+    /// `path`'s record key and parse without keeping the parse: the one
+    /// held when it is decoded already, otherwise one decoded now that only
+    /// the caller holds. For work that reads a file once, such as binding
+    /// it or listing its kinds: [`Self::get`] would keep every parse it
+    /// read decoded until [`Self::release_decoded`], and an update that
+    /// binds or lists most of a large checkout held over half a gigabyte of
+    /// parses that way.
+    pub(crate) fn read(&self, path: &str) -> Option<(BlobKey, Arc<ParseBlob>)> {
+        let slot = self.map.get(path)?;
+        Some(match slot.value.get() {
+            Some((key, parse)) => (key.clone(), Arc::clone(parse)),
+            None => slot.decode(path),
+        })
+    }
+
     /// `path`'s parse key, without decoding the parse when the key is known
     /// without it.
     pub(crate) fn key(&self, path: &str) -> Option<BlobKey> {
+        self.known_key(path)
+            .or_else(|| self.get(path).map(|(key, _)| key.clone()))
+    }
+
+    /// `path`'s parse key when it is known without decoding the parse.
+    fn known_key(&self, path: &str) -> Option<BlobKey> {
         let slot = self.map.get(path)?;
         if let Some((key, _)) = slot.value.get() {
             return Some(key.clone());
@@ -217,14 +286,10 @@ impl Parses {
         if let Some((key, _)) = &slot.encoded {
             return Some(key.clone());
         }
-        if let Some(key) = slot
-            .stored
+        slot.stored
             .as_ref()
             .and_then(|stored| stored.record_key_of(path))
-        {
-            return Some(key.to_string());
-        }
-        self.get(path).map(|(key, _)| key.clone())
+            .map(str::to_string)
     }
 
     pub(crate) fn contains_key(&self, path: &str) -> bool {
@@ -341,6 +406,31 @@ impl From<BTreeMap<String, (BlobKey, Arc<ParseBlob>)>> for Parses {
 /// [`Resolutions`].
 pub(crate) trait ResolutionLookup {
     fn resolution(&self, path: &str) -> Option<&FileResolution>;
+
+    /// `path`'s resolution for a caller that reads it once: the one
+    /// [`Self::resolution`] gives, unless the lookup can decode it without
+    /// keeping it ([`Resolutions::read`]).
+    fn read_once(&self, path: &str) -> Option<ReadOnce<'_>> {
+        self.resolution(path).map(ReadOnce::Held)
+    }
+}
+
+/// A resolution [`ResolutionLookup::read_once`] gives: one the lookup
+/// holds, or one decoded for the caller alone.
+pub(crate) enum ReadOnce<'r> {
+    Held(&'r FileResolution),
+    Decoded(Arc<FileResolution>),
+}
+
+impl std::ops::Deref for ReadOnce<'_> {
+    type Target = FileResolution;
+
+    fn deref(&self) -> &FileResolution {
+        match self {
+            Self::Held(resolution) => resolution,
+            Self::Decoded(resolution) => resolution,
+        }
+    }
 }
 
 impl ResolutionLookup for BTreeMap<String, FileResolution> {
@@ -395,15 +485,18 @@ enum ResolutionSource {
 
 impl ResolutionSlot {
     fn read(&self, path: &str) -> Option<&FileResolution> {
-        self.value
-            .get_or_init(|| match &self.source {
-                // A slot built in memory is made with its value, and never
-                // lets it go, so this is never reached.
-                ResolutionSource::Memory => None,
-                ResolutionSource::Stored(stored) => stored.resolution_of(path).map(Arc::new),
-                ResolutionSource::Encoded(encoded) => Some(Arc::new(encoded.decode(path))),
-            })
-            .as_deref()
+        self.value.get_or_init(|| self.decode(path)).as_deref()
+    }
+
+    /// The value decoded from its source, without keeping it.
+    fn decode(&self, path: &str) -> Option<Arc<FileResolution>> {
+        match &self.source {
+            // A slot built in memory is made with its value, and never
+            // lets it go, so this is never reached.
+            ResolutionSource::Memory => None,
+            ResolutionSource::Stored(stored) => stored.resolution_of(path).map(Arc::new),
+            ResolutionSource::Encoded(encoded) => Some(Arc::new(encoded.decode(path))),
+        }
     }
 
     /// Whether the value can be let go and decoded again.
@@ -491,6 +584,20 @@ impl Resolutions {
 
     pub(crate) fn get(&self, path: &str) -> Option<&FileResolution> {
         self.map.get(path)?.read(path)
+    }
+
+    /// `path`'s resolution without keeping it: the one held when it is
+    /// decoded already, otherwise one decoded now that only the caller
+    /// holds. For checking a file an update most often leaves as it is,
+    /// such as replaying its recorded answers: [`Self::get`] would keep
+    /// each one decoded until the update ends, and a change to a widely
+    /// read file has its readers' resolutions checked by the thousand.
+    pub(crate) fn read(&self, path: &str) -> Option<Arc<FileResolution>> {
+        let slot = self.map.get(path)?;
+        match slot.value.get() {
+            Some(value) => value.clone(),
+            None => slot.decode(path),
+        }
     }
 
     /// The encoding of `path`'s resolution, whose parse key is
@@ -616,6 +723,10 @@ impl Resolutions {
 impl ResolutionLookup for Resolutions {
     fn resolution(&self, path: &str) -> Option<&FileResolution> {
         self.get(path)
+    }
+
+    fn read_once(&self, path: &str) -> Option<ReadOnce<'_>> {
+        self.read(path).map(ReadOnce::Decoded)
     }
 }
 
@@ -868,9 +979,14 @@ impl BindCache {
         self.bind_missing(inputs, &paths)
     }
 
-    /// [`Self::lists`], reading the parses in parallel when the lists are
-    /// not built yet. The lock is not held while they are read: a pool
-    /// thread waiting on it could be the one a read needs.
+    /// [`Self::lists`], built in parallel when no resolution has built them.
+    /// Each file's kinds come from [`parse_kinds`] when this process has
+    /// decoded its parse before (a build of any checkout of the repository
+    /// decodes every one); only the others are read, each without keeping
+    /// it ([`Parses::read`]). An engine started from a publication has no
+    /// parse decoded, and keeping every one held over 600 MB on AFT's own
+    /// checkout. The lock is not held while they are read: a pool thread
+    /// waiting on it could be the one a read needs.
     fn lists_in_parallel(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
         if let Some(lists) = self
             .lists
@@ -881,15 +997,30 @@ impl BindCache {
             return Arc::clone(lists);
         }
         let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let known = {
+            let memo = parse_kinds()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            paths
+                .iter()
+                .map(|path| {
+                    let key = inputs.parses.known_key(path)?;
+                    memo.get(&parse_kinds_key(&key)?).copied()
+                })
+                .collect::<Vec<_>>()
+        };
         let carry = crate::alloc_trace::carry();
         let kinds = paths
             .par_iter()
-            .map(|path| {
+            .zip(known)
+            .map(|(path, known)| {
                 let _label = carry.enter();
-                inputs
-                    .parses
-                    .get(path)
-                    .map_or((false, false), |(_, parse)| FileLists::kinds(parse))
+                known.unwrap_or_else(|| {
+                    inputs
+                        .parses
+                        .read(path)
+                        .map_or((false, false), |(_, parse)| FileLists::kinds(&parse))
+                })
             })
             .collect::<Vec<_>>();
         let mut lists = FileLists::default();
@@ -960,9 +1091,11 @@ impl<'a> BoundFiles<'a> {
         if let Some(bound) = self.cache.get(path) {
             return Some(bound);
         }
-        let (_, parse) = self.inputs.parses.get(path)?;
+        // Read without keeping the parse: binding reads it once, and an
+        // update's resolution reaches many files it binds this way.
+        let (_, parse) = self.inputs.parses.read(path)?;
         self.cache.bound_on_first_use.note(path);
-        match bind_file(path, parse, &self.facts, None) {
+        match bind_file(path, &parse, &self.facts, None) {
             Ok((surface, binding)) => Some(self.cache.set_new(
                 path,
                 BoundFile {
@@ -1078,12 +1211,21 @@ pub(crate) fn resolve_checkout_into(
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
         // The whole-checkout lists read every parse, so they are built here,
-        // a batch at a time while binding has each batch decoded.
+        // a batch at a time: each parse is decoded once, for its kinds, and
+        // kept until binding (which keeps none it decodes) has read it.
         let mut lists = FileLists::default();
         for batch in paths.chunks(BATCH) {
+            let parses = &inputs.parses;
+            let carry = crate::alloc_trace::carry();
+            let kinds = batch
+                .par_iter()
+                .map(|path| {
+                    let _label = carry.enter();
+                    FileLists::kinds(&parses[path].1)
+                })
+                .collect::<Vec<_>>();
             bound.bind_missing(inputs, &refs(batch))?;
-            for path in batch {
-                let (rust, declaring) = FileLists::kinds(&inputs.parses[path].1);
+            for (path, (rust, declaring)) in batch.iter().zip(kinds) {
                 if rust {
                     lists.rust.push(path.clone());
                 }
@@ -1262,7 +1404,8 @@ pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
 }
 
 /// Pass 1 for `paths`, in parallel: each file's bound surface, and its
-/// binding before resolution. Records nothing in any cache.
+/// binding before resolution. Records nothing in any cache, and keeps no
+/// parse it decoded ([`Parses::read`]).
 ///
 /// # Errors
 ///
@@ -1278,8 +1421,11 @@ pub(crate) fn bind_all(
             || thread_facts(inputs),
             |facts, path| {
                 let _label = carry.enter();
-                let (_, parse) = &inputs.parses[path.as_str()];
-                bind_file(path, parse, facts, None).map(|(surface, binding)| {
+                let (_, parse) = inputs
+                    .parses
+                    .read(path)
+                    .unwrap_or_else(|| panic!("{path} is not a parsed file"));
+                bind_file(path, &parse, facts, None).map(|(surface, binding)| {
                     (
                         (*path).clone(),
                         BoundFile {
@@ -1729,10 +1875,13 @@ impl<'s> SiteSource<'s> {
             .as_deref()
     }
 
+    /// The file's pass-4 inputs, from its parse and resolution read without
+    /// keeping either decoded: the inputs keep only what pass 4 reads, and
+    /// a site calling a common method name reads every file declaring it.
     fn compute(&self, path: &str) -> Option<Arc<SiteFile>> {
-        let (_, parse) = self.inputs.parses.get(path)?;
-        let resolution = self.resolved.resolution(path)?;
-        Some(Arc::new(SiteFile::new(parse, resolution)))
+        let (_, parse) = self.inputs.parses.read(path)?;
+        let resolution = self.resolved.read_once(path)?;
+        Some(Arc::new(SiteFile::new(&parse, &resolution)))
     }
 
     /// Computes, in parallel, the inputs of every file that declares a

@@ -78,6 +78,11 @@ pub(crate) struct SourceWork {
     pub(crate) scans: usize,
     /// Call-graph resolutions: a build's, or a refresh's update.
     pub(crate) resolutions: usize,
+    /// The most stored parses, and separately resolutions, a refresh's
+    /// update held decoded when it finished: everything it decoded and
+    /// kept, since nothing is let go before then.
+    pub(crate) decoded_parses: usize,
+    pub(crate) decoded_resolutions: usize,
 }
 
 #[cfg(test)]
@@ -2473,6 +2478,12 @@ impl Checkout {
                 }
             }
             stats = Some(update);
+            note_source_work(&self.root, |work| {
+                let live = &engine.live;
+                work.decoded_parses = work.decoded_parses.max(live.inputs.parses.decoded_count());
+                work.decoded_resolutions =
+                    work.decoded_resolutions.max(live.resolved.decoded_count());
+            });
             // An update keeps every parse and resolution it decoded. A broad
             // one reads thousands (every file declaring a method named `new`,
             // say), and resolves a thousand again after a widely read change,
@@ -6593,6 +6604,90 @@ pub fn other() { callee(); }
             sibling_answers(&far.checkout.view().unwrap()),
             cold_sibling_answers(&layer, far.dir.path())
         );
+    }
+
+    /// A new worktree started from a sibling with the same files, edited in
+    /// the crate root every module reads, keeps decoded only what the edit
+    /// resolved again. The update still lists and binds the module-declaring
+    /// files and checks the recorded answers of every module that reads the
+    /// root, but keeps none of the stored parses and resolutions it reads
+    /// for that decoded: kept, they took over a gigabyte on AFT's own
+    /// checkout. Answers stay a cold build's.
+    #[test]
+    fn a_fresh_worktree_keeps_decoded_only_what_its_first_edit_resolves_again() {
+        const MODULES: usize = 24;
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+        );
+        let mut lib = String::from("pub fn shared() {}\n");
+        for index in 0..MODULES {
+            lib.push_str(&format!("pub mod m{index};\n"));
+            files.insert(
+                format!("src/m{index}.rs"),
+                format!("use crate::shared;\npub fn f{index}() {{ shared(); }}\n"),
+            );
+        }
+        files.insert("src/lib.rs".to_string(), lib.clone());
+        let sibling = Worktree::new(&layer, store.path(), files.clone());
+        assert_eq!(sibling.built.started_from_sibling, None);
+        let worktree = Worktree::new(&layer, store.path(), files);
+        assert_eq!(
+            worktree.built.started_from_sibling,
+            Some(0),
+            "{:?}",
+            worktree.built
+        );
+        let root = worktree.dir.path();
+        let before = source_work_for_test(root);
+
+        write(root, "src/lib.rs", &format!("{lib}fn added() {{}}\n"));
+        worktree
+            .checkout
+            .record_paths(&[b"src/lib.rs".to_vec()])
+            .unwrap();
+        let stats = worktree
+            .checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("the edit was resolved");
+        let work = source_work_for_test(root);
+        assert_eq!(work.resolutions, before.resolutions + 1);
+        // The update reached every module through the root, and resolved
+        // again only what the edit changed.
+        assert!(stats.replayed >= MODULES, "{stats:?}");
+        assert!(stats.resolved <= 1, "{stats:?}");
+        let touched = stats.touched.len();
+        assert!(touched <= 2, "{stats:?}");
+        assert!(
+            work.decoded_parses <= touched && work.decoded_resolutions <= touched,
+            "an update touching {touched} files kept {} parses and {} resolutions decoded \
+             of {} files",
+            work.decoded_parses,
+            work.decoded_resolutions,
+            MODULES + 1
+        );
+
+        let answers = |view: &CheckoutView| {
+            [
+                ("src/lib.rs", "shared"),
+                ("src/lib.rs", "added"),
+                ("src/m7.rs", "f7"),
+            ]
+            .map(|(file, symbol)| format!("{file} {symbol}: {}", callers_of(view, file, symbol)))
+        };
+        let ours = answers(&worktree.checkout.view().unwrap());
+        assert!(
+            ours[0].contains(&format!("total_callers: {MODULES},")),
+            "{ours:?}"
+        );
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
+        cold.build().unwrap();
+        assert_eq!(ours, answers(&cold.view().unwrap()));
     }
 
     #[test]
