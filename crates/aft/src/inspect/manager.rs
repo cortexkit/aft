@@ -6188,7 +6188,7 @@ mod guard_tests {
             0,
             "no project walk visited an entry"
         );
-        assert_eq!(listed, walked);
+        assert_same_files(&root, &listed, &walked);
         let scoped = JobScope::from_roots(root.clone(), vec![root.join("vendor")]);
         assert_eq!(
             scope_files(&root, &scoped),
@@ -6223,8 +6223,29 @@ mod guard_tests {
         assert_eq!(scope_files(&root, &project), walked);
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
         checkout.checkout().end_rescan();
-        assert_eq!(scope_files(&root, &project), walked);
+        assert_same_files(&root, &scope_files(&root, &project), &walked);
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+    }
+
+    /// Fails naming the files only one of the two sorted lists holds.
+    fn assert_same_files(root: &Path, listed: &[PathBuf], walked: &[PathBuf]) {
+        let only = |left: &[PathBuf], right: &[PathBuf]| {
+            left.iter()
+                .filter(|path| right.binary_search(path).is_err())
+                .map(|path| {
+                    path.strip_prefix(root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            listed == walked,
+            "only listed: {:?}; only walked: {:?}",
+            only(listed, walked),
+            only(walked, listed)
+        );
     }
 
     /// This thread's CPU time in milliseconds: the TODO refresh lists files
