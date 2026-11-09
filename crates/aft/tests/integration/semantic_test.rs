@@ -3,8 +3,9 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-mod aft {
-    pub mod search_index {
+// A local stand-in for the path-hash key, not the crate's identity implementation.
+mod fixture_identity {
+    pub mod path_hash {
         use std::fs;
         use std::path::Path;
 
@@ -21,7 +22,7 @@ mod aft {
     }
 }
 
-use aft::root_identity::key::artifact_cache_key;
+use fixture_identity::path_hash::artifact_cache_key;
 use serde_json::{json, Value};
 
 use crate::helpers::{user_config, AftProcess};
