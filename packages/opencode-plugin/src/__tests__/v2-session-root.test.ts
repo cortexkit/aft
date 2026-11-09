@@ -121,6 +121,24 @@ describe("OpenCode 2 tool root for a session in a linked worktree", () => {
     expect(projectRootFor({ directory: worktree, worktree: main })).toBe(main);
   });
 
+  test("OpenCode 2 follows a new per-call directory while OpenCode 1 keeps the cached directory", async () => {
+    const { main, worktree } = checkoutLayout();
+    const sessionID = "ses_moved";
+    await getSessionDirectory(
+      v2Context({ directory: main }, () => Effect.succeed({ location: { directory: main } })),
+      sessionID,
+      main,
+    );
+    expect(getSessionDirectoryCached(sessionID)).toBe(main);
+
+    const runtime = { directory: worktree, worktree: main, sessionID };
+    expect(projectRootFor({ ...runtime, directoryIsSessionRoot: true })).toBe(worktree);
+    expect(projectRootFor(runtime)).toBe(main);
+    expect(
+      projectRootFor({ ...runtime, directory: "", directoryIsSessionRoot: true }),
+    ).toBe(main);
+  });
+
   /**
    * Run one projected V2 tool whose body routes a bridge call the way every
    * AFT tool does, and report the root it resolved and the bridge root it hit.
