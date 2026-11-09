@@ -1436,6 +1436,14 @@ pub(crate) fn spawn_with_secrets(
     }
 
     let cleanup_plan = spawn_plan.clone();
+    // Record which saved folder grants this command's sandbox allows, so
+    // revoking one of them can stop it. A build-server job runs under no
+    // local sandbox and records none.
+    let _folder_grants = registry::folder_grants::spawn_guard(if remote.is_none() {
+        registry::folder_grants::for_plan(ctx, &spawn_plan)
+    } else {
+        None
+    });
     // The watchdog compresses this task's output through the shared filter
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.

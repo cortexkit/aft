@@ -1,0 +1,405 @@
+use super::*;
+use crate::access_policy::{AccessDecision, AccessGrant};
+use crate::config::Config;
+use crate::db::access_grants::{self as store, ScopeKey};
+use std::sync::Mutex;
+
+const OWNER: &str = r#"{"kind":"reserved","module_id":"prefrontal-core"}"#;
+
+fn key(scope_ref: &str, epoch: u64) -> ScopeKey {
+    ScopeKey {
+        owner: OWNER.into(),
+        scope_ref: scope_ref.into(),
+        epoch,
+    }
+}
+
+fn head() -> ScopeKey {
+    key("scope:head-alf", 7)
+}
+
+fn worker() -> ScopeKey {
+    key("scope:wkr-7f3a", 3)
+}
+
+/// aft.db with a head scope (agent `agent-alf`) and a worker scope it owns,
+/// registered the way a daemon-stamped bind registers them.
+fn database(dir: &Path) -> Mutex<crate::db::TrackedConnection> {
+    let conn = crate::db::open(&dir.join("aft.db")).unwrap();
+    store::register_scope(&conn, &head(), None, &Config::default()).unwrap();
+    store::register_agent(&conn, &head(), "agent-alf", true).unwrap();
+    store::register_scope(&conn, &worker(), Some(&head()), &Config::default()).unwrap();
+    store::register_worker(&conn, &worker()).unwrap();
+    Mutex::new(conn)
+}
+
+fn grant(path: &Path, kind: GrantKind, operation: AccessOperation) -> AccessGrant {
+    AccessGrant {
+        path: path.to_path_buf(),
+        kind,
+        operation,
+    }
+}
+
+fn cingulate() -> Option<Principal> {
+    Some(Principal::Reserved {
+        module_id: "cingulate".into(),
+    })
+}
+
+fn request(method: &str, params: Value) -> Request {
+    admit(
+        cingulate().as_ref(),
+        &json!({"method": method, "params": params}),
+    )
+    .unwrap()
+}
+
+fn list_all(db: &Mutex<crate::db::TrackedConnection>) -> Vec<Value> {
+    let reply = answer(Some(db), &request(LIST_OPERATION, json!({})), |_| 0).unwrap();
+    reply["grants"].as_array().unwrap().clone()
+}
+
+fn revoke(db: &Mutex<crate::db::TrackedConnection>, id: &str, stopped: usize) -> Value {
+    answer(
+        Some(db),
+        &request(REVOKE_OPERATION, json!({"id": id})),
+        |_| stopped,
+    )
+    .unwrap()
+}
+
+/// The fields a `permissions/v1` row may carry, and those it must.
+const ROW_FIELDS: [&str; 12] = [
+    "id",
+    "agent_id",
+    "holder",
+    "module",
+    "subject_label",
+    "scope",
+    "scope_label",
+    "group",
+    "methods",
+    "expires_at_ms",
+    "granted_at_ms",
+    "card_ref",
+];
+const REQUIRED_ROW_FIELDS: [&str; 7] = [
+    "id",
+    "holder",
+    "module",
+    "subject_label",
+    "scope",
+    "scope_label",
+    "granted_at_ms",
+];
+
+fn assert_contract_row(row: &Value) {
+    let object = row.as_object().expect("row is an object");
+    for field in object.keys() {
+        assert!(
+            ROW_FIELDS.contains(&field.as_str()),
+            "unknown field {field}: {row}"
+        );
+    }
+    for field in REQUIRED_ROW_FIELDS {
+        assert!(object.contains_key(field), "missing {field}: {row}");
+    }
+    assert_eq!(row["module"], "aft");
+    assert!(row["granted_at_ms"].is_u64(), "{row}");
+    // Saved answers last until revoked or until their scope ends.
+    assert!(row.get("expires_at_ms").is_none(), "{row}");
+    assert!(row.get("group").is_none() && row.get("methods").is_none());
+    assert!(["read", "read_write", "file_read", "file_read_write"]
+        .contains(&row["scope"].as_str().unwrap()));
+    // The row is listed under the holder's agent (a worker's owning head).
+    assert_eq!(row["agent_id"], row["holder"]["agent_id"], "{row}");
+    match row["holder"]["kind"].as_str() {
+        Some("agent") => assert_eq!(row["holder"].as_object().unwrap().len(), 2, "{row}"),
+        Some("worker") => {
+            assert_eq!(row["holder"].as_object().unwrap().len(), 3, "{row}");
+            assert!(row["holder"]["scope_ref"].is_string(), "{row}");
+        }
+        other => panic!("AFT never holds a grant as {other:?}: {row}"),
+    }
+}
+
+#[test]
+fn permissions_list_rows_for_agent_and_worker_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let home = crate::access_policy::policy_path(dir.path()).join("home");
+    let site = home.join("Work/site");
+    let notes = home.join("Work/notes");
+    {
+        let conn = db.lock().unwrap();
+        store::insert_from_card(
+            &conn,
+            &head(),
+            &grant(&site, GrantKind::Subtree, AccessOperation::Read),
+            Some("acc_1"),
+        )
+        .unwrap();
+        // Widening the same folder keeps one row per folder per holder.
+        store::insert_from_card(
+            &conn,
+            &head(),
+            &grant(&site, GrantKind::Subtree, AccessOperation::Write),
+            Some("acc_3"),
+        )
+        .unwrap();
+        store::insert_from_card(
+            &conn,
+            &worker(),
+            &grant(&notes, GrantKind::Subtree, AccessOperation::Read),
+            Some("acc_2"),
+        )
+        .unwrap();
+    }
+    let rows = list(&db.lock().unwrap(), None, &[home.clone()]).unwrap();
+    let rows = rows["grants"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    rows.iter().for_each(assert_contract_row);
+    let agent = &rows[0];
+    assert_eq!(
+        agent["holder"],
+        json!({"kind": "agent", "agent_id": "agent-alf"})
+    );
+    assert_eq!(agent["subject_label"], "~/Work/site");
+    assert_eq!(agent["scope"], "read_write");
+    assert_eq!(agent["scope_label"], "read and change files in ~/Work/site");
+    assert_eq!(agent["card_ref"], "acc_3");
+    let worker_row = &rows[1];
+    assert_eq!(
+        worker_row["holder"],
+        json!({"kind": "worker", "agent_id": "agent-alf", "scope_ref": "scope:wkr-7f3a"})
+    );
+    assert_eq!(worker_row["agent_id"], "agent-alf");
+    assert_eq!(worker_row["scope_label"], "read files in ~/Work/notes");
+    assert_ne!(agent["id"], worker_row["id"]);
+
+    // The agent filter keeps the head's own grants and its workers'.
+    let filtered = list(&db.lock().unwrap(), Some("agent-alf"), &[home.clone()]).unwrap();
+    assert_eq!(filtered["grants"].as_array().unwrap().len(), 2);
+    let other = list(&db.lock().unwrap(), Some("agent-other"), &[home]).unwrap();
+    assert_eq!(other, json!({"grants": []}));
+}
+
+#[test]
+fn permissions_list_drops_grants_whose_scope_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let notes = crate::access_policy::policy_path(dir.path()).join("notes");
+    store::insert(
+        &db.lock().unwrap(),
+        &worker(),
+        &grant(&notes, GrantKind::Subtree, AccessOperation::Read),
+    )
+    .unwrap();
+    let id = list_all(&db)[0]["id"].as_str().unwrap().to_owned();
+    // A saved answer ends with the scope that holds it: the daemon confirmed
+    // the worker ended, so the row drops out and its id is unknown.
+    store::end_scope_grants(&db.lock().unwrap(), &worker()).unwrap();
+    assert!(list_all(&db).is_empty());
+    assert_eq!(revoke(&db, &id, 0), json!({"outcome": "not_found"}));
+}
+
+#[test]
+fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let root = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside = crate::access_policy::policy_path(&outside);
+    store::insert_from_card(
+        &db.lock().unwrap(),
+        &worker(),
+        &grant(&outside, GrantKind::Subtree, AccessOperation::Write),
+        Some("acc_1"),
+    )
+    .unwrap();
+    let decide = || {
+        let mut policy = crate::access_policy::AccessPolicy::from_config(
+            &Config::default(),
+            &dir.path().join("store"),
+            vec![crate::access_policy::policy_path(&root)],
+            &dir.path().join("home"),
+        );
+        policy.grants = store::list(&db.lock().unwrap(), &worker()).unwrap();
+        policy.decide(AccessOperation::Write, &outside.join("file.txt"), false)
+    };
+    assert_eq!(decide(), AccessDecision::Allow);
+    let id = list_all(&db)[0]["id"].as_str().unwrap().to_owned();
+
+    let mut stopped_for = Vec::new();
+    let reply = answer(
+        Some(&db),
+        &request(REVOKE_OPERATION, json!({"id": id})),
+        |row| {
+            stopped_for.push((row.scope.clone(), row.path.clone()));
+            0
+        },
+    )
+    .unwrap();
+    assert_eq!(reply, json!({"outcome": "revoked"}));
+    assert_eq!(stopped_for, vec![(worker(), outside.clone())]);
+    assert_eq!(decide(), AccessDecision::Ask, "the next call asks again");
+    assert!(list_all(&db).is_empty());
+    assert_eq!(revoke(&db, &id, 0), json!({"outcome": "not_found"}));
+    assert_eq!(revoke(&db, "grt_99", 0), json!({"outcome": "not_found"}));
+}
+
+#[test]
+fn permissions_revoke_reports_stopping_only_when_running_work_lost_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let folder = crate::access_policy::policy_path(dir.path()).join("a");
+    for scope in [head(), worker()] {
+        store::insert(
+            &db.lock().unwrap(),
+            &scope,
+            &grant(&folder, GrantKind::Subtree, AccessOperation::Read),
+        )
+        .unwrap();
+    }
+    let ids: Vec<String> = list_all(&db)
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        revoke(&db, &ids[0], 1),
+        json!({"outcome": "revoked", "stopping": true})
+    );
+    assert_eq!(revoke(&db, &ids[1], 0), json!({"outcome": "revoked"}));
+}
+
+#[test]
+fn permissions_refuse_callers_other_than_cingulate_and_direct() {
+    let body = json!({"method": REVOKE_OPERATION, "params": {"id": "aftg_1"}});
+    for principal in [
+        Some(Principal::Reserved {
+            module_id: "plexus".into(),
+        }),
+        Some(Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+        Some(Principal::Reserved {
+            module_id: "aft".into(),
+        }),
+        Some(Principal::Unverified),
+        None,
+    ] {
+        for body in [&body, &json!({"method": LIST_OPERATION, "params": {}})] {
+            let refused = admit(principal.as_ref(), body).err().unwrap();
+            assert_eq!(
+                refused.code, "permissions_operator_required",
+                "{principal:?}"
+            );
+        }
+    }
+    assert!(admit(cingulate().as_ref(), &body).is_ok());
+    assert!(admit(Some(&Principal::Direct), &body).is_ok());
+    // An admitted caller still sends well-formed parameters.
+    for bad in [
+        json!({"method": REVOKE_OPERATION, "params": {}}),
+        json!({"method": REVOKE_OPERATION, "params": {"id": 7}}),
+        json!({"method": LIST_OPERATION, "params": {"agent_id": 7}}),
+        json!({"method": LIST_OPERATION, "params": []}),
+    ] {
+        assert_eq!(
+            admit(cingulate().as_ref(), &bad).err().unwrap().code,
+            "invalid_params"
+        );
+    }
+    assert!(!is_request(&json!({"method": "permissions.list_all"})));
+    assert!(is_request(&json!({"op": LIST_OPERATION})));
+}
+
+#[test]
+fn permissions_subject_labels_show_home_as_tilde() {
+    let homes = [PathBuf::from("/Users/person")];
+    assert_eq!(display_path(Path::new("/Users/person"), &homes), "~");
+    assert_eq!(
+        display_path(Path::new("/Users/person/Work/x"), &homes),
+        Path::new("~").join("Work/x").display().to_string()
+    );
+    assert_eq!(
+        display_path(Path::new("/Users/personal/x"), &homes),
+        "/Users/personal/x"
+    );
+    assert_eq!(display_path(Path::new("/srv/data"), &[]), "/srv/data");
+}
+
+/// The sample sent to the contract's owner: `permissions.list` from this
+/// handler for an agent grant and two worker grants (one saved from a card,
+/// one from the worker's launch plan, which has no card). Ids and times are
+/// pinned in the database so the reply is reproducible.
+#[cfg(unix)]
+#[test]
+fn permissions_list_matches_the_published_sample() {
+    let sample: Value = serde_json::from_str(include_str!(
+        "../../../../test-vectors/permissions-v1/aft-provider-list.json"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let home = PathBuf::from("/Users/person");
+    {
+        let conn = db.lock().unwrap();
+        for (scope, path, kind, operation, card) in [
+            (
+                head(),
+                "Work/site",
+                GrantKind::Subtree,
+                AccessOperation::Write,
+                Some("acc_1"),
+            ),
+            (
+                worker(),
+                "Work/notes",
+                GrantKind::Subtree,
+                AccessOperation::Read,
+                Some("acc_2"),
+            ),
+            (
+                worker(),
+                "Work/ref/spec.md",
+                GrantKind::File,
+                AccessOperation::Read,
+                None,
+            ),
+        ] {
+            store::insert_from_card(
+                &conn,
+                &scope,
+                &grant(&home.join(path), kind, operation),
+                card,
+            )
+            .unwrap();
+        }
+        for (index, path) in ["Work/site", "Work/notes", "Work/ref/spec.md"]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "UPDATE access_grants SET grant_id=?1, granted_at_ms=1000000 WHERE path=?2",
+                rusqlite::params![
+                    format!("aftg_{:024}", index + 1),
+                    home.join(path).to_string_lossy()
+                ],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(sample["method"], LIST_OPERATION);
+    assert_eq!(sample["route"]["principal"], "reserved:cingulate");
+    let reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
+    reply["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .for_each(assert_contract_row);
+    assert_eq!(reply, sample["reply"]);
+}

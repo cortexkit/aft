@@ -321,14 +321,31 @@ pub fn list(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Vec<AccessGra
 }
 
 pub fn insert(conn: &Connection, key: &ScopeKey, grant: &AccessGrant) -> rusqlite::Result<()> {
+    insert_from_card(conn, key, grant, None)
+}
+
+/// Save a grant, recording the consent card whose answer granted it. A new
+/// row gets a fresh grant id and the current time. A read grant widened to
+/// write keeps its row and id, and takes the new time and card, because its
+/// form changed; an answer that changes nothing leaves the row as it was.
+pub fn insert_from_card(
+    conn: &Connection,
+    key: &ScopeKey,
+    grant: &AccessGrant,
+    card_ref: Option<&str>,
+) -> rusqlite::Result<()> {
     if !grant.path.is_absolute() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let canonical = crate::access_policy::policy_path(&grant.path);
-    conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode)
-        SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
-        ON CONFLICT(owner,scope_ref,epoch,path,kind) DO UPDATE SET mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
-        params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"}])?;
+    conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref)
+        SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
+        ON CONFLICT(owner,scope_ref,epoch,path,kind) DO UPDATE SET
+         granted_at_ms=CASE WHEN (excluded.mode='write' AND access_grants.mode<>'write') OR access_grants.granted_at_ms IS NULL THEN excluded.granted_at_ms ELSE access_grants.granted_at_ms END,
+         card_ref=CASE WHEN excluded.mode='write' AND access_grants.mode<>'write' THEN excluded.card_ref ELSE access_grants.card_ref END,
+         grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
+         mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
+        params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref])?;
     Ok(())
 }
 

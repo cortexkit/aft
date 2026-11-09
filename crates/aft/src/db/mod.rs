@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub mod access_asks;
+pub mod access_grant_rows;
 pub mod access_grants;
 pub mod backups;
 pub mod bash_tasks;
@@ -38,7 +39,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 26;
+pub const CURRENT_SCHEMA_VERSION: u32 = 27;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -67,6 +68,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     24,
     25,
     26,
+    access_grant_rows::SCHEMA_VERSION,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1052,6 +1054,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         )"),
         25 => conn.execute_batch(call_ledger::HELD_UPDATES_MIGRATION),
         26 => conn.execute_batch(catalog_edit_modes::MIGRATION),
+        access_grant_rows::SCHEMA_VERSION => access_grant_rows::migrate(conn),
         _ => Ok(()),
     }
 }
