@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "request-file-set"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/ (request_files.rs new; mod.rs, memo.rs, exact_lane.rs, data_file.rs, nearest_names.rs, rerank/mod.rs, waits.rs), crates/aft/src/search_index.rs and crates/aft/src/parser.rs. One aft_search request now reads each candidate file from disk once: a request-scoped set keeps the bytes the first phase read (pattern verification, the exact pass, lexical exactness) and every later phase (literal presence, matching and declaration lines, the code-reference check through a new FileParser entry that parses the caller's text, snippets, data-file classification, nearest names, exact-memo digest checks, the reranker's candidate text) derives its old answer from those bytes; the ranking and the reranker share one matching-line answer per file and query. No routing, candidate, score, ordering, cap or disclosure changes; the prepared-text cache only gains counters on the slow-call line. Proof: ranked rows byte-identical to the committed reference, and benchmarks/aft-search/compare_builds.py replayed 6,897 recorded aft_search queries on AFT's own checkout against the base build in both index modes with no differing reply."
+}

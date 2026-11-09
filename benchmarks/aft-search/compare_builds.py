@@ -25,7 +25,20 @@ import time
 from pathlib import Path
 
 from compare_data_layer import WARM_UP_QUERY, Process, compare, latency, read_replies, replay, send_search
+from run_real_query import AftProtocolError
 from search_quality_lib import canonical_json
+
+
+def settle(process: Process, timeout: float) -> None:
+    """Wait for the watcher to go quiet. Nothing edits the tree during a
+    replay, so when the status call itself times out (a loaded machine), a
+    short pause stands in for it; a watcher that was still busy would show as
+    process noise in the comparison, never as a silent pass."""
+    try:
+        process.settle(timeout)
+    except AftProtocolError as error:
+        print(f"settle: {str(error)[:120]}; pausing instead", file=sys.stderr)
+        time.sleep(15.0)
 
 
 def run_build(binary: Path, root: Path, run_dir: Path, mode: str, rows: list, timeout: float) -> tuple[Path, list]:
@@ -35,7 +48,7 @@ def run_build(binary: Path, root: Path, run_dir: Path, mode: str, rows: list, ti
     try:
         process.configure_without_semantic(timeout)
         process.warm({"query": WARM_UP_QUERY}, send_search, timeout)
-        process.settle(timeout)
+        settle(process, timeout)
         measures = replay(process, rows, send_search, replies)
     finally:
         process.close()
