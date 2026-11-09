@@ -592,11 +592,12 @@ jobs:
   e2e-darwin-arm64:
     name: Shipped E2E (macOS ARM64)
     needs: build-darwin-arm64
-    # The rented Mac, like the macOS builds; see the note on build-darwin-arm64.
-    runs-on: [self-hosted, rented-mac]
-    # v0.62.0/v0.63.3/v0.63.4: 2.4/3.0/3.4 min on GitHub's runner. 20 min
-    # covers a first cold toolchain install on the rented Mac.
-    timeout-minutes: 20
+    # Stays on GitHub's runner: the rented Mac downloads the 135 MB tested
+    # bundle at about 160 KB/s (14 minutes), while the suite itself takes a
+    # few minutes here.
+    runs-on: macos-26
+    # v0.62.0/v0.63.3/v0.63.4: 2.4/3.0/3.4 min; 10 min covers cold setup.
+    timeout-minutes: 10
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -607,11 +608,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      # The rented Mac has no Node; the E2E suite installs its mock model
-      # server with npm, into setup-node's own writable prefix.
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
       - name: Sync versions from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag

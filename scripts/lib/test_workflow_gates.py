@@ -751,8 +751,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(producer["name"], "Cargo libtest archive (macOS)")
         for name in ("unit-macos-libtest-archive", "unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
             self.assertEqual(jobs[name]["runs-on"], "macos-26", name)
-        for name in ("build-darwin-arm64", "build-darwin-x64", "e2e-darwin-arm64"):
+        for name in ("build-darwin-arm64", "build-darwin-x64"):
             self.assertEqual(release["jobs"][name]["runs-on"], ["self-hosted", "rented-mac"], name)
+        self.assertEqual(release["jobs"]["e2e-darwin-arm64"]["runs-on"], "macos-26")
         for workflow in (suite, release):
             self.assertEqual(
                 [name for name, job in workflow["jobs"].items() if "blacksmith" in str(job.get("runs-on", "")).lower()],
