@@ -217,7 +217,7 @@ or lockfile was changed.
 | `cargo test -p agent-file-tools --bin aft -- callgraph` | 6 passed, 0 failed |
 | `cargo fmt --all -- --check` | exit 0, silent success; version shown above |
 | `cargo test -p agent-file-tools --lib callgraph -- --test-threads=1` | 350 passed, 4 failed, 6 ignored; baseline with isolated storage has the **same four failures**, 346 passed, 5 ignored |
-| `cargo test -p agent-file-tools --test rest -- callgraph` | 75 passed, 8 failed, 6 ignored; isolated-storage baseline has the **same eight failures**, 75 passed, 6 ignored |
+| `cargo test --features test-hooks -p agent-file-tools --test rest -- callgraph` | 75 passed, 8 failed, 6 ignored; isolated-storage baseline has the **same eight failures**, 75 passed, 6 ignored |
 | Scoped `aft_inspect` | partial rust-analyzer warm-up diagnostics; package compilation/tests are the authoritative compiler checks |
 
 The four broad-lib failures are

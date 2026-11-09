@@ -33,7 +33,7 @@ The macOS repetition gate passed **100/100 runs** again after adding the short p
 ```sh
 for i in $(seq 1 100); do
   echo "concurrent run $i/100"
-  CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test -q \
+  CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo test --features test-hooks -q \
     -p agent-file-tools --test integration \
     state_commands_test::db_set_host_state_concurrent_insert -- --exact || exit $?
 done

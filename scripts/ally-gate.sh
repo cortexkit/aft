@@ -33,7 +33,7 @@ echo "== nextest on ally: $FILTER"
 # Bare runner over ssh; ssh propagates the remote exit code, which is this
 # script's verdict. No pipes between the runner and the gate (rule 8231).
 ssh -o BatchMode=yes "$ALLY" \
-  "cd ~/aft && git fetch origin ally-gate && git reset --hard FETCH_HEAD && cargo nextest run -p agent-file-tools -E \"$FILTER\" --no-fail-fast"
+  "cd ~/aft && git fetch origin ally-gate && git reset --hard FETCH_HEAD && cargo nextest run --features test-hooks -p agent-file-tools -E \"$FILTER\" --no-fail-fast"
 rc=$?
 echo "ALLY_GATE_RC=$rc"
 exit $rc

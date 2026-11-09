@@ -72,7 +72,7 @@ The same search-admission mechanism cannot account for a module that stops answe
 ## Verification results
 
 - Fixed Linux debug binary: unchanged semantic-search e2e file passed all 4 tests (11 assertions).
-- `cargo test -p agent-file-tools --test search_b2_readiness`: all 13 passed, including after mutation restoration. Isolated post-restore runs of the real-handler regression and `building_indexes_refuse_with_each_lanes_status_instead_of_walking` also passed.
+- `cargo test --features test-hooks -p agent-file-tools --test search_b2_readiness`: all 13 passed, including after mutation restoration. Isolated post-restore runs of the real-handler regression and `building_indexes_refuse_with_each_lanes_status_instead_of_walking` also passed.
 - `cargo test -p agent-file-tools --lib commands::semantic_search::tests`: 87 passed, 1 failed the unrelated 200 ms wall-clock assertion in `blackholed_backend_never_blocks_status_or_search` under x86_64 emulation. It took 209.6 ms for status in the suite and 203.3 ms for search on an isolated retry. That fixture already has a ready lexical index, so the changed admission condition takes the same branch as before. The test was not relaxed.
 - Both new regressions failed against the old implementation; the real-handler test reproduced the same empty result and contradictory readiness metadata as the Linux e2e failure.
 - Controlled mutation restored the symbol-only shortcut in `readiness.rs`: `ready_symbols_wait_for_trigram_before_selecting_lexical_plan` alone failed, and the other 12 readiness tests passed. The staged fix was restored afterward with an empty unstaged diff.

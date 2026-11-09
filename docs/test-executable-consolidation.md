@@ -49,12 +49,12 @@ Cargo registry/toolchain and machine were shared with other workers.
 
 | Measurement | Before | After |
 | --- | ---: | ---: |
-| `cargo test -p agent-file-tools --no-run` test executables | 81 | 16 |
+| `cargo test --features test-hooks -p agent-file-tools --no-run` test executables | 81 | 16 |
 | Integration test executables within that count | 77 | 12 |
 | Cold `--no-run` wall time | 440.18 s | 1076.11 s |
 | Cold build user CPU time | 381.10 s | 317.64 s |
 | Cold build system CPU time | 80.24 s | 107.21 s |
-| `cargo nextest list -p agent-file-tools` test count | 7305 | 7305 |
+| `cargo nextest list --features test-hooks -p agent-file-tools` test count | 7305 | 7305 |
 | Ignored tests in that inventory | 84 | 84 |
 
 The executable count falls by 65 (80.2%). These wall-time samples are not a
@@ -86,7 +86,7 @@ which prefers `AFT_TEST_AFT_BINARY`, then nextest's `NEXTEST_BIN_EXE_aft`, then
 Cargo's build-time path, so it keeps working from a relocated nextest archive.
 Pointing `AFT_TEST_AFT_BINARY` at a missing file makes its tests fail at
 launch, which shows the folded module goes through that helper.
-`cargo nextest list -p agent-file-tools --run-ignored all`: 82 to 16 test
+`cargo nextest list --features test-hooks -p agent-file-tools --run-ignored all`: 82 to 16 test
 executables, 7541 tests and 89 ignored before and after, and the sorted
 multiset of (source, test name, ignore flag) is identical once the folded
 module prefix is accounted for.

@@ -129,10 +129,10 @@ python3 docs/investigations/scripts/daemon-unexplained-writes.py \
   --output-dir /tmp/aft-isolated-write-run
 
 # INPUT contains OFFLINE SQLite-backup snapshots, never live databases.
-AFT_WRITE_PROBE_DIR="$INPUT" cargo test -p agent-file-tools \
+AFT_WRITE_PROBE_DIR="$INPUT" cargo test --features test-hooks -p agent-file-tools \
   --test daemon_unexplained_writes_probe offline_database_read_writes \
   -- --ignored --nocapture --test-threads=1
-AFT_WRITE_PROBE_DIR="$INPUT" cargo test -p agent-file-tools \
+AFT_WRITE_PROBE_DIR="$INPUT" cargo test --features test-hooks -p agent-file-tools \
   --test daemon_unexplained_writes_probe offline_sparse_callgraph_writes \
   -- --ignored --nocapture --test-threads=1
 ```
@@ -179,7 +179,7 @@ For the actual refresh control, prepare a disposable `prefrontal-root` clone **i
 
 ```sh
 AFT_STORAGE_DIR="$INPUT/storage" AFT_WRITE_PROBE_DIR="$INPUT" \
-  cargo test -p agent-file-tools --test daemon_unexplained_writes_probe \
+  cargo test --features test-hooks -p agent-file-tools --test daemon_unexplained_writes_probe \
   offline_production_callgraph_refresh -- --ignored --nocapture --test-threads=1
 # Add AFT_WRITE_PROBE_DELETE=1 for the deletion variant.
 ```

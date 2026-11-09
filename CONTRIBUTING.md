@@ -30,3 +30,11 @@ Typo-class fixes do not need an issue. Open the PR; a maintainer applies the
 ## Before you push
 
 Run `bun run format` and `cargo fmt`. CI rejects unformatted code.
+
+## Rust test hooks
+
+Pass `--features test-hooks` when building or running integration tests, including
+`cargo test --features test-hooks -p agent-file-tools`. The integration and rest
+harnesses fail at compile time without it rather than silently skipping tests.
+Lib-only tests (`cargo test -p agent-file-tools --lib`) do not need the feature.
+Never enable `test-hooks` for a production or release build.

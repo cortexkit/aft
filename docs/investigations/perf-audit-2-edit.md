@@ -105,7 +105,7 @@ Run the real-compiler tests explicitly after `bun install`, under a throwaway
 the real `CARGO_HOME` and `RUSTUP_HOME` retained and `AFT_STORAGE_DIR` unset:
 
 ```
-cargo test -p agent-file-tools --test integration -- multi_file_full_validation --ignored --nocapture
+cargo test --features test-hooks -p agent-file-tools --test integration -- multi_file_full_validation --ignored --nocapture
 ```
 
 The four `multi_file_full_validation_ci_*` twins run normally on Linux and macOS
@@ -121,7 +121,7 @@ conditional on an ignored test being selected. Summary nouns use singular forms
 for one error, one touched file and one unchecked file.
 
 ```
-cargo test -p agent-file-tools --test integration -- multi_file_full_validation_ci_
+cargo test --features test-hooks -p agent-file-tools --test integration -- multi_file_full_validation_ci_
 ```
 
 The CI-coverage revision adds a six-case summary test for zero, one and multiple

@@ -178,8 +178,8 @@ USE TEMP B-TREE FOR ORDER BY
 ## Verification for the retention commit
 
 - `cargo test -p agent-file-tools --lib`: 3,149 passed, 21 ignored.
-- `cargo test -p agent-file-tools --test integration`: 1,708 passed, 12 ignored, 11 failed. Ten callgraph tests require a writable checkout/store and fail with `callgraph_unavailable` here; all ten reproduced after restoring the implementation files to the unchanged base, in a 53-test callgraph run (43 passed). The eleventh, `standalone_ndjson_polls_cold_navigation_off_the_input_loop`, passed when rerun alone on the fixed code (parallel-suite deadline sensitivity).
-- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: all 12 passed, including byte-envelope parity.
+- `cargo test --features test-hooks -p agent-file-tools --test integration`: 1,708 passed, 12 ignored, 11 failed. Ten callgraph tests require a writable checkout/store and fail with `callgraph_unavailable` here; all ten reproduced after restoring the implementation files to the unchanged base, in a 53-test callgraph run (43 passed). The eleventh, `standalone_ndjson_polls_cold_navigation_off_the_input_loop`, passed when rerun alone on the fixed code (parallel-suite deadline sensitivity).
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test`: all 12 passed, including byte-envelope parity.
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --all-targets`: passed.
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --target x86_64-pc-windows-gnu --all-targets`: passed.
 - Both ignored measurement probes passed. Scoped AFT inspection completed but had no authoritative Rust diagnostics; Cargo checks, not the diagnostic summary, are the compile gate.
@@ -207,9 +207,9 @@ Applied diff: `crates/aft/src/db/bash_tasks.rs | 3 ++-`; restored diff: empty. T
 Verification after restoration:
 
 - Full `cargo test -p agent-file-tools --lib`: 3,150 passed, 21 ignored.
-- `cargo test -p agent-file-tools --test integration bash`: 271 passed.
-- `cargo test -p agent-file-tools --test integration db_read_fallback_test`: 12 passed.
-- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: 12 passed.
+- `cargo test --features test-hooks -p agent-file-tools --test integration bash`: 271 passed.
+- `cargo test --features test-hooks -p agent-file-tools --test integration db_read_fallback_test`: 12 passed.
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test`: 12 passed.
 - Native and `--target x86_64-pc-windows-gnu` `cargo check -p agent-file-tools --all-targets` with `RUSTFLAGS='-D warnings'`: both passed.
 - Full integration was not rerun for this narrow read change; its unchanged callgraph-worktree failures and isolated LSP deadline rerun are documented above. No failing baseline test was rewritten.
 

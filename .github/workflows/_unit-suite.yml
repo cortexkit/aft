@@ -79,7 +79,7 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Linux Rust suite)
-        run: cargo nextest archive --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
+        run: cargo nextest archive --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
@@ -468,17 +468,17 @@ jobs:
         run: cargo build -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test -p agent-file-tools --lib -- gh_shim --test-threads=1
-          binary_listing="$(cargo test -p agent-file-tools --bin aft -- --list)"
+          cargo test -p agent-file-tools --features test-hooks --lib -- gh_shim --test-threads=1
+          binary_listing="$(cargo test -p agent-file-tools --features test-hooks --bin aft -- --list)"
           [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
-          cargo test -p agent-file-tools --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
+          cargo test -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
       - name: Require worker-read test inventory and run the native gate
         shell: bash
         run: |
           set -euo pipefail
           unset AFT_TEST_AFT_BINARY NEXTEST_BIN_EXE_aft CARGO_BIN_EXE_aft
           cargo --version
-          listing="$(cargo test -p agent-file-tools --test worker_jail -- --list)"
+          listing="$(cargo test --features test-hooks -p agent-file-tools --test worker_jail -- --list)"
           printf '%s\n' "$listing"
           for test in \
             gh_shim_router_host_read_uses_served_catalog_arguments \
@@ -498,16 +498,16 @@ jobs:
             worker_jail_temp_denies_other_task_directory; do
             [[ "$listing" == *"$test: test"* ]] || { printf 'missing native test: %s\n' "$test" >&2; exit 1; }
           done
-          cargo test -p agent-file-tools --test worker_jail -- gh_shim_router_host --test-threads=1 --nocapture
-          cargo test -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
-          cargo test -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
-          probe_listing="$(cargo test -p agent-file-tools --test sandbox_launch_probe -- --list)"
+          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- gh_shim_router_host --test-threads=1 --nocapture
+          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
+          cargo test --features test-hooks -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
+          probe_listing="$(cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --list)"
           [[ "$probe_listing" == *"launcher_closes_late_inherited_listener_above_marker_slots: test"* ]]
           [[ "$probe_listing" == *"launcher_fd_probe_required_mode_cannot_silently_skip: test"* ]]
           [[ "$probe_listing" == *"launcher_failure_marker_cannot_be_forged_by_jailed_exec: test"* ]]
-          cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_closes_late_inherited_listener_above_marker_slots --exact --test-threads=1 --nocapture
-          cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_fd_probe_required_mode_cannot_silently_skip --exact --test-threads=1 --nocapture
-          cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_failure_marker_cannot_be_forged_by_jailed_exec --exact --test-threads=1 --nocapture
+          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_closes_late_inherited_listener_above_marker_slots --exact --test-threads=1 --nocapture
+          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_fd_probe_required_mode_cannot_silently_skip --exact --test-threads=1 --nocapture
+          cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- launcher_failure_marker_cannot_be_forged_by_jailed_exec --exact --test-threads=1 --nocapture
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
@@ -533,7 +533,7 @@ jobs:
         run: cargo build -p agent-file-tools --bin aft
 
       - name: Run sandbox launch probes
-        run: cargo test -p agent-file-tools --test sandbox_launch_probe -- --test-threads=1 --nocapture
+        run: cargo test --features test-hooks -p agent-file-tools --test sandbox_launch_probe -- --test-threads=1 --nocapture
         env:
           AFT_REQUIRE_LANDLOCK: "1"
 
@@ -543,7 +543,7 @@ jobs:
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -552,7 +552,7 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
+          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
 
   # ---------------------------------------------------------------------------
   # Release-calibrated storm latency on a dedicated free Linux runner. The
@@ -653,8 +653,12 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Library and binaries as shipped (no test hooks), then every target
+      # with the hooks the test suites need.
       - name: Cargo check (locked, MSRV floor)
-        run: cargo check --workspace --all-targets --locked
+        run: |
+          cargo check --workspace --lib --bins --locked
+          cargo check --workspace --all-targets --features test-hooks --locked
 
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
@@ -778,7 +782,7 @@ jobs:
           started=$SECONDS
           trap 'printf "### macOS libtest archive\n\nRunner: macos-26 (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
           # Native time reports resident-memory and paging counters for the build.
-          /usr/bin/time -l cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
+          /usr/bin/time -l cargo nextest archive --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
@@ -793,10 +797,10 @@ jobs:
           if-no-files-found: error
 
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
+        run: cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
+        run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
 
       - name: Report macOS libtest archive size
         run: |
@@ -847,12 +851,12 @@ jobs:
       - name: Build nextest archive (macOS bin tests)
         # Keep the real CLI alongside the binary test harness without compiling
         # the unrelated library harnesses and integration suite.
-        run: cargo nextest archive --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
+        run: cargo nextest archive --features test-hooks --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
         env:
           MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
 
       - name: Capture bin source inventory
-        run: cargo nextest list --workspace --bins --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
+        run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
 
       - name: Report macOS bin archive size
         run: |
@@ -1110,7 +1114,7 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
-        run: cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$RUNNER_TEMP/macos-watcher-inventory.txt" 2>&1
+        run: cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$RUNNER_TEMP/macos-watcher-inventory.txt" 2>&1
         env:
           CARGO_TERM_COLOR: never
 
@@ -1218,7 +1222,7 @@ jobs:
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -1227,7 +1231,7 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
+          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
 
       - name: Fetch pinned subc-core
         id: subc_core
@@ -1288,7 +1292,7 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Windows Rust suite)
-        run: cargo nextest archive --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
+        run: cargo nextest archive --features test-hooks --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
         shell: pwsh
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
@@ -1530,14 +1534,21 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Library and binaries as shipped (no test hooks), then every target
+      # with the hooks the test suites need. pwsh doesn't stop on a failing
+      # native command, so each one checks its own exit code.
       - name: Cargo check (deny warnings)
-        run: cargo check --workspace --all-targets
+        run: |
+          cargo check --workspace --lib --bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --workspace --all-targets --features test-hooks
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: pwsh
         env:
           RUSTFLAGS: "-D warnings"
 
       - name: Check feature-enabled provider conformance (deny warnings)
-        run: cargo check -p agent-file-tools --features test-timing-hooks --test rest
+        run: cargo check -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
         shell: pwsh
         env:
           RUSTFLAGS: "-D warnings"

@@ -120,11 +120,11 @@ checkpoint omission rather than just a matching path or a no-op publication.
 
 ### Gates
 
-- `cargo test -p agent-file-tools --test view_assembly_wiring_test`: unavailable
+- `cargo test --features test-hooks -p agent-file-tools --test view_assembly_wiring_test`: unavailable
   in this base; the file is a module of the `integration` target.
 - Equivalent integration module: 6 passed. Publication/CAS, migration,
   schema, pins/GC, and staging selected integration modules: 44 passed.
-- `cargo test -p agent-file-tools --test watcher_integration branch_switch`:
+- `cargo test --features test-hooks -p agent-file-tools --test watcher_integration branch_switch`:
   2 passed (134.18 s). This real-watcher matrix is intentionally registered in
   the serial watcher binary, not the parallel integration binary. An accidental
   duplicate registration in integration/main.rs was reverted before committing.
@@ -313,7 +313,7 @@ acceptance. It provides a measured bucket answer and two proven lifecycle fixes.
   that this is the separately named 69-fixture parity gate).
 - The selected publication/CAS/migration/schema/pins/staging/assembly integration
   command above: 44 passed on final product code.
-- `cargo test -p agent-file-tools --test watcher_integration branch_switch`:
+- `cargo test --features test-hooks -p agent-file-tools --test watcher_integration branch_switch`:
   2 passed on final code (126.84 s), including the return-leg embedding/put checks.
 - Both compiler deny-warnings targets and release build passed on final code.
 - Final offline paired replay passed full cold-row parity.
@@ -574,10 +574,10 @@ reader changes, or legacy-plane retirement is included in this delivery.
 
 ### Final verification
 
-- `cargo test -p agent-file-tools --test integration tool_call_parity_test`:
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test`:
   12 passed, including the owner-confirmed 69-fixture
   `tool_call_matches_direct_spine_envelopes` matrix, with default views-off.
-- `cargo test -p agent-file-tools --test watcher_integration branch_switch`:
+- `cargo test --features test-hooks -p agent-file-tools --test watcher_integration branch_switch`:
   2 passed (134.20 s), including views-on round-trip reuse and the branch matrix.
 - `cargo test --release -p agent-file-tools --lib -- views::materialization::tests
   callgraph_store::join::`: 46 passed, 2 ignored, on final test-control code.

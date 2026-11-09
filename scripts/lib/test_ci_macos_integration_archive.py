@@ -42,6 +42,7 @@ class MacOSIntegrationArchiveTests(unittest.TestCase):
             self.assertNotIn("--tests", args)
             self.assertNotIn("--all-targets", args)
             self.assertIn("--workspace", args)
+            self.assertEqual(args[args.index("--features") + 1], "test-hooks")
             self.assertIn(plan.FILTER, args)
 
     def test_future_integration_targets_are_not_silently_dropped(self):

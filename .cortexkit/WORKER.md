@@ -6,17 +6,20 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 
 ## Rust (`crates/aft`, package `agent-file-tools`)
 
+Integration suites require `--features test-hooks` explicitly. Lib-only tests do
+not need it; production and release builds must never enable it.
+
 | Gate | Command | Proof it ran |
 |---|---|---|
 | Format | `cargo fmt --all -- --check` | Silent on success. Show `cargo fmt --version` and exit 0. |
-| Windows compile | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu` | `Finished` line. Compile-only: it cannot catch Windows runtime failures. |
+| Windows compile | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu --features test-hooks` | `Finished` line. Compile-only: it cannot catch Windows runtime failures. |
 | Unit (lib) | `cargo test -p agent-file-tools --lib -- <filter>` | `test result: ok. N passed` with N > 0. A filter that matches nothing reports `0 passed`, which is not a pass. |
 | Binary tests | `cargo test -p agent-file-tools --bin aft -- <filter>` | Same as above. Shared infrastructure (locks, leases, capability gates, path identity) breaks fixtures here too. |
-| Integration | `cargo test -p agent-file-tools --test integration -- <filter>` | Same as above. |
+| Integration | `cargo test --features test-hooks -p agent-file-tools --test integration -- <filter>` | Same as above. |
 | Windows native tests | `bash scripts/windows-gate.sh --filter <filter>` or `cargo test -p agent-file-tools --lib -- <filter>` | Run with `runon: "windows"`. The Windows job snapshots tracked and untracked files, but not ignored files. A gate filter that runs zero tests fails. |
-| Other test targets | `--test engine`, `--test list_envelope`, `--test rest`, `--test semantic`, `--test alert`, `--test watcher_integration` | Same as above. |
+| Other test targets | `--test engine`, `--test list_envelope`, `--test rest`, `--test semantic`, `--test alert`, `--test watcher_integration`, with `--features test-hooks` | Same as above. |
 | Real rust-analyzer | prefix with `AFT_TEST_REQUIRE_RUST_ANALYZER=1` | Without it, real-server tests skip silently. |
-| Full suite | `cargo test -p agent-file-tools`, or `scripts/rust-test-gate.sh` | The gate prints `GATE PASSED` / `GATE FAILED` as its last line. |
+| Full suite | `cargo test --features test-hooks -p agent-file-tools`, or `scripts/rust-test-gate.sh` | The gate prints `GATE PASSED` / `GATE FAILED` as its last line. |
 
 ### Build server jobs (`runon`)
 
@@ -27,10 +30,10 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 - **Build a scratch copy of the source with its own target folder.** Linux jobs share the checkout's warm build folder (`CARGO_TARGET_DIR=/run/motor/target`). A copy built there, for example a red-first proof under `$TMPDIR`, leaves its outputs where later jobs in the real checkout reuse them as current, so a gate can pass on old code. Give the copy `CARGO_TARGET_DIR=$TMPDIR/copy-target` or `--target-dir`. If it already happened, `cargo clean -p <crates>` repairs it.
 
 Mandatory when you touch them:
-- A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test -p agent-file-tools --test list_envelope`.
-- A new file under the search engine: register its owner, then run `cargo test -p agent-file-tools --test engine`.
+- A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test --features test-hooks -p agent-file-tools --test list_envelope`.
+- A new file under the search engine: register its owner, then run `cargo test --features test-hooks -p agent-file-tools --test engine`.
 - An agent tool argument: regenerate with `bun run --cwd packages/opencode-plugin build:tool-schemas`. The committed `crates/aft/src/subc_tool_schemas.json` must match byte for byte.
-- Config keys or the resolver: run `bun scripts/capture-config-parity.ts` (zero diff), then `cargo test -p agent-file-tools --test integration config_parity`.
+- Config keys or the resolver: run `bun scripts/capture-config-parity.ts` (zero diff), then `cargo test --features test-hooks -p agent-file-tools --test integration config_parity`.
 - Search ranking or routing files (the `RANKING_FENCE_PREFIXES` in `benchmarks/aft-search/search_quality_lib.py`): say so in your report. The train needs a search-quality descriptor, and ranking changes need benchmark evidence.
 
 ## TypeScript (`packages/*`)

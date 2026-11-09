@@ -36,7 +36,7 @@ Run the optimized probe with:
 AFT_CALLGRAPH_REFRESH_STORE="$HOME/.local/share/cortexkit/aft/callgraph/90ff783f3f4c5cf2" \
 AFT_CALLGRAPH_REFRESH_ROOT="$PWD" \
 AFT_CALLGRAPH_REFRESH_FILE="crates/aft/tests/engine_comparator_test.rs" \
-cargo test -p agent-file-tools --test callgraph_refresh_bench \
+cargo test --features test-hooks -p agent-file-tools --test callgraph_refresh_bench \
   bench_refresh_files_on_store_copy -- --ignored --nocapture
 ```
 

@@ -46,6 +46,6 @@ Mutation control replaced health's injected snapshot timestamp with the live wal
 - `cargo test -p agent-file-tools --lib build_breaker::tests::durable_trip_agrees_across_navigation_inspect_and_health_snapshots -- --exact --nocapture` passed after the deterministic rewrite; the red-first and live-clock mutation controls both failed at the intended health assertions before restoration.
 - `cargo test -p agent-file-tools --lib --quiet` passed all 2,875 selected unit tests (17 ignored).
 - The full integration suite passed 1,618 tests and hit 19 pre-existing `callgraph_test` failures: this linked Mason worktree is correctly borrow-only, while those fixtures require creating a callgraph store. Re-running with the baseline module excluded passed all 1,584 selected tests (11 ignored).
-- `cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1` passed all 18 tests.
+- `cargo test --features test-hooks -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1` passed all 18 tests.
 - `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` passed.
 - `cargo fmt --all -- --check` passed.

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Prove that every Rust test lands in exactly one split-gate bucket.
 
-By default, this script captures the current workspace inventory from `cargo test
+By default, this script captures the current workspace inventory from `cargo test --features test-hooks
 --workspace -- --list`, then compares it against the split buckets used by
 `scripts/rust-test-gate.sh`:
 
-* `cargo nextest list --workspace --lib --bins`
-* `cargo nextest list --workspace -E 'kind(test) - binary(=watcher_integration)'`
-* `cargo test -p agent-file-tools --test watcher_integration`
+* `cargo nextest list --features test-hooks --workspace --lib --bins`
+* `cargo nextest list --features test-hooks --workspace -E 'kind(test) - binary(=watcher_integration)'`
+* `cargo test --features test-hooks -p agent-file-tools --test watcher_integration`
 
 When `AFT_NEXTEST_ARCHIVE_FILE` is set, the archived test inventory is also
 compared by test identity with the non-watcher nextest bucket. macOS can provide
@@ -624,7 +624,7 @@ if any(
     sys.exit(0)
 
 
-baseline_output = run_command(["cargo", "test", "--workspace", "--", "--list"])
+baseline_output = run_command(["cargo", "test", "--workspace", "--features", "test-hooks", "--", "--list"])
 baseline_entries = parse_cargo_list(baseline_output)
 
 unit_bin_command = [
@@ -633,6 +633,10 @@ unit_bin_command = [
     "list",
     "--profile",
     "gate",
+    # The same features the CI archive builds with, so listing reuses its
+    # compiled library instead of building a second copy without the hooks.
+    "--features",
+    "test-hooks",
     "--workspace",
     "--lib",
     "--bins",
@@ -677,13 +681,17 @@ serial_unit_keys = {entry.key for entry in serial_tls_entries + serial_backtrace
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
 if doc_baseline_entries:
-    doc_output = run_command(["cargo", "test", "--workspace", "--doc", "--", "--list"])
+    doc_output = run_command(
+        ["cargo", "test", "--workspace", "--features", "test-hooks", "--doc", "--", "--list"]
+    )
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
 
 nextest_command = [
     "cargo",
     "nextest",
     "list",
+    "--features",
+    "test-hooks",
     "--profile",
     "gate",
     "--workspace",
@@ -722,6 +730,8 @@ if archive_path:
 watcher_output = run_command([
     "cargo",
     "test",
+    "--features",
+    "test-hooks",
     "-p",
     "agent-file-tools",
     "--test",

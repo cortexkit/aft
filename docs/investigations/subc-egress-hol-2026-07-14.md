@@ -97,7 +97,7 @@ measurement lock contained `bg_1d44c6cd F-3 rerun` for every final-code run and
 was removed afterward. The release-profile command was:
 
 ```text
-cargo test --release -p agent-file-tools --test integration \
+cargo test --features test-hooks --release -p agent-file-tools --test integration \
   subc_egress_hol_measurement -- --ignored --nocapture
 ```
 

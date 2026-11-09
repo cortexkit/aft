@@ -3758,7 +3758,7 @@ async fn regenerate_pre_flip_legacy_replies() {
     let body: Value = serde_json::from_slice(&frame.body).unwrap();
     assert_eq!(
         body["structuredContent"]["id"], "conformance-result-probe",
-        "build the fixture binary with test-conformance-result-inputs"
+        "build the fixture binary with test-hooks"
     );
     let mut snapshot = body["structuredContent"].clone();
     for key in ["id", "success", "text"] {
@@ -3774,7 +3774,7 @@ async fn regenerate_pre_flip_legacy_replies() {
         },
         "binary_sha256":format!("{:x}", Sha256::digest(std::fs::read(aft_binary::aft_binary()).unwrap())),
         "rustc":String::from_utf8(Command::new("rustc").arg("--version").output().unwrap().stdout).unwrap().trim(),
-        "profile":"debug, test-conformance-result-inputs",
+        "profile":"debug, test-hooks",
         "normalization":"only the disposable project root is replaced with {PROJECT}; status snapshot and response id are fixed producer inputs",
         "fixture_project_sha256":format!("{:x}", Sha256::digest(std::fs::read(root.path().join("project/.cortexkit/aft.jsonc")).unwrap())),
         "status_snapshot":fixed_status_values(snapshot),

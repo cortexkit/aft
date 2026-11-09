@@ -253,7 +253,7 @@ The continuation's required gates pass on Rust/cargo 1.99.0 and Python 3.9.6:
   116 tests (one Windows-only case skipped).
 - `cargo test -p agent-file-tools --lib -- semantic_search migration views`:
   503 passed, 12 ignored; child fixtures also passed.
-- `cargo test -p agent-file-tools --test integration per_checkout_semantic_runtime`:
+- `cargo test --features test-hooks -p agent-file-tools --test integration per_checkout_semantic_runtime`:
   six passed.
 - `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu`:
   finished successfully (compile-only, not Windows runtime execution).

@@ -52,8 +52,8 @@ PERF-31 now bounds both `CallGraphStore::call_tree` and the distinct command-ada
 
 - `cargo check -p agent-file-tools --locked`: passed after each Rust area.
 - `cargo check -p agent-file-tools --tests --locked`: passed, including library test compilation. This caught and prompted restoration of a test-only forward-call helper.
-- Final combined `cargo test -p agent-file-tools --test engine_anchored_test --test engine_fallback_test --test engine_exact_test --test engine_trailer_contract_test --test read_producer_bounds_test --test outline_producer_bounds_test -- --nocapture`: 53 passed.
-- `cargo test -p agent-file-tools --test callgraph_store_test -- --nocapture`: 38 passed, 1 ignored. Existing live poisoned-DB-copy test self-skipped because that optional fixture was absent.
+- Final combined `cargo test --features test-hooks -p agent-file-tools --test engine_anchored_test --test engine_fallback_test --test engine_exact_test --test engine_trailer_contract_test --test read_producer_bounds_test --test outline_producer_bounds_test -- --nocapture`: 53 passed.
+- `cargo test --features test-hooks -p agent-file-tools --test callgraph_store_test -- --nocapture`: 38 passed, 1 ignored. Existing live poisoned-DB-copy test self-skipped because that optional fixture was absent.
 - Bridge producer, durable-log, and transport tests: 36 passed; package `typecheck` and `build` passed. No manifests or lockfiles changed; no install required.
 - Separate safe mutations disabled the stderr fragment cap and durable queue cap. Each named corresponding producer regression alone reddened while its sibling remained green. Both mutations were staged-safe and restored, with empty unstaged diffs afterward.
 - AFT inspect timed out twice at LSP quiescence, including a single-file diagnostic scope. Cargo checks are the authoritative diagnostic evidence.

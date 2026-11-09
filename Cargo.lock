@@ -45,7 +45,6 @@ version = "0.63.4"
 dependencies = [
  "aft-secret-rules",
  "aft-tokenizer",
- "agent-file-tools",
  "apollo-parser",
  "ast-grep-core",
  "async-compression",

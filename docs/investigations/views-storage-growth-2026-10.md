@@ -255,7 +255,7 @@ proof. No mutant remains. Final Linux gates on rustc 1.99.0 / cargo 1.99.0:
 
 - `cargo fmt --all -- --check`: exit 0 (rustfmt 1.10.0-stable).
 - `cargo check -p agent-file-tools --tests`: `Finished dev`, passed.
-- `cargo test -p agent-file-tools --test integration -- view_assembly_wiring_test`:
+- `cargo test --features test-hooks -p agent-file-tools --test integration -- view_assembly_wiring_test`:
   9 passed, 1 existing full-checkout profiling test ignored.
 - `cargo test -p agent-file-tools --lib -- executor::view_publication::tests`:
   15 passed.
@@ -664,9 +664,9 @@ modified by this implementation or its censuses.
 Policy-update final Rust verification on Linux (rustc/cargo 1.99.0,
 rustfmt 1.10.0-stable): formatting and package-with-tests checking passed;
 `cargo test -p agent-file-tools --lib -- storage_retention` passed **35 tests**;
-`cargo test -p agent-file-tools --test integration -- per_checkout_registry`
+`cargo test --features test-hooks -p agent-file-tools --test integration -- per_checkout_registry`
 passed **16 tests** (one child fixture ignored in the parent run);
-`cargo test -p agent-file-tools --test integration -- pins_gc_test` passed
+`cargo test --features test-hooks -p agent-file-tools --test integration -- pins_gc_test` passed
 **4 tests**. Commands used the Linux guard and isolated HOME/XDG storage.
 Scoped inspection remained partial; the successful package check is authoritative.
 The pre-existing unavailable MinGW compiler still prevents claiming a Windows
