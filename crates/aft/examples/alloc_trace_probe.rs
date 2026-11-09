@@ -9,6 +9,8 @@
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
 //!     refresh <repo> [threads]
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
+//!     restart <repo> <dir> [threads]
+//! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
 //!     replay <pack.jsonl.gz> [publish_every] [threads]
 //! ```
 //!
@@ -35,6 +37,10 @@
 //! from it, then makes the same edit in the worktree, and in the sibling
 //! bound again by a new layer as a restarted process would, refreshing
 //! each, each a phase of its own.
+//!
+//! `restart <repo> <dir> [threads]` builds `<repo>` under `<dir>` on its
+//! first run; each later run, a new process, binds it again and refreshes
+//! the same edit, as the first refresh after a restart does.
 //!
 //! `replay <pack.jsonl.gz> [publish_every] [threads]` replays an edit pack
 //! through one checkout, publishing its changes every `publish_every` edits
@@ -313,19 +319,42 @@ fn edit_and_refresh(checkout: &Checkout, dir: &Path) -> String {
         started.elapsed().as_secs_f64() * 1000.0,
         stats.map_or_else(
             || "nothing to update".to_string(),
-            |stats| format!(
-                "rebound {}, resolved {}, replayed {}, dispatch replayed {}, recomputed {}, \
-                 sites {}, touched {}",
-                stats.rebound,
-                stats.resolved,
-                stats.replayed,
-                stats.dispatch_replayed,
-                stats.dispatch_recomputed,
-                stats.sites_resolved,
-                stats.touched.len()
-            )
+            |stats| {
+                let debug = format!("{stats:?}");
+                format!(
+                    "rebound {}, resolved {}, replayed {}, dispatch replayed {}, recomputed {}, \
+                     sites {}, touched {}; \
+                     update {} ms (facts {}, bind {}, resolve {}, dispatch {}, sites {})",
+                    stats.rebound,
+                    stats.resolved,
+                    stats.replayed,
+                    stats.dispatch_replayed,
+                    stats.dispatch_recomputed,
+                    stats.sites_resolved,
+                    stats.touched.len(),
+                    stat(&debug, "total_ms"),
+                    stat(&debug, "facts_ms"),
+                    stat(&debug, "bind_ms"),
+                    stat(&debug, "resolve_ms"),
+                    stat(&debug, "dispatch_ms"),
+                    stat(&debug, "sites_ms")
+                )
+            },
         )
     )
+}
+
+/// A count of the update statistics `debug` prints (`{:?}` of
+/// `UpdateStats`), by field name; 0 when it has no such field. Read from
+/// the debug form so this probe also builds against commits whose
+/// statistics lack the field, to measure them alike.
+fn stat(debug: &str, name: &str) -> usize {
+    debug
+        .split(&format!(" {name}: "))
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
 }
 
 fn burst(mut args: impl Iterator<Item = String>) {
@@ -548,13 +577,45 @@ fn replay(mut args: impl Iterator<Item = String>) {
     });
 }
 
+/// One refresh in a process that has decoded nothing yet. The first run
+/// with `dir` exports `repo` under it, builds it and exits; each later run
+/// binds that checkout again as a restarted process does, puts the edited
+/// file back as it was built, and makes the probe's edit and refreshes it.
+fn restart(mut args: impl Iterator<Item = String>) {
+    let repo = PathBuf::from(args.next().unwrap());
+    let dir = PathBuf::from(args.next().unwrap());
+    let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
+    start_tracing();
+    let store = dir.join("store");
+    let checkout_dir = dir.join("checkout");
+    let original = dir.join("edited.original");
+    let layer = Arc::new(DataLayer::new(256 << 20, threads));
+    let family = FamilyId::from_digest(Digest128::of(b"alloc trace restart"));
+    if !store.exists() {
+        export(&repo, &checkout_dir);
+        std::fs::copy(checkout_dir.join(EDITED), &original).unwrap();
+        let checkout = Checkout::bind(layer, &store, family, &checkout_dir).unwrap();
+        phase("build", || {
+            let report = checkout.build().unwrap();
+            format!("{} files, {} parsed", report.files, report.parsed_files)
+        });
+        return;
+    }
+    std::fs::copy(&original, checkout_dir.join(EDITED)).unwrap();
+    let checkout = Checkout::bind(layer, &store, family, &checkout_dir).unwrap();
+    phase("process_restart_first_refresh", || {
+        edit_and_refresh(&checkout, &checkout_dir)
+    });
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("overhead") => overhead(args),
         Some("burst") => burst(args),
         Some("refresh") => refresh(args),
+        Some("restart") => restart(args),
         Some("replay") => replay(args),
-        _ => panic!("usage: alloc_trace_probe overhead|burst|refresh|replay ..."),
+        _ => panic!("usage: alloc_trace_probe overhead|burst|refresh|restart|replay ..."),
     }
 }
