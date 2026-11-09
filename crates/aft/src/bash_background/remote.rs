@@ -513,8 +513,12 @@ struct ReattachBudget {
     attempts: u32,
     /// Attach requests sent by this worker, including retries without progress.
     attach_attempts: u32,
-    /// An acknowledged cancel needs terminal observation, not another cancel.
-    /// Kept only in this worker so a restarted worker can retry saved intent.
+    /// The job whose `exec.cancel` the runner has already acknowledged, so this
+    /// worker waits for the job's terminal instead of sending the cancel again.
+    /// The cancel itself is saved in the task's remote metadata
+    /// (`cancel_requested`); this field only lives in memory, so a worker
+    /// started after a restart begins without it and sends the saved cancel
+    /// once more, in case the first never reached the runner.
     cancel_acknowledged: Option<Uuid>,
     /// A test shortened the budget: the job's limits stay treated as passed.
     #[cfg(test)]
