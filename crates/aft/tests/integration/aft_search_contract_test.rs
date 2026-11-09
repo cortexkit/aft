@@ -949,9 +949,8 @@ fn assert_exact_only_on_files_containing(response: &Value, literal: &str) {
 
 #[test]
 fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact() {
-    // A path naming another Git project searches that project's persisted
-    // (borrowed) index instead of the session's own, so the literal routing
-    // must hold on that path too.
+    // A path naming another Git project walks that project's files rather
+    // than the session's corpus, so literal routing must hold there too.
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, _entries) = project_with_hyphenated_literal();
     init_git(external_project.path());
