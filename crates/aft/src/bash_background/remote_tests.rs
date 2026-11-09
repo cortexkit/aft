@@ -2422,6 +2422,13 @@ async fn exec_remote_bash_reattach_budget_cancel_observes_real_terminal() {
         .iter()
         .position(|(_, b)| b["method"] == "exec.cancel")
         .unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.cancel")
+            .count(),
+        1,
+        "terminal recovery must not resend an acknowledged job cancel"
+    );
     let attach = log
         .iter()
         .position(|(_, b)| b["method"] == "exec.attach")

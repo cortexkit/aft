@@ -203,6 +203,11 @@ pub(crate) enum Script {
     GatedStages {
         position: u32,
     },
+    /// Gated output and terminal with the executor's detach-only request Cancel;
+    /// only exec.cancel stops the job, independently of its observation.
+    DetachSafeStages {
+        position: u32,
+    },
     /// Accepted, then refused before start (`unreachable`): the runner took
     /// the inputs but never ran the command.
     AcceptedThenRefused,
@@ -597,7 +602,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 return;
                             }
                             if !attaching && !draining && !matches!(script, Script::Refused | Script::GatedPreStartRefusal { .. } | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
-                                let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
+                                let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } | Script::DetachSafeStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
                                 }
@@ -632,7 +637,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::RestartRunning { .. } | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::DetachSafeStages { .. } | Script::Started | Script::RestartRunning { .. } | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -716,6 +721,7 @@ pub(crate) async fn daemon_with_capabilities(
                         _ => panic!("unexpected caller operation {body}"),
                     }
                 },
+                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. }) => {},
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }
@@ -946,8 +952,12 @@ pub(crate) async fn daemon_with_capabilities(
                         }));
                     }
                 }
-                if matches!(script, Script::Staged { .. } | Script::GatedStages { .. })
-                    && body["method"] == "exec.run"
+                if matches!(
+                    script,
+                    Script::Staged { .. }
+                        | Script::GatedStages { .. }
+                        | Script::DetachSafeStages { .. }
+                ) && body["method"] == "exec.run"
                 {
                     let writer = writer.clone();
                     let output_gate = server_output_gate.clone();
@@ -1938,6 +1948,52 @@ async fn transient_terminal_gap_fills_on_next_attach_without_truncation() {
     assert_eq!(sink.stdout, b"ABC");
     assert_eq!(sink.seqs, [0, 1, 2]);
     assert!(sink.truncations.is_empty());
+}
+
+#[tokio::test]
+async fn held_bash_contract_request_cancel_detaches_exec_observation() {
+    let daemon = daemon(Script::DetachSafeStages { position: 1 }, client::CAPABILITY).await;
+    let client = client(&daemon).await;
+    let mut stream = client
+        .run(&RunRequest::new(
+            "/workspace/task",
+            "/src/repo",
+            "/workspace/task",
+            "cargo test",
+        ))
+        .await
+        .unwrap();
+    let mut sink = MemorySink::default();
+    assert_eq!(
+        stream.next(&mut sink).await.unwrap(),
+        StreamProgress::Record
+    );
+    // This API unsubscribes the request's stream and then attaches. Unlike exec.cancel,
+    // the request-level frame must leave the job's outcome unchanged.
+    let mut reattached = client.cancel(&stream).await.unwrap();
+    assert_eq!(
+        drain(&mut reattached, &mut sink).await.unwrap(),
+        Verdict::Exited { code: 0 }
+    );
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|(header, _)| header.ty == FrameType::Cancel)
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(_, body)| body["method"] == "exec.cancel")
+            .count(),
+        0
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(_, body)| body["method"] == "exec.attach")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -513,6 +513,9 @@ struct ReattachBudget {
     attempts: u32,
     /// Attach requests sent by this worker, including retries without progress.
     attach_attempts: u32,
+    /// An acknowledged cancel needs terminal observation, not another cancel.
+    /// Kept only in this worker so a restarted worker can retry saved intent.
+    cancel_acknowledged: Option<Uuid>,
     /// A test shortened the budget: the job's limits stay treated as passed.
     #[cfg(test)]
     budget_override: bool,
@@ -555,6 +558,7 @@ impl ReattachBudget {
             deadline: None,
             attempts: 0,
             attach_attempts: 0,
+            cancel_acknowledged: None,
             #[cfg(test)]
             budget_override: budget_override.is_some(),
             #[cfg(test)]
@@ -610,6 +614,7 @@ impl ReattachBudget {
         };
         self.job_end = tokio::time::Instant::now() + until_job_end;
         self.deadline = None;
+        self.cancel_acknowledged = None;
         #[cfg(test)]
         {
             self.clock_job_end = self.clock.as_ref().map(|clock| clock.now() + until_job_end);
@@ -3623,11 +3628,18 @@ impl BgTaskRegistry {
                     if tests::stop_draining_worker(&root) {
                         return Ok(());
                     }
-                    let result = client
-                        .cancel_job(point.job_id)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
+                    let result = if recovery.cancel_acknowledged == Some(point.job_id) {
+                        Ok(())
+                    } else {
+                        client
+                            .cancel_job(point.job_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    };
+                    if result.is_ok() {
+                        recovery.cancel_acknowledged = Some(point.job_id);
+                    }
                     if self.finish_owner_pause_cancel(&task, result) {
                         return Ok(());
                     }
@@ -4245,6 +4257,8 @@ impl BgTaskRegistry {
                 .remote
                 .as_ref()
                 .is_some_and(|r| r.cancel_requested);
+            let cancel = cancel && recovery.cancel_acknowledged != Some(point.job_id);
+            let mut cancel_acknowledged = false;
             recovery.attach_attempts = recovery.attach_attempts.saturating_add(1);
             let attempt = recovery
                 .wait(point.job_id, async {
@@ -4254,14 +4268,18 @@ impl BgTaskRegistry {
                             .await
                             .map(|_| ())
                             .map_err(|e| e.to_string());
+                        cancel_acknowledged = result.is_ok();
                         if self.finish_owner_pause_cancel(task, result) {
                             return Ok(Attached::OwnerPauseSettled);
                         }
                     }
                     client.attach(point.clone()).await.map(Attached::Stream)
                 })
-                .await?;
-            match attempt {
+                .await;
+            if cancel_acknowledged {
+                recovery.cancel_acknowledged = Some(point.job_id);
+            }
+            match attempt? {
                 Ok(attached) => return Ok(attached),
                 Err(error) => recovery.log_attach_failure(&task.task_id, point.job_id, &error),
             }

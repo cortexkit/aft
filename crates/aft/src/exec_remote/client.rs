@@ -417,8 +417,9 @@ pub enum StreamProgress {
     Complete(Verdict),
 }
 
-/// One held-open run/attach call. Dropping it sends Cancel (SDK semantics), not
-/// a detach. Persist its resume point before dropping when recovery is needed.
+/// One held-open run/attach observation. Dropping it sends request-level Cancel
+/// (SDK semantics), which detaches at the executor, unlike `exec.cancel` by job
+/// ID. Persist its resume point before dropping when recovery is needed.
 pub struct RemoteStream {
     subscription: Subscription,
     consumer: StreamConsumer,

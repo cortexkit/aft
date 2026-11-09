@@ -841,9 +841,9 @@ mod default_kill_tests {
     }
 }
 
-/// Hands a held call's command to the background the way a drain detach does
-/// (the task keeps running and delivers its completion later), off the
-/// executor and off the module loop's thread: promotion writes task metadata.
+/// Settles a held call off the executor and the module loop's thread, because
+/// promotion writes task metadata and stopping a command can wait for its exit.
+/// Drain detaches; an explicit Cancel stops a server-completion command.
 pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, cancelled: bool) {
     tokio::task::spawn_blocking(move || detach_held_bash_sync(target, cancelled));
 }
@@ -1008,10 +1008,11 @@ fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
 }
 
 /// Answers the held bash calls the module loop must answer itself (see
-/// [`drain::HeldBashCalls::claim_for_module_loop`]) and hands each command to
-/// the background. A drained call gets the same "detached" response its own
-/// wait loop would have sent; a cancelled call gets the `cancelled` error every
-/// other cancelled tool call gets. Returns how many calls were answered.
+/// [`drain::HeldBashCalls::claim_for_module_loop`]). A drained call gets the
+/// same detached response its own wait loop would have sent. A cancelled call
+/// gets the usual `cancelled` error and stops its server-completion command;
+/// older timed waits instead hand the command to the background for later
+/// completion delivery. Returns how many calls were answered.
 pub(super) async fn answer_held_bash_calls_from_module_loop(
     tx: &WriterSender,
     routes: &HashMap<RouteChannel, RouteIdentity>,
@@ -1025,7 +1026,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
             "subc attach: answered held bash call {} on route {route} corr={corr} from the module loop (reason={reason:?}); task {} {}",
             target.request_id,
             target.task_id,
-            if target.run_scoped { "remains governed by its run scope" } else { "keeps running in the background" }
+            held_bash_handoff_action(target.server_completion, target.run_scoped, reason)
         );
         let frame: Option<WriterFrame> = match (reason, routes.get(&route)) {
             (_, None) => None,
@@ -1082,6 +1083,20 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         }
     }
     Ok(answered)
+}
+
+fn held_bash_handoff_action(
+    server_completion: bool,
+    run_scoped: bool,
+    reason: drain::BashLoopAnswer,
+) -> &'static str {
+    if matches!(reason, drain::BashLoopAnswer::Cancel) && server_completion {
+        "is being stopped because the call was cancelled"
+    } else if run_scoped {
+        "remains governed by its run scope"
+    } else {
+        "keeps running in the background"
+    }
 }
 
 /// The terminal reply of a held bash call whose command now runs in the
@@ -3586,6 +3601,7 @@ async fn run_deferred_bash_wait(
         if let Ok(guard) = metrics.lifecycle_probe.lock() {
             if let Some(probe) = guard.as_ref() {
                 probe.bash_foreground_wait(route, corr, foreground_phase.label());
+                probe.bash_command_wait_ready(route, corr);
             }
         }
     }
@@ -6280,6 +6296,29 @@ mod grant_path_tests {
         use crate::bash_background::{registry::SCOPE_REVOKED_REASON, BgTaskStatus};
         use crate::exec_remote::wire_tests::{Daemon, Script};
 
+        #[test]
+        fn held_bash_log_names_cancellation_without_promising_background_work() {
+            use drain::BashLoopAnswer::{Cancel, Drain};
+            for run_scoped in [false, true] {
+                assert_eq!(
+                    held_bash_handoff_action(true, run_scoped, Cancel),
+                    "is being stopped because the call was cancelled"
+                );
+            }
+            assert_eq!(
+                held_bash_handoff_action(false, false, Cancel),
+                "keeps running in the background"
+            );
+            assert_eq!(
+                held_bash_handoff_action(true, false, Drain),
+                "keeps running in the background"
+            );
+            assert_eq!(
+                held_bash_handoff_action(true, true, Drain),
+                "remains governed by its run scope"
+            );
+        }
+
         struct HeldCall {
             task_id: String,
             metrics: Arc<DispatchPathMetrics>,
@@ -6295,11 +6334,6 @@ mod grant_path_tests {
             arguments: Value,
             worker: bool,
         ) -> HeldCall {
-            let waits = if arguments.get("runon").is_some() {
-                2
-            } else {
-                1
-            };
             let metrics = Arc::new(DispatchPathMetrics::new());
             let (events_tx, mut events) = mpsc::unbounded_channel();
             *metrics.lifecycle_probe.lock().unwrap() =
@@ -6322,18 +6356,12 @@ mod grant_path_tests {
                     )
                 });
             tokio::time::timeout(Duration::from_secs(30), async {
-                let mut observed = 0;
                 while let Some(event) = events.recv().await {
                     if matches!(
                         event,
-                        super::super::super::SubcLifecycleEvent::BashForegroundWait { .. }
+                        super::super::super::SubcLifecycleEvent::BashCommandWaitReady { .. }
                     ) {
-                        observed += 1;
-                        // Remote capture publishes a detach target before the
-                        // ordinary foreground wait publishes its own target.
-                        if observed == waits {
-                            return;
-                        }
+                        return;
                     }
                 }
                 panic!("held call must reach its foreground wait");
@@ -6414,7 +6442,7 @@ mod grant_path_tests {
         #[tokio::test]
         async fn held_runon_worker_cancel_sends_one_job_cancel() {
             let (daemon, _dir, root, executor, ctx) =
-                capture_fixture(Script::GatedStages { position: 1 }).await;
+                capture_fixture(Script::DetachSafeStages { position: 1 }).await;
             let call = start(
                 &executor,
                 &root,
@@ -6454,7 +6482,7 @@ mod grant_path_tests {
         #[tokio::test]
         async fn held_worker_call_refuses_yield_with_scope() {
             let (daemon, _dir, root, executor, ctx) =
-                capture_fixture(Script::GatedStages { position: 1 }).await;
+                capture_fixture(Script::DetachSafeStages { position: 1 }).await;
             let call = start(
                 &executor,
                 &root,
@@ -6487,7 +6515,7 @@ mod grant_path_tests {
         async fn held_runon_carrier_changes_and_yield_detach_without_job_cancel() {
             for change in ["route-close", "rebind", "drain", "restart", "yield"] {
                 let (daemon, _dir, root, executor, ctx) =
-                    capture_fixture(Script::GatedStages { position: 1 }).await;
+                    capture_fixture(Script::DetachSafeStages { position: 1 }).await;
                 let mut call = start(
                     &executor,
                     &root,
@@ -6555,7 +6583,7 @@ mod grant_path_tests {
         #[tokio::test]
         async fn held_runon_confirmed_scope_end_sends_one_job_cancel() {
             let (daemon, _dir, root, executor, ctx) =
-                capture_fixture(Script::GatedStages { position: 1 }).await;
+                capture_fixture(Script::DetachSafeStages { position: 1 }).await;
             let call = start(
                 &executor,
                 &root,
@@ -6594,7 +6622,7 @@ mod grant_path_tests {
         #[tokio::test]
         async fn held_runon_bash_kill_sends_one_job_cancel() {
             let (daemon, _dir, root, executor, ctx) =
-                capture_fixture(Script::GatedStages { position: 1 }).await;
+                capture_fixture(Script::DetachSafeStages { position: 1 }).await;
             let call = start(
                 &executor,
                 &root,

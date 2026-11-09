@@ -347,6 +347,13 @@ pub enum SubcLifecycleEvent {
         corr: u64,
         phase: String,
     },
+    /// Input capture and dispatch finished; the command's ordinary wait loop
+    /// now owns the detach target, rather than the startup capture waiter.
+    BashCommandWaitReady {
+        route_channel: u16,
+        route_epoch: u32,
+        corr: u64,
+    },
 }
 
 /// Test-only observer and rendezvous for the frame-loop lifecycle.
@@ -488,6 +495,16 @@ impl SubcTestLifecycleProbe {
             corr,
             phase: phase.to_string(),
         });
+    }
+
+    fn bash_command_wait_ready(&self, route: RouteChannel, corr: u64) {
+        let _ = self
+            .events_tx
+            .send(SubcLifecycleEvent::BashCommandWaitReady {
+                route_channel: route.channel,
+                route_epoch: route.epoch,
+                corr,
+            });
     }
 
     fn reliable_completion_retained(&self, task_id: &str, session_id: &str) {
@@ -6367,9 +6384,9 @@ where
                         }
                         // A held bash call never passes through the active
                         // tool calls above: its wait task holds it. The caller
-                        // is gone, so answer it now and let the command finish
-                        // as a background task instead of holding the request
-                        // (and the daemon's credit for it) until it exits.
+                        // cancelled the request, so answer it now and release
+                        // the daemon's credit. Server-completion calls stop
+                        // their command; legacy waits hand it to the background.
                         if dispatch_path_metrics.held_bash_calls.request_cancel(channel, corr) {
                             if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
                                 &writer_tx,
