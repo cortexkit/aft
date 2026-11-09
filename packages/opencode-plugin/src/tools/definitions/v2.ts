@@ -72,6 +72,8 @@ export interface V2BashExecution {
 }
 
 export interface V2ToolConsumers {
+  /** Admit the entire invocation before role, session or permission lookup. */
+  withExecution?: <T>(operation: () => Promise<T>) => Promise<T>;
   onToolAbort?: (sessionID: string) => void;
   /** A resumed session can discover pending wakes without starting another shell. */
   registerSession?: (sessionID: string | undefined) => void;
@@ -406,43 +408,46 @@ export function projectV2Tool(
     },
     execute: (rawInput, context) =>
       Effect.tryPromise({
-        try: async (signal) => {
-          const onAbort = () => {
-            if (context.sessionID) consumers.onToolAbort?.(context.sessionID);
-          };
-          signal.addEventListener("abort", onAbort, { once: true });
-          let stepAbort: { error: unknown } | undefined;
-          try {
-            if (name === "bash_status" || name === "bash_watch") {
-              consumers.registerSession?.(context.sessionID);
+        try: (signal) => {
+          const execute = async () => {
+            const onAbort = () => {
+              if (context.sessionID) consumers.onToolAbort?.(context.sessionID);
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            let stepAbort: { error: unknown } | undefined;
+            try {
+              if (name === "bash_status" || name === "bash_watch") {
+                consumers.registerSession?.(context.sessionID);
+              }
+              const runtime = runtimeFor(name, location, context, signal, consumers, (error) => {
+                stepAbort ??= { error };
+              });
+              const input = executionArguments(name, rawInput);
+              const result =
+                consumers.executeBash && V2_BASH_TOOLS.has(name)
+                  ? await consumers.executeBash({
+                      name: name as "bash" | "aft_bash",
+                      input,
+                      context: runtime,
+                      definition,
+                    })
+                  : await definition.execute(input, runtime as never);
+              if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
+              // Shared tools inspect the structured engine reply's success flag
+              // before rendering it. Rendered text is data, even when it is JSON
+              // containing success:false (for example a file read or shell stdout).
+              return resultContent(result);
+            } catch (error) {
+              // The shared tool implementations can catch permission errors and
+              // return denial text. Rejecting without feedback must instead end
+              // the model's current step, so preserve the host's original defect.
+              if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
+              throw error;
+            } finally {
+              signal.removeEventListener("abort", onAbort);
             }
-            const runtime = runtimeFor(name, location, context, signal, consumers, (error) => {
-              stepAbort ??= { error };
-            });
-            const input = executionArguments(name, rawInput);
-            const result =
-              consumers.executeBash && V2_BASH_TOOLS.has(name)
-                ? await consumers.executeBash({
-                    name: name as "bash" | "aft_bash",
-                    input,
-                    context: runtime,
-                    definition,
-                  })
-                : await definition.execute(input, runtime as never);
-            if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
-            // Shared tools inspect the structured engine reply's success flag
-            // before rendering it. Rendered text is data, even when it is JSON
-            // containing success:false (for example a file read or shell stdout).
-            return resultContent(result);
-          } catch (error) {
-            // The shared tool implementations can catch permission errors and
-            // return denial text. Rejecting without feedback must instead end
-            // the model's current step, so preserve the host's original defect.
-            if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
-            throw error;
-          } finally {
-            signal.removeEventListener("abort", onAbort);
-          }
+          };
+          return consumers.withExecution ? consumers.withExecution(execute) : execute();
         },
         catch: failure,
       }).pipe(

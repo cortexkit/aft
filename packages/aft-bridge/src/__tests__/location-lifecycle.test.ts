@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AsyncResource } from "node:async_hooks";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,8 +7,10 @@ import { BridgeTransportUnavailableError, BridgeTransportUnknownOutcomeError } f
 import {
   acquireBridge,
   getBridgeLifecycleTopology,
+  LOCATION_RELOADED_NOT_SENT,
   releaseBridge,
   sampleBridgeLifecycleCensus,
+  withLocationExecution,
 } from "../location-lifecycle.js";
 import { BridgePool } from "../pool.js";
 import type { AftProjectTransport, AftTransportPool } from "../transport.js";
@@ -73,6 +76,318 @@ function options(subc = false): AftTransportFactoryOptions {
     ...(subc ? { subcConnectionFile: "/fixture/subc-connection.json" } : {}),
   };
 }
+
+function gate() {
+  let open!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open };
+}
+
+function executionDeadline() {
+  let expire: (() => void) | undefined;
+  return {
+    clock: {
+      setTimeout(callback: () => void) {
+        expire = callback;
+        return 0;
+      },
+      clearTimeout() {},
+    },
+    expire() {
+      expect(expire).toBeDefined();
+      expire!();
+    },
+  };
+}
+
+async function heldStandalone(boundary: "permission" | "dispatched") {
+  const pool = new FakePool();
+  const deadline = executionDeadline();
+  const entered = gate();
+  const resume = gate();
+  const continued = gate();
+  let dispatches = 0;
+  let settled = false;
+  let continuationError: unknown;
+  pool.bridge.toolCall = async () => {
+    dispatches++;
+    if (boundary === "dispatched") {
+      entered.open();
+      await resume.promise;
+    }
+    return { success: true, text: "real result" };
+  };
+  const location = await acquireBridge("/fixture/shared-execution", options(), {
+    createPool: async () => pool,
+    executionClock: deadline.clock,
+  });
+  const outcome = withLocationExecution(location, async () => {
+    const transport = location.getBridge("/fixture/shared-execution");
+    try {
+      if (boundary === "permission") {
+        entered.open();
+        await resume.promise;
+      }
+      return await transport.toolCall("session", "write", {});
+    } catch (error) {
+      continuationError = error;
+      throw error;
+    } finally {
+      continued.open();
+    }
+  }).then(
+    (value) => {
+      settled = true;
+      return { value };
+    },
+    (error: unknown) => {
+      settled = true;
+      return { error };
+    },
+  );
+  await entered.promise;
+  return {
+    pool,
+    location,
+    deadline,
+    resume,
+    continued,
+    outcome,
+    dispatches: () => dispatches,
+    settled: () => settled,
+    continuationError: () => continuationError,
+    replace: () =>
+      acquireBridge("/fixture/shared-execution", options(), {
+        createPool: async () => {
+          throw new Error("replacement must share the owner");
+        },
+      }),
+  };
+}
+
+describe("Location execution holds", () => {
+  for (const boundary of ["permission", "dispatched"] as const) {
+    test(`shared owner preserves ${boundary} call past the drain deadline with its real result`, async () => {
+      const r = await heldStandalone(boundary);
+      const disposal = releaseBridge(r.location);
+      const replacement = await r.replace();
+      try {
+        r.deadline.expire();
+        await disposal;
+        expect(r.settled()).toBe(false);
+        expect(r.pool.shutdownCalls).toBe(0);
+        r.resume.open();
+        expect(await r.outcome).toEqual({ value: { success: true, text: "real result" } });
+        expect(r.dispatches()).toBe(1);
+      } finally {
+        r.resume.open();
+        await disposal;
+        await releaseBridge(replacement);
+      }
+    });
+
+    test(`last replacement shutdown interrupts a retired ${boundary} hold, not its earlier deadline`, async () => {
+      const r = await heldStandalone(boundary);
+      const disposal = releaseBridge(r.location);
+      const replacement = await r.replace();
+      try {
+        r.deadline.expire();
+        await disposal;
+        expect(r.settled()).toBe(false);
+        await releaseBridge(replacement);
+        const outcome = await r.outcome;
+        expect(outcome).toHaveProperty("error");
+        const error = (outcome as { error: unknown }).error;
+        if (boundary === "dispatched") {
+          expect(error).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+          expect(error).not.toMatchObject({ kind: "not_sent" });
+        } else {
+          expect(error).toMatchObject({ kind: "not_sent", message: LOCATION_RELOADED_NOT_SENT });
+        }
+        r.resume.open();
+        await r.continued.promise;
+        if (boundary === "permission") expect(r.continuationError()).toBe(error);
+        expect(r.dispatches()).toBe(boundary === "dispatched" ? 1 : 0);
+        expect(r.pool.shutdownCalls).toBe(1);
+      } finally {
+        r.resume.open();
+        await disposal;
+        await releaseBridge(replacement);
+      }
+    });
+  }
+
+  test("unsolicited transport callbacks outlive a completed call without retaining its hold", async () => {
+    const pool = new FakePool();
+    let dispatches = 0;
+    pool.bridge.send = async () => {
+      dispatches++;
+      return { success: true };
+    };
+    const location = await acquireBridge("/fixture/transport-events", options(true), {
+      createPool: async () => pool,
+    });
+    let events!: AsyncResource;
+    await withLocationExecution(location, async () => {
+      events = new AsyncResource("fixture-transport-events");
+      return location.getBridge("/fixture/transport-events").send("read");
+    });
+    try {
+      expect(
+        await events.runInAsyncScope(() =>
+          location.getBridge("/fixture/transport-events").send("bash_ack"),
+        ),
+      ).toEqual({ success: true });
+      await releaseBridge(location);
+      expect(() =>
+        events.runInAsyncScope(() =>
+          location.getBridge("/fixture/transport-events").send("bash_ack"),
+        ),
+      ).toThrow(BridgeTransportUnavailableError);
+      expect(dispatches).toBe(2);
+    } finally {
+      events.emitDestroy();
+      await releaseBridge(location);
+    }
+  });
+
+  for (const subc of [false, true]) {
+    const mode = subc ? "subc" : "standalone";
+
+    test(`${mode}: draining holds survive same-root replacement and duplicate finalizers`, async () => {
+      const created: FakePool[] = [];
+      const createPool = async () => {
+        const pool = new FakePool();
+        created.push(pool);
+        return pool;
+      };
+      const location = await acquireBridge("/fixture/held", options(subc), { createPool });
+      const resume = gate();
+      const result = withLocationExecution(location, async () => {
+        await resume.promise;
+        return location.toolCall("/fixture/held", {}, "write", {});
+      });
+      let disposed = false;
+      const disposal = Promise.all([releaseBridge(location), releaseBridge(location)]).then(() => {
+        disposed = true;
+      });
+      const replacement = await acquireBridge("/fixture/held", options(subc), { createPool });
+      try {
+        expect(disposed).toBe(false);
+        expect(created[0]!.shutdownCalls).toBe(0);
+        const refused = await withLocationExecution(location, async () => {
+          throw new Error("retired Location admitted a new call");
+        }).catch((error: unknown) => error);
+        expect(refused).toMatchObject({ kind: "not_sent", code: "aft_module_unavailable" });
+        expect((refused as Error).message).toBe(LOCATION_RELOADED_NOT_SENT);
+        resume.open();
+        expect(await result).toMatchObject({ success: true });
+        await disposal;
+        expect(created[0]!.toolCallCalls).toBe(1);
+        expect(created[0]!.shutdownCalls).toBe(subc ? 1 : 0);
+        expect(await replacement.toolCall("/fixture/held", {}, "read", {})).toMatchObject({
+          success: true,
+        });
+      } finally {
+        resume.open();
+        await disposal;
+        await releaseBridge(replacement);
+      }
+      expect(created.every((pool) => pool.shutdownCalls === 1)).toBe(true);
+    });
+
+    test(`${mode}: drain deadline interrupts an acknowledged mutation as unknown without replay`, async () => {
+      const pool = new FakePool();
+      const deadline = executionDeadline();
+      const acknowledged = gate();
+      const reply = gate();
+      let dispatches = 0;
+      pool.bridge.toolCall = async () => {
+        dispatches++;
+        acknowledged.open();
+        await reply.promise;
+        return { success: true, text: "ok" };
+      };
+      const location = await acquireBridge("/fixture/acknowledged", options(subc), {
+        createPool: async () => pool,
+        executionClock: deadline.clock,
+      });
+      const outcome = withLocationExecution(location, () =>
+        location.getBridge("/fixture/acknowledged").toolCall("session", "write", {}),
+      ).catch((error: unknown) => error);
+      await acknowledged.promise;
+      const disposal = releaseBridge(location);
+      const replacement = subc
+        ? await acquireBridge("/fixture/acknowledged", options(subc), {
+            createPool: async () => new FakePool(),
+          })
+        : undefined;
+      try {
+        deadline.expire();
+        const error = await outcome;
+        expect(error).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+        expect(error).not.toMatchObject({ kind: "not_sent" });
+        expect((error as Error).message).toContain("outcome is UNKNOWN");
+        await disposal;
+        reply.open();
+        expect(dispatches).toBe(1);
+        expect(pool.shutdownCalls).toBe(1);
+        if (replacement)
+          expect(await replacement.toolCall("/fixture/acknowledged", {}, "read", {})).toMatchObject(
+            {
+              success: true,
+            },
+          );
+      } finally {
+        reply.open();
+        await disposal;
+        if (replacement) await releaseBridge(replacement);
+      }
+    });
+  }
+
+  test("drain deadline before dispatch gives a typed refusal and blocks late escaped transports", async () => {
+    const pool = new FakePool();
+    let dispatches = 0;
+    pool.bridge.toolCall = async () => {
+      dispatches++;
+      return { success: true, text: "ok" };
+    };
+    const deadline = executionDeadline();
+    const location = await acquireBridge("/fixture/no-dispatch", options(true), {
+      createPool: async () => pool,
+      executionClock: deadline.clock,
+    });
+    const resume = gate();
+    const settled = gate();
+    let lateError: unknown;
+    const outcome = withLocationExecution(location, async () => {
+      const bridge = location.getBridge("/fixture/no-dispatch");
+      await resume.promise;
+      try {
+        return await bridge.toolCall("session", "write", {});
+      } catch (error) {
+        lateError = error;
+        throw error;
+      } finally {
+        settled.open();
+      }
+    }).catch((error: unknown) => error);
+    const disposal = releaseBridge(location);
+    deadline.expire();
+    const error = await outcome;
+    expect(error).toMatchObject({ kind: "not_sent", code: "aft_module_unavailable" });
+    expect((error as Error).message).toBe(LOCATION_RELOADED_NOT_SENT);
+    await disposal;
+    resume.open();
+    await settled.promise;
+    expect(lateError).toBe(error);
+    expect(dispatches).toBe(0);
+    expect(pool.toolCallCalls).toBe(0);
+  });
+});
 
 describe("Location bridge lifecycle", () => {
   test("shutdown classifies an in-flight Location call as outcome unknown", async () => {
