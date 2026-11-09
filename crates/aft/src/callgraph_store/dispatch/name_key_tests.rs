@@ -288,7 +288,19 @@ fn name_keys_java_directory_negative_probe_is_scoped() {
     ]));
     assert!(resolver.project_type("pkg/Caller.java", "Fresh").is_none());
     let reads = resolver.take_dependencies();
+    assert!(reads.contains(&dependency::directory("pkg/Caller.java")));
     let new = blob("class Existing {} class Fresh {}", "java");
+    let mut added_file_keys = BTreeSet::new();
+    FileFacts::changed_keys_by_method(
+        "pkg/New.java",
+        None,
+        Some(&FileFacts::new(&new)),
+        &mut added_file_keys,
+    );
+    assert!(
+        !added_file_keys.is_disjoint(&reads),
+        "a new directory member reaches the negative probe through the coarse directory key"
+    );
     covered(
         "pkg/Types.java",
         &old,

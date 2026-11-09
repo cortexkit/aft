@@ -614,3 +614,22 @@ fn name_keys_unrelated_rust_return_hint_refreshes_only_its_own_file() {
         .any(|site| site.site.member.as_deref() == Some("run")
             && !site.resolution.targets.is_empty()));
 }
+
+#[test]
+fn name_keys_own_fact_change_is_independent_of_external_reader_keys() {
+    let before = checkout(&[("a.rs", "pub struct A;\n")], &[]);
+    let after = checkout(&[("a.rs", "pub struct A; pub struct Fresh;\n")], &[]);
+    let old = resolve_checkout(&before, 1).unwrap();
+    let new = resolve_checkout(&after, 1).unwrap();
+    let mut inputs = super::callgraph::MethodCallInputs::build(&before, &old);
+    let (keys, own) = inputs.update(&after, "a.rs", new.get("a.rs"));
+    assert!(
+        own,
+        "own fact changes must not rely on the coarse reader key"
+    );
+    assert!(
+        !keys.contains(&crate::callgraph_store::join::dispatch::dependency::file(
+            "a.rs"
+        ))
+    );
+}
