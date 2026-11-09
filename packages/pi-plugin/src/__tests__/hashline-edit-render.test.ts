@@ -39,13 +39,13 @@ function unifiedPatch(path: string, hunks: string): string {
 /**
  * A successful hashline `edit` reply as the Pi transport sends it
  * (`crates/aft/src/hashline/integration/transport.rs::render_mutation_response`),
- * plus the `text` the tool_call layer copies from `output`.
+ * plus the `text` the tool_call layer copies from `output`. The absolute-path
+ * fields of the real reply are left out: the Pi adapter does not read them.
  */
 function hashlineReply(files: DisplayFile[]): Record<string, unknown> {
   const metaFiles = files.map((file) => {
     const patch = unifiedPatch(file.path, file.hunks);
     return {
-      filePath: `/project/${file.path}`,
       relativePath: file.path,
       type: file.type,
       patch,
@@ -71,7 +71,6 @@ function hashlineReply(files: DisplayFile[]): Record<string, unknown> {
       diff: metaFiles.map((file) => file.patch).join("\n"),
       files: metaFiles,
     },
-    filePath: files[0]?.path,
     op_id: "op-1",
     hashline: true,
     registers_committed: false,

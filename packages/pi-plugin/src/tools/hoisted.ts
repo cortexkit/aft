@@ -1188,7 +1188,7 @@ function hashlineFileDetails(row: Record<string, unknown>): MutationFileDetails 
   const patch = asString(row.patch) ?? "";
   const diff = formatUnifiedDiffForPi(patch);
   return {
-    path: asString(row.relativePath) ?? asString(row.filePath) ?? "",
+    path: asString(row.relativePath) ?? "",
     sourcePath: asString(row.sourcePath) ?? asString(row.movePath),
     diff: diff.length > 0 ? diff : undefined,
     additions: asNumber(row.additions) ?? 0,
