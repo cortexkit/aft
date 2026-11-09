@@ -332,12 +332,24 @@ impl InspectInventory {
         root: &Path,
         view: &crate::data_layer::checkout::CheckoutView,
     ) -> Option<Self> {
+        Self::from_view(root, view).ok()
+    }
+
+    /// [`from_checkout`](Self::from_checkout), saying why the view cannot
+    /// stand in for a walk when it cannot.
+    pub(crate) fn from_view(
+        root: &Path,
+        view: &crate::data_layer::checkout::CheckoutView,
+    ) -> Result<Self, StoreListMiss> {
         let normalized_root = canonicalize_normalized(root);
-        if view.rescanning()
-            || canonicalize_normalized(view.root()) != normalized_root
-            || walks_use_other_ignore_settings(root)
-        {
-            return None;
+        if canonicalize_normalized(view.root()) != normalized_root {
+            return Err(StoreListMiss::OtherRoot);
+        }
+        if walks_use_other_ignore_settings(root) {
+            return Err(StoreListMiss::OtherIgnoreSettings);
+        }
+        if view.rescanning() {
+            return Err(StoreListMiss::Rescanning);
         }
         let mut sources = Vec::new();
         let mut manifests = Vec::new();
@@ -377,7 +389,7 @@ impl InspectInventory {
         sources.sort();
         manifests.sort();
         manifests.dedup();
-        Some(Self {
+        Ok(Self {
             root: normalized_root,
             sources,
             manifests,
@@ -488,6 +500,44 @@ impl InspectInventory {
             root: normalized_root,
             sources,
             manifests,
+        }
+    }
+}
+
+/// Why the index store's list of a folder's files could not stand in for a
+/// walk of the folder, so the caller walked it instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreListMiss {
+    /// No index-store checkout of the folder is bound in this process.
+    NotBound,
+    /// The folder holds repositories, each with a checkout of its own, and
+    /// has none itself.
+    FolderOfRepositories,
+    /// The index store never binds the folder (home folder, drive root, or
+    /// every index off).
+    Withheld,
+    /// The checkout is bound but has not published its first scan.
+    NotPublished,
+    /// A rescan against the disk is pending, so the list can miss changes.
+    Rescanning,
+    /// The checkout is of another folder.
+    OtherRoot,
+    /// The source walk uses ignore settings the store's scan does not
+    /// (confinement, or a Jujutsu-only repository).
+    OtherIgnoreSettings,
+}
+
+impl StoreListMiss {
+    /// The name logs give this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBound => "not_bound",
+            Self::FolderOfRepositories => "folder_of_repositories",
+            Self::Withheld => "withheld",
+            Self::NotPublished => "not_published",
+            Self::Rescanning => "rescanning",
+            Self::OtherRoot => "other_root",
+            Self::OtherIgnoreSettings => "other_ignore_settings",
         }
     }
 }

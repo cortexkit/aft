@@ -4046,22 +4046,40 @@ thread_local! {
 }
 
 pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
-    if let Some(inventory) = super::inventory::current(project_root) {
-        return inventory
+    let in_scope = |inventory: &super::inventory::InspectInventory| {
+        inventory
             .sources
             .iter()
             .filter(|path| scope.contains(path))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>()
+    };
+    if let Some(inventory) = super::inventory::current(project_root) {
+        return in_scope(&inventory);
     }
+    // No caller installed a census on this thread (background jobs such as
+    // the status bar's TODO refresh never do): the root's bound index-store
+    // checkout lists the same files without touching the disk.
+    let miss = match crate::data_layer::tools::inspect::bound_inventory(project_root) {
+        Ok(inventory) => return in_scope(&inventory),
+        Err(miss) => miss,
+    };
     #[cfg(test)]
     let _profile = super::walk_profile::Walk::start("scope_files");
     #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
+    let started = Instant::now();
     let mut files = crate::callgraph::walk_project_files(project_root)
         .filter(|path| scope.contains(path))
         .collect::<Vec<_>>();
     files.sort();
+    crate::slog_info!(
+        "inspect scope files walked: reason={} files={} ms={} root={}",
+        miss.as_str(),
+        files.len(),
+        started.elapsed().as_millis(),
+        crate::logging::normalize_index_root(project_root)
+    );
     files
 }
 
@@ -6056,6 +6074,306 @@ mod guard_tests {
         let scope = JobScope::from_roots(root.clone(), vec![root.join("src")]);
         assert_eq!(scope_files(&root, &scope), vec![root.join("src/one.ts")]);
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+    }
+
+    /// A tree where every rule of the source walk decides something: files
+    /// ignored by `.gitignore`, `.aftignore` and a nested repository's own
+    /// `.gitignore`, a nested linked worktree (skipped), a nested independent
+    /// repository and a submodule-style checkout (both walked), skipped
+    /// folders, non-source files and symlinks. Returns the root, the folder
+    /// holding it, and the sorted list a walk of it finds.
+    fn store_list_fixture() -> (PathBuf, tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "store_list");
+        let root = canonicalize_for_snapshot(&fixture.root);
+        for (path, contents) in [
+            ("src/lib.ts", "export const lib = 1;\n"),
+            (".gitignore", "ignored/\n"),
+            (".aftignore", "aftignored/\n"),
+            ("ignored/skip.rs", "fn skip() {}\n"),
+            ("aftignored/skip.rs", "fn skip() {}\n"),
+            ("node_modules/dep/index.js", "module.exports = 1;\n"),
+            ("src/.hidden.rs", "fn hidden() {}\n"),
+            ("vendor/independent/.gitignore", "generated/\n"),
+            ("vendor/independent/generated/out.rs", "fn out() {}\n"),
+            ("docs/readme.md", "# docs\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("src/main.rs", root.join("link.rs")).unwrap();
+            std::os::unix::fs::symlink("src", root.join("linked_src")).unwrap();
+        }
+        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        walked.sort();
+        for kept in [
+            "src/main.rs",
+            "src/lib.ts",
+            "vendor/independent/inner.rs",
+            "submod/code.rs",
+        ] {
+            assert!(walked.contains(&root.join(kept)), "{kept}: {walked:?}");
+        }
+        for left_out in [
+            "ignored/skip.rs",
+            "aftignored/skip.rs",
+            "node_modules/dep/index.js",
+            "src/.hidden.rs",
+            "vendor/independent/generated/out.rs",
+            "link.rs",
+            "linked_src/main.rs",
+        ] {
+            assert!(!walked.contains(&root.join(left_out)), "{left_out}");
+        }
+        assert!(
+            !walked
+                .iter()
+                .any(|path| path.starts_with(&fixture.worktree)),
+            "the nested linked worktree is walked: {walked:?}"
+        );
+        (root, dir, walked)
+    }
+
+    /// A context whose index-store checkout of `root` is bound and has
+    /// published its scan, as the daemon's is once a root is configured.
+    fn bound_store_context(root: &Path) -> crate::context::AppContext {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+        ctx
+    }
+
+    /// The status bar's TODO refresh enqueues its job from a maintenance
+    /// thread where no request installed a census. With the root's
+    /// index-store checkout bound and published, the enqueue lists the root's
+    /// files from the store and walks nothing, and the list is the one a walk
+    /// of the folder finds.
+    #[test]
+    fn background_todo_refresh_lists_files_from_the_bound_store_without_walking() {
+        let (root, _dir, walked) = store_list_fixture();
+        let ctx = bound_store_context(&root);
+        assert!(ctx
+            .data_checkout()
+            .is_some_and(|checkout| checkout.view().is_some_and(|view| !view.rescanning())));
+        assert!(
+            super::super::inventory::current(&root).is_none(),
+            "no census is installed on this thread"
+        );
+        // The job must not wait for the store's TODO records on a worker.
+        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        crate::callgraph::PROJECT_WALK_ENTRIES.with(|entries| entries.set(0));
+        let manager = InspectManager::new();
+        manager
+            .submit_background(
+                tier1_snapshot(&root),
+                InspectCategory::Todos,
+                JobScope::for_project(root.clone()),
+            )
+            .expect("the refresh is scheduled");
+        let listed = scope_files(&root, &JobScope::for_project(root.clone()));
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get),
+            0,
+            "no project walk visited an entry"
+        );
+        assert_eq!(listed, walked);
+        let scoped = JobScope::from_roots(root.clone(), vec![root.join("vendor")]);
+        assert_eq!(
+            scope_files(&root, &scoped),
+            vec![root.join("vendor/independent/inner.rs")]
+        );
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+    }
+
+    /// While the store's list can miss changes (a rescan against the disk is
+    /// pending) or there is no store to ask, the files are walked, giving the
+    /// same list; once the rescan ends the store's list is used again.
+    #[test]
+    fn scope_files_walks_only_while_the_store_cannot_stand_in() {
+        use super::super::inventory::StoreListMiss;
+        let (root, _dir, walked) = store_list_fixture();
+        let unbound = tempfile::tempdir().unwrap();
+        let unbound = canonicalize_for_snapshot(unbound.path());
+        assert_eq!(
+            crate::data_layer::tools::inspect::bound_inventory(&unbound).err(),
+            Some(StoreListMiss::NotBound)
+        );
+
+        let ctx = bound_store_context(&root);
+        let checkout = ctx.data_checkout().expect("bound");
+        let project = JobScope::for_project(root.clone());
+        checkout.checkout().begin_rescan();
+        assert_eq!(
+            crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+            Some(StoreListMiss::Rescanning)
+        );
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(scope_files(&root, &project), walked);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+        checkout.checkout().end_rescan();
+        assert_eq!(scope_files(&root, &project), walked);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+    }
+
+    /// This thread's CPU time in milliseconds: the TODO refresh lists files
+    /// on the thread that enqueues it, so that thread's clock is the cost.
+    fn thread_cpu_ms() -> f64 {
+        #[cfg(unix)]
+        {
+            let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } == 0
+            {
+                let time = unsafe { time.assume_init() };
+                return time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1_000_000.0;
+            }
+        }
+        0.0
+    }
+
+    /// Opt-in replay of a busy worktree on a copy of a real checkout named by
+    /// `AFT_SCOPE_WALK_REPLAY_ROOT` (it edits the files there). It edits
+    /// source files one at a time (`AFT_SCOPE_WALK_REPLAY_EDITS`, default
+    /// 430), records each edit in the index store as the watcher does, and
+    /// after every `AFT_SCOPE_WALK_REPLAY_BATCH` edits (default 10) adds one
+    /// file, removes the previous one, and lists the root's files as the TODO
+    /// refresh's enqueue does: by walking, as it did before it asked the
+    /// store, and through `scope_files`. It prints the walks and this
+    /// thread's CPU for each, why the store could not stand in when it could
+    /// not, and how long a rescan of the checkout stays pending; it fails if
+    /// the two lists ever differ.
+    #[test]
+    #[ignore = "edits a copy of a real checkout named by AFT_SCOPE_WALK_REPLAY_ROOT"]
+    fn scope_files_busy_worktree_replay() {
+        let number = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let root = canonicalize_for_snapshot(Path::new(
+            &std::env::var("AFT_SCOPE_WALK_REPLAY_ROOT").expect("AFT_SCOPE_WALK_REPLAY_ROOT"),
+        ));
+        let edits = number("AFT_SCOPE_WALK_REPLAY_EDITS", 430);
+        let batch = number("AFT_SCOPE_WALK_REPLAY_BATCH", 10).max(1);
+        let bind_started = Instant::now();
+        let ctx = bound_store_context(&root);
+        let bind_ms = bind_started.elapsed().as_millis();
+        let checkout = ctx.data_checkout().expect("bound");
+        let project = JobScope::for_project(root.clone());
+        let targets = crate::callgraph::walk_project_files(&root)
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "rs" || extension == "ts")
+            })
+            .take(64)
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty(), "no source file to edit");
+        let added_dir = root.join("crates/replay_added");
+        std::fs::create_dir_all(&added_dir).unwrap();
+        let mut previous_added: Option<PathBuf> = None;
+        let (mut listings, mut mismatches) = (0usize, 0usize);
+        let (mut walk_cpu, mut walk_ms, mut store_cpu, mut store_ms) = (0.0, 0.0, 0.0, 0.0);
+        let mut store_walks = 0usize;
+        let mut misses = BTreeMap::<&'static str, usize>::new();
+        let mut files = 0usize;
+        let replay_started = Instant::now();
+        for edit in 0..edits {
+            let target = &targets[edit % targets.len()];
+            let mut contents = std::fs::read(target).unwrap();
+            contents.extend_from_slice(format!("// replay edit {edit}\n").as_bytes());
+            std::fs::write(target, contents).unwrap();
+            checkout.note_paths(std::slice::from_ref(target));
+            if (edit + 1) % batch != 0 {
+                continue;
+            }
+            let added = added_dir.join(format!("added_{edit}.rs"));
+            std::fs::write(&added, "fn added() {}\n").unwrap();
+            let mut changed = vec![added.clone()];
+            if let Some(previous) = previous_added.replace(added) {
+                std::fs::remove_file(&previous).unwrap();
+                changed.push(previous);
+            }
+            checkout.note_paths(&changed);
+
+            let (cpu, started) = (thread_cpu_ms(), Instant::now());
+            let mut walked = crate::callgraph::walk_project_files(&root)
+                .filter(|path| project.contains(path))
+                .collect::<Vec<_>>();
+            walked.sort();
+            walk_cpu += thread_cpu_ms() - cpu;
+            walk_ms += started.elapsed().as_secs_f64() * 1000.0;
+
+            if let Err(miss) = crate::data_layer::tools::inspect::bound_inventory(&root) {
+                *misses.entry(miss.as_str()).or_default() += 1;
+            }
+            let walks = SCOPE_FILE_WALKS.with(std::cell::Cell::get);
+            let (cpu, started) = (thread_cpu_ms(), Instant::now());
+            let listed = scope_files(&root, &project);
+            store_cpu += thread_cpu_ms() - cpu;
+            store_ms += started.elapsed().as_secs_f64() * 1000.0;
+            store_walks += SCOPE_FILE_WALKS.with(std::cell::Cell::get) - walks;
+
+            listings += 1;
+            files = walked.len();
+            if listed != walked {
+                mismatches += 1;
+                let only = |left: &[PathBuf], right: &[PathBuf]| {
+                    left.iter()
+                        .filter(|path| right.binary_search(path).is_err())
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                eprintln!(
+                    "listing {listings} differs: only listed {:?}, only walked {:?}",
+                    only(&listed, &walked),
+                    only(&walked, &listed)
+                );
+            }
+        }
+        let replay_ms = replay_started.elapsed().as_millis();
+
+        // How long a rescan of the checkout against the disk stays pending,
+        // the one state of a bound, published checkout that sends the
+        // listing back to the walk.
+        let rescan_started = Instant::now();
+        checkout.rescan();
+        let mut observed_pending = false;
+        while checkout.view().is_some_and(|view| view.rescanning()) {
+            observed_pending = true;
+            assert!(rescan_started.elapsed() < Duration::from_secs(300));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let rescan_ms = rescan_started.elapsed().as_secs_f64() * 1000.0;
+
+        let per = |total: f64| total / listings.max(1) as f64;
+        let report = serde_json::json!({
+            "root": root.display().to_string(),
+            "files": files,
+            "bind_ms": bind_ms,
+            "edits": edits,
+            "listings": listings,
+            "replay_ms": replay_ms,
+            "walk": {"walks": listings, "cpu_ms_per_listing": per(walk_cpu), "wall_ms_per_listing": per(walk_ms)},
+            "store": {"walks": store_walks, "cpu_ms_per_listing": per(store_cpu), "wall_ms_per_listing": per(store_ms)},
+            "store_misses": misses,
+            "mismatches": mismatches,
+            "rescan": {"observed_pending": observed_pending, "pending_ms": rescan_ms},
+        });
+        eprintln!("scope files replay {report}");
+        assert_eq!(mismatches, 0, "{report}");
     }
     use super::*;
 
