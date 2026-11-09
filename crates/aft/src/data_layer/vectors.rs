@@ -110,6 +110,18 @@ impl Producer {
     pub fn model(&self) -> &ModelIdentity {
         &self.model
     }
+
+    /// A producer of vectors stored under `model`, cutting with today's
+    /// default caps: for measurements that search and merge a family's
+    /// stored vectors and embed nothing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_stored_model(model: ModelIdentity) -> Self {
+        Self {
+            model,
+            caps: EmbedTextCaps::default(),
+        }
+    }
 }
 
 /// `path` (relative to the root, `/`-separated) in the platform's own form,
@@ -825,6 +837,28 @@ struct FillLock {
 }
 
 impl FillLock {
+    /// Takes the lock of the family in `dir` if no other fill holds it.
+    fn try_take(dir: &Path) -> Result<Option<Self>, DataError> {
+        let path = dir.join(FILL_LOCK);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(DataError::Store(format!("{}: {error}", path.display())))
+            }
+        }
+    }
+
     /// Takes the lock of the family in `dir`, waiting up to [`FILL_WAIT`];
     /// `waiting` hears once if it has to wait.
     fn take(dir: &Path, waiting: &mut dyn FnMut()) -> Result<Self, DataError> {
@@ -941,8 +975,51 @@ pub struct FillReport {
     pub files_filled_elsewhere: usize,
     /// Time spent waiting for other fills of the repository.
     pub wait_ms: f64,
+    /// Merges of the family's vector segments this fill ran after its
+    /// rounds (see [`VectorPlane::merge_segments`]), the segments they
+    /// merged, and their time.
+    pub merges: usize,
+    pub merged_segments: usize,
+    pub merge_ms: f64,
     /// Why the fill stopped before finishing; what it published stands.
     pub error: Option<String>,
+}
+
+/// Vector segments of the plane's model a family keeps before a fill round
+/// merges them. Each round publishes one, folds never copy vectors, and a
+/// vector segment leaves only once no checkout reaches any of its vectors,
+/// so without merging their number only grew: 133 of one family's 212
+/// segments, and 291 of another's 335, after three days of use.
+const MERGE_AT: usize = 8;
+
+/// A vector segment written less than this long ago is left out of a
+/// merge. Its vectors may be reached only by a checkout's changes that are
+/// not published yet, which no merge can see; a checkout publishes its
+/// changes within minutes of going quiet.
+const MERGE_GRACE: Duration = Duration::from_secs(600);
+
+/// What a merge of vector segments did.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct MergeReport {
+    /// Segments holding the model's vectors in the generation it read.
+    pub examined: usize,
+    /// Segments merged into the new one, and their length together.
+    pub merged: usize,
+    pub merged_bytes: u64,
+    /// Chunk maps and vectors the new segment holds, and its length.
+    pub chunk_maps: usize,
+    pub vectors: usize,
+    pub segment_bytes: u64,
+    /// Chunk maps and vectors the merged segments held that are not what a
+    /// reader reaches there (none reaches them, or a newer segment holds
+    /// them too), left out.
+    pub dropped_chunk_maps: usize,
+    pub dropped_vectors: usize,
+    /// Files the reclamation after publishing removed, or why it could not
+    /// run (the publication stands either way).
+    pub reclaimed_files: usize,
+    pub reclaim_error: Option<String>,
+    pub ms: f64,
 }
 
 /// One checkout's meaning search: its fill and its searches.
@@ -954,6 +1031,8 @@ pub struct VectorPlane {
     members: Mutex<Option<Arc<Members>>>,
     /// The old meaning index whose vectors fills take where they match.
     old: Option<OldIndex>,
+    /// When a fill round merges the family's vector segments.
+    merge: MergeLimits,
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -972,7 +1051,17 @@ impl VectorPlane {
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
             old: None,
+            merge: MergeLimits::default(),
         }
+    }
+
+    /// Makes this plane's merges take vector segments written at least
+    /// `grace` ago, instead of [`MERGE_GRACE`]. For tests and measurement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_merge_grace(mut self, grace: Duration) -> Self {
+        self.merge.grace = grace;
+        self
     }
 
     /// Makes this plane's fills take a chunk's vector from `old`, the old
@@ -1336,7 +1425,7 @@ impl VectorPlane {
             // Wait for any other fill of the repository to publish, then
             // leave out what it published: its texts' vectors, and the files
             // whose chunk maps it finished.
-            let _lock = if wanted.is_empty() && imported.is_empty() {
+            let round_lock = if wanted.is_empty() && imported.is_empty() {
                 None
             } else {
                 let started = Instant::now();
@@ -1499,6 +1588,31 @@ impl VectorPlane {
                 report.segments_published += 1;
                 report.files_filled += filled;
                 loaded = self.load()?;
+                // Each round adds a vector segment and nothing else folds
+                // them, so past `MERGE_AT` this round merges them: once at
+                // most, under the round's fill lock, or one taken now when
+                // no other fill holds it (that fill merges after its round).
+                if loaded.open.len() > self.merge.merge_at {
+                    let taken = match round_lock {
+                        Some(_) => None,
+                        None => FillLock::try_take(self.checkout.family_dir())?,
+                    };
+                    if round_lock.is_some() || taken.is_some() {
+                        match self.merge_segments() {
+                            Ok(Some(merged)) => {
+                                report.merges += 1;
+                                report.merged_segments += merged.merged;
+                                report.merge_ms += merged.ms;
+                                loaded = self.load()?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => crate::slog_warn!(
+                                "data layer could not merge the vector segments of {}: {error}",
+                                parts.root.display()
+                            ),
+                        }
+                    }
+                }
             }
             progress(FillProgress {
                 files_done,
@@ -1531,6 +1645,279 @@ impl VectorPlane {
             .map_err(store_error)?;
         Ok(session.base().segment(id).map_or(0, |entry| entry.len))
     }
+
+    /// Merges vector segments of this plane's model into one, when the
+    /// family holds more than [`MERGE_AT`] of them (see
+    /// [`merge_vector_segments`]). The current states of the family's
+    /// checkouts bound in this process, published or not, count among the
+    /// readers whose vectors the merge keeps. `None` when nothing was
+    /// merged.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read or written. Nothing is published then.
+    pub fn merge_segments(&self) -> Result<Option<MergeReport>, DataError> {
+        let bound = self.checkout.bound_states();
+        let merged = merge_vector_segments(
+            &self.checkout.vector_parts(),
+            &self.producer.model,
+            &bound,
+            self.merge,
+        )?;
+        if let Some(report) = &merged {
+            crate::slog_info!(
+                "data layer merged vector segments of {}: examined {} segments of the model; merged {} ({} bytes) into one of {} bytes ({} chunk maps, {} vectors; left out {} chunk maps and {} vectors no checkout reaches), {:.0} ms",
+                self.checkout.root().display(),
+                report.examined,
+                report.merged,
+                report.merged_bytes,
+                report.segment_bytes,
+                report.chunk_maps,
+                report.vectors,
+                report.dropped_chunk_maps,
+                report.dropped_vectors,
+                report.ms
+            );
+        }
+        Ok(merged)
+    }
+}
+
+/// When a merge of vector segments runs and how much it copies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MergeLimits {
+    /// Segments of the model the family must hold more of.
+    pub(crate) merge_at: usize,
+    /// The vector bytes one merge copies at most.
+    pub(crate) budget: usize,
+    /// Segments younger than this are left out.
+    pub(crate) grace: Duration,
+}
+
+impl Default for MergeLimits {
+    fn default() -> Self {
+        Self {
+            merge_at: MERGE_AT,
+            budget: ROUND_BYTES,
+            grace: MERGE_GRACE,
+        }
+    }
+}
+
+/// Merges vector segments of `model` into one new segment, when the
+/// newest generation holds more than `limits.merge_at` of them.
+///
+/// It takes the vector-only segments older than `limits.grace`, those
+/// whose reached vectors take the fewest bytes first, while the vectors it
+/// copies stay within `limits.budget`. Into the new segment go the chunk
+/// maps and vectors of those segments that a reader reaches, by the rule
+/// readers follow ([`needed_vector_segments`]): each chunk map of a
+/// checkout's path from the newest segment holding it, and each vector its
+/// chunks name from the newest segment holding that. The readers are every
+/// checkout state the generation names, and `bound`: the current states of
+/// checkouts bound in this process, whose changes not yet published no
+/// published state names. Every copied unit is
+/// stored with the bytes it had, and the new segment is the newest that
+/// holds it, so readers find the same maps and vectors as before. The rest
+/// of those segments is what no reader reaches, and leaves with them.
+///
+/// `None` when there was nothing to merge, or a segment or state of the
+/// generation cannot be read by this build (it could need anything).
+///
+/// # Errors
+///
+/// When the store cannot be read or written. Nothing is published then.
+pub(crate) fn merge_vector_segments(
+    parts: &VectorParts<'_>,
+    model: &ModelIdentity,
+    bound: &[CheckoutState],
+    limits: MergeLimits,
+) -> Result<Option<MergeReport>, DataError> {
+    let started = Instant::now();
+    let mut session = writer(parts.family)?;
+    // With the writer held, this is the generation the merge changes.
+    let snapshot = parts.family.snapshot().map_err(store_error)?;
+    let entries = snapshot.manifest().segments().to_vec();
+    // Read once, in order: a small cache of its own, as a fold does.
+    let copying = Arc::new(BlockCache::new(16 << 20));
+    let mut opened = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match snapshot.open_segment(entry.id, &parts.known, Arc::clone(&copying)) {
+            Ok(segment) => opened.push(segment),
+            Err(error) if error.is_unusable_file() => return Ok(None),
+            Err(error) => return Err(store_error(error)),
+        }
+    }
+    let vectors = opened
+        .iter()
+        .map(|segment| VectorSegment::open(segment).map_err(store_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ours = (0..opened.len())
+        .filter(|&place| {
+            vectors[place]
+                .as_ref()
+                .is_some_and(|vectors| vectors.model() == model)
+        })
+        .collect::<Vec<_>>();
+    let mut report = MergeReport {
+        examined: ours.len(),
+        ..MergeReport::default()
+    };
+    if ours.len() <= limits.merge_at {
+        return Ok(None);
+    }
+    let ours_at = |place: usize| vectors[place].as_ref().expect("a segment of the model");
+
+    // The newest holder of each chunk map and vector of the model.
+    let mut maps = HashMap::new();
+    let mut texts = HashMap::new();
+    for &place in &ours {
+        for key in ours_at(place).chunk_map_keys().map_err(store_error)? {
+            maps.insert(key, place);
+        }
+        for text in ours_at(place).texts().map_err(store_error)? {
+            texts.insert(text, place);
+        }
+    }
+    // What the readers reach, by holder.
+    let mut states = Vec::new();
+    for state_ref in snapshot.manifest().checkouts() {
+        match snapshot.checkout_state(state_ref.checkout) {
+            Ok(Some(state)) => states.push(state),
+            Ok(None) => {}
+            Err(error) if error.is_unusable_file() => return Ok(None),
+            Err(error) => return Err(store_error(error)),
+        }
+    }
+    let mut reached_maps = HashMap::<usize, Vec<(ContentKey, Vec<u8>)>>::new();
+    let mut reached_texts = HashMap::<usize, HashSet<TextDigest>>::new();
+    let mut asked = HashSet::new();
+    for state in states.iter().chain(bound) {
+        for record in state.paths() {
+            if !record.kind.has_content() {
+                continue;
+            }
+            let key = ChunkMapKey::new(record.content, &record.path);
+            if !asked.insert(key) {
+                continue;
+            }
+            let Some(&holder) = maps.get(&key) else {
+                continue;
+            };
+            let chunks = ours_at(holder)
+                .chunk_map(record.content, &record.path)
+                .map_err(store_error)?
+                .unwrap_or_default();
+            reached_maps
+                .entry(holder)
+                .or_default()
+                .push((record.content, record.path.clone()));
+            for chunk in chunks {
+                if let Some(&text_holder) = texts.get(&chunk.text) {
+                    reached_texts
+                        .entry(text_holder)
+                        .or_default()
+                        .insert(chunk.text);
+                }
+            }
+        }
+    }
+
+    // The segments to merge: vector-only and old enough, fewest reached
+    // vector bytes first, cut where the copied bytes would pass the budget.
+    let per_vector = VectorSectionsBuilder::bytes_per_vector(model.dimensions as usize);
+    let now = unix_ms();
+    let grace = u64::try_from(limits.grace.as_millis()).unwrap_or(u64::MAX);
+    let mut candidates = Vec::new();
+    for &place in &ours {
+        let segment = &opened[place];
+        let vector_only = aft_store::text::TextSegment::open(segment)
+            .map_err(store_error)?
+            .is_none()
+            && aft_store::content::ContentSegment::open(segment)
+                .map_err(store_error)?
+                .is_none()
+            && aft_store::graph::GraphSegment::open(segment)
+                .map_err(store_error)?
+                .is_none();
+        if vector_only && now.saturating_sub(segment.created_unix_ms()) >= grace {
+            let bytes = reached_texts.get(&place).map_or(0, HashSet::len) * per_vector;
+            candidates.push((bytes, place));
+        }
+    }
+    candidates.sort_unstable();
+    let mut taken = Vec::new();
+    let mut copied = 0usize;
+    for (bytes, place) in candidates {
+        if copied.saturating_add(bytes) > limits.budget {
+            break;
+        }
+        copied += bytes;
+        taken.push(place);
+    }
+    if taken.len() < 2 {
+        return Ok(None);
+    }
+    taken.sort_unstable();
+
+    let mut builder = VectorSectionsBuilder::new(model.clone()).map_err(store_error)?;
+    for &place in &taken {
+        let segment = ours_at(place);
+        let maps_here = reached_maps.remove(&place).unwrap_or_default();
+        report.dropped_chunk_maps += usize::try_from(segment.chunk_map_count())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(maps_here.len());
+        for (content, path) in maps_here {
+            let chunks = segment
+                .chunk_map(content, &path)
+                .map_err(store_error)?
+                .ok_or_else(|| DataError::Store("a listed chunk map is missing".to_string()))?;
+            match segment.chunk_details(content, &path).map_err(store_error)? {
+                Some(details) => builder
+                    .add_chunk_map_with_details(content, &path, &chunks, details)
+                    .map_err(store_error)?,
+                None => builder.add_chunk_map(content, &path, &chunks),
+            }
+        }
+        let texts_here = reached_texts.remove(&place).unwrap_or_default();
+        report.dropped_vectors += usize::try_from(segment.len())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(texts_here.len());
+        for text in texts_here {
+            let ordinal = segment
+                .find(text)
+                .map_err(store_error)?
+                .ok_or_else(|| DataError::Store("a listed vector is missing".to_string()))?;
+            builder
+                .add_vector(text, &segment.vector(ordinal).map_err(store_error)?)
+                .map_err(store_error)?;
+        }
+        report.merged += 1;
+        report.merged_bytes += entries[place].len;
+    }
+    report.chunk_maps = builder.chunk_maps();
+    report.vectors = builder.vectors();
+    let mut pending = session.create_segment().map_err(store_error)?;
+    builder.write(pending.writer()).map_err(store_error)?;
+    let id = session.finish_segment(pending).map_err(store_error)?;
+    session
+        .publish(&Publication {
+            add_segments: vec![id],
+            remove_segments: taken.iter().map(|&place| entries[place].id).collect(),
+            ..Publication::default()
+        })
+        .map_err(store_error)?;
+    report.segment_bytes = session.base().segment(id).map_or(0, |entry| entry.len);
+    // A reader still holding the older generation keeps its files.
+    match session.reclaim() {
+        Ok(reclaimed) => {
+            report.reclaimed_files =
+                reclaimed.removed_segments + reclaimed.removed_states + reclaimed.removed_manifests;
+        }
+        Err(error) => report.reclaim_error = Some(error.to_string()),
+    }
+    report.ms = elapsed_ms(started);
+    Ok(Some(report))
 }
 
 /// Which of `segments` (one generation's, in manifest order) hold vector
@@ -1664,6 +2051,7 @@ impl VectorPlane {
             loaded,
             members,
             old,
+            merge: _,
         } = self;
         model.heap_bytes(seen)
             + loaded.heap_bytes(seen)
@@ -2147,6 +2535,207 @@ mod tests {
                 .unwrap()
                 .results
                 .is_empty());
+        }
+    }
+
+    /// The family's segments that hold vectors.
+    fn vector_segment_count(checkout: &Checkout) -> usize {
+        let parts = checkout.vector_parts();
+        let snapshot = parts.family.snapshot().unwrap();
+        snapshot
+            .manifest()
+            .segments()
+            .iter()
+            .filter(|entry| {
+                let segment = snapshot
+                    .open_segment(entry.id, &parts.known, Arc::new(BlockCache::new(1 << 20)))
+                    .unwrap();
+                VectorSegment::open(&segment).unwrap().is_some()
+            })
+            .count()
+    }
+
+    /// A file of its own for the merge tests, one function each.
+    fn extra_file(root: &Path, index: usize, body: &str) {
+        write(
+            root,
+            &format!("src/extra{index}.rs"),
+            &format!("pub fn extra_{index}(value: u8) -> u8 {{\n    {body}\n}}\n"),
+        );
+    }
+
+    /// What `plane` answers for `view` to every test query.
+    fn answers(plane: &VectorPlane, checkout: &Checkout) -> Vec<Vec<String>> {
+        let view = checkout.view().unwrap();
+        queries()
+            .iter()
+            .map(|query| rows(&plane.search(&view, query, 10, &|_| true).unwrap().results))
+            .collect()
+    }
+
+    /// Merging vector segments keeps exactly what a reader reaches in them:
+    /// another checkout's vectors, those only its edit not yet published
+    /// reads included, and the merging checkout's alike, so both search and
+    /// cover as before; the chunk map and vector of a file content no
+    /// checkout holds any more leave with the merged segments. Segments
+    /// younger than the grace are not merged.
+    #[test]
+    fn merged_vector_segments_keep_what_every_checkout_reaches() {
+        let store = tempfile::tempdir().unwrap();
+        let first_root = tempfile::tempdir().unwrap();
+        let first_root = std::fs::canonicalize(first_root.path()).unwrap();
+        project(&first_root);
+        for index in 0..2 * MERGE_AT {
+            extra_file(&first_root, index, &format!("value + {index}"));
+        }
+        // Both checkouts bound in one process, as a running AFT binds them.
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let bind_here = |root: &Path| {
+            let checkout =
+                Checkout::bind(Arc::clone(&layer), store.path(), family(), root).unwrap();
+            checkout.build().unwrap();
+            Arc::new(checkout)
+        };
+        let first = bind_here(&first_root);
+        let first_plane = VectorPlane::new(Arc::clone(&first), producer(), 20_000);
+        // Two files a round, so the segment holding the first extra file's
+        // vectors holds another file's too, and stays after the first one
+        // changes.
+        let report = fill(&first_plane, &mut Recorder::default(), 2);
+        assert!(report.segments_published > MERGE_AT, "{report:?}");
+        assert_eq!(report.merges, 0, "every segment is younger than the grace");
+
+        // A second checkout: one function edited, a file added, and the
+        // first extra file gone.
+        let second_root = tempfile::tempdir().unwrap();
+        let second_root = std::fs::canonicalize(second_root.path()).unwrap();
+        copy_tree(&first_root, &second_root);
+        let lib = std::fs::read_to_string(second_root.join("src/lib.rs")).unwrap();
+        write(&second_root, "src/lib.rs", &lib.replace("x + 1", "x + 2"));
+        write(
+            &second_root,
+            "src/second.rs",
+            "pub fn second_only(items: &[u8]) -> usize {\n    items.len()\n}\n",
+        );
+        std::fs::remove_file(second_root.join("src/extra0.rs")).unwrap();
+        let second = bind_here(&second_root);
+        let second_plane = VectorPlane::new(Arc::clone(&second), producer(), 20_000);
+        fill(&second_plane, &mut Recorder::default(), 1);
+
+        // The first checkout's first extra file changes and is published:
+        // no checkout holds its old content any more.
+        extra_file(&first_root, 0, "value * 7");
+        first.record_paths(&[b"src/extra0.rs".to_vec()]).unwrap();
+        first.refresh_callgraph().unwrap();
+        first.publish_changes().unwrap().expect("published");
+        fill(&first_plane, &mut Recorder::default(), 1);
+
+        // The second checkout then edits its own file and does not publish
+        // the edit: what its fill embeds for it only its unpublished state
+        // reads.
+        write(
+            &second_root,
+            "src/second.rs",
+            "pub fn second_only(items: &[u8]) -> usize {\n    items.len() * 3\n}\n",
+        );
+        second.record_paths(&[b"src/second.rs".to_vec()]).unwrap();
+        second.refresh_callgraph().unwrap();
+        let unpublished = fill(&second_plane, &mut Recorder::default(), 1);
+        assert!(unpublished.chunks_embedded >= 1, "{unpublished:?}");
+
+        let first_before = answers(&first_plane, &first);
+        let second_before = answers(&second_plane, &second);
+        assert!(first_before.iter().any(|rows| !rows.is_empty()));
+        for (plane, checkout) in [(&first_plane, &first), (&second_plane, &second)] {
+            let coverage = plane.coverage(&checkout.view().unwrap()).unwrap();
+            assert!(coverage.complete(), "before the merge: {coverage:?}");
+        }
+        let segments_before = vector_segment_count(&first);
+        let bound = first.bound_states();
+        let limits = MergeLimits {
+            grace: Duration::ZERO,
+            ..MergeLimits::default()
+        };
+        let merged =
+            merge_vector_segments(&first.vector_parts(), producer().model(), &bound, limits)
+                .unwrap()
+                .expect("merged");
+        assert!(merged.merged >= 2, "{merged:?}");
+        assert!(
+            merged.dropped_chunk_maps >= 1 && merged.dropped_vectors >= 1,
+            "the old content's map and vector leave: {merged:?}"
+        );
+        assert_eq!(
+            vector_segment_count(&first),
+            segments_before - merged.merged + 1,
+            "{merged:?}"
+        );
+
+        for (plane, checkout, before) in [
+            (&first_plane, &first, &first_before),
+            (&second_plane, &second, &second_before),
+        ] {
+            plane.refresh().unwrap();
+            assert_eq!(&answers(plane, checkout), before);
+            let coverage = plane.coverage(&checkout.view().unwrap()).unwrap();
+            assert!(coverage.complete(), "{coverage:?}");
+            // Nothing is embedded again.
+            let mut idle = Recorder::default();
+            fill(plane, &mut idle, 1);
+            assert!(idle.texts.is_empty(), "{:?}", idle.texts);
+        }
+    }
+
+    /// Past [`MERGE_AT`] vector segments, a fill round merges them, so a
+    /// fill one file per round leaves a bounded number, and its searches
+    /// answer as today's index does over the same vectors.
+    #[test]
+    fn a_fill_merges_vector_segments_past_the_limit() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        project(&root);
+        for index in 0..2 * MERGE_AT {
+            extra_file(&root, index, &format!("value ^ {index}"));
+        }
+        let checkout = bind(store.path(), &root);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000)
+            .with_merge_grace(Duration::ZERO);
+        let mut recorder = Recorder::default();
+        let report = fill(&plane, &mut recorder, 1);
+        assert!(report.segments_published > 2 * MERGE_AT, "{report:?}");
+        assert!(report.merges >= 1, "{report:?}");
+        assert!(
+            vector_segment_count(&checkout) <= MERGE_AT + 1,
+            "{report:?}: {}",
+            vector_segment_count(&checkout)
+        );
+
+        let view = checkout.view().unwrap();
+        let files: Vec<PathBuf> = view
+            .current_state()
+            .paths()
+            .iter()
+            .filter(|record| is_semantic_path(&record.path))
+            .map(|record| root.join(native_path(&record.path).unwrap()))
+            .collect();
+        let today = SemanticIndex::build(
+            &root,
+            &files,
+            &mut |texts| Recorder::default().embed(texts),
+            5,
+        )
+        .unwrap();
+        for query in queries() {
+            assert_eq!(
+                rows(
+                    &plane
+                        .search(&view, &query, 1000, &|_| true)
+                        .unwrap()
+                        .results
+                ),
+                rows(&today.search_filtered(&query, 1000, |_| true)),
+            );
         }
     }
 

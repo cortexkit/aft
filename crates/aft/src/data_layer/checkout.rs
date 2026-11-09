@@ -43,7 +43,7 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 mod engines;
 mod fold;
 
-pub use fold::{FoldReport, Folded};
+pub use fold::{FoldReport, Folded, OtherFoldReport};
 
 /// [`aft_store::scan::scan`]: every pass over the checkout's files goes
 /// through here, so tests can tell work that reads none.
@@ -242,6 +242,11 @@ pub struct DataLayer {
     /// Every checkout's call-graph engine, kept between refreshes until it
     /// falls idle or the engines together hold too much.
     engines: Arc<engines::EngineKeeper>,
+    /// Every checkout bound through this data layer, by its family's
+    /// folder: a merge of vector segments keeps what their current states
+    /// read, published or not. Entries of dropped checkouts are pruned as
+    /// checkouts are bound.
+    bound: Mutex<Vec<(PathBuf, std::sync::Weak<RwLock<Live>>)>>,
 }
 
 impl DataLayer {
@@ -254,6 +259,7 @@ impl DataLayer {
             threads: threads.max(1),
             policy: super::content::scan_policy(),
             engines: Arc::new(engines::EngineKeeper::new()),
+            bound: Mutex::new(Vec::new()),
         }
     }
 
@@ -310,8 +316,9 @@ pub struct Checkout {
     root: PathBuf,
     family: Family,
     checkout: CheckoutId,
-    /// The last published generation, and the changes made since.
-    live: RwLock<Live>,
+    /// The last published generation, and the changes made since. Shared
+    /// with the data layer's list of bound checkouts, which only reads it.
+    live: Arc<RwLock<Live>>,
     /// The call graph's incremental state, built from the publication on
     /// the first refresh and moved onto each publication of its changes;
     /// shared with the data layer, which lets it go once it falls idle or
@@ -870,6 +877,12 @@ impl Checkout {
     ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
+        let live = Arc::new(RwLock::new(Live::default()));
+        {
+            let mut bound = layer.bound.lock().expect("no panics while holding it");
+            bound.retain(|(_, live)| live.strong_count() > 0);
+            bound.push((family.dir().to_path_buf(), Arc::downgrade(&live)));
+        }
         let memory_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let engine = layer
             .engines
@@ -880,7 +893,7 @@ impl Checkout {
             root: root.to_path_buf(),
             family,
             checkout,
-            live: RwLock::new(Live::default()),
+            live,
             engine,
             recording: Mutex::new(()),
             memory_epoch,
@@ -2045,9 +2058,24 @@ impl Checkout {
     /// rule ([`super::vectors::needed_vector_segments`]), over every other
     /// checkout's state and `own`, since no new segment holds vectors.
     fn unneeded(&self, own: &CheckoutState, own_reads: bool) -> Result<Unneeded, DataError> {
+        self.unneeded_besides(self.checkout, own, own_reads, &[])
+    }
+
+    /// [`Self::unneeded`] for a publication of checkout `besides` with the
+    /// state `own`, which may be another checkout of the family than this
+    /// one (a fold on its behalf). The vector rule also keeps what the
+    /// states of `bound` read: checkouts bound in this process, whose
+    /// changes not yet published read vectors no published state names.
+    fn unneeded_besides(
+        &self,
+        besides: CheckoutId,
+        own: &CheckoutState,
+        own_reads: bool,
+        bound: &[CheckoutState],
+    ) -> Result<Unneeded, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        let (states, gone) = match self.other_states(&snapshot)? {
-            OtherStates::Read { states, gone } => (states, gone),
+        let (states, gone) = match self.states_besides(&snapshot, besides)? {
+            OtherStates::Read { states, gone, .. } => (states, gone),
             // A state this build cannot read could need any segment.
             OtherStates::Unreadable { gone } => {
                 return Ok(Unneeded {
@@ -2065,6 +2093,7 @@ impl Checkout {
         if !own_reads {
             readers.push(own);
         }
+        readers.extend(bound);
         let usable = read
             .usable
             .iter()
@@ -2106,17 +2135,17 @@ impl Checkout {
         snapshot: &Snapshot,
         states: &[&CheckoutState],
     ) -> Result<SegmentsRead, DataError> {
-        self.segments_read_noting(snapshot, states, |_, _| {})
+        self.segments_read_noting(snapshot, states, |_, _, _| {})
     }
 
     /// [`Self::segments_read_by`], also calling `note` with each unit a
-    /// member of `states` reads and the place in the manifest of the
-    /// segment it reads it from.
+    /// member of `states` reads: the member's place in `states`, the unit,
+    /// and the place in the manifest of the segment it reads it from.
     fn segments_read_noting(
         &self,
         snapshot: &Snapshot,
         states: &[&CheckoutState],
-        mut note: impl FnMut(ReadUnit, usize),
+        mut note: impl FnMut(usize, ReadUnit, usize),
     ) -> Result<SegmentsRead, DataError> {
         let known = known_sections();
         let entries = snapshot.manifest().segments().to_vec();
@@ -2156,13 +2185,13 @@ impl Checkout {
                 .collect::<Result<Vec<_>, _>>()?;
             let locator = TextLocator::build(&texts).map_err(DataError::store)?;
             let mut needs_unusable = false;
-            for state in states {
+            for (member, state) in states.iter().enumerate() {
                 for (position, record) in state.paths().iter().enumerate() {
                     match locator.get(record.content) {
                         Some(Located::Indexed { segment, .. }) => {
                             let holder = text_index[segment as usize];
                             needed[holder] = true;
-                            note(ReadUnit::Text(record.content), holder);
+                            note(member, ReadUnit::Text(record.content), holder);
                         }
                         Some(_) => {}
                         None if record.kind == PathKind::Text
@@ -2178,7 +2207,7 @@ impl Checkout {
                         match newest_holder(&contents, |content| content.find(key))? {
                             Some(holder) => {
                                 needed[usable[holder]] = true;
-                                note(ReadUnit::Record(key), usable[holder]);
+                                note(member, ReadUnit::Record(key), usable[holder]);
                             }
                             None => needs_unusable = true,
                         }
@@ -2188,7 +2217,7 @@ impl Checkout {
                         match newest_holder(&graphs, |graph| graph.find(key))? {
                             Some(holder) => {
                                 needed[usable[holder]] = true;
-                                note(ReadUnit::Fragment(key), usable[holder]);
+                                note(member, ReadUnit::Fragment(key), usable[holder]);
                             }
                             None => needs_unusable = true,
                         }
@@ -2214,17 +2243,58 @@ impl Checkout {
     /// The states of the family's other checkouts in `snapshot`, apart from
     /// those whose folder is gone, which are listed by id.
     fn other_states(&self, snapshot: &Snapshot) -> Result<OtherStates, DataError> {
+        self.states_besides(snapshot, self.checkout)
+    }
+
+    /// The current state of every checkout of this family bound through
+    /// this data layer, this one included: its publication's state with
+    /// the changes recorded since, which its views read whether published
+    /// or not. Taken before the store's writer, never under it.
+    pub(crate) fn bound_states(&self) -> Vec<CheckoutState> {
+        let lives = self
+            .layer
+            .bound
+            .lock()
+            .expect("no panics while holding it")
+            .iter()
+            .filter(|(dir, _)| dir == self.family.dir())
+            .filter_map(|(_, live)| live.upgrade())
+            .collect::<Vec<_>>();
+        lives
+            .iter()
+            .filter_map(|live| {
+                let live = live.read().expect("no panics while holding it");
+                live.state.as_deref().cloned().or_else(|| {
+                    live.published
+                        .as_ref()
+                        .map(|published| published.state.clone())
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::other_states`]: every checkout's state in `snapshot` but
+    /// that of `besides`.
+    fn states_besides(
+        &self,
+        snapshot: &Snapshot,
+        besides: CheckoutId,
+    ) -> Result<OtherStates, DataError> {
         let mut states = Vec::new();
+        let mut ids = Vec::new();
         let mut gone = Vec::new();
         for state_ref in snapshot.manifest().checkouts() {
-            if state_ref.checkout == self.checkout {
+            if state_ref.checkout == besides {
                 continue;
             }
             match snapshot.checkout_state(state_ref.checkout) {
                 Ok(Some(state)) if state.root().is_some_and(folder_is_gone) => {
                     gone.push(state_ref.checkout);
                 }
-                Ok(Some(state)) => states.push(state),
+                Ok(Some(state)) => {
+                    states.push(state);
+                    ids.push(state_ref.checkout);
+                }
                 Ok(None) => {}
                 // A state this build cannot read: an older format version,
                 // or damaged. One a newer build wrote is not among them: it
@@ -2236,14 +2306,23 @@ impl Checkout {
                 Err(error) => return Err(DataError::store(error)),
             }
         }
-        Ok(OtherStates::Read { states, gone })
+        Ok(OtherStates::Read { states, ids, gone })
     }
 
     /// The units the family's other checkouts read, each with the segment
     /// they read it from; `None` when another checkout's state cannot be
     /// read, since that state could read anything.
     fn read_by_others(&self, snapshot: &Snapshot) -> Result<Option<ReadByOthers>, DataError> {
-        let OtherStates::Read { states, .. } = self.other_states(snapshot)? else {
+        self.read_by_others_than(snapshot, self.checkout)
+    }
+
+    /// [`Self::read_by_others`] for the checkouts other than `besides`.
+    fn read_by_others_than(
+        &self,
+        snapshot: &Snapshot,
+        besides: CheckoutId,
+    ) -> Result<Option<ReadByOthers>, DataError> {
+        let OtherStates::Read { states, .. } = self.states_besides(snapshot, besides)? else {
             return Ok(None);
         };
         let mut read = ReadByOthers::default();
@@ -2251,7 +2330,7 @@ impl Checkout {
             return Ok(Some(read));
         }
         let others = states.iter().collect::<Vec<_>>();
-        self.segments_read_noting(snapshot, &others, |unit, holder| match unit {
+        self.segments_read_noting(snapshot, &others, |_, unit, holder| match unit {
             ReadUnit::Text(key) => {
                 read.text.insert(key, holder);
             }
@@ -4337,6 +4416,8 @@ impl ContentSink for ChangeSink {
 enum OtherStates {
     Read {
         states: Vec<CheckoutState>,
+        /// Each state's checkout, in the same order.
+        ids: Vec<CheckoutId>,
         gone: Vec<CheckoutId>,
     },
     /// One of them cannot be read: it could need any segment.
@@ -6605,6 +6686,165 @@ pub fn other() { callee(); }
         let restarted = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
         assert_eq!(restarted.changed_paths(), 0);
         assert_eq!(fold_answers(&restarted.view().unwrap(), rounds), before);
+    }
+
+    /// Publishes `rounds` rounds of changes to `checkout`, the fold tests'
+    /// crate at `root`: each edits a module and adds a module calling it,
+    /// so every round's segment stays read. Returns the last report.
+    fn publish_fold_rounds(checkout: &Checkout, root: &Path, rounds: usize) -> DeltaReport {
+        let mut added = Vec::new();
+        let mut report = None;
+        for round in 0..rounds {
+            let index = round % FOLD_MODULES;
+            added.push((round, index));
+            fold_lib(root, &added);
+            fold_module(root, index, &format!("pub fn r{round}() {{}}\n"));
+            checkout
+                .record_paths(&[
+                    b"src/lib.rs".to_vec(),
+                    format!("src/m{index}.rs").into_bytes(),
+                    format!("src/added{round}.rs").into_bytes(),
+                ])
+                .unwrap();
+            checkout.refresh_callgraph().unwrap();
+            report = checkout.publish_changes().unwrap();
+        }
+        report.expect("published")
+    }
+
+    /// A checkout folds its own segments only after it publishes, so one
+    /// that stopped publishing kept every segment it reads. Another
+    /// checkout's fold on its behalf folds them while it stays bound in the
+    /// same process, with its call-graph engine kept and a change of its own
+    /// recorded: it reads no file of that checkout, leaves fewer segments,
+    /// and that checkout, a view of it held across the fold, and its next
+    /// edit, publication, own fold and restart all answer as a cold build
+    /// of its files does. With nothing due, nothing is folded.
+    #[test]
+    fn a_checkout_that_stopped_publishing_is_folded_on_its_behalf() {
+        let idle_root = tempfile::tempdir().unwrap();
+        let busy_root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        fold_crate(idle_root.path(), &[]);
+        fold_crate(busy_root.path(), &[]);
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let idle =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), idle_root.path()).unwrap();
+        idle.build().unwrap();
+        let busy =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), busy_root.path()).unwrap();
+        busy.build().unwrap();
+        let rounds = COMPACT_AT + 1;
+        let report = publish_fold_rounds(&idle, idle_root.path(), rounds);
+        assert!(report.wants_fold(), "{report:?}");
+        // A change recorded and resolved, not published, so the engine is
+        // kept and the change laid over the publication.
+        write(
+            idle_root.path(),
+            "src/m3.rs",
+            "pub fn f3() { marker(); }\npub fn marker() {}\n",
+        );
+        idle.record_paths(&[b"src/m3.rs".to_vec()]).unwrap();
+        idle.refresh_callgraph().unwrap();
+        let held = idle.view().unwrap();
+        let before = fold_answers(&held, rounds);
+        assert!(before.iter().any(|answer| answer.contains("marker")));
+        let cold_answers = |rounds: usize| {
+            let cold_store = tempfile::tempdir().unwrap();
+            let cold = Checkout::bind(
+                Arc::clone(&layer),
+                cold_store.path(),
+                family(),
+                idle_root.path(),
+            )
+            .unwrap();
+            cold.build().unwrap();
+            fold_answers(&cold.view().unwrap(), rounds)
+        };
+        assert_eq!(cold_answers(rounds), before);
+
+        // The other checkout publishes a change of its own, which calls for
+        // no fold of its own.
+        write(busy_root.path(), "notes.txt", "busy here\n");
+        busy.record_paths(&[b"notes.txt".to_vec()]).unwrap();
+        busy.refresh_callgraph().unwrap();
+        let own = busy.publish_changes().unwrap().expect("published");
+        assert!(!own.wants_fold(), "{own:?}");
+        let segments_before = live_segments(&busy);
+        let work = source_work_for_test(idle_root.path());
+        let other = busy.fold_other().unwrap();
+        assert_eq!(
+            source_work_for_test(idle_root.path()),
+            work,
+            "a fold on its behalf reads no file of the checkout"
+        );
+        assert_eq!(other.examined, 1, "{other:?}");
+        assert_eq!(
+            other
+                .root
+                .as_deref()
+                .map(|root| std::fs::canonicalize(root).unwrap()),
+            Some(std::fs::canonicalize(idle_root.path()).unwrap()),
+            "{other:?}"
+        );
+        assert!(other.own_segments > COMPACT_AT, "{other:?}");
+        assert_eq!(other.skipped, None);
+        let fold = other.fold.clone().expect("folded");
+        assert!(fold.retired_segments >= COMPACT_AT, "{other:?}");
+        assert!(live_segments(&busy) < segments_before, "{other:?}");
+
+        // A later publication reclaims what the fold retired; the held view
+        // and the publication the idle checkout serves keep reading the
+        // generation their lease holds.
+        write(busy_root.path(), "notes.txt", "busy again\n");
+        busy.record_paths(&[b"notes.txt".to_vec()]).unwrap();
+        busy.refresh_callgraph().unwrap();
+        busy.publish_changes().unwrap().expect("published");
+        assert_eq!(fold_answers(&held, rounds), before);
+        assert_eq!(fold_answers(&idle.view().unwrap(), rounds), before);
+        drop(held);
+
+        // Edited again and queried, it answers as a cold build of its files.
+        write(
+            idle_root.path(),
+            "src/m2.rs",
+            "pub fn f2() { crate::m3::f3(); marker_two(); }\npub fn marker_two() {}\n",
+        );
+        idle.record_paths(&[b"src/m2.rs".to_vec()]).unwrap();
+        idle.refresh_callgraph().unwrap();
+        let edited = fold_answers(&idle.view().unwrap(), rounds);
+        assert_ne!(edited, before);
+        assert_eq!(edited, cold_answers(rounds));
+        // Its own next publication and its own fold work over the fold.
+        idle.publish_changes().unwrap().expect("published");
+        assert_eq!(fold_answers(&idle.view().unwrap(), rounds), edited);
+        let Folded::Done(_) = idle.fold().unwrap() else {
+            panic!("the idle checkout's own fold did not finish");
+        };
+        assert_eq!(fold_answers(&idle.view().unwrap(), rounds), edited);
+        drop(idle);
+        let restarted =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), idle_root.path()).unwrap();
+        assert_eq!(restarted.changed_paths(), 0);
+        assert_eq!(fold_answers(&restarted.view().unwrap(), rounds), edited);
+
+        // The other checkout answers as a cold build of its own files, and
+        // with nothing due now, it folds nothing.
+        let busy_cold_store = tempfile::tempdir().unwrap();
+        let busy_cold = Checkout::bind(
+            Arc::clone(&layer),
+            busy_cold_store.path(),
+            family(),
+            busy_root.path(),
+        )
+        .unwrap();
+        busy_cold.build().unwrap();
+        assert_eq!(
+            fold_answers(&busy.view().unwrap(), 0),
+            fold_answers(&busy_cold.view().unwrap(), 0)
+        );
+        let none = busy.fold_other().unwrap();
+        assert!(none.root.is_none() && none.fold.is_none(), "{none:?}");
     }
 
     /// One checkout of the repository the store-growth test replays: its

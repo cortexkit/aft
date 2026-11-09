@@ -19,20 +19,22 @@
 //! build would leave and the checkout answers as it did before.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use aft_store::cache::BlockCache;
+use aft_store::checkout::CheckoutState;
 use aft_store::content::{ContentSegment, RecordKey};
-use aft_store::family::{Publication, Snapshot};
+use aft_store::family::{Publication, Snapshot, WriteSession};
 use aft_store::graph::{FragmentKey, GraphSegment};
-use aft_store::ids::ContentKey;
+use aft_store::ids::{CheckoutId, ContentKey, SegmentId};
 use aft_store::segment::Segment;
 use aft_store::text::{Located, TextCopy, TextLocator, TextSegment};
 
 use super::{
-    checkpoint, elapsed_ms, known_sections, Checkout, DataError, Published, ReadByOthers, ReadUnit,
-    SharedUnits, EXTRACTOR_VERSION,
+    checkpoint, elapsed_ms, known_sections, Checkout, DataError, OtherStates, Planes, Published,
+    ReadByOthers, ReadUnit, SharedUnits, COMPACT_AT, EXTRACTOR_VERSION, READ_AT,
 };
 
 /// What folding a checkout's segments did.
@@ -74,6 +76,31 @@ pub enum Folded {
     /// names cannot be found or copied. Nothing was written; a whole build
     /// is needed, and this says why.
     NeedsBuild(String),
+}
+
+/// What [`Checkout::fold_other`] did: which other checkout of the family it
+/// found due a fold, and the fold it ran on that checkout's behalf.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct OtherFoldReport {
+    /// Other checkouts whose counts it examined: every checkout of the
+    /// newest generation but this one and those whose folder is gone.
+    pub examined: usize,
+    /// The checkout it folded, by its root folder (`None` when none was
+    /// due, or its root was not recorded).
+    pub root: Option<PathBuf>,
+    /// That checkout's counts before the fold, as a publication of its
+    /// changes reports them: segments its text, content and call graph
+    /// read that no other checkout reads, and all it reads.
+    pub own_segments: usize,
+    pub read_segments: usize,
+    /// The fold, when one ran.
+    pub fold: Option<FoldReport>,
+    /// Why the due checkout could not be folded from what the store holds;
+    /// nothing was written. Its next build or publication writes it again.
+    pub skipped: Option<String>,
+    /// Milliseconds spent finding the checkout, and in all.
+    pub examine_ms: f64,
+    pub ms: f64,
 }
 
 /// The block cache a fold copies through (see [`Checkout::fold`]). Each
@@ -185,6 +212,42 @@ impl Checkout {
             self.adopt_newest()?;
             return Ok(Folded::Superseded);
         }
+        let (_, mut report) = match self.fold_state(
+            &mut session,
+            &snapshot,
+            self.checkout,
+            &published.state,
+            self.planes,
+            &[],
+        )? {
+            Ok(done) => done,
+            Err(why) => return Ok(Folded::NeedsBuild(why)),
+        };
+        drop(session);
+        drop(snapshot);
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        self.serve_folded(snapshot, &published)?;
+        report.ms = elapsed_ms(started);
+        Ok(Folded::Done(report))
+    }
+
+    /// Folds the segments `state`, the published state of `checkout` in
+    /// `snapshot`, reads into one new segment, and publishes it with what
+    /// no checkout reads any more left out, under `session`, which the
+    /// caller holds over `snapshot`. `checkout` may be this checkout or
+    /// another one of the family ([`Self::fold_other`]); the state stays
+    /// the one published either way. Vector segments the states of `bound`
+    /// read stay too (see [`Self::unneeded_besides`]). `Err` says why the
+    /// store cannot give what the fold needs; nothing is published then.
+    fn fold_state(
+        &self,
+        session: &mut WriteSession<'_>,
+        snapshot: &Snapshot,
+        checkout: CheckoutId,
+        state: &CheckoutState,
+        planes: Planes,
+        bound: &[CheckoutState],
+    ) -> Result<Result<(SegmentId, FoldReport), String>, DataError> {
         let known = known_sections();
         // What the fold reads it reads once, in order, so it reads through a
         // small cache of its own: through the block cache every checkout
@@ -197,34 +260,30 @@ impl Checkout {
             match snapshot.open_segment(entry.id, &known, Arc::clone(&copying)) {
                 Ok(segment) => segments.push(Arc::new(segment)),
                 Err(error) if error.is_unusable_file() => {
-                    return Ok(Folded::NeedsBuild(format!(
-                        "a segment this build cannot read: {error}"
-                    )));
+                    return Ok(Err(format!("a segment this build cannot read: {error}")));
                 }
                 Err(error) => return Err(DataError::store(error)),
             }
         }
-        let mut plan = match self.plan(&published, &segments)? {
+        let mut plan = match self.plan(state, planes, &segments)? {
             Ok(plan) => plan,
-            Err(why) => return Ok(Folded::NeedsBuild(why)),
+            Err(why) => return Ok(Err(why)),
         };
         let read_before = plan.holders().len();
-        let shared = self.share_from(&snapshot, &mut plan)?;
+        let shared = self.share_from(snapshot, checkout, &mut plan)?;
         checkpoint()?;
 
         let mut pending = session.create_segment().map_err(DataError::store)?;
         if let Err(error) = write(pending.writer(), &segments, &plan) {
             return match DataError::store(error) {
                 refused @ DataError::NewerFormat(_) => Err(refused),
-                error => Ok(Folded::NeedsBuild(format!(
-                    "a stored unit could not be copied: {error}"
-                ))),
+                error => Ok(Err(format!("a stored unit could not be copied: {error}"))),
             };
         }
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         // The new segment holds everything the state reads that other
         // checkouts do not read from where it shares, as a build's does.
-        let unneeded = self.unneeded(&published.state, false)?;
+        let unneeded = self.unneeded_besides(checkout, state, false, bound)?;
         let mut report = FoldReport {
             text_units: plan.text.len(),
             records: plan.records.len(),
@@ -245,6 +304,7 @@ impl Checkout {
                 retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        report.segment_bytes = session.base().segment(segment).map_or(0, |entry| entry.len);
         // As after a build: a view still reading the older generation holds
         // a lease on it, so its files stay until the view drops.
         match session.reclaim() {
@@ -255,32 +315,126 @@ impl Checkout {
             }
             Err(error) => report.reclaim_error = Some(error.to_string()),
         }
-        drop(session);
-        drop(segments);
-        drop(snapshot);
-        let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        report.segment_bytes = snapshot
-            .manifest()
-            .segment(segment)
-            .map_or(0, |entry| entry.len);
-        self.serve_folded(snapshot, &published)?;
-        report.ms = elapsed_ms(started);
-        Ok(Folded::Done(report))
+        Ok(Ok((segment, report)))
     }
 
-    /// Every unit `published`'s state reads, from the newest of `segments`
-    /// (the generation's, in manifest order) that holds it. `Err` names a
-    /// fragment the state names that no segment holds: only a build can
-    /// write it again. A text unit or content record no segment holds is
-    /// one the publication serves without, and so does the fold.
+    /// Folds, on its behalf, the one other checkout of the family that
+    /// reads from the most segments no other checkout reads, when its
+    /// counts call for a fold by the rule its own publications follow
+    /// ([`super::DeltaReport::wants_fold`]). A checkout folds itself only
+    /// after publishing its changes, so one that stopped publishing (a
+    /// worktree left idle with its folder still there) never did, and kept
+    /// every segment it reads, many written by other checkouts that have
+    /// since moved on, for the few units it still reads from each.
+    ///
+    /// The fold runs as [`Self::fold`] does, under the same writer, over
+    /// that checkout's published state, and publishes no state: the other
+    /// checkout keeps its state and reads its units from the new segment,
+    /// the newest that holds them. One bound in a process (this one or
+    /// another) keeps serving the generation it holds, whose files its
+    /// lease keeps on disk, until it next publishes. At most one checkout is
+    /// folded per call.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read or written, or a newer build wrote a
+    /// file it names. Nothing is published then.
+    pub fn fold_other(&self) -> Result<OtherFoldReport, DataError> {
+        let _alloc_label =
+            crate::alloc_trace::scope(crate::alloc_trace::Label::SEGMENT_FOLD, Some(self.root()));
+        let started = Instant::now();
+        let mut report = OtherFoldReport::default();
+        self.family.check_formats().map_err(DataError::store)?;
+        self.check_disk_floor()?;
+        checkpoint()?;
+        // What checkouts bound here read now, published or not, read
+        // before the writer is held.
+        let bound = self.bound_states();
+        let mut session = self.writer()?;
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        // A state this build cannot read could read any segment: nothing
+        // can be counted then.
+        let OtherStates::Read {
+            mut states,
+            mut ids,
+            ..
+        } = self.other_states(&snapshot)?
+        else {
+            return Ok(report);
+        };
+        let candidates = states.len();
+        report.examined = candidates;
+        // This checkout reads too, from its published state.
+        match snapshot.checkout_state(self.checkout) {
+            Ok(Some(own)) => {
+                states.push(own);
+                ids.push(self.checkout);
+            }
+            Ok(None) => {}
+            Err(error) if error.is_unusable_file() => return Ok(report),
+            Err(error) => return Err(DataError::store(error)),
+        }
+        let members = states.iter().collect::<Vec<_>>();
+        let mut reads = vec![BTreeSet::new(); members.len()];
+        self.segments_read_noting(&snapshot, &members, |member, _, holder| {
+            reads[member].insert(holder);
+        })?;
+        // Each candidate's counts as its own publication reports them, and
+        // of those due a fold, the one with the most segments only it reads.
+        let due = (0..candidates)
+            .map(|member| {
+                let others = reads
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != member)
+                    .flat_map(|(_, read)| read.iter().copied())
+                    .collect::<HashSet<_>>();
+                let own = reads[member]
+                    .iter()
+                    .filter(|place| !others.contains(place))
+                    .count();
+                (member, own, reads[member].len())
+            })
+            .filter(|(_, own, read)| *own > COMPACT_AT || *read > READ_AT)
+            .max_by_key(|(member, own, read)| (*own, *read, std::cmp::Reverse(*member)));
+        report.examine_ms = elapsed_ms(started);
+        let Some((member, own, read)) = due else {
+            report.ms = report.examine_ms;
+            return Ok(report);
+        };
+        report.root = states[member].root().map(std::path::Path::to_path_buf);
+        report.own_segments = own;
+        report.read_segments = read;
+        checkpoint()?;
+        match self.fold_state(
+            &mut session,
+            &snapshot,
+            ids[member],
+            &states[member],
+            Planes::ALL,
+            &bound,
+        )? {
+            Ok((_, fold)) => report.fold = Some(fold),
+            Err(why) => report.skipped = Some(why),
+        }
+        report.ms = elapsed_ms(started);
+        Ok(report)
+    }
+
+    /// Every unit `state` reads in the planes `planes` serves, from the
+    /// newest of `segments` (the generation's, in manifest order) that holds
+    /// it. `Err` names a fragment the state names that no segment holds:
+    /// only a build can write it again. A text unit or content record no
+    /// segment holds is one the publication serves without, and so does the
+    /// fold.
     fn plan(
         &self,
-        published: &Published,
+        state: &CheckoutState,
+        planes: Planes,
         segments: &[Arc<Segment>],
     ) -> Result<Result<Plan, String>, DataError> {
         let mut plan = Plan::default();
-        let state = &published.state;
-        if self.planes.text {
+        if planes.text {
             // TextLocator numbers only the segments with a text section.
             let mut places = Vec::new();
             let mut texts = Vec::new();
@@ -304,7 +458,7 @@ impl Checkout {
                 plan.text.insert(record.content, copy);
             }
         }
-        if !self.planes.callgraph {
+        if !planes.callgraph {
             return Ok(Ok(plan));
         }
         let contents = segments
@@ -340,11 +494,16 @@ impl Checkout {
         Ok(Ok(plan))
     }
 
-    /// Leaves out of `plan` what other checkouts read from the segments a
-    /// build of this checkout would share from (see
-    /// [`Self::leave_out_shared`]).
-    fn share_from(&self, snapshot: &Snapshot, plan: &mut Plan) -> Result<SharedUnits, DataError> {
-        let Some(read) = self.read_by_others(snapshot)? else {
+    /// Leaves out of `plan`, the units of checkout `checkout`, what the
+    /// family's other checkouts read from the segments a build of it would
+    /// share from (see [`Self::leave_out_shared`]).
+    fn share_from(
+        &self,
+        snapshot: &Snapshot,
+        checkout: CheckoutId,
+        plan: &mut Plan,
+    ) -> Result<SharedUnits, DataError> {
+        let Some(read) = self.read_by_others_than(snapshot, checkout)? else {
             return Ok(SharedUnits::default());
         };
         let kept = shared_holders(&read, plan.units());

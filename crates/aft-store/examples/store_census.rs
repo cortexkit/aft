@@ -356,7 +356,17 @@ fn main() {
         "extractor version: {extractor}; idle past {idle_hours} h; now {}",
         utc(now_ms)
     );
-
+    // With AFT_CENSUS_RECLAIM=1, first removes what nothing can read any
+    // more, as the next publication's reclamation would: for a copy whose
+    // last writer left files that its readers' leases held then.
+    if std::env::var("AFT_CENSUS_RECLAIM").is_ok_and(|value| value == "1") {
+        let family = Family::open(&dir, family_id).unwrap();
+        let mut session = family
+            .try_write()
+            .unwrap()
+            .expect("no writer holds the copy");
+        println!("reclaimed first: {:?}", session.reclaim().unwrap());
+    }
     // Manifests, horizon and leases, as files.
     println!("\n## manifests, horizon, leases");
     let manifests = numbered(&dir, "MANIFEST-")

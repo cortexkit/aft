@@ -553,11 +553,74 @@ impl Work {
     }
 
     /// Folds the checkout's segments when a publication of its changes left
-    /// it reading from too many.
+    /// it reading from too many, and otherwise looks for another checkout
+    /// of the family that is due a fold and has not published to get one
+    /// (see [`Checkout::fold_other`]): at most one fold per publication.
     fn after_publish(self: &Arc<Self>, report: &DeltaReport) {
         if report.wants_fold() {
             self.start_fold();
+        } else {
+            self.start_fold_other();
         }
+    }
+
+    /// Folds, on its behalf, the other checkout of the family most due a
+    /// fold, unless a fold of this root is queued or running already. It
+    /// runs in the build pool and takes the store's writer as a fold does.
+    fn start_fold_other(self: &Arc<Self>) {
+        if self.folding.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.folding));
+        let work = Arc::clone(self);
+        self.runner.run(FOLD_REQUEST, Pool::Build, move || {
+            if work.building.load(Ordering::Acquire) {
+                return;
+            }
+            let result = work.checkout.fold_other();
+            drop(flag);
+            match result {
+                Ok(report) => match (&report.fold, &report.skipped) {
+                    (Some(fold), _) => crate::slog_info!(
+                        "data layer folded {} on behalf of {}: examined {} checkouts in {:.0} ms; it read {} segments only it reads, {} in all; {} segments into one of {} bytes ({} text units, {} records, {} fragments; shared with other checkouts: {} text units, {} records, {} fragments; {} retired), {:.0} ms",
+                        report.root.as_deref().unwrap_or(std::path::Path::new("?")).display(),
+                        work.checkout.root().display(),
+                        report.examined,
+                        report.examine_ms,
+                        report.own_segments,
+                        report.read_segments,
+                        fold.read_before,
+                        fold.segment_bytes,
+                        fold.text_units,
+                        fold.records,
+                        fold.fragments,
+                        fold.shared.text_units,
+                        fold.shared.records,
+                        fold.shared.fragments,
+                        fold.retired_segments,
+                        report.ms
+                    ),
+                    (None, Some(why)) => crate::slog_info!(
+                        "data layer cannot fold {} on behalf of {} ({why}); examined {} checkouts in {:.0} ms",
+                        report.root.as_deref().unwrap_or(std::path::Path::new("?")).display(),
+                        work.checkout.root().display(),
+                        report.examined,
+                        report.examine_ms
+                    ),
+                    (None, None) => crate::slog_debug!(
+                        "data layer: no other checkout of {} is due a fold; examined {} checkouts in {:.0} ms",
+                        work.checkout.root().display(),
+                        report.examined,
+                        report.examine_ms
+                    ),
+                },
+                Err(DataError::Cancelled) => {}
+                Err(error) => crate::slog_warn!(
+                    "data layer could not fold another checkout on behalf of {}: {error}",
+                    work.checkout.root().display()
+                ),
+            }
+        });
     }
 
     /// Folds the segments the checkout reads into one, unless a fold is
