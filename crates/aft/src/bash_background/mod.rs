@@ -975,7 +975,9 @@ pub(crate) fn powershell_available() -> bool {
     static LAST: std::sync::Mutex<Option<(Option<std::ffi::OsString>, bool)>> =
         std::sync::Mutex::new(None);
     let path = std::env::var_os("PATH");
-    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((seen, available)) = last.as_ref() {
         if *seen == path {
             return *available;
