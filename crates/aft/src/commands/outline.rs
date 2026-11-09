@@ -4157,7 +4157,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
 
         // This module's own source: many nodes, few traits.
         let own = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/outline.rs"),
+            crate::test_support::manifest_dir().join("src/commands/outline.rs"),
         )
         .unwrap();
         assert_eq!(trait_previews_of(&own).0, recursive_previews_of(&own));
@@ -4196,7 +4196,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     fn trait_preview_walk_cost_on_a_source_tree() {
         let root = std::env::var_os("AFT_TRAIT_WALK_ROOT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+            .unwrap_or_else(|| crate::test_support::manifest_dir().join("../.."));
         let mut pending = vec![root];
         let mut files = Vec::new();
         while let Some(dir) = pending.pop() {
