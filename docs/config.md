@@ -679,6 +679,10 @@ Whole-line `runon` additionally requires `bash.runon_enabled: true` in the user 
 
 Both keys are honored only in user config. A project config may set `remote_exec.enabled: false` to turn remote runs off for that project, and then a `runon` call there is refused with `remote runs are off for this project`; a project value of `true`, or any `default_demand`, is ignored with a warning. Whether `runon` is offered is decided when the session starts, so a change takes effect after a restart. Broca workers take the same two fields from their plan's `remote_exec` item instead of this config; an older plan's `remote_exec.commands` list is accepted and ignored.
 
+## Saved folder access
+
+When an agent's tool reaches a folder outside what its session may use, AFT asks you through a folder-access card in the CortexKit apps. An answer you save there is kept for that agent or worker until its session ends. Under the daemon, the apps' Permissions pages list these saved answers (one row per folder per agent or worker) and can revoke them. A revoke takes effect at once: the next tool call asks again, and shell commands still running with that folder in their sandbox are stopped and end as `killed (folder access revoked)`. Commands running on a build server (`runon`) work on a copy of the checkout outside this machine's sandbox and are not stopped. Grants saved before AFT recorded grant times show the time of the upgrade instead.
+
 ## Native command sandbox
 
 `sandbox.profile` selects a shell profile by authenticated session role. Put user choices in `~/.config/cortexkit/aft.jsonc` (or the absolute XDG config location):

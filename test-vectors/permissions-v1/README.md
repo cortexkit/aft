@@ -33,13 +33,16 @@ Head agent `agent-alf` owns worker scope `scope:wkr-7f3a`.
   the page shows; `subject_label` is the path with the home folder as `~`.
 - No `expires_at_ms`, `group` or `methods`: a saved answer lasts until it is
   revoked or the holder's scope ends, and then the row is no longer listed.
-- `card_ref`: the elicitation id of the card whose answer saved the grant, when
-  there was one. Grants saved before AFT recorded it (aft.db schema 27) have
+- `card_ref`: the id of the Cingulate card whose answer saved the grant (for
+  AFT, an access ask `acc_…`), when there was one; a grant from a worker's
+  launch plan has none. Grants saved before AFT recorded it (aft.db schema 27) have
   none and show the upgrade time as `granted_at_ms`.
 
 `permissions.revoke {id}` answers `{outcome: "revoked"}`, adds `stopping: true`
 when shell commands whose sandbox allowed that folder were still running (AFT
 stops them; they end as "killed (folder access revoked)"), and answers
-`{outcome: "not_found"}` for an unknown, ended or already revoked id. Only
+`{outcome: "not_found"}` for an unknown, ended or already revoked id. Commands
+running on a build server (`runon`) are outside this machine's sandbox and are
+not stopped. Only
 `reserved:cingulate` and the local `direct` route are admitted; every other
 caller gets `permissions_operator_required`.
