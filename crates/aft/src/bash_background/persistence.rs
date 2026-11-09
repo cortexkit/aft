@@ -7010,7 +7010,8 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("artifact open work: {counts:?}");
         assert_eq!(counts.metadata_reads, 1);
-        assert_eq!(counts.parses, 2);
+        // Pin the read cost: version validation shares the typed task decode.
+        assert_eq!(counts.parses, 1);
         #[cfg(unix)]
         assert_eq!(counts.opens, 7);
     }
@@ -7078,7 +7079,8 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("missing marker work: {counts:?}");
         assert_eq!(counts.metadata_reads, 1);
-        assert_eq!(counts.parses, 2);
+        // A missing marker still needs only one typed metadata decode.
+        assert_eq!(counts.parses, 1);
     }
 
     #[cfg(unix)]
