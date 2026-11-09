@@ -60,7 +60,6 @@ search_b2/         `aft_search` query router, lane plans, token variants, readin
 secret/            Secret vault seam and its consent adapter
 secret_proxy/      Command-private proxy that releases resolved secrets to one command
 subc/              Subc daemon edge: binds, trust, tool-provider role, scopes, code mode, consent, push, drain, health
-views/             Manifest path types and parent-folder sessions
 watcher/           Project file watcher
 watcher_backend/   Native watcher backends (FSEvents, inotify, Windows)
 ```

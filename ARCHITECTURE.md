@@ -130,7 +130,7 @@ with cold builds. `aft_search` blends lexical and meaning lanes
 (`synapse_embed.rs`, chunking in `semantic_index.rs`). A plane that is still
 building says so: `grep` and `glob` walk the folder until text is ready, and
 call-graph tools answer "building" rather than from an old graph.
-Parent-folder sessions (`views/parent.rs`) answer from each child
+Parent-folder sessions (`data_layer/parent_session/`) answer from each child
 repository's checkout. User-configured standing roots (`index.roots`,
 `standing_roots.rs`, `scoped_key.rs`) are indexed by the subc standing actor
 independent of sessions.
@@ -282,7 +282,7 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Text search | `grep_executor.rs`, `data_layer/tools/grep.rs` |
 | Semantic search | `commands/semantic_search/`, `search_b2/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs` |
 | Call graph | `callgraph_store/` (resolver), `data_layer/callgraph.rs`, `callgraph.rs`, `calls.rs` |
-| Parent-folder sessions | `views/parent.rs`, `data_layer/parent.rs` |
+| Parent-folder sessions | `data_layer/parent_session/`, `data_layer/parent.rs` |
 | Standing roots | `standing_roots.rs`, `scoped_key.rs`, `subc/standing.rs`, `db/standing_roots.rs` |
 | Parsing and symbols | `parser.rs`, `symbols.rs`, `symbol_cache_disk.rs`, `language.rs`, `imports/` |
 | Edit, patch, hashline | `edit.rs`, `format.rs`, `patch/`, `hashline/`, `fuzzy_match.rs` |
