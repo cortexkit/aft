@@ -2,7 +2,7 @@ use super::*;
 use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
 use crate::config::Config;
 use crate::subc::permissions;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::Path;
 use subc_protocol::scope::ScopeStatus;
 

@@ -15,6 +15,7 @@
         "module": "aft",
         "scope": "read_write",
         "scope_label": "read and change files in ~/Work/site",
+        "source": "person",
         "subject_label": "~/Work/site"
       },
       {
@@ -30,10 +31,12 @@
         "module": "aft",
         "scope": "read",
         "scope_label": "read files in ~/Work/notes",
+        "source": "head_grant",
         "subject_label": "~/Work/notes"
       },
       {
         "agent_id": "agent-alf",
+        "granted_at_bound": "at_or_before",
         "granted_at_ms": 1000000,
         "holder": {
           "agent_id": "agent-alf",
@@ -44,7 +47,23 @@
         "module": "aft",
         "scope": "file_read",
         "scope_label": "read the file ~/Work/ref/spec.md",
+        "source": "unknown",
         "subject_label": "~/Work/ref/spec.md"
+      },
+      {
+        "agent_id": "agent-alf",
+        "granted_at_ms": 1000000,
+        "holder": {
+          "agent_id": "agent-alf",
+          "kind": "worker",
+          "scope_ref": "scope:wkr-7f3a"
+        },
+        "id": "aftg_000000000000000000000004",
+        "module": "aft",
+        "scope": "read",
+        "scope_label": "read files in ~/Work/tools",
+        "source": "head_policy",
+        "subject_label": "~/Work/tools"
       }
     ]
   },

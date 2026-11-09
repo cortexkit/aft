@@ -15,9 +15,10 @@ Head agent `agent-alf` owns worker scope `scope:wkr-7f3a`.
 
 | id | holder | what | how it was saved |
 |---|---|---|---|
-| `aftg_…01` | agent `agent-alf` | read and change `~/Work/site` | card `acc_1` |
-| `aftg_…02` | worker `scope:wkr-7f3a` of `agent-alf` | read `~/Work/notes` | card `acc_2` |
-| `aftg_…03` | worker `scope:wkr-7f3a` of `agent-alf` | read the file `~/Work/ref/spec.md` | the worker's launch plan, so no `card_ref` |
+| `aftg_…01` | agent `agent-alf` | read and change `~/Work/site` | person answer on card `acc_1` |
+| `aftg_…02` | worker `scope:wkr-7f3a` of `agent-alf` | read `~/Work/notes` | head delegates a person-given grant, card `acc_2` |
+| `aftg_…03` | worker `scope:wkr-7f3a` of `agent-alf` | read the file `~/Work/ref/spec.md` | legacy unknown source and upper-bound time |
+| `aftg_…04` | worker `scope:wkr-7f3a` of `agent-alf` | read `~/Work/tools` | head delegates its default policy |
 
 ## AFT's rows
 
@@ -37,6 +38,20 @@ Head agent `agent-alf` owns worker scope `scope:wkr-7f3a`.
   AFT, an access ask `acc_…`), when there was one; a grant from a worker's
   launch plan has none. Grants saved before AFT recorded it (aft.db schema 27) have
   none and show the upgrade time as `granted_at_ms`.
+- `source`: `person`, `head_grant`, `head_policy` or `unknown`; all live grants
+  remain visible and revocable regardless of source. Readers treat unrecognized
+  source values as `unknown`.
+- `granted_at_ms` is always present. Legacy rows without a recorded source or
+  card carry `granted_at_bound: "at_or_before"`: the stored time is an upper
+  bound, not an exact grant time. Card-linked legacy times remain exact.
+
+`provider-list-grant-sources.json` and `.jcs` are copied unchanged from
+Cingulate tag `permissions-grant-sources-v1`, commit
+`9d673921553cbd29d2813b4441d4cbcda47d4286`. The unit test
+`permissions_list_matches_published_grant_sources_sample` checks both SHA256s
+and pins the shared fields; Cingulate's app-specific fields are replaced by
+separate assertions on AFT's folder fields. AFT's own sample above pins the
+complete AFT reply, including provenance and time bounds.
 
 `permissions.revoke {id}` answers `{outcome: "revoked"}`, adds `stopping: true`
 when shell commands whose sandbox allowed that folder were still running (AFT

@@ -1,0 +1,75 @@
+{
+  "method": "permissions.list",
+  "now_ms": 1060000,
+  "reply": {
+    "grants": [
+      {
+        "agent_id": "agent-cedar",
+        "card_ref": "el_src_1",
+        "granted_at_ms": 1000000,
+        "holder": {
+          "agent_id": "agent-cedar",
+          "kind": "worker",
+          "scope_ref": "scope:wkr-cedar"
+        },
+        "id": "grt_src_01",
+        "module": "cerebellum",
+        "scope": "app",
+        "scope_label": "the app Preview",
+        "source": "person",
+        "subject_label": "Preview"
+      },
+      {
+        "agent_id": "agent-cedar",
+        "granted_at_ms": 1020000,
+        "holder": {
+          "agent_id": "agent-cedar",
+          "kind": "worker",
+          "scope_ref": "scope:wkr-cedar"
+        },
+        "id": "grt_src_02",
+        "module": "cerebellum",
+        "scope": "app",
+        "scope_label": "the app TextEdit",
+        "source": "head_grant",
+        "subject_label": "TextEdit"
+      },
+      {
+        "agent_id": "agent-cedar",
+        "granted_at_ms": 1040000,
+        "holder": {
+          "agent_id": "agent-cedar",
+          "kind": "worker",
+          "scope_ref": "scope:wkr-cedar"
+        },
+        "id": "grt_src_03",
+        "module": "cerebellum",
+        "scope": "app",
+        "scope_label": "the app Notes",
+        "source": "head_policy",
+        "subject_label": "Notes"
+      },
+      {
+        "agent_id": "agent-cedar",
+        "granted_at_bound": "at_or_before",
+        "granted_at_ms": 940000,
+        "holder": {
+          "agent_id": "agent-cedar",
+          "kind": "worker",
+          "scope_ref": "scope:wkr-cedar"
+        },
+        "id": "grt_src_04",
+        "module": "cerebellum",
+        "scope": "app",
+        "scope_label": "the app Mail",
+        "source": "unknown",
+        "subject_label": "Mail"
+      }
+    ]
+  },
+  "request": {},
+  "route": {
+    "principal": "reserved:cingulate"
+  },
+  "tag": "permissions-v1"
+}

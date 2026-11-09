@@ -424,12 +424,13 @@ fn permissions_subject_labels_show_home_as_tilde() {
 
 /// The published sample of AFT's `permissions/v1` rows
 /// (`test-vectors/permissions-v1/aft-provider-list.json`): `permissions.list`
-/// from this handler for an agent grant and two worker grants (one saved from
-/// a card, one from the worker's launch plan, which has no card). Ids and
-/// times are pinned in the database so the reply is reproducible.
+/// from this handler for an agent grant and three worker grants, covering all
+/// recorded sources and a legacy grant with an upper-bound time. Ids and times
+/// are pinned in the database so the reply is reproducible.
 #[cfg(unix)]
 #[test]
 fn permissions_list_matches_the_published_sample() {
+    use crate::db::access_grant_rows::GrantSource;
     let sample: Value = serde_json::from_str(include_str!(
         "../../../../test-vectors/permissions-v1/aft-provider-list.json"
     ))
@@ -439,13 +440,14 @@ fn permissions_list_matches_the_published_sample() {
     let home = PathBuf::from("/Users/person");
     {
         let conn = db.lock().unwrap();
-        for (scope, path, kind, operation, card) in [
+        for (scope, path, kind, operation, card, source) in [
             (
                 head(),
                 "Work/site",
                 GrantKind::Subtree,
                 AccessOperation::Write,
                 Some("acc_1"),
+                Some(GrantSource::Person),
             ),
             (
                 worker(),
@@ -453,6 +455,7 @@ fn permissions_list_matches_the_published_sample() {
                 GrantKind::Subtree,
                 AccessOperation::Read,
                 Some("acc_2"),
+                Some(GrantSource::HeadGrant),
             ),
             (
                 worker(),
@@ -460,17 +463,27 @@ fn permissions_list_matches_the_published_sample() {
                 GrantKind::File,
                 AccessOperation::Read,
                 None,
+                None,
+            ),
+            (
+                worker(),
+                "Work/tools",
+                GrantKind::Subtree,
+                AccessOperation::Read,
+                None,
+                Some(GrantSource::HeadPolicy),
             ),
         ] {
-            store::insert_from_card(
+            store::insert_with_source(
                 &conn,
                 &scope,
                 &grant(&home.join(path), kind, operation),
                 card,
+                source,
             )
             .unwrap();
         }
-        for (index, path) in ["Work/site", "Work/notes", "Work/ref/spec.md"]
+        for (index, path) in ["Work/site", "Work/notes", "Work/ref/spec.md", "Work/tools"]
             .into_iter()
             .enumerate()
         {
@@ -486,19 +499,99 @@ fn permissions_list_matches_the_published_sample() {
     }
     assert_eq!(sample["method"], LIST_OPERATION);
     assert_eq!(sample["route"]["principal"], "reserved:cingulate");
-    let mut reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
+    let reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
     reply["grants"]
         .as_array()
         .unwrap()
         .iter()
         .for_each(assert_contract_row);
-    // The older pinned sample predates additive provenance fields. Keep its
-    // original row contract pinned; the sources sample pins the new fields.
-    for row in reply["grants"].as_array_mut().unwrap() {
-        row.as_object_mut().unwrap().remove("source");
-        row.as_object_mut().unwrap().remove("granted_at_bound");
-    }
     assert_eq!(reply, sample["reply"]);
+}
+
+/// Pin provenance to Cingulate's tagged cross-provider sample. Its app-specific
+/// fields differ from AFT's folder fields; the shared fields must be identical.
+#[cfg(unix)]
+#[test]
+fn permissions_list_matches_published_grant_sources_sample() {
+    use crate::db::access_grant_rows::GrantSource;
+    use sha2::{Digest, Sha256};
+    const JSON: &[u8] =
+        include_bytes!("../../../../test-vectors/permissions-v1/provider-list-grant-sources.json");
+    const JCS: &[u8] =
+        include_bytes!("../../../../test-vectors/permissions-v1/provider-list-grant-sources.jcs");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(JSON)),
+        "139dcbcba60df326a5c025c10534cc7e33809c1799e07c38dbedccfc3aa7bd79"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(JCS)),
+        "e186b0523685ee704bf6ada1e9fd1bd80af758d61d74472f2744ee2716f48ae6"
+    );
+    let sample: Value = serde_json::from_slice(JSON).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(JCS).unwrap(), sample);
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let home = PathBuf::from("/Users/person");
+    let head = key("scope:head-cedar", 7);
+    let worker = key("scope:wkr-cedar", 3);
+    {
+        let conn = db.lock().unwrap();
+        store::register_scope(&conn, &head, None, &Config::default()).unwrap();
+        store::register_agent(&conn, &head, "agent-cedar", true).unwrap();
+        store::register_scope(&conn, &worker, Some(&head), &Config::default()).unwrap();
+        store::register_worker(&conn, &worker).unwrap();
+        for (index, source) in [
+            Some(GrantSource::Person),
+            Some(GrantSource::HeadGrant),
+            Some(GrantSource::HeadPolicy),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = &sample["reply"]["grants"][index];
+            let path = home.join(format!("Work/source-{}", index + 1));
+            store::insert_with_source(
+                &conn,
+                &worker,
+                &grant(&path, GrantKind::Subtree, AccessOperation::Read),
+                expected["card_ref"].as_str(),
+                source,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE access_grants SET grant_id=?1,granted_at_ms=?2 WHERE path=?3",
+                rusqlite::params![
+                    expected["id"].as_str().unwrap(),
+                    expected["granted_at_ms"].as_i64().unwrap(),
+                    path.to_string_lossy()
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let mut reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
+    let mut expected = sample["reply"].clone();
+    assert_eq!(reply["grants"].as_array().unwrap().len(), 4);
+    for (index, (actual, expected)) in reply["grants"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(expected["grants"].as_array_mut().unwrap())
+        .enumerate()
+    {
+        assert_contract_row(actual);
+        assert_eq!(actual["scope"], "read");
+        assert_eq!(
+            actual["subject_label"],
+            format!("~/Work/source-{}", index + 1)
+        );
+        for field in ["module", "scope", "subject_label", "scope_label"] {
+            actual.as_object_mut().unwrap().remove(field);
+            expected.as_object_mut().unwrap().remove(field);
+        }
+    }
+    assert_eq!(reply, expected);
 }
 
 /// Cingulate is not a first-party AFT principal, so its management route is
