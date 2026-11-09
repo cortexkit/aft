@@ -7,7 +7,6 @@ use aft::cache_freshness::{search_warm_verify_plan_for_test, seed_search_verify_
 use aft::commands::configure::ensure_project_watcher;
 use aft::config::Config;
 use aft::context::{App, AppContext};
-use aft::search_index::{resolve_cache_dir, SearchIndex};
 
 struct EnvGuard {
     key: &'static str,
@@ -112,11 +111,8 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
     );
     ctx.set_canonical_cache_root(canonical_root.clone());
 
-    let cache_dir = resolve_cache_dir(&canonical_root, Some(storage.path()));
-    let mut index = SearchIndex::build(&canonical_root);
-    let git_head = index.stored_git_head().map(str::to_owned);
-    index.write_to_disk(&cache_dir, git_head.as_deref());
-    let cache_file = cache_dir.join("cache.bin");
+    let cache_file = storage.path().join("legacy-cache.bin");
+    std::fs::write(&cache_file, b"legacy artifact generation").unwrap();
     assert!(seed_search_verify_memo_for_test(
         &canonical_root,
         &cache_file

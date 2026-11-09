@@ -13783,12 +13783,10 @@ mod split_request_tests {
         )
     }
 
-    fn save_external_index(root: &Path, storage: &Path) {
-        let mut index = SearchIndex::build(root);
-        index.write_to_disk(
-            &crate::search_index::resolve_cache_dir(root, Some(storage)),
-            None,
-        );
+    fn seed_ignored_legacy_cache(root: &Path, storage: &Path) {
+        let cache = crate::search_index::resolve_cache_dir(root, Some(storage));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("cache.bin"), b"obsolete search cache").unwrap();
     }
 
     fn assert_external_split(response: &serde_json::Value, root: &Path) {
@@ -13904,7 +13902,7 @@ mod split_request_tests {
             let (_dir, root) = project();
             git_init(&root);
             if indexed {
-                save_external_index(&root, storage.path());
+                seed_ignored_legacy_cache(&root, storage.path());
             }
             let ctx = external_context(session.path(), storage.path(), false);
             let response = search(

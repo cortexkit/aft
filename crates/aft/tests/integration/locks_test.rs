@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aft::search_index::CacheLock;
 use aft::semantic_index::SemanticIndexLock;
 use serde::Serialize;
 
@@ -136,68 +135,8 @@ where
     assert_eq!(max_inside.load(Ordering::SeqCst), 1);
 }
 
-fn search_cache_dir(root: &Path) -> PathBuf {
-    root.join("index").join("project")
-}
-
 fn semantic_lock_path(root: &Path, project_key: &str) -> PathBuf {
     root.join("semantic").join(project_key).join("cache.lock")
-}
-
-#[test]
-fn search_lock_acquires_when_uncontended() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let cache_dir = search_cache_dir(dir.path());
-    let lock_path = cache_dir.join("cache.lock");
-
-    let guard = CacheLock::acquire(&cache_dir, dir.path()).expect("acquire search lock");
-    assert!(lock_path.exists());
-    drop(guard);
-    assert!(!lock_path.exists());
-}
-
-#[test]
-fn search_lock_serializes_concurrent_callers() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let cache_dir = Arc::new(search_cache_dir(dir.path()));
-    let lock_path = cache_dir.join("cache.lock");
-
-    assert_serializes_concurrent_callers({
-        let cache_dir = Arc::clone(&cache_dir);
-        move || CacheLock::acquire(&cache_dir, &cache_dir)
-    });
-
-    assert!(!lock_path.exists());
-}
-
-#[test]
-fn search_lock_reclaims_dead_owner() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let cache_dir = search_cache_dir(dir.path());
-    let lock_path = cache_dir.join("cache.lock");
-    write_synthetic_lock(&lock_path, dead_owner_metadata());
-
-    let guard = CacheLock::acquire(&cache_dir, dir.path()).expect("reclaim dead search owner");
-    assert!(lock_path.exists());
-    drop(guard);
-    assert!(!lock_path.exists());
-}
-
-#[test]
-fn search_lock_blocks_cross_host() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let cache_dir = search_cache_dir(dir.path());
-    let lock_path = cache_dir.join("cache.lock");
-    write_synthetic_lock(&lock_path, cross_host_metadata());
-
-    let error = match CacheLock::acquire(&cache_dir, dir.path()) {
-        Ok(_) => panic!("cross-host search lock should block"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("timed out acquiring search cache lock"));
-    assert!(lock_path.exists());
 }
 
 #[test]

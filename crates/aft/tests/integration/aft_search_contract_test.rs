@@ -13,7 +13,7 @@ use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
 use aft::context::{AppContext, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
-use aft::search_index::{artifact_cache_key, resolve_cache_dir, SearchIndex};
+use aft::search_index::artifact_cache_key;
 use aft::semantic_index::SemanticIndex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -220,14 +220,6 @@ fn git_head(root: &Path) -> String {
         .expect("utf8 git head")
         .trim()
         .to_string()
-}
-
-fn persist_search_index(root: &Path, storage_dir: &Path) {
-    let canonical_root = std::fs::canonicalize(root).expect("canonical root");
-    let cache_dir = resolve_cache_dir(&canonical_root, Some(storage_dir));
-    let mut index = SearchIndex::build(&canonical_root);
-    let head = git_head(&canonical_root);
-    index.write_to_disk(&cache_dir, Some(&head));
 }
 
 fn openai_context(project_root: &Path, base_url: String) -> AppContext {
@@ -842,7 +834,6 @@ fn external_path_obeys_force_restrict_guard() {
     let (external_project, _external_source, _source) = git_project_with_needle();
     let session_project = tempfile::tempdir().expect("session project");
     let storage = tempfile::tempdir().expect("storage");
-    persist_search_index(external_project.path(), storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
     let request = request_with_path("needle_symbol", Some("literal"), external_project.path());
 
@@ -966,7 +957,6 @@ fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_ex
     init_git(external_project.path());
     commit_all(external_project.path());
     let storage = tempfile::tempdir().expect("storage");
-    persist_search_index(external_project.path(), storage.path());
     let session_project = tempfile::tempdir().expect("session project");
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 

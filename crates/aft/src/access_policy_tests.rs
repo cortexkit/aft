@@ -873,9 +873,6 @@ fn artifact_read_search_does_not_authorize_containing_git_store() {
         .unwrap();
     assert!(initialized.success());
     std::fs::write(storage.join("private.rs"), "fn private_artifact() {}\n").unwrap();
-    let mut index = crate::search_index::SearchIndex::build(&storage);
-    let cache_dir = crate::search_index::resolve_cache_dir(&storage, Some(&storage));
-    assert!(index.write_to_disk(&cache_dir, None));
     let response = crate::commands::semantic_search::handle_semantic_search(
         &request(
             "semantic_search",

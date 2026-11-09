@@ -422,15 +422,6 @@ pub(crate) fn advance(files: usize) {
     });
 }
 
-pub(crate) fn remaining(files: usize) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            let mut entry = lock(entry);
-            entry.total = Some(entry.done.saturating_add(files as u64));
-        }
-    });
-}
-
 pub(crate) struct Counter(Arc<Mutex<Entry>>);
 impl Counter {
     pub(crate) fn advance(&self, files: usize) {

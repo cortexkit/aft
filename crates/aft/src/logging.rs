@@ -4309,17 +4309,6 @@ mod tests {
     }
 
     #[test]
-    fn search_cold_build_emits_started_progress_ready() {
-        let (_temp, root) = tiny_project("search", "file.txt", "alpha token\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let (index, lines) = capture_index_events(|| {
-            crate::search_index::SearchIndex::build_with_limit(&root, 1_000_000)
-        });
-        assert!(index.ready);
-        assert_lifecycle_sequence(&lines, "search", &normalize_index_root(&root), &key, true);
-    }
-
-    #[test]
     fn semantic_cold_build_emits_started_progress_ready() {
         let (_temp, root) = tiny_project("sem", "lib.rs", "pub fn hello() {}\n");
         let key = crate::search_index::artifact_cache_key(&root);

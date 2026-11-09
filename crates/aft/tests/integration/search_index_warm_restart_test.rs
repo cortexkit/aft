@@ -6,10 +6,6 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aft::cache_freshness::{
-    reset_verify_file_strict_count_for_debug, verify_file_strict_count_for_debug,
-};
-use aft::search_index::SearchIndex;
 use serde_json::{json, Value};
 
 use super::helpers::{user_config, AftProcess};
@@ -110,25 +106,6 @@ fn standalone_configure_builds_the_search_index_without_a_query() {
 
     let status = aft.shutdown();
     assert!(status.success());
-}
-
-#[test]
-fn verify_file_mtimes_checks_each_cached_file_once() {
-    let project = setup_project(&[
-        ("src/lib.rs", "pub fn alpha() {}\n"),
-        ("src/main.rs", "fn main() { alpha(); }\n"),
-    ]);
-    let mut index = SearchIndex::build(project.path());
-    let cached_files = index
-        .files
-        .iter()
-        .filter(|entry| !entry.path.as_os_str().is_empty())
-        .count();
-
-    reset_verify_file_strict_count_for_debug();
-    index.verify_against_disk_for_debug(None);
-
-    assert_eq!(verify_file_strict_count_for_debug(), cached_files);
 }
 
 #[test]

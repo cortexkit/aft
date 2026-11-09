@@ -1232,63 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn trigram_cold_build_writes_land_in_search_index_build_not_unexplained() {
-        let _guard = test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let mut ledger_conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        for index in 0..16 {
-            std::fs::write(
-                project.join(format!("file_{index}.rs")),
-                format!("pub fn function_{index}() -> u32 {{ {index} * 7 }}\n"),
-            )
-            .unwrap();
-        }
-        // The builder keys its credit by the canonical root it indexes.
-        let root = std::fs::canonicalize(&project)
-            .unwrap()
-            .display()
-            .to_string();
-        let cache_dir = dir.path().join("index").join("trigram-census");
-        let credited_before = pending_for_test(Domain::SearchIndexBuild, &root).1;
-
-        let index = crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
-            &project,
-            1024 * 1024,
-            &cache_dir,
-        );
-        assert!(
-            index.ready,
-            "the fixture build must take the streaming path"
-        );
-
-        // The expected value comes from the filesystem, not from the writer's
-        // own bookkeeping: the finished cache file is what the build wrote.
-        let written = std::fs::metadata(cache_dir.join("cache.bin"))
-            .unwrap()
-            .len();
-        assert!(written > 0);
-        let credited = pending_for_test(Domain::SearchIndexBuild, &root)
-            .1
-            .saturating_sub(credited_before);
-        assert_eq!(
-            credited, written,
-            "the trigram build must credit the physical bytes of cache.bin it wrote"
-        );
-
-        let report = census_after_process_wrote(&mut ledger_conn, &root, written);
-        let row = report
-            .writers
-            .iter()
-            .find(|row| row.domain == Domain::SearchIndexBuild.as_str())
-            .expect("the trigram build must appear as an attributed writer");
-        assert_eq!(row.physical_bytes, written);
-        assert_eq!(report.attributed_physical_bytes, written);
-        assert_eq!(report.unexplained_physical_bytes, Some(0));
-    }
-
-    #[test]
     fn inspect_tier2_writes_land_in_inspect_cache_not_unexplained() {
         let _guard = test_lock();
         let dir = tempfile::tempdir().unwrap();

@@ -96,12 +96,6 @@ path = "tests/daemon_malloc_small_growth_repro.rs"
 name = "applicability_cost"
 path = "tests/applicability_cost.rs"
 
-# The cold trigram build's peak heap is counted process-wide by its own
-# allocator, so it needs a binary of its own.
-[[test]]
-name = "search_index_build_memory"
-path = "tests/search_index_build_memory.rs"
-
 [lints.rust]
 # The ignored navigation profile is enabled explicitly for manual measurements.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }

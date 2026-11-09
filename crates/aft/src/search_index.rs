@@ -1,11 +1,11 @@
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError, Weak,
+    Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,11 +16,10 @@ use regex::bytes::Regex;
 use regex_syntax::hir::{Hir, HirKind};
 use serde::{Deserialize, Serialize};
 
-use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::cache_freshness;
 use crate::commands::semantic_search::request_files::{
     Fetched, FileStat, RequestFile, RequestFiles,
 };
-use crate::fs_lock;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};
@@ -64,51 +63,13 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
-// The warm change budget admits at most 512 Git-diff or stat-stale paths.
-// Larger refreshes belong under the shared build limit, not the disk-load lane.
-const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
-const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
-const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
-const SPILL_MAGIC: &[u8; 8] = b"AFTSPI01";
-const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
-const INDEX_VERSION: u32 = 4;
-/// Highest trigram cache format this build reads (and the one it writes).
-pub const INDEX_FORMAT_VERSION: u32 = INDEX_VERSION;
-const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
-const SPIMI_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
-const SPILL_RECORD_ESTIMATED_BYTES: usize = 16;
-const DELTA_COMPACT_SOFT_FILES: usize = 1_000;
-const DELTA_COMPACT_HARD_FILES: usize = 5_000;
-const DELTA_COMPACT_SOFT_BYTES: usize = 32 * 1024 * 1024;
-const DELTA_COMPACT_HARD_BYTES: usize = 128 * 1024 * 1024;
 const EOF_SENTINEL: u8 = 0;
-const MAX_ENTRIES: usize = 10_000_000;
-const MIN_FILE_ENTRY_BYTES: usize = 57;
-const LOOKUP_ENTRY_BYTES: usize = 16;
-const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const LEGACY_IDENTITY_MEMO_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const LEGACY_IDENTITY_MEMO_MAX_STORAGE_ROOTS: usize = 4;
-#[cfg(test)]
-const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-#[cfg(test)]
-const INDEX_ORPHAN_SWEEP_LIMIT: usize = 200;
-const TRANSIENT_SEARCH_CACHE_PREFIX: &str = "aft-search-cache.";
-/// Our scratch caches live in one directory of our own inside the system
-/// temporary directory. The sweep below reads whatever directory it is given,
-/// and the shared `$TMPDIR` is a fleet dumping ground: on this box it held
-/// 290,697 entries and one bare listing of it took ~870 s, which pinned six of
-/// eight executor workers inside a configure sweep and starved route binds
-/// (2026-09-19). Owning a subdirectory makes the sweep O(our entries).
-const TRANSIENT_SEARCH_CACHE_DIR_NAME: &str = "aft-search-caches";
-static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
-#[cfg(test)]
-static INDEX_ORPHAN_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
-static TRANSIENT_SEARCH_CACHE_BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
-    OnceLock::new();
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -156,105 +117,8 @@ thread_local! {
     static AFTER_LEGACY_MEMO_RENAME: std::cell::RefCell<Option<AfterLegacyMemoRename>> = const { std::cell::RefCell::new(None) };
 }
 
-#[derive(Default)]
-#[cfg(test)]
-struct IndexOrphanSweepSummary {
-    scanned: usize,
-    removed: usize,
-    skipped_derived: usize,
-    skipped_memo: usize,
-    skipped_fresh: usize,
-    skipped_live: usize,
-    skipped_locked: usize,
-    skipped_unreadable: usize,
-    budget_exhausted: bool,
-}
-
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
 const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BorrowedIndexLoadStop {
-    BudgetExceeded,
-    Cancelled,
-    /// The snapshot was written for a different part of the checkout than the
-    /// loading root covers (see `checkout_position`).
-    CoverageMismatch,
-}
-
-struct BorrowedIndexLoadBudget<'a> {
-    keep_going: &'a dyn Fn() -> bool,
-    started_at: Instant,
-    duration: Duration,
-    max_records: usize,
-    stop: Cell<Option<BorrowedIndexLoadStop>>,
-}
-
-impl<'a> BorrowedIndexLoadBudget<'a> {
-    fn preflight(&self, records: usize) -> bool {
-        if records > self.max_records {
-            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
-            return false;
-        }
-        self.checkpoint()
-    }
-
-    fn preflight_lookup_bytes(&self, bytes: u64, file_records: usize) -> bool {
-        let lookup_records = self.max_records.saturating_sub(file_records);
-        let max_bytes = 20u64.saturating_add(
-            u64::try_from(lookup_records)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(LOOKUP_ENTRY_BYTES as u64),
-        );
-        if bytes > max_bytes {
-            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
-            return false;
-        }
-        self.checkpoint()
-    }
-
-    fn checkpoint_at(&self, record: usize) -> bool {
-        if record % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0 {
-            self.checkpoint()
-        } else {
-            true
-        }
-    }
-
-    fn checkpoint(&self) -> bool {
-        if !(self.keep_going)()
-            || crate::executor::current_job_cancellation()
-                .is_some_and(|token| token.cancel_requested_before_commit())
-        {
-            self.stop.set(Some(BorrowedIndexLoadStop::Cancelled));
-            return false;
-        }
-        if self.started_at.elapsed() >= self.duration {
-            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
-            return false;
-        }
-        true
-    }
-}
-
-/// Borrowed-load record reads observed per fixture root. A borrowed reload
-/// parses on a background thread, so a thread-local counter on the searching
-/// thread cannot see it; each test registers its own temporary root and the
-/// read loop bumps only that root's counter. Asserting the count stayed at or
-/// below the entry budget proves the reload stopped at the entry budget,
-/// which a wall-clock bound cannot show on a loaded machine.
-#[cfg(test)]
-static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
-    OnceLock::new();
-
-#[cfg(test)]
-fn note_borrowed_load_record_read_for_test(project_root: &Path) {
-    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
-        if let Some(counter) = probes.lock().unwrap().get(project_root) {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
 
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
@@ -281,186 +145,34 @@ pub(crate) fn try_read_with_budget<T>(
     }
 }
 
-pub struct CacheLock {
-    _guard: Option<fs_lock::LockGuard>,
-}
-
-impl CacheLock {
-    pub fn acquire(cache_dir: &Path, project_root: &Path) -> std::io::Result<Self> {
-        Self::acquire_with_timeout(cache_dir, project_root, Duration::from_secs(2))
-    }
-
-    pub fn try_acquire_for_shutdown(
-        cache_dir: &Path,
-        project_root: &Path,
-    ) -> std::io::Result<Self> {
-        // Graceful shutdown gets one short best-effort lock attempt so a
-        // sibling writer cannot hold process exit open.
-        Self::acquire_with_timeout(cache_dir, project_root, Duration::from_millis(25))
-    }
-
-    fn acquire_with_timeout(
-        cache_dir: &Path,
-        project_root: &Path,
-        timeout: Duration,
-    ) -> std::io::Result<Self> {
-        let path = cache_dir.join("cache.lock");
-        if !artifact_write_allowed(project_root, cache_dir, &path) {
-            return Ok(Self { _guard: None });
-        }
-        crate::private_storage::open_keyed_dir(cache_dir, "index")?;
-        let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        fs_lock::try_acquire(&path, timeout)
-            .map(|guard| Self {
-                _guard: Some(guard),
-            })
-            .map_err(|error| match error {
-                fs_lock::AcquireError::Timeout => {
-                    std::io::Error::other("timed out acquiring search cache lock")
-                }
-                fs_lock::AcquireError::Io(error) => error,
-            })
-    }
-}
-
-fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Path) -> bool {
-    let artifact_key = cache_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    crate::root_cache::ArtifactAccess::for_root(project_root).allows_write(artifact_key, write_path)
-        // A cache written by a newer build is never replaced (and no build or
-        // lock is started for it): that build's data outlives a rollback.
-        && SearchIndex::check_disk_cache_format(cache_dir).is_ok()
-}
-
-/// Revokes only legacy search publication when a checkout switches to views.
-/// Shared holders cover the final rename, not the build or serialization, so
-/// ordinary legacy publications never wait for one another.
-pub(crate) struct LegacySearchPublicationGate {
-    allowed: std::sync::atomic::AtomicBool,
-    publication: parking_lot::RwLock<()>,
-    #[cfg(test)]
-    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-}
-
-impl Default for LegacySearchPublicationGate {
-    fn default() -> Self {
-        Self {
-            allowed: std::sync::atomic::AtomicBool::new(true),
-            publication: parking_lot::RwLock::new(()),
-            #[cfg(test)]
-            before_publish: Default::default(),
-        }
-    }
-}
-
-thread_local! {
-    static LEGACY_SEARCH_PUBLICATION: std::cell::RefCell<Option<Arc<LegacySearchPublicationGate>>> = const { std::cell::RefCell::new(None) };
-}
-
-impl LegacySearchPublicationGate {
-    pub(crate) fn allowed(&self) -> bool {
-        self.allowed.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn publish(&self, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-        #[cfg(test)]
-        if let Some(hook) = self.before_publish.lock().take() {
-            hook();
-        }
-        let _publication = self.publication.read();
-        if !self.allowed() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "legacy search publication revoked by views",
-            ));
-        }
-        operation()
-    }
-}
-
-fn publish_legacy_search_cache(
-    operation: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let gate = LEGACY_SEARCH_PUBLICATION.with(|slot| slot.borrow().clone());
-    match gate {
-        Some(gate) => gate.publish(operation),
-        None => operation(),
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
-    base: Option<Arc<BasePostings>>,
     delta: Arc<DeltaState>,
     // This reverse lookup is writer-only. Snapshots never read it, so exclusive
     // SearchIndex write access keeps it synchronized with the versioned postings.
     delta_file_trigrams: HashMap<u32, Vec<u32>>,
-    // Base IDs cannot be reused while immutable base postings still refer to
-    // them. Delta IDs can: removal first erases every posting for the ID, and
+    // Removal erases every posting for an ID before it can be reused;
     // snapshots retain the old tables through copy-on-write.
     free_delta_file_ids: Vec<u32>,
     pub files: Arc<Vec<FileEntry>>,
     pub path_to_id: Arc<HashMap<PathBuf, u32>>,
     pub ready: bool,
-    /// Set when a cold build was refused because this root may not write the
-    /// shared cache artifact. The index stays empty and `ready` stays false so
-    /// grep/glob keep serving through the bounded fallback walk, but health must
-    /// not report "building" for it: nothing will ever produce a real index here
-    /// until write access changes, so it is a terminal settled state.
-    pub build_denied: bool,
     project_root: PathBuf,
     git_head: Option<String>,
     max_file_size: u64,
     ignore_rules_fingerprint: String,
     pub file_trigram_count: Arc<Vec<u32>>,
     unindexed_files: Arc<HashSet<u32>>,
-    base_file_count: u32,
-    delta_packed_bytes: usize,
-    compaction_state: Arc<Mutex<CompactionState>>,
 }
 
-// A query must observe postings and superseded base files from one version;
-// mixing versions can hide both an old base posting and its delta replacement.
+// A query observes postings and file tables from one copy-on-write version.
 #[derive(Clone, Debug, Default)]
 struct DeltaState {
     postings: HashMap<u32, Vec<Posting>>,
-    superseded: HashSet<u32>,
-    /// Paths of the superseded base files. Removing a file clears its entry's
-    /// path, so without this record an edited base file could not be told
-    /// apart from a deleted one when counting how far the delta has moved this
-    /// index away from the snapshot it loaded.
-    superseded_paths: HashSet<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-struct BasePostings {
-    file: Arc<File>,
-    postings_blob_start: u64,
-    postings_blob_len: u64,
-    lookup: Arc<Vec<LookupEntry>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LookupEntry {
-    trigram: u32,
-    offset: u64,
-    count: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CompactionState {
-    running: bool,
-    requested_again: bool,
-    buffered_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SearchIndexSnapshot {
-    base: Option<Arc<BasePostings>>,
     delta: Arc<DeltaState>,
     files: Arc<Vec<FileEntry>>,
     path_to_id: Arc<HashMap<PathBuf, u32>>,
@@ -483,37 +195,19 @@ impl SearchIndex {
         self.files.len()
     }
 
-    /// Number of unique trigrams in the combined base index and delta postings.
+    /// Number of unique trigrams in the in-memory corpus.
     pub fn trigram_count(&self) -> usize {
-        let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
-        let Some(base) = &self.base else {
-            return self.delta.postings.len();
-        };
-        base_count
-            + self
-                .delta
-                .postings
-                .keys()
-                .filter(|trigram| base.lookup_entry(**trigram).is_none())
-                .count()
+        self.delta.postings.len()
     }
 
-    /// Estimate resident trigram-index bytes. Base posting lists stay on disk
-    /// and are read with `pread`; only the resident base lookup table, delta
-    /// postings, superseded mask, and file tables are included here.
+    /// Estimate resident postings and file-table bytes.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        let Ok(compaction) = self.compaction_state.try_lock() else {
-            return crate::memory::MemoryEstimate::busy();
-        };
-        if self.base.is_none()
-            && self.delta.postings.is_empty()
+        if self.delta.postings.is_empty()
             && self.delta_file_trigrams.is_empty()
             && self.files.is_empty()
             && self.path_to_id.is_empty()
             && self.file_trigram_count.is_empty()
             && self.unindexed_files.is_empty()
-            && self.delta.superseded.is_empty()
-            && compaction.buffered_paths.is_empty()
         {
             return crate::memory::MemoryEstimate::estimated(0)
                 .count("files", 0)
@@ -564,29 +258,8 @@ impl SearchIndex {
         });
         let file_count_table_bytes = crate::memory::usize_to_u64(self.file_trigram_count.len())
             .saturating_mul(std::mem::size_of::<u32>() as u64);
-        let masks_bytes = crate::memory::usize_to_u64(
-            self.delta
-                .superseded
-                .len()
-                .saturating_add(self.unindexed_files.len()),
-        )
-        .saturating_mul(std::mem::size_of::<u32>() as u64);
-        let base_lookup_bytes = self
-            .base
-            .as_ref()
-            .map(|base| {
-                crate::memory::usize_to_u64(base.lookup.len())
-                    .saturating_mul(std::mem::size_of::<LookupEntry>() as u64)
-            })
-            .unwrap_or(0);
-        let compaction_bytes = compaction
-            .buffered_paths
-            .iter()
-            .map(|path| {
-                (std::mem::size_of::<PathBuf>() as u64)
-                    .saturating_add(crate::memory::path_bytes(path))
-            })
-            .fold(0u64, u64::saturating_add);
+        let masks_bytes = crate::memory::usize_to_u64(self.unindexed_files.len())
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
         let metadata_bytes = crate::memory::path_bytes(&self.project_root)
             .saturating_add(
                 self.git_head
@@ -603,23 +276,15 @@ impl SearchIndex {
             .saturating_add(path_table_bytes)
             .saturating_add(file_count_table_bytes)
             .saturating_add(masks_bytes)
-            .saturating_add(base_lookup_bytes)
-            .saturating_add(compaction_bytes)
             .saturating_add(metadata_bytes);
         crate::memory::MemoryEstimate::estimated(estimated_bytes)
             .count("files", self.files.len())
             .count("delta_trigrams", self.delta.postings.len())
             .count("delta_postings", delta_posting_count)
-            .count("superseded_files", self.delta.superseded.len())
+            .count("superseded_files", 0)
             .count("unindexed_files", self.unindexed_files.len())
-            .count(
-                "base_lookup_entries",
-                self.base
-                    .as_ref()
-                    .map(|base| base.lookup.len())
-                    .unwrap_or(0),
-            )
-            .count_u64("delta_packed_bytes", self.delta_packed_bytes as u64)
+            .count("base_lookup_entries", 0)
+            .count_u64("delta_packed_bytes", 0)
             .count_u64("base_postings_resident_bytes", 0)
     }
 
@@ -629,7 +294,6 @@ impl SearchIndex {
     /// lexical ranking.
     pub fn snapshot(&self) -> SearchIndexSnapshot {
         SearchIndexSnapshot {
-            base: self.base.clone(),
             delta: Arc::clone(&self.delta),
             files: Arc::clone(&self.files),
             path_to_id: Arc::clone(&self.path_to_id),
@@ -760,7 +424,6 @@ impl SearchIndexSnapshot {
             crate::run_tool_call::progress::report();
         }
         Self {
-            base: None,
             delta: Arc::new(delta),
             files: Arc::new(files),
             path_to_id: Arc::new(paths),
@@ -779,19 +442,9 @@ impl SearchIndexSnapshot {
             .map(|file| file.modified)
     }
 
-    /// Number of unique trigrams in the combined base index and delta postings.
+    /// Number of unique trigrams in the in-memory corpus.
     pub fn trigram_count(&self) -> usize {
-        let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
-        let Some(base) = &self.base else {
-            return self.delta.postings.len();
-        };
-        base_count
-            + self
-                .delta
-                .postings
-                .keys()
-                .filter(|trigram| base.lookup_entry(**trigram).is_none())
-                .count()
+        self.delta.postings.len()
     }
 
     /// How this snapshot holds `path`, for the benchmark-only search recall
@@ -1745,31 +1398,21 @@ enum SearchMatcher {
     Regex(Regex),
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum IgnoreRulesLoadPolicy {
-    Strict,
-}
-
 impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
-            base: None,
             delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
             free_delta_file_ids: Vec::new(),
             files: Arc::new(Vec::new()),
             path_to_id: Arc::new(HashMap::new()),
             ready: false,
-            build_denied: false,
             project_root: PathBuf::new(),
             git_head: None,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             ignore_rules_fingerprint: String::new(),
             file_trigram_count: Arc::new(Vec::new()),
             unindexed_files: Arc::new(HashSet::new()),
-            base_file_count: 0,
-            delta_packed_bytes: 0,
-            compaction_state: Arc::new(Mutex::new(CompactionState::default())),
         }
     }
 
@@ -1789,179 +1432,7 @@ impl SearchIndex {
     }
 
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
-        let started = Instant::now();
-        let cache_dir = transient_search_cache_dir(root);
-        // The streaming index keeps its postings in cache.bin, so this scratch
-        // directory cannot be replaced by a purely in-memory build. A directory
-        // embeds this process's PID, so only threads in this process can share it;
-        // serialize those threads and clear the previous files before rebuilding
-        // instead of minting an unbounded timestamped path.
-        let build_lock = transient_search_cache_build_lock(&cache_dir);
-        let _build_guard = build_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = truncate_transient_search_cache_dir(&cache_dir) {
-            log::warn!(
-                "search index: could not reset transient cache {} ({}); falling back to bounded in-memory delta",
-                cache_dir.display(),
-                error
-            );
-            return Self::build_in_memory(root, max_file_size, started);
-        }
-        Self::build_with_limit_to_cache_dir(root, max_file_size, &cache_dir)
-    }
-
-    pub fn build_with_limit_to_cache_dir(
-        root: &Path,
-        max_file_size: u64,
-        cache_dir: &Path,
-    ) -> Self {
-        Self::build_with_limit_to_cache_dir_cancellable(root, max_file_size, cache_dir, &|| true)
-            .expect("uncancellable search build")
-    }
-
-    /// Cancelled refreshes must neither publish a partial index nor start a
-    /// second, in-memory walk through the streaming-error fallback.
-    pub(crate) fn build_with_limit_to_cache_dir_cancellable(
-        root: &Path,
-        max_file_size: u64,
-        cache_dir: &Path,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Self> {
-        if !keep_going() {
-            return None;
-        }
-        let started = std::time::Instant::now();
-        // Persistent builders already receive configure's keyed directory.
-        // Its identity must also label build events when Git changed since bind.
-        let key = cache_dir
-            .parent()
-            .filter(|parent| parent.file_name().is_some_and(|name| name == "index"))
-            .and_then(|_| cache_dir.file_name())
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| artifact_cache_key_for_build(root));
-        let scope =
-            crate::logging::IndexBuildScope::new(crate::logging::IndexPlane::Search, root, key);
-        let _index_build = crate::logging::install_index_build(scope.clone());
-        let mut failure_guard = crate::logging::IndexBuildFailureGuard::new();
-        crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
-            crate::logging::IndexEventKind::BuildStarted,
-            &scope,
-        ));
-        if !artifact_write_allowed(root, cache_dir, &cache_dir.join("cache.bin")) {
-            // Write-denied roots cannot persist or materialize a real index.
-            // Return an empty index flagged as build-denied (ready stays false
-            // so grep/glob keep using the bounded fallback walk). Health reads
-            // the flag to avoid reporting a permanent "building" state for a
-            // build that was never going to run here.
-            crate::slog_info!(
-                    "search index cold build denied: {} may not write the cache artifact at {}; reporting build-denied instead of building",
-                    root.display(),
-                    cache_dir.display()
-                );
-            crate::logging::log_index_event(
-                crate::logging::IndexEvent::from_scope(
-                    crate::logging::IndexEventKind::BuildFailed,
-                    &scope,
-                )
-                .field("reason", "denied"),
-            );
-            failure_guard.disarm();
-            let mut index = Self::new();
-            index.project_root = root.to_path_buf();
-            index.max_file_size = max_file_size;
-            index.build_denied = true;
-            return Some(index);
-        }
-        crate::logging::log_index_event(
-            crate::logging::IndexEvent::from_scope(
-                crate::logging::IndexEventKind::BuildProgress,
-                &scope,
-            )
-            .field("stage", "streaming")
-            .field("completed", 0)
-            .field("total", 1)
-            .field("elapsed_ms", scope.elapsed_ms()),
-        );
-        match build_streaming_index(root, max_file_size, cache_dir, keep_going) {
-            Ok((mut index, indexed)) => {
-                index.ready = true;
-                crate::slog_info!(
-                    "search index cold streaming build: {} files, {} trigrams, {} ms (pool={})",
-                    indexed,
-                    index.trigram_count(),
-                    started.elapsed().as_millis(),
-                    search_index_build_pool_size()
-                );
-                crate::logging::log_index_event(
-                    crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildProgress,
-                        &scope,
-                    )
-                    .field("stage", "streaming")
-                    .field("completed", 1)
-                    .field("total", 1)
-                    .field("elapsed_ms", scope.elapsed_ms()),
-                );
-                crate::logging::log_index_event(
-                    crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildReady,
-                        &scope,
-                    )
-                    .field("elapsed_ms", scope.elapsed_ms())
-                    .field("files", indexed)
-                    .field("trigrams", index.trigram_count()),
-                );
-                failure_guard.disarm();
-                Some(index)
-            }
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::Interrupted || !keep_going() {
-                    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildCancelled,
-                        &scope,
-                    ));
-                    failure_guard.disarm();
-                    return None;
-                }
-                log::warn!(
-                        "search index: streaming build failed ({}); falling back to bounded in-memory delta",
-                        error
-                    );
-                crate::logging::log_index_event(
-                    crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildProgress,
-                        &scope,
-                    )
-                    .field("stage", "fallback")
-                    .field("completed", 0)
-                    .field("total", 1)
-                    .field("elapsed_ms", scope.elapsed_ms()),
-                );
-                let Some(index) =
-                    Self::build_in_memory_cancellable(root, max_file_size, started, keep_going)
-                else {
-                    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildCancelled,
-                        &scope,
-                    ));
-                    failure_guard.disarm();
-                    return None;
-                };
-                crate::logging::log_index_event(
-                    crate::logging::IndexEvent::from_scope(
-                        crate::logging::IndexEventKind::BuildReady,
-                        &scope,
-                    )
-                    .field("elapsed_ms", scope.elapsed_ms())
-                    .field("files", index.files.len())
-                    .field("trigrams", index.trigram_count()),
-                );
-                failure_guard.disarm();
-                Some(index)
-            }
-        }
+        Self::build_in_memory(root, max_file_size, Instant::now())
     }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
@@ -2121,16 +1592,12 @@ impl SearchIndex {
         }
 
         let trigram_count = file_trigrams.len() as u32;
-        self.delta_packed_bytes = self
-            .delta_packed_bytes
-            .saturating_add(file_trigrams.len().saturating_mul(POSTING_BYTES));
         self.delta_file_trigrams.insert(file_id, file_trigrams);
         ensure_count_slot(Arc::make_mut(&mut self.file_trigram_count), file_id);
         if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
             *count = trigram_count;
         }
         Arc::make_mut(&mut self.unindexed_files).remove(&file_id);
-        self.update_compaction_flags(Some(path));
         true
     }
 
@@ -2185,23 +1652,7 @@ impl SearchIndex {
             }
         };
 
-        if file_id < self.base_file_count {
-            let superseded_path = self
-                .files
-                .get(file_id as usize)
-                .map(|entry| entry.path.clone())
-                .filter(|path| !path.as_os_str().is_empty());
-            let delta = Arc::make_mut(&mut self.delta);
-            delta.superseded.insert(file_id);
-            if let Some(path) = superseded_path {
-                delta.superseded_paths.insert(path);
-            }
-        }
-
         if let Some(trigrams) = self.delta_file_trigrams.remove(&file_id) {
-            self.delta_packed_bytes = self
-                .delta_packed_bytes
-                .saturating_sub(trigrams.len().saturating_mul(POSTING_BYTES));
             let delta = Arc::make_mut(&mut self.delta);
             for trigram in trigrams {
                 let should_remove = if let Some(postings) = delta.postings.get_mut(&trigram) {
@@ -2224,13 +1675,10 @@ impl SearchIndex {
             file.modified = UNIX_EPOCH;
             file.content_hash = cache_freshness::zero_hash();
         }
-        if file_id >= self.base_file_count {
-            self.free_delta_file_ids.push(file_id);
-        }
+        self.free_delta_file_ids.push(file_id);
         if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
             *count = 0;
         }
-        self.update_compaction_flags(Some(path));
     }
 
     pub fn update_file(&mut self, path: &Path) {
@@ -2256,8 +1704,8 @@ impl SearchIndex {
     }
 
     /// Whether `path` belongs to this index's corpus: it lies under the
-    /// index root in a form [`Self::write_to_disk`] can store as a relative
-    /// path. An index without a root (built in memory) admits every path.
+    /// index root with a safe relative path. An index without a root
+    /// admits every path.
     pub(crate) fn admits_path(&self, path: &Path) -> bool {
         self.project_root.as_os_str().is_empty()
             || storable_relative_path(&self.project_root, path).is_some()
@@ -2273,7 +1721,7 @@ impl SearchIndex {
             // AFT's own writes report every path they touched, and a session
             // may edit files in a sibling checkout or a temporary directory.
             // Such a file is not part of this root's corpus, and one stored
-            // entry outside the root would make every later `write_to_disk`
+            // entry outside the root would let queries escape their corpus.
             // refuse the whole cache.
             return;
         }
@@ -2328,432 +1776,6 @@ impl SearchIndex {
         self.snapshot().candidates(query)
     }
 
-    /// Persist the current base+delta to `cache.bin`.
-    ///
-    /// Borrow-only roots (linked worktrees, including those with
-    /// `worktree.ram_overlay`) never take this path: `artifact_write_allowed`
-    /// fail-closes before any bytes are written.
-    pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) -> bool {
-        if !artifact_write_allowed(&self.project_root, cache_dir, &cache_dir.join("cache.bin")) {
-            return false;
-        }
-        let Some(plan) = CacheWritePlan::from_index(self, git_head) else {
-            return false;
-        };
-
-        // A rewrite that folds a delta into an existing base is attributed
-        // separately from a first build so the census can tell them apart.
-        let domain = if self.base.is_some() {
-            crate::write_ledger::Domain::SearchIndexDelta
-        } else {
-            crate::write_ledger::Domain::SearchIndexBuild
-        };
-        let write_result = {
-            let mut sources = self.compaction_record_sources(Arc::clone(&plan.id_map));
-            write_cache_file_from_sources(cache_dir, &plan, &mut sources, domain, &|| true)
-        };
-
-        match write_result {
-            Ok(base) => {
-                self.base = Some(Arc::new(base));
-                self.delta = Arc::new(DeltaState::default());
-                self.delta_file_trigrams.clear();
-                self.free_delta_file_ids.clear();
-                self.delta_packed_bytes = 0;
-                self.base_file_count = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
-                self.files = Arc::new(plan.files);
-                self.path_to_id = Arc::new(plan.path_to_id);
-                self.unindexed_files = Arc::new(plan.unindexed_files);
-                self.file_trigram_count = Arc::new(plan.file_trigram_count);
-                self.git_head = plan.git_head.filter(|head| !head.is_empty());
-                self.ignore_rules_fingerprint = plan.ignore_fingerprint;
-                true
-            }
-            Err(error) => {
-                log::warn!("search index: failed to write disk cache: {}", error);
-                false
-            }
-        }
-    }
-
-    pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
-        crate::private_storage::tighten_keyed_dir(cache_dir, "index");
-        Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
-    }
-
-    /// Refuse, by name, a `cache.bin` whose outer header carries a format
-    /// version above [`INDEX_FORMAT_VERSION`] (or any cache while the storage
-    /// root's reader floor is above it). Reads only the 8-byte header. An
-    /// absent file, or one that is not a trigram cache at all, passes: those
-    /// are ordinary misses and rebuilds.
-    pub(crate) fn check_disk_cache_format(
-        cache_dir: &Path,
-    ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
-        let cache_path = cache_dir.join("cache.bin");
-        let version = (|| {
-            let mut reader = BufReader::new(open_cache_file_read(&cache_path).ok()?);
-            if read_u32(&mut reader).ok()? != CACHE_MAGIC {
-                return None;
-            }
-            read_u32(&mut reader).ok().map(u64::from)
-        })();
-        crate::persisted_format::gate(
-            crate::persisted_format::PersistedStore::SearchIndex,
-            &cache_path,
-            &cache_path,
-            version,
-        )
-    }
-
-    fn read_from_disk_with_options(
-        cache_dir: &Path,
-        current_canonical_root: &Path,
-        allow_legacy_repair: bool,
-    ) -> Option<Self> {
-        Self::read_from_disk_with_policy(
-            cache_dir,
-            current_canonical_root,
-            allow_legacy_repair,
-            IgnoreRulesLoadPolicy::Strict,
-            None,
-        )
-        .map(|(index, _)| index)
-    }
-
-    fn read_from_disk_with_policy(
-        cache_dir: &Path,
-        current_canonical_root: &Path,
-        allow_legacy_repair: bool,
-        ignore_rules_load_policy: IgnoreRulesLoadPolicy,
-        borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
-    ) -> Option<(Self, bool)> {
-        crate::root_cache::check_cache_access(cache_dir).ok()?;
-        debug_assert!(current_canonical_root.is_absolute());
-        // A newer build's cache is refused by name before its payload is read;
-        // callers see a miss, and every write path refuses to replace it.
-        if Self::check_disk_cache_format(cache_dir).is_err() {
-            return None;
-        }
-        let cache_path = cache_dir.join("cache.bin");
-        let cache_file = open_cache_file_read(&cache_path).ok()?;
-        let file_len = cache_file.metadata().ok()?.len();
-        if file_len < 16 {
-            return None;
-        }
-
-        let mut reader = BufReader::new(cache_file.try_clone().ok()?);
-        if read_u32(&mut reader).ok()? != CACHE_MAGIC {
-            return None;
-        }
-        if read_u32(&mut reader).ok()? != INDEX_VERSION {
-            return None;
-        }
-        let postings_len_total = read_u64(&mut reader).ok()?;
-        let postings_section_start = reader.stream_position().ok()?;
-        let postings_section_end = postings_section_start.checked_add(postings_len_total)?;
-        if postings_len_total < 4 || postings_section_end > file_len {
-            return None;
-        }
-        let postings_body_end = postings_section_end.checked_sub(4)?;
-
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic).ok()?;
-        if &magic != INDEX_MAGIC {
-            return None;
-        }
-        if read_u32(&mut reader).ok()? != INDEX_VERSION {
-            return None;
-        }
-
-        let head_len = read_u32(&mut reader).ok()? as usize;
-        let root_len = read_u32(&mut reader).ok()? as usize;
-        let ignore_fingerprint_len = read_u32(&mut reader).ok()? as usize;
-        let max_file_size = read_u64(&mut reader).ok()?;
-        let file_count = read_u32(&mut reader).ok()? as usize;
-        if file_count > MAX_ENTRIES {
-            return None;
-        }
-        if borrowed_load_budget.is_some_and(|budget| !budget.preflight(file_count)) {
-            return None;
-        }
-
-        if !reader_has_remaining(&mut reader, postings_body_end, head_len).ok()? {
-            return None;
-        }
-        let mut head_bytes = vec![0u8; head_len];
-        reader.read_exact(&mut head_bytes).ok()?;
-        let git_head = String::from_utf8(head_bytes)
-            .ok()
-            .filter(|head| !head.is_empty());
-
-        if !reader_has_remaining(&mut reader, postings_body_end, root_len).ok()? {
-            return None;
-        }
-        let mut root_bytes = vec![0u8; root_len];
-        reader.read_exact(&mut root_bytes).ok()?;
-        let stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
-        // Resolve aliases before deriving cached keys so scoped queries can see
-        // both cached and new files. Keep the caller's Windows prefix convention:
-        // configure supplies verbatim roots, while read-only callers may supply
-        // plain canonical roots for disk-walk lookups shared with the semantic index.
-        let project_root = fs::canonicalize(current_canonical_root)
-            .unwrap_or_else(|_| current_canonical_root.to_path_buf());
-        #[cfg(windows)]
-        let project_root = match current_canonical_root.components().next() {
-            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim() => project_root,
-            _ => crate::windows_path::normalize_windows_path(&project_root),
-        };
-        // Snapshot paths are stored relative to the root that wrote them and
-        // are re-rooted onto the loading root. That is only sound when both
-        // roots sit at the same place in their checkouts: a snapshot written
-        // by a session in a subfolder, loaded at a checkout's top level (or
-        // the reverse), would present partial coverage as a complete index.
-        // Older versions published subfolder snapshots under the repository
-        // key, so such artifacts can still be on disk.
-        if !stored_project_root.as_os_str().is_empty()
-            && checkout_position(&stored_project_root) != checkout_position(&project_root)
-        {
-            if let Some(budget) = borrowed_load_budget {
-                budget
-                    .stop
-                    .set(Some(BorrowedIndexLoadStop::CoverageMismatch));
-            }
-            return None;
-        }
-
-        if !reader_has_remaining(&mut reader, postings_body_end, ignore_fingerprint_len).ok()? {
-            return None;
-        }
-        let mut ignore_fingerprint_bytes = vec![0u8; ignore_fingerprint_len];
-        reader.read_exact(&mut ignore_fingerprint_bytes).ok()?;
-        let stored_ignore_rules_fingerprint = String::from_utf8(ignore_fingerprint_bytes).ok()?;
-        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&project_root);
-        let ignore_rules_differ =
-            stored_ignore_rules_fingerprint != current_ignore_rules_fingerprint;
-        if ignore_rules_differ && ignore_rules_load_policy == IgnoreRulesLoadPolicy::Strict {
-            return None;
-        }
-
-        let mut files = Vec::with_capacity(file_count);
-        let mut path_to_id = HashMap::new();
-        let mut unindexed_files = HashSet::new();
-        let mut canonical_parents = ParentCanonicalizationMemo::default();
-
-        for file_id in 0..file_count {
-            if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint_at(file_id)) {
-                return None;
-            }
-            if !reader_has_remaining(&mut reader, postings_body_end, MIN_FILE_ENTRY_BYTES).ok()? {
-                return None;
-            }
-            let mut unindexed = [0u8; 1];
-            reader.read_exact(&mut unindexed).ok()?;
-            let path_len = read_u32(&mut reader).ok()? as usize;
-            let size = read_u64(&mut reader).ok()?;
-            let secs = read_u64(&mut reader).ok()?;
-            let nanos = read_u32(&mut reader).ok()?;
-            let mut hash_bytes = [0u8; 32];
-            reader.read_exact(&mut hash_bytes).ok()?;
-            let content_hash = blake3::Hash::from_bytes(hash_bytes);
-            if nanos >= 1_000_000_000 {
-                return None;
-            }
-            if !reader_has_remaining(&mut reader, postings_body_end, path_len).ok()? {
-                return None;
-            }
-            let mut path_bytes = vec![0u8; path_len];
-            reader.read_exact(&mut path_bytes).ok()?;
-            let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
-            let full_path = cached_path_under_root_with_memo(
-                &project_root,
-                &relative_path,
-                &mut canonical_parents,
-            )?;
-            let file_id_u32 = u32::try_from(file_id).ok()?;
-
-            files.push(FileEntry {
-                path: full_path.clone(),
-                size,
-                modified: UNIX_EPOCH + Duration::new(secs, nanos),
-                content_hash,
-            });
-            path_to_id.insert(full_path, file_id_u32);
-            if unindexed[0] == 1 {
-                unindexed_files.insert(file_id_u32);
-            }
-            #[cfg(test)]
-            if borrowed_load_budget.is_some() {
-                note_borrowed_load_record_read_for_test(&project_root);
-            }
-        }
-
-        if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
-            return None;
-        }
-        let postings_blob_len = read_u64(&mut reader).ok()?;
-        let postings_blob_start = reader.stream_position().ok()?;
-        let postings_blob_end = postings_blob_start.checked_add(postings_blob_len)?;
-        if postings_blob_end > postings_body_end || postings_blob_len % POSTING_BYTES as u64 != 0 {
-            return None;
-        }
-
-        let lookup_section_start = postings_section_end;
-        if lookup_section_start >= file_len {
-            return None;
-        }
-        let lookup_section_len = file_len.checked_sub(lookup_section_start)?;
-        if borrowed_load_budget
-            .is_some_and(|budget| !budget.preflight_lookup_bytes(lookup_section_len, file_count))
-        {
-            return None;
-        }
-        let mut lookup_file = cache_file.try_clone().ok()?;
-        lookup_file
-            .seek(SeekFrom::Start(lookup_section_start))
-            .ok()?;
-        let mut lookup_bytes = Vec::new();
-        lookup_file.read_to_end(&mut lookup_bytes).ok()?;
-        if lookup_bytes.len() < 4 {
-            return None;
-        }
-        verify_crc32_bytes_slice(&lookup_bytes).ok()?;
-        let lookup_body_len = lookup_bytes.len().checked_sub(4)?;
-        let mut lookup_reader = BufReader::new(Cursor::new(&lookup_bytes));
-        let mut lookup_magic = [0u8; 8];
-        lookup_reader.read_exact(&mut lookup_magic).ok()?;
-        if &lookup_magic != LOOKUP_MAGIC {
-            return None;
-        }
-        if read_u32(&mut lookup_reader).ok()? != INDEX_VERSION {
-            return None;
-        }
-        let entry_count = read_u32(&mut lookup_reader).ok()? as usize;
-        if entry_count > MAX_ENTRIES {
-            return None;
-        }
-        let total_records = file_count.checked_add(entry_count)?;
-        if borrowed_load_budget.is_some_and(|budget| !budget.preflight(total_records)) {
-            return None;
-        }
-        let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_body_len)?;
-        let minimum_lookup_bytes = entry_count.checked_mul(LOOKUP_ENTRY_BYTES)?;
-        if minimum_lookup_bytes > remaining_lookup {
-            return None;
-        }
-
-        let mut lookup = Vec::with_capacity(entry_count);
-        let mut previous_trigram = None;
-        for lookup_index in 0..entry_count {
-            if borrowed_load_budget.is_some_and(|budget| {
-                !budget.checkpoint_at(file_count.saturating_add(lookup_index))
-            }) {
-                return None;
-            }
-            let trigram = read_u32(&mut lookup_reader).ok()?;
-            let offset = read_u64(&mut lookup_reader).ok()?;
-            let count = read_u32(&mut lookup_reader).ok()?;
-            if count as usize > MAX_ENTRIES {
-                return None;
-            }
-            if previous_trigram.is_some_and(|previous| previous >= trigram) {
-                return None;
-            }
-            previous_trigram = Some(trigram);
-            let bytes_len = (count as u64).checked_mul(POSTING_BYTES as u64)?;
-            let end = offset.checked_add(bytes_len)?;
-            if end > postings_blob_len {
-                return None;
-            }
-            lookup.push(LookupEntry {
-                trigram,
-                offset,
-                count,
-            });
-            #[cfg(test)]
-            if borrowed_load_budget.is_some() {
-                note_borrowed_load_record_read_for_test(&project_root);
-            }
-        }
-
-        let base = BasePostings {
-            file: Arc::new(cache_file),
-            postings_blob_start,
-            postings_blob_len,
-            lookup: Arc::new(lookup),
-        };
-
-        if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint()) {
-            return None;
-        }
-        let (file_trigram_count, migrated_counts) = match read_file_trigram_count_extension(
-            &base,
-            postings_blob_end,
-            postings_body_end,
-            file_count,
-        ) {
-            Ok(Some(counts)) => (counts, false),
-            Ok(None) => (
-                compute_file_trigram_counts_from_base(&base, file_count, borrowed_load_budget)
-                    .ok()?,
-                true,
-            ),
-            Err(_) => return None,
-        };
-
-        let mut index = SearchIndex {
-            base: Some(Arc::new(base)),
-            delta: Arc::new(DeltaState::default()),
-            delta_file_trigrams: HashMap::new(),
-            free_delta_file_ids: Vec::new(),
-            files: Arc::new(files),
-            path_to_id: Arc::new(path_to_id),
-            ready: false,
-            build_denied: false,
-            project_root,
-            git_head,
-            max_file_size,
-            ignore_rules_fingerprint: current_ignore_rules_fingerprint,
-            file_trigram_count: Arc::new(file_trigram_count),
-            unindexed_files: Arc::new(unindexed_files),
-            base_file_count: u32::try_from(file_count).ok()?,
-            delta_packed_bytes: 0,
-            compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-        };
-
-        if migrated_counts && allow_legacy_repair {
-            if let Ok(_lock) = CacheLock::acquire(cache_dir, current_canonical_root) {
-                let head = index.git_head.clone();
-                index.write_to_disk(cache_dir, head.as_deref());
-            }
-        }
-
-        Some((index, ignore_rules_differ))
-    }
-
-    pub fn stored_git_head(&self) -> Option<&str> {
-        self.git_head.as_deref()
-    }
-
-    pub(crate) fn verify_against_disk_with_strategy(
-        &mut self,
-        current_head: Option<String>,
-        verify_strategy: cache_freshness::VerifyStrategy,
-    ) -> bool {
-        self.git_head = current_head;
-        let changed = verify_file_mtimes(self, verify_strategy);
-        self.ready = true;
-        changed
-    }
-
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
-        let _ = self.verify_against_disk_with_strategy(
-            current_head,
-            cache_freshness::VerifyStrategy::Strict,
-        );
-    }
-
     fn allocate_file_id_with_metadata(
         &mut self,
         path: &Path,
@@ -2795,10 +1817,6 @@ impl SearchIndex {
         true
     }
 
-    fn active_file_ids(&self) -> Vec<u32> {
-        self.snapshot().active_file_ids()
-    }
-
     #[cfg(test)]
     fn postings_for_trigram(
         &self,
@@ -2806,120 +1824,6 @@ impl SearchIndex {
         filter: Option<PostingFilter>,
     ) -> std::io::Result<Vec<u32>> {
         self.snapshot().postings_for_trigram(trigram, filter)
-    }
-
-    fn update_compaction_flags(&mut self, changed_path: Option<&Path>) {
-        let delta_files = self.delta_file_trigrams.len();
-        let hard = delta_files >= DELTA_COMPACT_HARD_FILES
-            || self.delta_packed_bytes >= DELTA_COMPACT_HARD_BYTES;
-        let soft = delta_files >= DELTA_COMPACT_SOFT_FILES
-            || self.delta_packed_bytes >= DELTA_COMPACT_SOFT_BYTES;
-        if let Ok(mut state) = self.compaction_state.lock() {
-            if state.running {
-                if let Some(path) = changed_path {
-                    state.buffered_paths.push(path.to_path_buf());
-                }
-                if soft || hard {
-                    state.requested_again = true;
-                }
-            } else if hard || (soft && !state.requested_again) {
-                state.requested_again = true;
-            }
-        }
-    }
-
-    fn compaction_record_sources(
-        &self,
-        id_map: Arc<HashMap<u32, u32>>,
-    ) -> Vec<Box<dyn PostingRecordSource>> {
-        let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
-        if let Some(base) = self.base.clone() {
-            sources.push(Box::new(BaseRecordSource::new(
-                base,
-                Arc::clone(&id_map),
-                Arc::clone(&self.delta),
-            )));
-        }
-
-        let mut delta_records = Vec::new();
-        for (&trigram, postings) in &self.delta.postings {
-            for posting in postings {
-                let Some(mapped_file_id) = id_map.get(&posting.file_id).copied() else {
-                    continue;
-                };
-                delta_records.push(SpillRecord {
-                    trigram,
-                    file_id: mapped_file_id,
-                    next_mask: posting.next_mask,
-                    loc_mask: posting.loc_mask,
-                });
-            }
-        }
-        if !delta_records.is_empty() {
-            delta_records.sort_unstable_by_key(|record| (record.trigram, record.file_id));
-            sources.push(Box::new(VecRecordSource::new(delta_records)));
-        }
-        sources
-    }
-}
-
-impl BasePostings {
-    fn lookup_entry(&self, trigram: u32) -> Option<LookupEntry> {
-        self.lookup
-            .binary_search_by_key(&trigram, |entry| entry.trigram)
-            .ok()
-            .and_then(|index| self.lookup.get(index).copied())
-    }
-
-    fn read_posting_bytes(&self, entry: LookupEntry) -> std::io::Result<Vec<u8>> {
-        let bytes_len = (entry.count as usize)
-            .checked_mul(POSTING_BYTES)
-            .ok_or_else(|| std::io::Error::other("posting list too large"))?;
-        let offset = self
-            .postings_blob_start
-            .checked_add(entry.offset)
-            .ok_or_else(|| std::io::Error::other("posting offset overflow"))?;
-        let end = entry
-            .offset
-            .checked_add(bytes_len as u64)
-            .ok_or_else(|| std::io::Error::other("posting offset overflow"))?;
-        if end > self.postings_blob_len {
-            return Err(std::io::Error::other("posting list exceeds blob"));
-        }
-        let mut bytes = vec![0u8; bytes_len];
-        pread_exact(&self.file, offset, &mut bytes)?;
-        Ok(bytes)
-    }
-
-    fn for_each_posting(
-        &self,
-        entry: LookupEntry,
-        mut visit: impl FnMut(u32, u8, u8) -> bool,
-    ) -> std::io::Result<()> {
-        let bytes = self.read_posting_bytes(entry)?;
-        for chunk in bytes.chunks_exact(POSTING_BYTES) {
-            if !visit(
-                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                chunk[4],
-                chunk[5],
-            ) {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn read_postings(&self, entry: LookupEntry) -> std::io::Result<Vec<Posting>> {
-        let bytes = self.read_posting_bytes(entry)?;
-        let mut postings = Vec::with_capacity(entry.count as usize);
-        for chunk in bytes.chunks_exact(POSTING_BYTES) {
-            postings.push(Posting {
-                file_id: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                next_mask: chunk[4],
-                loc_mask: chunk[5],
-            });
-        }
-        Ok(postings)
     }
 }
 
@@ -3742,12 +2646,7 @@ impl SearchIndexSnapshot {
     fn posting_count(&self, trigram: u32) -> usize {
         #[cfg(test)]
         POSTING_COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let base_count = self
-            .base
-            .as_ref()
-            .and_then(|base| base.lookup_entry(trigram))
-            .map_or(0usize, |entry| entry.count as usize);
-        base_count.saturating_add(self.delta.postings.get(&trigram).map_or(0usize, Vec::len))
+        self.delta.postings.get(&trigram).map_or(0usize, Vec::len)
     }
 
     fn active_file_ids(&self) -> Vec<u32> {
@@ -3760,9 +2659,6 @@ impl SearchIndexSnapshot {
     fn is_active_file(&self, file_id: u32) -> bool {
         #[cfg(test)]
         SUPERSEDED_LOOKUPS.with(|count| count.set(count.get() + 1));
-        if self.delta.superseded.contains(&file_id) {
-            return false;
-        }
         self.files
             .get(file_id as usize)
             .map(|file| !file.path.as_os_str().is_empty())
@@ -3777,45 +2673,6 @@ impl SearchIndexSnapshot {
         #[cfg(debug_assertions)]
         POSTINGS_FOR_TRIGRAM_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         let mut matches = Vec::new();
-        if let Some(base_entry) = self
-            .base
-            .as_ref()
-            .and_then(|base| base.lookup_entry(trigram))
-        {
-            if let Some(base) = &self.base {
-                matches.reserve(base_entry.count as usize);
-                let mut posting_index = 0usize;
-                base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
-                    // Check cancellation on the same 64-record cadence as the
-                    // delta loop below. Superseded files are dropped by
-                    // `is_active_file`, so no separate lookup is needed here.
-                    let checkpoint = posting_index % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0;
-                    posting_index += 1;
-                    if checkpoint {
-                        #[cfg(test)]
-                        BASE_CANCELLATION_CHECKS.with(|count| count.set(count.get() + 1));
-                        if crate::executor::current_job_cancelled() {
-                            return false;
-                        }
-                    }
-                    let posting = Posting {
-                        file_id,
-                        next_mask,
-                        loc_mask,
-                    };
-                    if !posting_matches_filter(&posting, filter) {
-                        return true;
-                    }
-                    if self.is_active_file(file_id) {
-                        matches.push(file_id);
-                    }
-                    true
-                }).map_err(|error| std::io::Error::new(error.kind(), format!(
-                    "lexical postings read failed for trigram {trigram:#08x} ({} stored file records): {error}",
-                    base_entry.count,
-                )))?;
-            }
-        }
         if let Some(postings) = self.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
             for (posting_index, posting) in postings.iter().enumerate() {
@@ -4334,8 +3191,6 @@ fn read_search_corpus_file_inner(
     if crate::project_content::is_excluded(path) {
         return SearchCorpusEligibility::Skipped;
     }
-    #[cfg(test)]
-    cache_freshness::record_metadata_call(path);
     let metadata = match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
         _ => return SearchCorpusEligibility::Skipped,
@@ -4366,8 +3221,6 @@ fn read_search_corpus_file_with_metadata(
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
-    #[cfg(test)]
-    cache_freshness::record_corpus_read(path);
     let read = crate::project_content::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -4400,1120 +3253,11 @@ fn search_index_build_pool_size() -> usize {
         .clamp(1, 8)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SpillRecord {
-    trigram: u32,
-    file_id: u32,
-    next_mask: u8,
-    loc_mask: u8,
-}
-
-struct CacheWritePlan {
-    project_root: PathBuf,
-    git_head: Option<String>,
-    ignore_fingerprint: String,
-    max_file_size: u64,
-    files: Vec<FileEntry>,
-    path_to_id: HashMap<PathBuf, u32>,
-    unindexed_files: HashSet<u32>,
-    file_trigram_count: Vec<u32>,
-    id_map: Arc<HashMap<u32, u32>>,
-}
-
-impl CacheWritePlan {
-    fn from_index(index: &SearchIndex, git_head: Option<&str>) -> Option<Self> {
-        let active_ids = index.active_file_ids();
-        let mut id_map = HashMap::with_capacity(active_ids.len());
-        for (new_id, old_id) in active_ids.iter().enumerate() {
-            let new_id = u32::try_from(new_id).ok()?;
-            id_map.insert(*old_id, new_id);
-        }
-
-        let mut files = Vec::with_capacity(active_ids.len());
-        let mut path_to_id = HashMap::with_capacity(active_ids.len());
-        let mut unindexed_files = HashSet::new();
-        let mut file_trigram_count = Vec::with_capacity(active_ids.len());
-        for old_id in active_ids {
-            let new_id = *id_map.get(&old_id)?;
-            let file = index.files.get(old_id as usize)?.clone();
-            if file.path.as_os_str().is_empty() {
-                continue;
-            }
-            path_to_id.insert(file.path.clone(), new_id);
-            if index.unindexed_files.contains(&old_id) {
-                unindexed_files.insert(new_id);
-            }
-            file_trigram_count.push(
-                index
-                    .file_trigram_count
-                    .get(old_id as usize)
-                    .copied()
-                    .unwrap_or(0),
-            );
-            files.push(file);
-        }
-
-        Some(Self {
-            project_root: index.project_root.clone(),
-            git_head: git_head.map(ToOwned::to_owned),
-            ignore_fingerprint: if index.ignore_rules_fingerprint.is_empty() {
-                ignore_rules_fingerprint(&index.project_root)
-            } else {
-                index.ignore_rules_fingerprint.clone()
-            },
-            max_file_size: index.max_file_size,
-            files,
-            path_to_id,
-            unindexed_files,
-            file_trigram_count,
-            id_map: Arc::new(id_map),
-        })
-    }
-}
-
-trait PostingRecordSource {
-    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>>;
-}
-
-struct VecRecordSource {
-    records: Arc<Vec<SpillRecord>>,
-    index: usize,
-    end: usize,
-}
-
-impl VecRecordSource {
-    fn new(records: Vec<SpillRecord>) -> Self {
-        Self {
-            end: records.len(),
-            records: Arc::new(records),
-            index: 0,
-        }
-    }
-}
-
-impl PostingRecordSource for VecRecordSource {
-    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
-        if self.index == self.end {
-            return Ok(None);
-        }
-        let record = self.records.get(self.index).copied();
-        if record.is_some() {
-            self.index += 1;
-        }
-        Ok(record)
-    }
-}
-
-const SEARCH_BUILD_RECORD_BATCH: usize = 8192;
-
-fn check_search_build(keep_going: &dyn Fn() -> bool) -> std::io::Result<()> {
-    if keep_going() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "search refresh superseded",
-        ))
-    }
-}
-
-fn sorted_record_sources(
-    mut records: Vec<SpillRecord>,
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<Vec<Box<dyn PostingRecordSource>>> {
-    // Sort bounded runs so cancellation need not wait for the entire in-memory
-    // posting block.
-    // The normal merge restores the same global (trigram, file_id) ordering.
-    for run in records.chunks_mut(SEARCH_BUILD_RECORD_BATCH) {
-        check_search_build(keep_going)?;
-        run.sort_unstable_by_key(|record| (record.trigram, record.file_id));
-    }
-    check_search_build(keep_going)?;
-    let records = Arc::new(records);
-    Ok((0..records.len())
-        .step_by(SEARCH_BUILD_RECORD_BATCH)
-        .map(|index| {
-            Box::new(VecRecordSource {
-                records: records.clone(),
-                index,
-                end: (index + SEARCH_BUILD_RECORD_BATCH).min(records.len()),
-            }) as Box<dyn PostingRecordSource>
-        })
-        .collect())
-}
-
-struct SpillSegmentSource {
-    reader: BufReader<File>,
-    remaining_records: u64,
-    current_trigram: u32,
-    remaining_in_group: u32,
-}
-
-impl SpillSegmentSource {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != SPILL_MAGIC {
-            return Err(std::io::Error::other("invalid search spill magic"));
-        }
-        if read_u32(&mut reader)? != INDEX_VERSION {
-            return Err(std::io::Error::other("invalid search spill version"));
-        }
-        let remaining_records = read_u64(&mut reader)?;
-        Ok(Self {
-            reader,
-            remaining_records,
-            current_trigram: 0,
-            remaining_in_group: 0,
-        })
-    }
-}
-
-impl PostingRecordSource for SpillSegmentSource {
-    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
-        if self.remaining_records == 0 {
-            return Ok(None);
-        }
-        if self.remaining_in_group == 0 {
-            self.current_trigram = read_u32(&mut self.reader)?;
-            self.remaining_in_group = read_u32(&mut self.reader)?;
-            if self.remaining_in_group == 0 {
-                return Err(std::io::Error::other("empty search spill group"));
-            }
-        }
-        let mut file_id = [0u8; 4];
-        self.reader.read_exact(&mut file_id)?;
-        let mut masks = [0u8; 2];
-        self.reader.read_exact(&mut masks)?;
-        self.remaining_in_group -= 1;
-        self.remaining_records -= 1;
-        Ok(Some(SpillRecord {
-            trigram: self.current_trigram,
-            file_id: u32::from_le_bytes(file_id),
-            next_mask: masks[0],
-            loc_mask: masks[1],
-        }))
-    }
-}
-
-struct BaseRecordSource {
-    base: Arc<BasePostings>,
-    id_map: Arc<HashMap<u32, u32>>,
-    delta: Arc<DeltaState>,
-    lookup_index: usize,
-    current: Vec<SpillRecord>,
-    current_index: usize,
-}
-
-impl BaseRecordSource {
-    fn new(
-        base: Arc<BasePostings>,
-        id_map: Arc<HashMap<u32, u32>>,
-        delta: Arc<DeltaState>,
-    ) -> Self {
-        Self {
-            base,
-            id_map,
-            delta,
-            lookup_index: 0,
-            current: Vec::new(),
-            current_index: 0,
-        }
-    }
-
-    fn load_next_group(&mut self) -> std::io::Result<bool> {
-        while let Some(entry) = self.base.lookup.get(self.lookup_index).copied() {
-            self.lookup_index += 1;
-            let postings = self.base.read_postings(entry)?;
-            self.current.clear();
-            self.current_index = 0;
-            for posting in postings {
-                if self.delta.superseded.contains(&posting.file_id) {
-                    continue;
-                }
-                let Some(mapped_file_id) = self.id_map.get(&posting.file_id).copied() else {
-                    continue;
-                };
-                self.current.push(SpillRecord {
-                    trigram: entry.trigram,
-                    file_id: mapped_file_id,
-                    next_mask: posting.next_mask,
-                    loc_mask: posting.loc_mask,
-                });
-            }
-            if !self.current.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
-
-impl PostingRecordSource for BaseRecordSource {
-    fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
-        if self.current_index >= self.current.len() && !self.load_next_group()? {
-            return Ok(None);
-        }
-        let record = self.current[self.current_index];
-        self.current_index += 1;
-        Ok(Some(record))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HeapItem {
-    record: SpillRecord,
-    source_index: usize,
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .record
-            .trigram
-            .cmp(&self.record.trigram)
-            .then_with(|| other.record.file_id.cmp(&self.record.file_id))
-            .then_with(|| other.source_index.cmp(&self.source_index))
-    }
-}
-
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(test)]
-type RefreshReadProbe = (Arc<AtomicUsize>, Arc<AtomicBool>);
-#[cfg(test)]
-static REFRESH_READ_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, RefreshReadProbe>>> = OnceLock::new();
-#[cfg(test)]
-thread_local! {
-    static FAIL_STREAMING_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn note_refresh_read_for_test(root: &Path) {
-    if let Some((reads, cancelled)) = REFRESH_READ_PROBES
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap()
-        .get(root)
-    {
-        reads.fetch_add(1, Ordering::SeqCst);
-        cancelled.store(true, Ordering::SeqCst);
-    }
-}
-
-fn build_streaming_index(
-    root: &Path,
-    max_file_size: u64,
-    cache_dir: &Path,
-    keep_going: &(dyn Fn() -> bool + Sync),
-) -> std::io::Result<(SearchIndex, usize)> {
-    let _progress = crate::cold_build_limiter::progress::start(
-        root,
-        "trigram build",
-        None,
-        crate::cold_build_limiter::progress::StartLog::Info,
-    );
-    crate::cold_build_limiter::progress::phase("enumerating", None);
-    #[cfg(test)]
-    if FAIL_STREAMING_BUILD.replace(false) {
-        return Err(std::io::Error::other("injected streaming cache failure"));
-    }
-    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
-    sweep_stale_search_build_dirs(cache_dir);
-    let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let ignore_fingerprint = ignore_rules_fingerprint_cancellable(&project_root, keep_going)
-        .ok_or(std::io::ErrorKind::Interrupted)?;
-    let filters = PathFilters::default();
-    let mut walk = BuildFileWalk::new(&project_root, &filters);
-    // The walk and the indexing now run together, so the file total is known
-    // only once the walk ends; it is reported then.
-    crate::cold_build_limiter::progress::phase("indexing", None);
-    let pool_size = search_index_build_pool_size();
-    let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(pool_size)
-        .thread_name(|index| format!("aft-rayon-search-build-{index}"))
-        .stack_size(8 * 1024 * 1024)
-        .build()
-        .ok();
-
-    let spill_dir = create_spill_dir(cache_dir)?;
-    let spill_counter = crate::write_ledger::register(
-        crate::write_ledger::Domain::SearchIndexBuild,
-        project_root.display().to_string(),
-    );
-    let mut spill_paths = Vec::new();
-    let mut spill_seq = 0usize;
-    let mut block: Vec<SpillRecord> = Vec::new();
-    let mut files = Vec::new();
-    let mut path_to_id = HashMap::new();
-    let mut unindexed_files = HashSet::new();
-    let mut file_trigram_count = Vec::new();
-    let mut indexed = 0usize;
-
-    // Read once at publish time and shared by the written cache and the
-    // returned index, so the two always agree on HEAD.
-    let mut git_head: Option<String> = None;
-    let build_result = (|| -> std::io::Result<BasePostings> {
-        while !walk.is_finished() {
-            let chunk = walk.next_chunk(chunk_size, keep_going).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
-            })?;
-            if walk.is_finished() {
-                crate::cold_build_limiter::progress::remaining(chunk.len());
-            }
-            if chunk.is_empty() {
-                continue;
-            }
-            if !keep_going() {
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            let prepare_chunk = || -> Vec<PreparedSearchPath> {
-                chunk
-                    .par_iter()
-                    .map(|path| {
-                        if keep_going() {
-                            let prepared = prepare_search_path(path, max_file_size);
-                            #[cfg(test)]
-                            note_refresh_read_for_test(&project_root);
-                            prepared
-                        } else {
-                            PreparedSearchPath::Skipped
-                        }
-                    })
-                    .collect()
-            };
-            let prepared = match &pool {
-                Some(pool) => pool.install(prepare_chunk),
-                None => prepare_chunk(),
-            };
-
-            let chunk_len = chunk.len();
-            for (mut path, prepared) in chunk.into_iter().zip(prepared) {
-                // The walk's paths carry spare capacity. The index keeps them
-                // for its lifetime, so trim them to their length first.
-                path.shrink_to_fit();
-                match prepared {
-                    PreparedSearchPath::Indexed(file) => {
-                        let file_id = u32::try_from(files.len())
-                            .map_err(|_| std::io::Error::other("too many files to index"))?;
-                        path_to_id.insert(path.clone(), file_id);
-                        files.push(FileEntry {
-                            path,
-                            size: file.metadata.size,
-                            modified: file.metadata.modified,
-                            content_hash: file.content_hash,
-                        });
-                        file_trigram_count.push(file.trigram_map.len() as u32);
-                        for (trigram, filter) in file.trigram_map {
-                            block.push(SpillRecord {
-                                trigram,
-                                file_id,
-                                next_mask: filter.next_mask,
-                                loc_mask: filter.loc_mask,
-                            });
-                        }
-                        indexed += 1;
-                    }
-                    PreparedSearchPath::Unindexed(metadata) => {
-                        let file_id = u32::try_from(files.len())
-                            .map_err(|_| std::io::Error::other("too many files to index"))?;
-                        path_to_id.insert(path.clone(), file_id);
-                        files.push(FileEntry {
-                            path,
-                            size: metadata.size,
-                            modified: metadata.modified,
-                            content_hash: cache_freshness::zero_hash(),
-                        });
-                        unindexed_files.insert(file_id);
-                        file_trigram_count.push(0);
-                        indexed += 1;
-                    }
-                    PreparedSearchPath::Skipped => {}
-                }
-
-                let block_bytes = block.len().saturating_mul(SPILL_RECORD_ESTIMATED_BYTES);
-                if block_bytes >= SPIMI_SOFT_LIMIT_BYTES || block_bytes >= SPIMI_HARD_LIMIT_BYTES {
-                    let path =
-                        flush_spill_segment(&spill_dir, spill_seq, &mut block, &spill_counter)?;
-                    spill_paths.push(path);
-                    spill_seq += 1;
-                }
-            }
-            crate::cold_build_limiter::progress::advance(chunk_len);
-        }
-
-        crate::cold_build_limiter::progress::phase("publishing", None);
-        if !keep_going() {
-            return Err(std::io::ErrorKind::Interrupted.into());
-        }
-        let mut sources = sorted_record_sources(std::mem::take(&mut block), keep_going)?;
-        for path in &spill_paths {
-            check_search_build(keep_going)?;
-            sources.push(Box::new(SpillSegmentSource::open(path)?));
-        }
-
-        git_head = current_git_head(&project_root);
-        // The tables move into the plan and back out after the write. Cloning
-        // them held a second copy of every path while the cache was written.
-        let plan = CacheWritePlan {
-            project_root: project_root.clone(),
-            git_head: git_head.clone(),
-            ignore_fingerprint: ignore_fingerprint.clone(),
-            max_file_size,
-            files: std::mem::take(&mut files),
-            path_to_id: std::mem::take(&mut path_to_id),
-            unindexed_files: std::mem::take(&mut unindexed_files),
-            file_trigram_count: std::mem::take(&mut file_trigram_count),
-            // Only a rewrite of an existing index renumbers files. A cold
-            // build's ids are already the cache's ids, and the writer never
-            // reads this map, so it stays empty.
-            id_map: Arc::new(HashMap::new()),
-        };
-        let written = write_cache_file_from_sources(
-            cache_dir,
-            &plan,
-            &mut sources,
-            crate::write_ledger::Domain::SearchIndexBuild,
-            keep_going,
-        );
-        files = plan.files;
-        path_to_id = plan.path_to_id;
-        unindexed_files = plan.unindexed_files;
-        file_trigram_count = plan.file_trigram_count;
-        written
-    })();
-
-    let _ = fs::remove_dir_all(&spill_dir);
-    let base = build_result?;
-    let base_file_count =
-        u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
-    let index = SearchIndex {
-        base: Some(Arc::new(base)),
-        delta: Arc::new(DeltaState::default()),
-        delta_file_trigrams: HashMap::new(),
-        free_delta_file_ids: Vec::new(),
-        files: Arc::new(files),
-        path_to_id: Arc::new(path_to_id),
-        ready: false,
-        build_denied: false,
-        project_root,
-        git_head,
-        max_file_size,
-        ignore_rules_fingerprint: ignore_fingerprint,
-        file_trigram_count: Arc::new(file_trigram_count),
-        unindexed_files: Arc::new(unindexed_files),
-        base_file_count,
-        delta_packed_bytes: 0,
-        compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-    };
-    Ok((index, indexed))
-}
-
-/// Write `cache.bin` through a temp file and credit the bytes to the write
-/// census under `domain`. Crediting here, where the bytes are produced, covers
-/// every caller (cold streaming builds and base+delta rewrites alike); a build
-/// that credits nothing shows up in the census as unexplained daemon writes.
-fn write_cache_file_from_sources(
-    cache_dir: &Path,
-    plan: &CacheWritePlan,
-    sources: &mut [Box<dyn PostingRecordSource>],
-    domain: crate::write_ledger::Domain,
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<BasePostings> {
-    check_search_build(keep_going)?;
-    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
-    sweep_stale_search_build_dirs(cache_dir);
-    let cache_path = cache_dir.join("cache.bin");
-    let tmp_cache = cache_dir.join(format!(
-        "cache.bin.tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
-
-    let write_result = (|| -> std::io::Result<BasePostings> {
-        let raw = crate::private_storage::options()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_cache)?;
-        let mut writer = BufWriter::new(raw);
-        write_u32(&mut writer, CACHE_MAGIC)?;
-        write_u32(&mut writer, INDEX_VERSION)?;
-        let postings_len_patch = writer.stream_position()?;
-        write_u64(&mut writer, 0)?;
-
-        let postings_section_start = writer.stream_position()?;
-        write_postings_header(&mut writer, plan, keep_going)?;
-        let postings_blob_len_patch = writer.stream_position()?;
-        write_u64(&mut writer, 0)?;
-        let postings_blob_start = writer.stream_position()?;
-
-        let (lookup_entries, postings_blob_len) =
-            merge_sources_to_writer(sources, &mut writer, keep_going)?;
-        let extension = build_file_trigram_count_extension(&plan.file_trigram_count, keep_going)?;
-        write_search_build_bytes(&mut writer, &extension, keep_going)?;
-        let postings_crc_end = writer.stream_position()?;
-
-        writer.flush()?;
-        writer.seek(SeekFrom::Start(postings_blob_len_patch))?;
-        write_u64(&mut writer, postings_blob_len)?;
-        writer.flush()?;
-
-        let checksum = crc32_file_range(
-            &tmp_cache,
-            postings_section_start,
-            postings_crc_end.saturating_sub(postings_section_start),
-            keep_going,
-        )?;
-        writer.seek(SeekFrom::Start(postings_crc_end))?;
-        writer.write_all(&checksum.to_le_bytes())?;
-        let postings_section_end = writer.stream_position()?;
-        let postings_len_total = postings_section_end.saturating_sub(postings_section_start);
-        writer.seek(SeekFrom::Start(postings_len_patch))?;
-        write_u64(&mut writer, postings_len_total)?;
-        writer.seek(SeekFrom::Start(postings_section_end))?;
-
-        let lookup_blob = build_lookup_section_bytes(&lookup_entries, keep_going)?;
-        write_search_build_bytes(&mut writer, &lookup_blob, keep_going)?;
-        let file_bytes = writer.stream_position()?;
-        writer.flush()?;
-        // CRC-checked caches rebuild from source after power loss. The rename,
-        // not a sync, keeps concurrent readers from seeing a partial write.
-        drop(writer);
-
-        check_search_build(keep_going)?;
-        publish_legacy_search_cache(|| {
-            fs::rename(&tmp_cache, &cache_path)?;
-            // Account inside the publication fence so a completed views bind
-            // cannot be followed by credit for an older legacy publication.
-            crate::write_ledger::credit(
-                domain,
-                plan.project_root.display().to_string(),
-                file_bytes,
-                file_bytes,
-            );
-            Ok(())
-        })?;
-        let file = open_cache_file_read(&cache_path)?;
-        Ok(BasePostings {
-            file: Arc::new(file),
-            postings_blob_start,
-            postings_blob_len,
-            lookup: Arc::new(lookup_entries),
-        })
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp_cache);
-    }
-    write_result
-}
-
-fn merge_sources_to_writer(
-    sources: &mut [Box<dyn PostingRecordSource>],
-    writer: &mut BufWriter<File>,
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<(Vec<LookupEntry>, u64)> {
-    let mut heap = BinaryHeap::new();
-    for (source_index, source) in sources.iter_mut().enumerate() {
-        check_search_build(keep_going)?;
-        if let Some(record) = source.next_record()? {
-            heap.push(HeapItem {
-                record,
-                source_index,
-            });
-        }
-    }
-
-    let mut lookup_entries = Vec::new();
-    let mut postings_blob_len = 0u64;
-    let mut current_trigram: Option<u32> = None;
-    let mut current_offset = 0u64;
-    let mut current_count = 0u32;
-
-    while let Some(item) = heap.pop() {
-        if postings_blob_len % (SEARCH_BUILD_RECORD_BATCH * POSTING_BYTES) as u64 == 0 {
-            check_search_build(keep_going)?;
-        }
-        let record = item.record;
-        if current_trigram != Some(record.trigram) {
-            if let Some(trigram) = current_trigram {
-                lookup_entries.push(LookupEntry {
-                    trigram,
-                    offset: current_offset,
-                    count: current_count,
-                });
-            }
-            current_trigram = Some(record.trigram);
-            current_offset = postings_blob_len;
-            current_count = 0;
-        }
-
-        writer.write_all(&record.file_id.to_le_bytes())?;
-        writer.write_all(&[record.next_mask, record.loc_mask])?;
-        postings_blob_len = postings_blob_len
-            .checked_add(POSTING_BYTES as u64)
-            .ok_or_else(|| std::io::Error::other("postings blob too large"))?;
-        current_count = current_count
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("posting list too large"))?;
-
-        if let Some(next) = sources[item.source_index].next_record()? {
-            heap.push(HeapItem {
-                record: next,
-                source_index: item.source_index,
-            });
-        }
-    }
-
-    if let Some(trigram) = current_trigram {
-        lookup_entries.push(LookupEntry {
-            trigram,
-            offset: current_offset,
-            count: current_count,
-        });
-    }
-
-    check_search_build(keep_going)?;
-    Ok((lookup_entries, postings_blob_len))
-}
-
-fn write_search_build_bytes(
-    writer: &mut impl Write,
-    bytes: &[u8],
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<()> {
-    for chunk in bytes.chunks(64 * 1024) {
-        check_search_build(keep_going)?;
-        writer.write_all(chunk)?;
-    }
-    Ok(())
-}
-
-/// Writes the file table straight to the cache writer. Building it in memory
-/// first held another copy of every relative path while the cache was written.
-fn write_postings_header(
-    writer: &mut impl Write,
-    plan: &CacheWritePlan,
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<()> {
-    check_search_build(keep_going)?;
-    writer.write_all(INDEX_MAGIC)?;
-    write_u32(writer, INDEX_VERSION)?;
-
-    let head = plan.git_head.as_deref().unwrap_or_default();
-    let root = plan.project_root.to_string_lossy();
-    let head_len = u32::try_from(head.len())
-        .map_err(|_| std::io::Error::other("git head too large to cache"))?;
-    let root_len = u32::try_from(root.len())
-        .map_err(|_| std::io::Error::other("project root too large to cache"))?;
-    let ignore_fingerprint_len = u32::try_from(plan.ignore_fingerprint.len())
-        .map_err(|_| std::io::Error::other("ignore fingerprint too large to cache"))?;
-    let file_count = u32::try_from(plan.files.len())
-        .map_err(|_| std::io::Error::other("too many files to cache"))?;
-
-    write_u32(writer, head_len)?;
-    write_u32(writer, root_len)?;
-    write_u32(writer, ignore_fingerprint_len)?;
-    write_u64(writer, plan.max_file_size)?;
-    write_u32(writer, file_count)?;
-    writer.write_all(head.as_bytes())?;
-    writer.write_all(root.as_bytes())?;
-    writer.write_all(plan.ignore_fingerprint.as_bytes())?;
-
-    for (file_id, file) in plan.files.iter().enumerate() {
-        if file_id % SEARCH_BUILD_RECORD_BATCH == 0 {
-            check_search_build(keep_going)?;
-        }
-        let file_id =
-            u32::try_from(file_id).map_err(|_| std::io::Error::other("too many files to cache"))?;
-        let path = storable_relative_path(&plan.project_root, &file.path).ok_or_else(|| {
-            std::io::Error::other(format!(
-                "refusing to cache path outside project root: {}",
-                file.path.display()
-            ))
-        })?;
-        let path = path.to_string_lossy();
-        let path_len = u32::try_from(path.len())
-            .map_err(|_| std::io::Error::other("cached path too large"))?;
-        let modified = file
-            .modified
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        let unindexed = if plan.unindexed_files.contains(&file_id) {
-            1u8
-        } else {
-            0u8
-        };
-
-        writer.write_all(&[unindexed])?;
-        write_u32(writer, path_len)?;
-        write_u64(writer, file.size)?;
-        write_u64(writer, modified.as_secs())?;
-        write_u32(writer, modified.subsec_nanos())?;
-        writer.write_all(file.content_hash.as_bytes())?;
-        writer.write_all(path.as_bytes())?;
-    }
-
-    Ok(())
-}
-
-fn build_lookup_section_bytes(
-    lookup_entries: &[LookupEntry],
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<Vec<u8>> {
-    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
-    let entry_count = u32::try_from(lookup_entries.len())
-        .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
-    writer.write_all(LOOKUP_MAGIC)?;
-    write_u32(&mut writer, INDEX_VERSION)?;
-    write_u32(&mut writer, entry_count)?;
-    for (index, entry) in lookup_entries.iter().enumerate() {
-        if index % SEARCH_BUILD_RECORD_BATCH == 0 {
-            check_search_build(keep_going)?;
-        }
-        write_u32(&mut writer, entry.trigram)?;
-        write_u64(&mut writer, entry.offset)?;
-        write_u32(&mut writer, entry.count)?;
-    }
-    writer.flush()?;
-    let mut lookup_blob = writer
-        .into_inner()
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .into_inner();
-    let mut hasher = crc32fast::Hasher::new();
-    for chunk in lookup_blob.chunks(64 * 1024) {
-        check_search_build(keep_going)?;
-        hasher.update(chunk);
-    }
-    let checksum = hasher.finalize();
-    lookup_blob.extend_from_slice(&checksum.to_le_bytes());
-    Ok(lookup_blob)
-}
-
-fn build_file_trigram_count_extension(
-    counts: &[u32],
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<Vec<u8>> {
-    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
-    writer.write_all(FILE_TRIGRAM_COUNT_MAGIC)?;
-    write_u32(&mut writer, INDEX_VERSION)?;
-    write_u32(
-        &mut writer,
-        u32::try_from(counts.len())
-            .map_err(|_| std::io::Error::other("too many file trigram counts"))?,
-    )?;
-    for (index, count) in counts.iter().enumerate() {
-        if index % SEARCH_BUILD_RECORD_BATCH == 0 {
-            check_search_build(keep_going)?;
-        }
-        write_u32(&mut writer, *count)?;
-    }
-    writer.flush()?;
-    Ok(writer
-        .into_inner()
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .into_inner())
-}
-
-fn flush_spill_segment(
-    spill_dir: &Path,
-    seq: usize,
-    block: &mut Vec<SpillRecord>,
-    counter: &crate::write_ledger::Counter,
-) -> std::io::Result<PathBuf> {
-    if block.is_empty() {
-        return Err(std::io::Error::other(
-            "refusing to write empty search spill",
-        ));
-    }
-    block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
-    let path = spill_dir.join(format!("segment.{seq:06}.bin"));
-    let mut writer = BufWriter::new(crate::private_storage::create(&path)?);
-    writer.write_all(SPILL_MAGIC)?;
-    write_u32(&mut writer, INDEX_VERSION)?;
-    write_u64(
-        &mut writer,
-        u64::try_from(block.len()).map_err(|_| std::io::Error::other("search spill too large"))?,
-    )?;
-
-    let mut index = 0usize;
-    while index < block.len() {
-        let trigram = block[index].trigram;
-        let group_start = index;
-        while index < block.len() && block[index].trigram == trigram {
-            index += 1;
-        }
-        write_u32(&mut writer, trigram)?;
-        write_u32(
-            &mut writer,
-            u32::try_from(index - group_start)
-                .map_err(|_| std::io::Error::other("search spill group too large"))?,
-        )?;
-        for record in &block[group_start..index] {
-            writer.write_all(&record.file_id.to_le_bytes())?;
-            writer.write_all(&[record.next_mask, record.loc_mask])?;
-        }
-    }
-    let segment_bytes = writer.stream_position()?;
-    writer.flush()?;
-    // Spill segments are read and deleted by this build. Kernel visibility is
-    // enough; they have no recovery role after the process exits.
-    counter.credit(segment_bytes, segment_bytes);
-    block.clear();
-    Ok(path)
-}
-
-fn create_spill_dir(cache_dir: &Path) -> std::io::Result<PathBuf> {
-    let dir = cache_dir.join(format!(
-        "search-build.tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
-    crate::private_storage::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-fn sweep_stale_search_build_dirs(cache_dir: &Path) {
-    // A vanished mounted child can make ReadDir::drop panic after closedir
-    // returns ENXIO, aborting the daemon. Do not recurse through a foreign
-    // temporary directory while cleaning stale search-index builds.
-    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(cache_dir) else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(cache_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let path = entry.path();
-        if file_name.to_string_lossy().starts_with("search-build.tmp.") {
-            if boundary.should_descend(&path).unwrap_or(false) {
-                let _ = fs::remove_dir_all(path);
-            } else {
-                crate::slog_warn!(
-                    "search-index sweep skipped foreign filesystem mount {}",
-                    path.display()
-                );
-            }
-        }
-    }
-}
-
-fn transient_search_cache_home() -> PathBuf {
-    std::env::temp_dir().join(TRANSIENT_SEARCH_CACHE_DIR_NAME)
-}
-
-fn transient_search_cache_dir(root: &Path) -> PathBuf {
-    transient_search_cache_home().join(format!(
-        "{TRANSIENT_SEARCH_CACHE_PREFIX}{}.{}",
-        artifact_cache_key_for_build(root),
-        std::process::id()
-    ))
-}
-
-/// Return the process-local mutex for a process/root transient cache directory.
-/// The PID in the directory name isolates separate processes, while this registry
-/// prevents two threads from truncating the same directory during concurrent builds.
-fn transient_search_cache_build_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
-    let locks = TRANSIENT_SEARCH_CACHE_BUILD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = locks.get(cache_dir).and_then(Weak::upgrade) {
-        return lock;
-    }
-    if locks.len() >= 1_024 {
-        locks.retain(|_, lock| lock.strong_count() > 0);
-    }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(cache_dir.to_path_buf(), Arc::downgrade(&lock));
-    lock
-}
-
-/// Reuse one scratch directory for this process/root pair. The streaming index
-/// opens cache.bin as its postings store, so its previous files must be removed
-/// only while the process-local cache lock is held.
-fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> {
-    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
-    for entry in fs::read_dir(cache_dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-
-fn read_file_trigram_count_extension(
-    base: &BasePostings,
-    extension_start: u64,
-    postings_body_end: u64,
-    file_count: usize,
-) -> std::io::Result<Option<Vec<u32>>> {
-    if extension_start >= postings_body_end {
-        return Ok(None);
-    }
-    let extension_len = postings_body_end - extension_start;
-    if extension_len < 16 {
-        return Ok(None);
-    }
-    let mut header = [0u8; 16];
-    pread_exact(&base.file, extension_start, &mut header)?;
-    if &header[..8] != FILE_TRIGRAM_COUNT_MAGIC {
-        return Ok(None);
-    }
-    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-    if version != INDEX_VERSION {
-        return Err(std::io::Error::other("invalid file trigram count version"));
-    }
-    let count = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    if count != file_count {
-        return Err(std::io::Error::other("file trigram count length mismatch"));
-    }
-    let counts_len = count
-        .checked_mul(4)
-        .ok_or_else(|| std::io::Error::other("file trigram count extension too large"))?;
-    if 16u64 + counts_len as u64 > extension_len {
-        return Err(std::io::Error::other(
-            "truncated file trigram count extension",
-        ));
-    }
-    let mut bytes = vec![0u8; counts_len];
-    pread_exact(&base.file, extension_start + 16, &mut bytes)?;
-    let mut counts = Vec::with_capacity(count);
-    for chunk in bytes.chunks_exact(4) {
-        counts.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(Some(counts))
-}
-
-fn compute_file_trigram_counts_from_base(
-    base: &BasePostings,
-    file_count: usize,
-    borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
-) -> std::io::Result<Vec<u32>> {
-    let mut counts = vec![0u32; file_count];
-    for (entry_index, entry) in base.lookup.iter().copied().enumerate() {
-        if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint_at(entry_index)) {
-            return Err(std::io::Error::other("borrowed index load stopped"));
-        }
-        for posting in base.read_postings(entry)? {
-            let Some(count) = counts.get_mut(posting.file_id as usize) else {
-                return Err(std::io::Error::other("posting references missing file"));
-            };
-            *count = count.saturating_add(1);
-        }
-    }
-    Ok(counts)
-}
-
 fn ensure_count_slot(counts: &mut Vec<u32>, file_id: u32) {
     let len = file_id as usize + 1;
     if counts.len() < len {
         counts.resize(len, 0);
     }
-}
-
-fn reader_has_remaining<R: Seek>(
-    reader: &mut R,
-    absolute_end: u64,
-    len: usize,
-) -> std::io::Result<bool> {
-    let position = reader.stream_position()?;
-    Ok(position <= absolute_end && (len as u64) <= absolute_end - position)
-}
-
-fn crc32_file_range(
-    path: &Path,
-    start: u64,
-    len: u64,
-    keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<u32> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut remaining = len;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    while remaining > 0 {
-        check_search_build(keep_going)?;
-        let read_len = buffer.len().min(remaining as usize);
-        let bytes_read = file.read(&mut buffer[..read_len])?;
-        if bytes_read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated cache while checksumming",
-            ));
-        }
-        hasher.update(&buffer[..bytes_read]);
-        remaining -= bytes_read as u64;
-    }
-    Ok(hasher.finalize())
-}
-
-fn open_cache_file_read(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    }
-    options.open(path)
-}
-
-#[cfg(unix)]
-fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    while !buffer.is_empty() {
-        let bytes_read = file.read_at(buffer, offset)?;
-        if bytes_read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short pread from search cache",
-            ));
-        }
-        offset += bytes_read as u64;
-        let (_, rest) = buffer.split_at_mut(bytes_read);
-        buffer = rest;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buffer.is_empty() {
-        let bytes_read = file.seek_read(buffer, offset)?;
-        if bytes_read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short pread from search cache",
-            ));
-        }
-        offset += bytes_read as u64;
-        let (_, rest) = buffer.split_at_mut(bytes_read);
-        buffer = rest;
-    }
-    Ok(())
 }
 
 /// Insert a delta posting without disturbing the sorted-id invariant required by
@@ -5870,11 +3614,7 @@ pub(crate) fn build_path_filters(
     })
 }
 
-/// The cold build's file walk, read a chunk at a time. The streaming build
-/// indexes each chunk before asking for the next one, so it never holds the
-/// whole root's path list: on a root with a million files that list alone was
-/// several hundred megabytes. Files come out in the same order as one
-/// collected walk, so file ids and the written cache do not change.
+/// The in-memory corpus builder's cancellable file walk, read in chunks.
 struct BuildFileWalk<'a> {
     root: &'a Path,
     filters: &'a PathFilters,
@@ -5892,14 +3632,13 @@ impl<'a> BuildFileWalk<'a> {
         }
     }
 
-    /// True once the walk has returned its last file.
+    #[cfg(test)]
     fn is_finished(&self) -> bool {
         self.finished
     }
 
     /// The next `max` admitted files, or fewer when the walk ends first.
-    /// `keep_going` is checked before every walk entry, as the collected walk
-    /// did, and a cancelled walk returns `None`.
+    /// `keep_going` is checked before every walk entry; cancellation returns `None`.
     fn next_chunk(&mut self, max: usize, keep_going: &dyn Fn() -> bool) -> Option<Vec<PathBuf>> {
         let mut paths = Vec::new();
         while paths.len() < max && !self.finished {
@@ -7847,243 +5586,6 @@ fn artifact_key_looks_valid(key: &str) -> bool {
     key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Reclaim old index directories that no configured or in-process root can use.
-/// Each candidate holds both search and root-keyed writer leases until deletion,
-/// so a concurrent publisher leaves the directory for a later maintenance pass.
-// Retained for isolated cache-lock fixtures; production eviction is scheduled
-// through storage_retention rather than inferring abandonment from payload age.
-#[cfg(test)]
-pub(crate) fn sweep_orphaned_index_dirs(storage_root: &crate::root_cache::StoragePaths) {
-    let index_root = storage_root.artifacts.join("index");
-    let referenced_keys = match referenced_artifact_cache_keys(&storage_root.durable) {
-        Ok(keys) => keys,
-        Err(error) => {
-            crate::slog_warn!(
-                "search index orphan sweep root={} scanned=0 removed=0 skipped_derived=0 skipped_memo=0 skipped_fresh=0 skipped_live=0 skipped_locked=0 skipped_unreadable=0 budget_exhausted=false memo_unreadable=true error={}",
-                index_root.display(),
-                error
-            );
-            return;
-        }
-    };
-    let derived_keys = derived_artifact_cache_keys();
-    let mut summary = IndexOrphanSweepSummary::default();
-    let mut entries = match fs::read_dir(&index_root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                (file_type.is_dir() && artifact_key_looks_valid(&name))
-                    .then(|| (name, entry.path()))
-            })
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(_) => {
-            crate::slog_warn!(
-                "search index orphan sweep root={} scanned=0 removed=0 skipped_derived=0 skipped_memo=0 skipped_fresh=0 skipped_live=0 skipped_locked=0 skipped_unreadable=1 budget_exhausted=false memo_unreadable=false",
-                index_root.display()
-            );
-            return;
-        }
-    };
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let cursor_store = INDEX_ORPHAN_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let last_name = cursor_store
-        .lock()
-        .ok()
-        .and_then(|cursors| cursors.get(&index_root).cloned());
-    if let Some(start) = last_name
-        .as_deref()
-        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
-    {
-        entries.rotate_left(start);
-    }
-
-    let mut cursor_name = last_name;
-    for (processed, (key, cache_dir)) in entries.into_iter().enumerate() {
-        if processed >= INDEX_ORPHAN_SWEEP_LIMIT {
-            summary.budget_exhausted = true;
-            break;
-        }
-        summary.scanned += 1;
-        cursor_name = Some(key.clone());
-        if derived_keys.contains(&key) {
-            summary.skipped_derived += 1;
-            continue;
-        }
-        if referenced_keys.contains(&key) {
-            summary.skipped_memo += 1;
-            continue;
-        }
-        let newest_file = match newest_index_cache_file_mtime(&cache_dir) {
-            Ok(Some(time)) => time,
-            Ok(None) | Err(()) => {
-                summary.skipped_unreadable += 1;
-                continue;
-            }
-        };
-        if SystemTime::now()
-            .duration_since(newest_file)
-            .unwrap_or(Duration::ZERO)
-            <= INDEX_ORPHAN_MIN_AGE
-        {
-            summary.skipped_fresh += 1;
-            continue;
-        }
-
-        let Some((_cache_lock, _writer_lease)) = try_acquire_index_orphan_sweep_locks(&cache_dir)
-        else {
-            summary.skipped_locked += 1;
-            continue;
-        };
-        if crate::root_cache::sweep_all_read_markers(&cache_dir).protected {
-            summary.skipped_live += 1;
-            continue;
-        }
-        // An orphaned cache in a newer build's format still belongs to that
-        // build; only it may decide to discard it.
-        if SearchIndex::check_disk_cache_format(&cache_dir).is_err() {
-            summary.skipped_unreadable += 1;
-            continue;
-        }
-        match fs::remove_dir_all(&cache_dir) {
-            Ok(()) => summary.removed += 1,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => summary.removed += 1,
-            Err(_) => summary.skipped_unreadable += 1,
-        }
-    }
-
-    if let Ok(mut cursors) = cursor_store.lock() {
-        if summary.budget_exhausted {
-            if let Some(cursor_name) = cursor_name {
-                cursors.insert(index_root.clone(), cursor_name);
-            }
-        } else {
-            cursors.remove(&index_root);
-        }
-    }
-    if summary.removed > 0 {}
-    crate::slog_info!(
-        "search index orphan sweep root={} scanned={} removed={} skipped_derived={} skipped_memo={} skipped_fresh={} skipped_live={} skipped_locked={} skipped_unreadable={} budget_exhausted={}",
-        index_root.display(),
-        summary.scanned,
-        summary.removed,
-        summary.skipped_derived,
-        summary.skipped_memo,
-        summary.skipped_fresh,
-        summary.skipped_live,
-        summary.skipped_locked,
-        summary.skipped_unreadable,
-        summary.budget_exhausted
-    );
-}
-
-/// Return durable cache keys referenced by `cache-keys.json` without deriving new
-/// identities. Maintenance sweeps use this read-only snapshot as their liveness
-/// boundary so a failed or corrupt memo leaves artifacts untouched.
-#[cfg(test)]
-pub(crate) fn referenced_artifact_cache_keys(
-    storage_root: &Path,
-) -> std::io::Result<HashSet<String>> {
-    let state = artifact_cache_key_memo_state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entries = state
-        .by_storage_root
-        .get(storage_root)
-        .cloned()
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let path = artifact_cache_key_memo_path(storage_root);
-            match fs::read(path) {
-                Ok(bytes) => {
-                    serde_json::from_slice::<BTreeMap<String, ArtifactCacheKeyMemoEntry>>(&bytes)
-                        .map_err(std::io::Error::other)
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-                Err(error) => Err(error),
-            }
-        })?;
-    Ok(entries
-        .into_values()
-        .filter_map(|entry| artifact_key_looks_valid(&entry.key).then_some(entry.key))
-        .collect())
-}
-
-/// Return keys derived by this process. They supplement the durable memo during
-/// maintenance, protecting an active root before its next memo write completes.
-#[cfg(test)]
-pub(crate) fn derived_artifact_cache_keys() -> HashSet<String> {
-    DERIVED_CACHE_KEYS
-        .get()
-        .and_then(|keys| keys.try_read().ok())
-        .map(|keys| keys.values().cloned().collect())
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-fn try_acquire_index_orphan_sweep_locks(
-    cache_dir: &Path,
-) -> Option<(fs_lock::LockGuard, fs_lock::LockGuard)> {
-    let cache_lock = fs_lock::try_acquire(&cache_dir.join("cache.lock"), Duration::ZERO).ok()?;
-    let writer_lease = fs_lock::try_acquire(
-        &crate::root_cache::writer_lease_path(cache_dir),
-        Duration::ZERO,
-    )
-    .ok()?;
-    Some((cache_lock, writer_lease))
-}
-
-#[cfg(test)]
-fn newest_index_cache_file_mtime(cache_dir: &Path) -> Result<Option<SystemTime>, ()> {
-    let boundary = crate::walk_boundary::DeviceBoundary::for_root(cache_dir).map_err(|_| ())?;
-    let mut newest = None;
-    newest_index_cache_file_mtime_inner(cache_dir, &boundary, &mut newest)?;
-    Ok(newest)
-}
-
-#[cfg(test)]
-fn newest_index_cache_file_mtime_inner(
-    directory: &Path,
-    boundary: &crate::walk_boundary::DeviceBoundary,
-    newest: &mut Option<SystemTime>,
-) -> Result<(), ()> {
-    for entry in fs::read_dir(directory).map_err(|_| ())? {
-        let entry = entry.map_err(|_| ())?;
-        let file_type = entry.file_type().map_err(|_| ())?;
-        if file_type.is_symlink() {
-            return Err(());
-        }
-        let path = entry.path();
-        if file_type.is_dir() {
-            // A mounted child can disappear while this background cache scan owns
-            // its ReadDir; skip it before opening it to avoid ENXIO Drop aborts.
-            if !boundary.should_descend(&path).map_err(|_| ())? {
-                crate::slog_warn!(
-                    "search-index cache scan skipped foreign filesystem mount {}",
-                    path.display()
-                );
-                continue;
-            }
-            newest_index_cache_file_mtime_inner(&path, boundary, newest)?;
-        } else if file_type.is_file() {
-            let modified = entry
-                .metadata()
-                .map_err(|_| ())?
-                .modified()
-                .map_err(|_| ())?;
-            if newest.is_none_or(|current| modified > current) {
-                *newest = Some(modified);
-            }
-        } else {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
 fn current_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9157,8 +6659,6 @@ fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
 fn path_modified_time(path: &Path) -> Option<SystemTime> {
     #[cfg(test)]
     audit_record(|work| work.sort_stats += 1);
-    #[cfg(test)]
-    cache_freshness::record_metadata_call(path);
     crate::bounded_io::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -9215,98 +6715,6 @@ where
         .canonicalize_parent_with(parent, canonicalize)
         .map(|canonical_parent| canonical_parent.join(file_name))
         .unwrap_or_else(|| path.to_path_buf())
-}
-
-/// Verify stored file mtimes against disk. Re-index any files whose mtime changed
-/// since the index was last written. Also detect new files and deleted files.
-fn verify_file_mtimes(
-    index: &mut SearchIndex,
-    verify_strategy: cache_freshness::VerifyStrategy,
-) -> bool {
-    let filters = PathFilters::default();
-    let current_files = walk_project_files_from_inner(
-        &index.project_root,
-        &index.project_root,
-        &filters,
-        None,
-        false,
-    )
-    .expect("unbounded project walk cannot exceed a file limit");
-    let current_file_set: HashSet<&PathBuf> = current_files.iter().collect();
-    let mut stale_paths = Vec::new();
-    let mut removed_paths = Vec::new();
-    let mut changed = false;
-    let mut canonical_parents = ParentCanonicalizationMemo::default();
-
-    let mut to_verify = Vec::new();
-    for (file_id, entry) in index.files.iter().enumerate() {
-        if entry.path.as_os_str().is_empty() {
-            continue; // tombstoned entry
-        }
-        if !current_file_set.contains(&entry.path) {
-            removed_paths.push(entry.path.clone());
-            continue;
-        }
-        to_verify.push((
-            file_id,
-            entry.path.clone(),
-            FileFreshness {
-                mtime: entry.modified,
-                size: entry.size,
-                content_hash: entry.content_hash,
-            },
-        ));
-    }
-    // Hash against immutable snapshots in the bounded pool before changing the index.
-    let verdicts = cache_freshness::verify_files_bounded(to_verify, verify_strategy);
-    for (file_id, path, verdict) in verdicts {
-        match verdict {
-            FreshnessVerdict::HotFresh => {}
-            FreshnessVerdict::ContentFresh {
-                new_mtime,
-                new_size,
-            } => {
-                let entry = &mut Arc::make_mut(&mut index.files)[file_id];
-                entry.modified = new_mtime;
-                entry.size = new_size;
-                changed = true;
-            }
-            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => stale_paths.push(path),
-        }
-    }
-
-    for path in &removed_paths {
-        index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
-        changed = true;
-    }
-
-    // Re-index stale files that are still in the current walk set. If an ignore
-    // rule changed while AFT was down but the fingerprint missed it, this keeps
-    // warm-cache verification from resurrecting now-ignored cached entries.
-    for path in &stale_paths {
-        if current_file_set.contains(path) {
-            index.update_file_with_canonicalization_memo(path, &mut canonical_parents);
-        } else {
-            index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
-        }
-        changed = true;
-    }
-
-    // Detect new files not in the index
-    for path in current_files {
-        if !index.path_to_id.contains_key(&path) {
-            index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
-            changed = true;
-        }
-    }
-
-    if !stale_paths.is_empty() {
-        crate::slog_info!(
-            "search index: refreshed {} stale file(s) from disk cache",
-            stale_paths.len()
-        );
-    }
-    changed
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
@@ -9479,43 +6887,6 @@ fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>, String> {
     builder.build().map(Some).map_err(|error| error.to_string())
 }
 
-fn read_u32<R: Read>(reader: &mut R) -> std::io::Result<u32> {
-    let mut buffer = [0u8; 4];
-    reader.read_exact(&mut buffer)?;
-    Ok(u32::from_le_bytes(buffer))
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> std::io::Result<u64> {
-    let mut buffer = [0u8; 8];
-    reader.read_exact(&mut buffer)?;
-    Ok(u64::from_le_bytes(buffer))
-}
-
-fn write_u32<W: Write>(writer: &mut W, value: u32) -> std::io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn verify_crc32_bytes_slice(bytes: &[u8]) -> std::io::Result<()> {
-    let Some((body, stored)) = bytes.split_last_chunk::<4>() else {
-        return Err(std::io::Error::other("search index checksum missing"));
-    };
-    let expected = u32::from_le_bytes(*stored);
-    let actual = crc32fast::hash(body);
-    if actual != expected {
-        return Err(std::io::Error::other("search index checksum mismatch"));
-    }
-    Ok(())
-}
-
-fn remaining_bytes<R: Seek>(reader: &mut R, total_len: usize) -> Option<usize> {
-    let pos = usize::try_from(reader.stream_position().ok()?).ok()?;
-    total_len.checked_sub(pos)
-}
-
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -9576,7 +6947,6 @@ thread_local! {
     pub(crate) static LINE_STARTS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static POSTING_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SUPERSEDED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static BASE_CANCELLATION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Called on every `line_details_bytes` call on this thread, so tests can
     /// count line-detail work or act at a chosen point inside a scan.
     static LINE_DETAILS_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
@@ -10446,18 +7816,6 @@ mod tests {
         );
     }
 
-    fn publication_records(count: usize) -> Vec<SpillRecord> {
-        (0..count as u32)
-            .rev()
-            .map(|trigram| SpillRecord {
-                trigram,
-                file_id: 0,
-                next_mask: (trigram % 255) as u8,
-                loc_mask: (trigram % 127) as u8,
-            })
-            .collect()
-    }
-
     /// A tree that spans several walk chunks and has every kind of file the
     /// build records: indexed, binary (unindexed) and over the size limit.
     fn chunked_build_fixture(root: &Path) {
@@ -10504,263 +7862,6 @@ mod tests {
             calls.load(Ordering::SeqCst),
             4,
             "checked before every entry"
-        );
-    }
-
-    #[test]
-    fn issue1007_cold_build_cache_reloads_identically() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        chunked_build_fixture(&root);
-        let cache = tempfile::tempdir().unwrap();
-        let built = SearchIndex::build_with_limit_to_cache_dir(&root, 1024, cache.path());
-        assert_eq!(built.unindexed_files.len(), 2, "binary and oversize files");
-
-        // The built index lists files in walk order with dense ids.
-        let walked =
-            walk_build_files_cancellable(&root, &PathFilters::default(), &|| true).unwrap();
-        let built_paths: Vec<_> = built.files.iter().map(|file| file.path.clone()).collect();
-        assert_eq!(built_paths, walked);
-        for (id, file) in built.files.iter().enumerate() {
-            assert_eq!(built.path_to_id.get(&file.path), Some(&(id as u32)));
-        }
-
-        let reloaded = SearchIndex::read_from_disk(cache.path(), &root).expect("cache reloads");
-        // A loaded cache serves queries once configure verifies it; mark it
-        // ready the same way so both answer from their postings.
-        let mut reloaded = reloaded;
-        reloaded.ready = true;
-        assert!(built.ready);
-        assert_eq!(reloaded.files.len(), built.files.len());
-        for (left, right) in built.files.iter().zip(reloaded.files.iter()) {
-            assert_eq!(left.path, right.path);
-            assert_eq!(left.size, right.size);
-            assert_eq!(left.modified, right.modified);
-            assert_eq!(left.content_hash, right.content_hash);
-        }
-        assert_eq!(*reloaded.path_to_id, *built.path_to_id);
-        assert_eq!(*reloaded.unindexed_files, *built.unindexed_files);
-        assert_eq!(*reloaded.file_trigram_count, *built.file_trigram_count);
-        assert_eq!(reloaded.git_head, built.git_head);
-        for pattern in ["shared_token", "marker_3_17", "fn marker_", "absent_text"] {
-            assert_eq!(
-                format!(
-                    "{:?}",
-                    built.grep(pattern, true, &[], &[], &root, 1000).unwrap()
-                ),
-                format!(
-                    "{:?}",
-                    reloaded.grep(pattern, true, &[], &[], &root, 1000).unwrap()
-                ),
-                "grep {pattern}"
-            );
-        }
-
-        // Rewriting the reloaded index through the base+delta writer gives
-        // the cold build's bytes, so the moved tables and the streamed header
-        // wrote the same cache a full rewrite does.
-        let rewrite = tempfile::tempdir().unwrap();
-        let head = reloaded.stored_git_head().map(str::to_owned);
-        assert!(reloaded.write_to_disk(rewrite.path(), head.as_deref()));
-        assert_eq!(
-            fs::read(cache.path().join("cache.bin")).unwrap(),
-            fs::read(rewrite.path().join("cache.bin")).unwrap()
-        );
-    }
-
-    #[test]
-    fn issue645_publication_sort_merge_and_checksum_cancel_promptly() {
-        let calls = AtomicUsize::new(0);
-        let result =
-            sorted_record_sources(publication_records(SEARCH_BUILD_RECORD_BATCH * 3), &|| {
-                calls.fetch_add(1, Ordering::SeqCst) < 1
-            });
-        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        struct CancellingSource {
-            reads: Arc<AtomicUsize>,
-        }
-        impl PostingRecordSource for CancellingSource {
-            fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
-                let reads = self.reads.fetch_add(1, Ordering::SeqCst);
-                Ok(
-                    (reads < SEARCH_BUILD_RECORD_BATCH * 3).then_some(SpillRecord {
-                        trigram: reads as u32,
-                        file_id: 0,
-                        next_mask: 0,
-                        loc_mask: 0,
-                    }),
-                )
-            }
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("postings");
-        let reads = Arc::new(AtomicUsize::new(0));
-        let mut sources: Vec<Box<dyn PostingRecordSource>> = vec![Box::new(CancellingSource {
-            reads: reads.clone(),
-        })];
-        let mut writer = BufWriter::new(File::create(&output).unwrap());
-        let result = merge_sources_to_writer(&mut sources, &mut writer, &|| {
-            reads.load(Ordering::SeqCst) < 2
-        });
-        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
-        assert!(reads.load(Ordering::SeqCst) <= SEARCH_BUILD_RECORD_BATCH + 1);
-
-        let bytes = vec![42; 3 * 1024 * 1024];
-        fs::write(&output, &bytes).unwrap();
-        let calls = AtomicUsize::new(0);
-        let result = crc32_file_range(&output, 0, bytes.len() as u64, &|| {
-            calls.fetch_add(1, Ordering::SeqCst) < 1
-        });
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            crc32_file_range(&output, 0, bytes.len() as u64, &|| true).unwrap(),
-            crc32fast::hash(&bytes)
-        );
-    }
-
-    #[test]
-    fn issue645_cancelled_publication_preserves_cache() {
-        use super::*;
-        let temp = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        fs::write(root.join("source.rs"), "fn original_marker() {}\n").unwrap();
-        let original = SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, cache.path());
-        let before = fs::read(cache.path().join("cache.bin")).unwrap();
-        fs::write(root.join("source.rs"), "fn replacement_marker() {}\n").unwrap();
-        let completed_cache = tempfile::tempdir().unwrap();
-        let _completed =
-            SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, completed_cache.path());
-        let completed_size = fs::metadata(completed_cache.path().join("cache.bin"))
-            .unwrap()
-            .len();
-        // The full serialized size becomes visible only after the final flush,
-        // so the second case cancels at the last checkpoint before rename.
-        for (phase, min_bytes) in [("writing", 0), ("before rename", completed_size)] {
-            let cancelled = AtomicBool::new(false);
-            let result = SearchIndex::build_with_limit_to_cache_dir_cancellable(
-                &root,
-                1024 * 1024,
-                cache.path(),
-                &|| {
-                    let stop = fs::read_dir(cache.path()).unwrap().flatten().any(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("cache.bin.tmp.")
-                            && entry.metadata().unwrap().len() >= min_bytes
-                    });
-                    cancelled.fetch_or(stop, Ordering::SeqCst);
-                    !cancelled.load(Ordering::SeqCst)
-                },
-            );
-            assert!(
-                result.is_none(),
-                "a build cancelled {phase} must not publish"
-            );
-            assert!(cancelled.load(Ordering::SeqCst), "did not reach {phase}");
-            assert_eq!(fs::read(cache.path().join("cache.bin")).unwrap(), before);
-            assert_eq!(
-                fs::read_dir(cache.path()).unwrap().count(),
-                1,
-                "no temporary files leak"
-            );
-        }
-        assert_eq!(
-            original
-                .candidates(&decompose_regex("original_marker"))
-                .expect("candidates from a test index")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn issue645_cancelled_fallback_logs_cancelled_not_failed() {
-        use super::*;
-        let temp = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
-        // A malformed cache path is rejected at admission, before streaming.
-        // Fail after admission so this still exercises cancellation in fallback.
-        FAIL_STREAMING_BUILD.set(true);
-        let probes = AtomicUsize::new(0);
-        let (result, events) = crate::logging::capture_index_events(|| {
-            SearchIndex::build_with_limit_to_cache_dir_cancellable(
-                &root,
-                1024 * 1024,
-                cache.path(),
-                &|| probes.fetch_add(1, Ordering::SeqCst) < 2,
-            )
-        });
-        assert!(result.is_none());
-        let root_field = format!("root={}", crate::logging::normalize_index_root(&root));
-        let events = events
-            .into_iter()
-            .filter(|event| event.contains(&root_field))
-            .collect::<Vec<_>>();
-        assert!(
-            events.iter().any(|event| event.contains("stage=fallback")),
-            "{events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.contains("kind=build_cancelled")),
-            "{events:?}"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.contains("kind=build_failed")),
-            "{events:?}"
-        );
-    }
-
-    #[test]
-    fn issue645_superseded_search_build_stops_reading_files() {
-        use super::*;
-        let temp = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        for index in 0..256 {
-            fs::write(root.join(format!("source-{index}.rs")), "fn marker() {}\n").unwrap();
-        }
-        let reads = Arc::new(AtomicUsize::new(0));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        REFRESH_READ_PROBES
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap()
-            .insert(root.clone(), (reads.clone(), cancelled.clone()));
-        let result = SearchIndex::build_with_limit_to_cache_dir_cancellable(
-            &root,
-            1024 * 1024,
-            cache.path(),
-            &|| !cancelled.load(Ordering::SeqCst),
-        );
-        REFRESH_READ_PROBES
-            .get()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .remove(&root);
-        let count = reads.load(Ordering::SeqCst);
-        assert!(
-            result.is_none(),
-            "superseded builds cannot publish a partial index; files read={count}"
-        );
-        assert!(
-            (1..=32).contains(&count),
-            "must stop within the active chunk, read {count}/256 files"
-        );
-        assert!(
-            !cache.path().join("cache.bin").exists(),
-            "cancelled build must not persist"
         );
     }
 
@@ -11104,41 +8205,8 @@ mod tests {
     }
 
     #[test]
-    fn audit10_search_lock_poison_recovers() {
-        let poisoned = std::panic::catch_unwind(|| {
-            let _guard = super::CACHE_LOCK_ACQUIRE_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            panic!("simulate acquisition panic");
-        });
-        assert!(poisoned.is_err());
-        let storage = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let cache_dir = storage.path().join("index").join("poison");
-        let lock = super::CacheLock::acquire(&cache_dir, project.path()).unwrap();
-        assert!(lock._guard.is_some());
-    }
-
-    #[test]
     fn audit10_candidate_sort_counts_each_trigram_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut index = super::SearchIndex::new();
-        let path = dir.path().join("empty-postings.bin");
-        std::fs::write(&path, []).unwrap();
-        index.base = Some(std::sync::Arc::new(super::BasePostings {
-            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
-            postings_blob_start: 0,
-            postings_blob_len: 0,
-            lookup: std::sync::Arc::new(
-                (0..32)
-                    .map(|trigram| super::LookupEntry {
-                        trigram,
-                        offset: 0,
-                        count: 0,
-                    })
-                    .collect(),
-            ),
-        }));
+        let index = super::SearchIndex::new();
         let query = super::RegexQuery {
             and_trigrams: (0..32).rev().collect(),
             and_filters: std::collections::HashMap::new(),
@@ -11148,39 +8216,6 @@ mod tests {
         super::POSTING_COUNT_CALLS.with(|calls| calls.set(0));
         assert!(index.snapshot().candidates(&query).unwrap().is_empty());
         super::POSTING_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 32));
-    }
-
-    #[test]
-    fn audit10_base_postings_use_bounded_cancellation_checkpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut index = super::SearchIndex::new();
-        let mut bytes = Vec::new();
-        for i in 0..200u32 {
-            index.index_file(&dir.path().join(format!("file_{i}.rs")), b"needle");
-            bytes.extend_from_slice(&i.to_le_bytes());
-            bytes.extend_from_slice(&[255, 255]);
-        }
-        let path = dir.path().join("postings.bin");
-        std::fs::write(&path, &bytes).unwrap();
-        index.base = Some(std::sync::Arc::new(super::BasePostings {
-            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
-            postings_blob_start: 0,
-            postings_blob_len: bytes.len() as u64,
-            lookup: std::sync::Arc::new(vec![super::LookupEntry {
-                trigram: 7,
-                offset: 0,
-                count: 200,
-            }]),
-        }));
-        index.delta = std::sync::Arc::new(super::DeltaState::default());
-        super::BASE_CANCELLATION_CHECKS.with(|count| count.set(0));
-        super::SUPERSEDED_LOOKUPS.with(|count| count.set(0));
-        assert_eq!(
-            index.snapshot().postings_for_trigram(7, None).unwrap(),
-            (0..200).collect::<Vec<_>>()
-        );
-        super::BASE_CANCELLATION_CHECKS.with(|count| assert_eq!(count.get(), 4));
-        super::SUPERSEDED_LOOKUPS.with(|count| assert_eq!(count.get(), 200));
     }
 
     #[test]
@@ -11288,42 +8323,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn durability_search_cache_write_count() {
-        let project = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        fs::write(project.path().join("source.txt"), "abcdef").unwrap();
-        let mut index = SearchIndex::build(project.path());
-        crate::durability::take();
-        assert!(index.write_to_disk(cache.path(), None));
-        let events = crate::durability::take();
-        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
-        assert!(SearchIndex::read_from_disk(cache.path(), project.path()).is_some());
-    }
-
-    #[test]
-    fn durability_search_spill_write_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut block = vec![SpillRecord {
-            trigram: 1,
-            file_id: 0,
-            next_mask: 0,
-            loc_mask: 0,
-        }];
-        let counter = crate::write_ledger::register(
-            crate::write_ledger::Domain::SearchIndexBuild,
-            "durability-spill",
-        );
-        crate::durability::take();
-        let path = flush_spill_segment(dir.path(), 0, &mut block, &counter).unwrap();
-        assert!(path.is_file());
-        assert!(block.is_empty());
-        let events = crate::durability::take();
-        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
-    }
-    use std::process::Command;
-
     use super::*;
+    use std::process::Command;
 
     /// Unmatched leading `..` components must survive comparison normalization:
     /// dropping them makes a path that escapes upward look like a nearby child.
@@ -11397,78 +8398,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn transient_builds_reuse_one_cache_dir_and_truncate_previous_contents() {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let root = fs::canonicalize(project.path()).expect("canonical project root");
-        fs::write(root.join("source.rs"), "pub fn transient_cache() {}\n")
-            .expect("write project source");
-        let key = artifact_cache_key(&root);
-        let prefix = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.");
-        // Our own directory, not the shared one: a listing of `$TMPDIR` costs
-        // whatever the rest of the machine left in it (~870 s at 290k entries
-        // on a fleet box), which is the same trap the product hit.
-        let temp_root = transient_search_cache_home();
-        let _ = fs::create_dir_all(&temp_root);
-        let remove_matching = || {
-            let Ok(entries) = fs::read_dir(&temp_root) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&prefix) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-            }
-        };
-        remove_matching();
-
-        let cache_dir = transient_search_cache_dir(&root);
-        let first = SearchIndex::build(&root);
-        assert!(first.ready, "first transient build must complete");
-        let stale_file = cache_dir.join("must-be-truncated");
-        fs::write(&stale_file, "old scratch data").expect("plant stale scratch file");
-        let second = SearchIndex::build(&root);
-        assert!(second.ready, "second transient build must complete");
-
-        let matching = fs::read_dir(&temp_root)
-            .expect("read system temp directory")
-            .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with(&prefix)
-                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
-            })
-            .count();
-        assert!(
-            matching <= 1,
-            "two transient builds may retain at most one process/root cache directory"
-        );
-        assert!(
-            !stale_file.exists(),
-            "reusing a transient cache directory must clear stale scratch files"
-        );
-        drop((first, second));
-        remove_matching();
-    }
-
-    /// Our scratch must not sit loose in the shared temporary directory, whose
-    /// listing is the fleet's, not ours.
-    #[test]
-    fn transient_cache_lives_in_a_directory_of_our_own() {
-        let root = tempfile::tempdir().expect("temporary project root");
-        let cache_dir = transient_search_cache_dir(root.path());
-
-        let parent = cache_dir.parent().expect("cache dir has a parent");
-        assert_eq!(
-            parent.file_name().and_then(|name| name.to_str()),
-            Some(TRANSIENT_SEARCH_CACHE_DIR_NAME)
-        );
-        assert_eq!(parent.parent(), Some(std::env::temp_dir().as_path()));
-    }
-
-    /// The cache writer stores paths relative to the root and refuses the
-    /// whole cache if one entry lies outside it. An update for an outside
-    /// path must therefore never enter the index, whichever caller sends it.
+    /// An external-root query must not admit a sibling project's files
+    /// through an update, whichever caller sends it.
     #[test]
     fn update_for_a_path_outside_the_root_is_not_admitted() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -11493,7 +8424,6 @@ mod tests {
             index.path_to_id.contains_key(&added),
             "in-root updates still apply"
         );
-        assert!(index.write_to_disk(&base.join("cache"), None));
     }
 
     fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {
@@ -11508,10 +8438,7 @@ mod tests {
             .expect("write base fixture file");
         }
 
-        let cache_dir = dir.path().join("cache");
-        let mut built = SearchIndex::build(&project);
-        assert!(built.write_to_disk(&cache_dir, None));
-        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base index");
+        let mut index = SearchIndex::build(&project);
 
         let replaced = project.join("file_000.txt");
         index.remove_file(&replaced);
@@ -11524,56 +8451,8 @@ mod tests {
         fs::write(&added, "abcdefghij sharedalpha added_delta").expect("write delta file");
         index.index_file(&added, b"abcdefghij sharedalpha added_delta");
 
-        assert!(index.base.is_some());
         assert!(!index.delta.postings.is_empty());
-        assert!(!index.delta.superseded.is_empty());
         (dir, index)
-    }
-
-    fn postings_for_trigram_materialized_reference(
-        index: &SearchIndexSnapshot,
-        trigram: u32,
-        filter: Option<PostingFilter>,
-    ) -> Vec<u32> {
-        let mut matches = Vec::new();
-        if let Some(base_entry) = index
-            .base
-            .as_ref()
-            .and_then(|base| base.lookup_entry(trigram))
-        {
-            if let Some(base) = &index.base {
-                if let Ok(postings) = base.read_postings(base_entry) {
-                    matches.reserve(postings.len());
-                    for posting in postings {
-                        if index.delta.superseded.contains(&posting.file_id) {
-                            continue;
-                        }
-                        if !posting_matches_filter(&posting, filter) {
-                            continue;
-                        }
-                        if index.is_active_file(posting.file_id) {
-                            matches.push(posting.file_id);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(postings) = index.delta.postings.get(&trigram) {
-            matches.reserve(postings.len());
-            for posting in postings {
-                if !posting_matches_filter(posting, filter) {
-                    continue;
-                }
-                if index.is_active_file(posting.file_id) {
-                    matches.push(posting.file_id);
-                }
-            }
-        }
-        if matches.len() > 1 {
-            matches.sort_unstable();
-            matches.dedup();
-        }
-        matches
     }
 
     fn assert_rank_matches_reference(
@@ -11954,103 +8833,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_base_decode_matches_materialized_reference_for_all_storage_and_filters() {
-        let (_dir, index) = lexical_rank_mixed_storage_fixture();
-        let snapshot = index.snapshot();
-        let base_only = pack_trigram(b'm', b'a', b'r');
-        let base_and_delta = pack_trigram(b'a', b'b', b'c');
-
-        assert!(snapshot.delta.postings.get(&base_only).is_none());
-        assert!(snapshot.delta.postings.contains_key(&base_and_delta));
-        assert!(!snapshot.delta.superseded.is_empty());
-
-        let filters = [
-            None,
-            Some(PostingFilter::default()),
-            Some(PostingFilter {
-                next_mask: mask_for_next_char(b'd'),
-                loc_mask: 0,
-            }),
-            Some(PostingFilter {
-                next_mask: mask_for_next_char(b'z'),
-                loc_mask: 0,
-            }),
-            Some(PostingFilter {
-                next_mask: 0,
-                loc_mask: mask_for_position(0),
-            }),
-            Some(PostingFilter {
-                next_mask: mask_for_next_char(b'd'),
-                loc_mask: mask_for_position(17),
-            }),
-            Some(PostingFilter {
-                next_mask: mask_for_next_char(b'z'),
-                loc_mask: mask_for_position(17),
-            }),
-        ];
-
-        for trigram in [base_only, base_and_delta] {
-            for filter in filters {
-                let expected =
-                    postings_for_trigram_materialized_reference(&snapshot, trigram, filter);
-                let actual = snapshot.postings_for_trigram(trigram, filter).unwrap();
-                assert_eq!(
-                    actual, expected,
-                    "trigram={trigram:#08x}, filter={filter:?}"
-                );
-                assert!(actual
-                    .iter()
-                    .all(|file_id| !snapshot.delta.superseded.contains(file_id)));
-            }
-        }
-
-        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None).unwrap();
-        let loc_only = snapshot
-            .postings_for_trigram(
-                base_and_delta,
-                Some(PostingFilter {
-                    next_mask: 0,
-                    loc_mask: mask_for_position(31),
-                }),
-            )
-            .unwrap();
-        assert_eq!(loc_only, unfiltered);
-    }
-
-    #[test]
-    fn base_delta_readd_masks_base_and_keeps_postings_sorted() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        let project = fs::canonicalize(&project).expect("canonical project root");
-        let a = project.join("a.txt");
-        let b = project.join("b.txt");
-        fs::write(&a, "abc old").expect("write a");
-        fs::write(&b, "abc base").expect("write b");
-
-        let mut built = SearchIndex::build(&project);
-        let cache_dir = dir.path().join("cache");
-        built.write_to_disk(&cache_dir, None);
-        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base");
-        assert_eq!(index.base_file_count, 2);
-
-        let old_a_id = *index.path_to_id.get(&a).expect("original a id");
-        let b_id = *index.path_to_id.get(&b).expect("original b id");
-        index.remove_file(&a);
-        index.index_file(&a, b"abc new");
-        let new_id = *index.path_to_id.get(&a).expect("re-added file id");
-        assert!(new_id >= index.base_file_count);
-        let abc = pack_trigram(b'a', b'b', b'c');
-        let ids = index.postings_for_trigram(abc, None).unwrap();
-        assert_eq!(ids, {
-            let mut expected = vec![b_id, new_id];
-            expected.sort_unstable();
-            expected
-        });
-        assert!(!ids.contains(&old_a_id));
-    }
-
-    #[test]
     fn snapshot_started_before_edit_keeps_coherent_pre_edit_postings() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
@@ -12059,10 +8841,7 @@ mod tests {
         let file = project.join("source.txt");
         fs::write(&file, "old_generation marker").expect("write old source");
 
-        let mut built = SearchIndex::build(&project);
-        let cache_dir = dir.path().join("cache");
-        assert!(built.write_to_disk(&cache_dir, None));
-        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base index");
+        let mut index = SearchIndex::build(&project);
         index.ready = true;
         let old_file_id = *index.path_to_id.get(&file).expect("old file id");
         let index = std::sync::RwLock::new(index);
@@ -12080,8 +8859,6 @@ mod tests {
         let after_edit = index.read().expect("read updated index").snapshot();
         let new_file_id = *after_edit.path_to_id.get(&file).expect("new file id");
         assert!(!Arc::ptr_eq(&before_edit.delta, &after_edit.delta));
-        assert!(!before_edit.delta.superseded.contains(&old_file_id));
-        assert!(after_edit.delta.superseded.contains(&old_file_id));
 
         let old_trigram = pack_trigram(b'o', b'l', b'd');
         let new_trigram = pack_trigram(b'n', b'e', b'w');
@@ -12107,12 +8884,7 @@ mod tests {
             .expect("read dirty index")
             .grep("new_generation", true, &[], &[], &project, 100)
             .unwrap();
-        let reference_cache = dir.path().join("reference-cache");
-        let reference = SearchIndex::build_with_limit_to_cache_dir(
-            &project,
-            DEFAULT_MAX_FILE_SIZE,
-            &reference_cache,
-        );
+        let reference = SearchIndex::build(&project);
         let reference_result = reference
             .grep("new_generation", true, &[], &[], &project, 100)
             .unwrap();
@@ -12164,210 +8936,6 @@ mod tests {
     }
 
     #[test]
-    fn borrow_only_root_skips_shared_lock_persist_and_streaming_spills() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("project dir");
-        fs::write(project.join("source.txt"), "borrow only search index").expect("source file");
-        let project_key = "shared-artifact-key".to_string();
-        let cache_dir = dir.path().join("index").join(&project_key);
-        crate::root_cache::configure_artifact_access(&project, &project_key, true);
-
-        let _lock = CacheLock::acquire(&cache_dir, &project).expect("borrow-only lock downgrade");
-        assert!(!cache_dir.join("cache.lock").exists());
-
-        let mut index =
-            SearchIndex::build_with_limit_to_cache_dir(&project, DEFAULT_MAX_FILE_SIZE, &cache_dir);
-        assert!(!index.ready);
-        index.write_to_disk(&cache_dir, None);
-
-        assert!(!cache_dir.join("cache.bin").exists());
-        assert!(!cache_dir.exists());
-    }
-
-    #[test]
-    fn write_to_disk_compacts_base_and_delta() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        let file = project.join("src.txt");
-        fs::write(&file, "abcdef").expect("write source");
-        let mut index = SearchIndex::build(&project);
-        let cache_dir = dir.path().join("cache");
-        index.write_to_disk(&cache_dir, None);
-        fs::write(&file, "abcxyz").expect("edit source");
-        index.update_file(&file);
-        assert!(!index.delta.postings.is_empty());
-        index.write_to_disk(&cache_dir, None);
-        assert!(index.delta.postings.is_empty());
-        assert!(index.delta.superseded.is_empty());
-        assert_eq!(
-            index
-                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
-                .unwrap(),
-            vec![0]
-        );
-        assert!(index
-            .postings_for_trigram(pack_trigram(b'd', b'e', b'f'), None)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn legacy_cache_without_file_trigram_count_migrates_streaming_counts() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::write(project.join("src.txt"), "abcdef").expect("write source");
-        let cache_dir = dir.path().join("cache");
-        let mut index = SearchIndex::build(&project);
-        index.write_to_disk(&cache_dir, None);
-        let cache_path = cache_dir.join("cache.bin");
-        strip_file_trigram_count_extension(&cache_path);
-        assert!(!cache_has_file_trigram_count_extension(&cache_path));
-
-        let loaded = SearchIndex::read_from_disk(&cache_dir, &project).expect("load legacy cache");
-        assert_eq!(loaded.file_trigram_count.as_ref(), &[4]);
-        assert!(loaded.delta.postings.is_empty());
-        assert!(cache_has_file_trigram_count_extension(&cache_path));
-    }
-
-    #[test]
-    fn compaction_flags_buffer_paths_while_running() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        let project = fs::canonicalize(&project).expect("canonical project root");
-        fs::write(project.join("src.txt"), "abcdef").expect("write source");
-        for root in [
-            project.clone(),
-            crate::inspect::job::normalize_path(&project),
-        ] {
-            let file = root.join("src.txt");
-            let mut index = SearchIndex::new();
-            index.project_root = root;
-            {
-                let mut state = index.compaction_state.lock().expect("compaction state");
-                state.running = true;
-            }
-            index.update_file(&file);
-            assert!(index.path_to_id.contains_key(&file));
-            let state = index.compaction_state.lock().expect("compaction state");
-            assert!(state.requested_again || !index.delta.postings.is_empty());
-            assert!(state.buffered_paths.contains(&file));
-        }
-    }
-
-    fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {
-        file_trigram_count_extension_range(cache_path).is_some()
-    }
-
-    fn strip_file_trigram_count_extension(cache_path: &Path) {
-        let mut bytes = fs::read(cache_path).expect("read cache");
-        let (start, end) = file_trigram_count_extension_range_from_bytes(&bytes)
-            .expect("file trigram count extension");
-        bytes.drain(start..end);
-        let postings_len_total = u64::from_le_bytes(bytes[8..16].try_into().unwrap())
-            - u64::try_from(end - start).unwrap();
-        bytes[8..16].copy_from_slice(&postings_len_total.to_le_bytes());
-        let checksum_pos = 16 + usize::try_from(postings_len_total).unwrap() - 4;
-        let checksum = crc32fast::hash(&bytes[16..checksum_pos]);
-        bytes[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
-        fs::write(cache_path, bytes).expect("write legacy cache");
-    }
-
-    fn file_trigram_count_extension_range(cache_path: &Path) -> Option<(usize, usize)> {
-        let bytes = fs::read(cache_path).ok()?;
-        file_trigram_count_extension_range_from_bytes(&bytes)
-    }
-
-    fn file_trigram_count_extension_range_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
-        let postings_len_total = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize;
-        let postings_start = 16usize;
-        let postings_end = postings_start.checked_add(postings_len_total)?;
-        let postings_body_end = postings_end.checked_sub(4)?;
-        let mut reader = Cursor::new(&bytes[postings_start..postings_body_end]);
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic).ok()?;
-        if &magic != INDEX_MAGIC {
-            return None;
-        }
-        read_u32(&mut reader).ok()?;
-        let head_len = read_u32(&mut reader).ok()? as u64;
-        let root_len = read_u32(&mut reader).ok()? as u64;
-        let ignore_len = read_u32(&mut reader).ok()? as u64;
-        read_u64(&mut reader).ok()?;
-        let file_count = read_u32(&mut reader).ok()? as usize;
-        let skip = head_len.checked_add(root_len)?.checked_add(ignore_len)?;
-        reader.seek(SeekFrom::Current(skip as i64)).ok()?;
-        for _ in 0..file_count {
-            let mut unindexed = [0u8; 1];
-            reader.read_exact(&mut unindexed).ok()?;
-            let path_len = read_u32(&mut reader).ok()? as u64;
-            read_u64(&mut reader).ok()?;
-            read_u64(&mut reader).ok()?;
-            read_u32(&mut reader).ok()?;
-            let mut hash = [0u8; 32];
-            reader.read_exact(&mut hash).ok()?;
-            reader.seek(SeekFrom::Current(path_len as i64)).ok()?;
-        }
-        let postings_blob_len = read_u64(&mut reader).ok()? as usize;
-        let extension_start = postings_start
-            .checked_add(reader.position() as usize)?
-            .checked_add(postings_blob_len)?;
-        if extension_start + 16 > postings_body_end {
-            return None;
-        }
-        if bytes.get(extension_start..extension_start + 8)? != FILE_TRIGRAM_COUNT_MAGIC {
-            return None;
-        }
-        let count = u32::from_le_bytes(
-            bytes[extension_start + 12..extension_start + 16]
-                .try_into()
-                .ok()?,
-        ) as usize;
-        let extension_end = extension_start
-            .checked_add(16)?
-            .checked_add(count.checked_mul(4)?)?;
-        (extension_end <= postings_body_end).then_some((extension_start, extension_end))
-    }
-
-    #[test]
-    fn disk_round_trip_preserves_postings_and_files() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        let file = project.join("src.txt");
-        fs::write(&file, "abcdef").expect("write source");
-
-        let mut index = SearchIndex::build(&project);
-        index.git_head = Some("deadbeef".to_string());
-        let cache_dir = dir.path().join("cache");
-        let head = index.git_head.clone();
-        index.write_to_disk(&cache_dir, head.as_deref());
-
-        let loaded =
-            SearchIndex::read_from_disk(&cache_dir, &project).expect("load index from disk");
-        assert_eq!(loaded.stored_git_head(), Some("deadbeef"));
-        assert_eq!(loaded.files.len(), 1);
-        assert_eq!(
-            relative_to_root(&loaded.project_root, &loaded.files[0].path),
-            PathBuf::from("src.txt")
-        );
-        assert_eq!(loaded.trigram_count(), index.trigram_count());
-        assert_eq!(
-            loaded
-                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
-                .unwrap(),
-            vec![0]
-        );
-        assert_eq!(
-            loaded.file_trigram_count.as_ref(),
-            index.file_trigram_count.as_ref()
-        );
-    }
-
-    #[test]
     fn cache_path_helpers_reject_absolute_and_parent_paths() {
         let root = PathBuf::from("/tmp/aft-project");
 
@@ -12388,85 +8956,6 @@ mod tests {
         let mut command = Command::new("git");
         crate::test_env::apply_hermetic_git_env(command.arg("-C").arg(root));
         command
-    }
-
-    #[test]
-    fn read_from_disk_rejects_corrupt_lookup_checksum() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::write(project.join("src.txt"), "abcdef").expect("write source");
-
-        let mut index = SearchIndex::build(&project);
-        let cache_dir = dir.path().join("cache");
-        index.write_to_disk(&cache_dir, None);
-
-        let cache_path = cache_dir.join("cache.bin");
-        let mut bytes = fs::read(&cache_path).expect("read cache");
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xff;
-        fs::write(&cache_path, bytes).expect("write corrupted cache");
-
-        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_none());
-    }
-
-    #[test]
-    fn write_to_disk_uses_temp_files_and_cleans_them_up() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::write(project.join("src.txt"), "abcdef").expect("write source");
-
-        let mut index = SearchIndex::build(&project);
-        let cache_dir = dir.path().join("cache");
-        index.write_to_disk(&cache_dir, None);
-
-        assert!(cache_dir.join("cache.bin").is_file());
-        assert!(fs::read_dir(&cache_dir)
-            .expect("read cache dir")
-            .all(|entry| !entry
-                .expect("cache entry")
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp.")));
-    }
-
-    #[test]
-    fn concurrent_search_index_writes_do_not_corrupt() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::write(project.join("src.txt"), "abcdef\n").expect("write source");
-        let cache_dir = dir.path().join("cache");
-
-        let a_project = project.clone();
-        let a_cache = cache_dir.clone();
-        let a = std::thread::spawn(move || {
-            let _lock = CacheLock::acquire(&a_cache, &a_project).expect("acquire cache lock a");
-            let mut index = SearchIndex::build(&a_project);
-            index.write_to_disk(&a_cache, None);
-        });
-        let b_project = project.clone();
-        let b_cache = cache_dir.clone();
-        let b = std::thread::spawn(move || {
-            let _lock = CacheLock::acquire(&b_cache, &b_project).expect("acquire cache lock b");
-            let mut index = SearchIndex::build(&b_project);
-            index.write_to_disk(&b_cache, None);
-        });
-        a.join().expect("writer a");
-        b.join().expect("writer b");
-
-        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_some());
-    }
-
-    #[test]
-    fn search_index_atomic_rename_survives_partial_write() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let cache_dir = dir.path().join("cache");
-        fs::create_dir_all(&cache_dir).expect("create cache dir");
-        fs::write(cache_dir.join("cache.bin.tmp.1.1"), b"partial").expect("write partial tmp");
-
-        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
     }
 
     fn grafted_history_test_roots() -> [&'static str; 3] {
@@ -13057,54 +9546,6 @@ mod tests {
             packed('b').as_bytes(),
         );
         assert_ne!(RootCommitStamp::capture(&root), Some(before));
-    }
-
-    #[test]
-    fn index_orphan_sweep_reclaims_only_aged_unreferenced_dirs() {
-        let storage = tempfile::tempdir().expect("create storage root");
-        let index_root = storage.path().join("index");
-        let aged_orphan = index_root.join("1111111111111111");
-        let fresh_orphan = index_root.join("2222222222222222");
-        let memo_referenced = index_root.join("3333333333333333");
-        for directory in [&aged_orphan, &fresh_orphan, &memo_referenced] {
-            fs::create_dir_all(directory).expect("create index fixture directory");
-            fs::write(directory.join("cache.bin"), b"fixture cache").expect("write cache fixture");
-        }
-        let old_time = SystemTime::now()
-            .checked_sub(INDEX_ORPHAN_MIN_AGE + Duration::from_secs(1))
-            .expect("construct old fixture time");
-        filetime::set_file_mtime(
-            aged_orphan.join("cache.bin"),
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .expect("age orphan cache");
-        filetime::set_file_mtime(
-            memo_referenced.join("cache.bin"),
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .expect("age referenced cache");
-        let mut memo = BTreeMap::new();
-        memo.insert(
-            "fixture-root".to_string(),
-            ArtifactCacheKeyMemoEntry {
-                key: "3333333333333333".to_string(),
-                git_root_commit: "fixture-commit".to_string(),
-                recorded_at_ms: current_time_millis(),
-            },
-        );
-        write_cache_key_memo(storage.path(), &memo);
-
-        sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(storage.path()));
-
-        assert!(
-            !aged_orphan.exists(),
-            "the aged orphan must be reclaimed by the index sweep"
-        );
-        assert!(fresh_orphan.exists(), "fresh index data must be retained");
-        assert!(
-            memo_referenced.exists(),
-            "cache-keys.json references must protect an aged index directory"
-        );
     }
 
     #[test]
@@ -14706,48 +11147,6 @@ mod tests {
     }
 
     #[test]
-    fn read_from_disk_rejects_invalid_nanos() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let cache_dir = dir.path().join("cache");
-        fs::create_dir_all(&cache_dir).expect("create cache dir");
-
-        let mut postings = Vec::new();
-        postings.extend_from_slice(INDEX_MAGIC);
-        postings.extend_from_slice(&INDEX_VERSION.to_le_bytes());
-        postings.extend_from_slice(&0u32.to_le_bytes());
-        postings.extend_from_slice(&1u32.to_le_bytes());
-        postings.extend_from_slice(&DEFAULT_MAX_FILE_SIZE.to_le_bytes());
-        postings.extend_from_slice(&1u32.to_le_bytes());
-        postings.extend_from_slice(b"/");
-        postings.push(0u8);
-        postings.extend_from_slice(&1u32.to_le_bytes());
-        postings.extend_from_slice(&0u64.to_le_bytes());
-        postings.extend_from_slice(&0u64.to_le_bytes());
-        postings.extend_from_slice(&1_000_000_000u32.to_le_bytes());
-        postings.extend_from_slice(b"a");
-        postings.extend_from_slice(&0u64.to_le_bytes());
-
-        let mut lookup = Vec::new();
-        lookup.extend_from_slice(LOOKUP_MAGIC);
-        lookup.extend_from_slice(&INDEX_VERSION.to_le_bytes());
-        lookup.extend_from_slice(&0u32.to_le_bytes());
-
-        let postings_checksum = crc32fast::hash(&postings);
-        postings.extend_from_slice(&postings_checksum.to_le_bytes());
-        let lookup_checksum = crc32fast::hash(&lookup);
-        lookup.extend_from_slice(&lookup_checksum.to_le_bytes());
-        let mut cache = Vec::new();
-        cache.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
-        cache.extend_from_slice(&INDEX_VERSION.to_le_bytes());
-        cache.extend_from_slice(&(postings.len() as u64).to_le_bytes());
-        cache.extend_from_slice(&postings);
-        cache.extend_from_slice(&lookup);
-        fs::write(cache_dir.join("cache.bin"), cache).expect("write cache");
-
-        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
-    }
-
-    #[test]
     fn ignore_rule_discovery_respects_gitignore() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -15176,222 +11575,6 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod warm_reload_verification_tests {
-    use super::*;
-
-    /// `read_from_disk` resolves a root alias before deriving keys, so a caller
-    /// that removes a file by the alias spelling must still reach the cached
-    /// record. On Windows the alias is a case variant and the canonical
-    /// fallback is verbatim while a plain-root load stores plain keys.
-    #[test]
-    #[cfg(any(unix, windows))]
-    fn remove_file_through_root_alias_supersedes_the_cached_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let real_root = dir.path().join("checkout");
-        fs::create_dir_all(&real_root).unwrap();
-        #[cfg(unix)]
-        let alias_root = {
-            let alias = dir.path().join("alias");
-            std::os::unix::fs::symlink(&real_root, &alias).unwrap();
-            alias
-        };
-        #[cfg(windows)]
-        let alias_root = dir.path().join("CHECKOUT");
-        fs::write(real_root.join("cached.txt"), "AliasRemovalNeedle\n").unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let mut built = SearchIndex::build(&real_root);
-        assert!(built.write_to_disk(cache.path(), None));
-
-        let mut index = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
-        #[cfg(windows)]
-        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
-        let stored_key = index.project_root.join("cached.txt");
-        let cached_id = index.path_to_id[&stored_key];
-        assert!(cached_id < index.base_file_count);
-
-        index.remove_file(&alias_root.join("cached.txt"));
-
-        assert!(!index.path_to_id.contains_key(&stored_key));
-        assert!(index.delta.superseded.contains(&cached_id));
-        assert!(index.delta.superseded_paths.contains(&stored_key));
-    }
-
-    /// Windows runners can hand out 8.3 short temp paths (`C:\Users\RUNNER~1`).
-    /// Loading from such a root resolves it to the long name, so removing a
-    /// file by its short spelling must still reach the long-name cached key.
-    #[test]
-    #[cfg(windows)]
-    fn remove_file_through_short_name_root_supersedes_the_cached_record() {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-
-        let dir = tempfile::tempdir().unwrap();
-        // Longer than eight characters, so the volume assigns it a short name
-        // when 8.3 name generation is enabled.
-        let real_root = dir.path().join("checkout_with_long_name");
-        fs::create_dir_all(&real_root).unwrap();
-        fs::write(real_root.join("cached.txt"), "ShortNameRemovalNeedle\n").unwrap();
-
-        let wide: Vec<u16> = real_root
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut buffer = vec![0u16; 1024];
-        // SAFETY: `wide` is NUL-terminated and `buffer` holds `buffer.len()` units.
-        let written = unsafe {
-            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
-                wide.as_ptr(),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-            )
-        } as usize;
-        assert!(
-            written > 0 && written < buffer.len(),
-            "GetShortPathNameW failed"
-        );
-        let short_root = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written]));
-        if short_root.file_name() == real_root.file_name() {
-            eprintln!(
-                "skipping: 8.3 short names are disabled on the volume holding {}",
-                real_root.display()
-            );
-            return;
-        }
-
-        let cache = tempfile::tempdir().unwrap();
-        let mut built = SearchIndex::build(&real_root);
-        assert!(built.write_to_disk(cache.path(), None));
-
-        let mut index = SearchIndex::read_from_disk(cache.path(), &short_root).unwrap();
-        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
-        assert_eq!(index.project_root.file_name(), real_root.file_name());
-        let stored_key = index.project_root.join("cached.txt");
-        let cached_id = index.path_to_id[&stored_key];
-
-        index.remove_file(&short_root.join("cached.txt"));
-
-        assert!(!index.path_to_id.contains_key(&stored_key));
-        assert!(index.delta.superseded.contains(&cached_id));
-    }
-
-    #[test]
-    fn warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        for n in 0..128 {
-            fs::write(root.join(format!("file-{n}.rs")), vec![b'x'; 64 * 1024]).unwrap();
-        }
-        let mut index = SearchIndex::build(&root);
-        for schedule in [
-            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
-            cache_freshness::VerifyScheduleForTest::Concurrent,
-        ] {
-            // A two-worker pool may legitimately drain a small batch on one
-            // worker. Check the installed pool independently of that schedule,
-            // then force overlap to prove verification can run concurrently.
-            let watch = cache_freshness::watch_verify_stats(&root, schedule);
-            verify_file_mtimes(&mut index, cache_freshness::VerifyStrategy::Strict);
-            let stats = watch.take_stats();
-            assert_eq!(
-                stats.pool_size,
-                Some(2),
-                "bounded verification must install the two-worker pool"
-            );
-            assert!(
-                !index.path_to_id.is_empty(),
-                "verification fixture has indexed files"
-            );
-            let mut counts = HashMap::new();
-            let mut threads = HashSet::new();
-            for (path, thread) in stats.calls {
-                *counts.entry(path).or_insert(0) += 1;
-                threads.insert(thread);
-            }
-            for path in index.path_to_id.keys() {
-                assert_eq!(
-                    counts.get(path),
-                    Some(&1),
-                    "indexed file stat count: {}",
-                    path.display()
-                );
-            }
-            match schedule {
-                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain => {
-                    assert_eq!(
-                        threads.len(),
-                        1,
-                        "forced unsplit batch drains on one worker"
-                    );
-                }
-                cache_freshness::VerifyScheduleForTest::Concurrent => {
-                    assert!(
-                        stats.concurrent,
-                        "two workers must take items before the first completes"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn warm_disk_verification_uses_stat_first_and_hashes_changed_stats() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        let path = root.join("warm.rs");
-        fs::write(&path, "fn warm_reload() {}\n").unwrap();
-        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-        filetime::set_file_mtime(&path, original_mtime).unwrap();
-        let mut index = SearchIndex::build(&root);
-
-        cache_freshness::watch_hash_file_for_debug(&path);
-        index.verify_against_disk_with_strategy(None, cache_freshness::VerifyStrategy::StatFirst);
-        assert_eq!(cache_freshness::watched_hash_file_count_for_debug(), 0);
-
-        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
-        cache_freshness::watch_hash_file_for_debug(&path);
-        index.verify_against_disk_with_strategy(None, cache_freshness::VerifyStrategy::StatFirst);
-        assert_eq!(cache_freshness::watched_hash_file_count_for_debug(), 1);
-    }
-
-    #[test]
-    fn write_denied_cold_build_flags_build_denied_instead_of_building() {
-        // A borrow-only root cannot write the shared search artifact. The cold
-        // build must flag the empty index as build-denied (and leave it
-        // not-ready) so health reports a settled state while grep/glob keep
-        // serving through the bounded fallback walk — never a permanent
-        // "building".
-        let project = tempfile::tempdir().expect("project");
-        let source = project.path().join("lib.rs");
-        fs::write(&source, "pub fn answer() -> i32 { 42 }\n").expect("write source");
-        let project_key = "shared-search-artifact".to_string();
-        crate::root_cache::configure_artifact_access(project.path(), &project_key, true);
-
-        // cache_dir.file_name() == project_key (the shared key) → write denied.
-        let storage = tempfile::tempdir().expect("storage");
-        let cache_dir = storage.path().join(&project_key);
-        let index = SearchIndex::build_with_limit_to_cache_dir(
-            project.path(),
-            DEFAULT_MAX_FILE_SIZE,
-            &cache_dir,
-        );
-
-        assert!(
-            index.build_denied,
-            "a write-denied cold build must flag build_denied so health can report a settled state"
-        );
-        assert!(
-            !index.ready,
-            "build_denied must keep ready=false so grep/glob keep using the bounded fallback walk"
-        );
-        assert!(
-            index.files.is_empty(),
-            "a write-denied build must not materialize an in-RAM index"
-        );
-    }
-}
-
 #[cfg(test)]
 mod interactive_artifact_read_budget_tests {
     use super::*;

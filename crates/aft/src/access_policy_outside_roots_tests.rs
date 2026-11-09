@@ -123,21 +123,15 @@ impl Fixture {
 
     /// A context for `aft_search` (`semantic_search`) rooted at `root/`, with
     /// a Git repository nested inside the root and another one outside it.
-    /// Both repositories have a saved trigram index, which an allowed search
-    /// uses after its freshness check walks the repository.
+    /// An allowed external search walks the selected repository.
     fn search_context(&self, doc: &str) -> (AppContext, PathBuf, PathBuf) {
         let nested = self.root.join("nested");
         let outside_repo = self.base().join("outside-repo");
-        let storage = self.base().join("store");
         for repo in [&nested, &outside_repo] {
             if !repo.exists() {
                 std::fs::create_dir(repo).unwrap();
                 std::fs::write(repo.join("marker.rs"), "fn nested_marker() {}\n").unwrap();
                 git(repo, &["init", "-q"]);
-                crate::search_index::SearchIndex::build(repo).write_to_disk(
-                    &crate::search_index::resolve_cache_dir(repo, Some(&storage)),
-                    None,
-                );
             }
         }
         let ctx = AppContext::new(
