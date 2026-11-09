@@ -100,7 +100,7 @@ fn large_allocation_logs_one_event_with_its_label_and_caller() {
     assert!(line.contains(" root=large-repo"), "{line}");
     assert!(line.contains(" build_id="), "{line}");
     // One frame is the return address inside the function that allocated.
-    let (image, start) = image_offset(allocate_large_for_test as usize);
+    let (image, start) = image_offset(allocate_large_for_test as *const () as usize);
     let frames = frames_of(line);
     assert!(
         frames
