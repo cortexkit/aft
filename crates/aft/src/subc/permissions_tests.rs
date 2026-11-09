@@ -332,10 +332,11 @@ fn permissions_subject_labels_show_home_as_tilde() {
     assert_eq!(display_path(Path::new("/srv/data"), &[]), "/srv/data");
 }
 
-/// The sample sent to the contract's owner: `permissions.list` from this
-/// handler for an agent grant and two worker grants (one saved from a card,
-/// one from the worker's launch plan, which has no card). Ids and times are
-/// pinned in the database so the reply is reproducible.
+/// The published sample of AFT's `permissions/v1` rows
+/// (`test-vectors/permissions-v1/aft-provider-list.json`): `permissions.list`
+/// from this handler for an agent grant and two worker grants (one saved from
+/// a card, one from the worker's launch plan, which has no card). Ids and
+/// times are pinned in the database so the reply is reproducible.
 #[cfg(unix)]
 #[test]
 fn permissions_list_matches_the_published_sample() {
