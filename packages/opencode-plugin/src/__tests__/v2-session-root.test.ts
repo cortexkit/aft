@@ -134,9 +134,7 @@ describe("OpenCode 2 tool root for a session in a linked worktree", () => {
     const runtime = { directory: worktree, worktree: main, sessionID };
     expect(projectRootFor({ ...runtime, directoryIsSessionRoot: true })).toBe(worktree);
     expect(projectRootFor(runtime)).toBe(main);
-    expect(
-      projectRootFor({ ...runtime, directory: "", directoryIsSessionRoot: true }),
-    ).toBe(main);
+    expect(projectRootFor({ ...runtime, directory: "", directoryIsSessionRoot: true })).toBe(main);
   });
 
   /**

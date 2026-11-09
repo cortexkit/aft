@@ -2830,6 +2830,23 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 300_000);
 
+  test("GA host relative reads follow a session moved to another repository", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const liveDbBefore = await snapshotPath(operatorDb, false);
+    const result = await withOperatorCanary("v2-session-move", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-session-move.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 210_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-session-move-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+    expect(await snapshotPath(operatorDb, false)).toEqual(liveDbBefore);
+  }, 240_000);
+
   test("GA host admits background completions as synthetic steering input", async () => {
     const { v2 } = await ensureHostInstalls();
     const result = await withOperatorCanary("v2-synthetic-completion", () =>
@@ -3411,6 +3428,7 @@ export default entry;
       "v2-node",
       "v2-lifecycle",
       "v2-permission-prompt",
+      "v2-session-move",
       "v2-synthetic-completion",
       "v2-completion-detach",
       "v2-host-tool-names",
