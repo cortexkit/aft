@@ -3568,21 +3568,11 @@ fn build_health_diagnostic_rollup_from_actors(
     // Roots whose data-layer checkout could not bind, build or refresh, or
     // whose store a newer build wrote. Present only while the data layer
     // runs.
-    let data_store_failed_roots = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.health.data_store.as_ref().is_some_and(|store| {
-                store.failure.is_some()
-                    || matches!(
-                        store.reason,
-                        Some(
-                            crate::data_layer::surfaces::reason::BIND_FAILED
-                                | crate::data_layer::surfaces::reason::REQUIRES_NEWER_READER
-                        )
-                    )
-            })
-        })
-        .count();
+    let data_store_failures =
+        DataStoreFailedRoots::collect(candidates.iter().filter_map(|candidate| {
+            let store = candidate.health.data_store.as_ref()?;
+            Some((candidate.health.project_root.as_str(), store))
+        }));
     let standing_refusals = candidates
         .iter()
         .filter(|candidate| {
@@ -3767,7 +3757,7 @@ fn build_health_diagnostic_rollup_from_actors(
             warming_roots,
             disk_reserve_detail,
         ),
-        data_store_failed_roots,
+        &data_store_failures,
     );
 
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
@@ -3823,9 +3813,7 @@ fn build_health_diagnostic_rollup_from_actors(
         "roots": roots,
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
-    if data_store_failed_roots > 0 {
-        metrics["data_store_failed_roots"] = json!(data_store_failed_roots);
-    }
+    data_store_failures.insert_into(&mut metrics);
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
     if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
@@ -3860,20 +3848,138 @@ fn build_health_diagnostic_rollup_from_actors(
     }
 }
 
+/// How many roots with a failed index store the health summary names, in
+/// path order; the rest are only counted.
+const HEALTH_DATA_STORE_FAILED_NAMED: usize = 5;
+/// The most bytes the failed roots' names may add to the health `detail`.
+/// The detail sits outside the metrics byte budget, in the 4 KiB SUBC keeps
+/// for the reply's envelope, so it is capped on its own.
+const HEALTH_DATA_STORE_FAILED_DETAIL_BYTES: usize = 1024;
+
+/// The reason code a root's failed index store is listed with, or `None`
+/// when its store did not fail. A store fails when its checkout could not
+/// bind, build or refresh, or when a newer build wrote it. The reason code
+/// the store reports is kept. A failed build or refresh while the previous
+/// build still answers queries reports no reason code, so its recorded
+/// failure is classified the way the store classifies one.
+fn data_store_failure_reason(
+    store: &crate::data_layer::surfaces::DataStoreHealth,
+) -> Option<&'static str> {
+    use crate::data_layer::surfaces::reason;
+    match (store.reason, &store.failure) {
+        (Some(code @ (reason::BIND_FAILED | reason::REQUIRES_NEWER_READER)), _) => Some(code),
+        (_, None) => None,
+        (
+            Some(
+                code @ (reason::BUILD_FAILED
+                | reason::REFRESH_FAILED
+                | reason::STORE_BUSY
+                | reason::DISK_RESERVE),
+            ),
+            Some(_),
+        ) => Some(code),
+        (_, Some(failure)) => Some(if crate::view_storage_reserve::is_message(&failure.error) {
+            reason::DISK_RESERVE
+        } else if failure.busy {
+            reason::STORE_BUSY
+        } else if failure.stage == "refresh" {
+            reason::REFRESH_FAILED
+        } else {
+            reason::BUILD_FAILED
+        }),
+    }
+}
+
+/// The roots whose index store failed, as the health summary reports them:
+/// how many, and the first few by path with a reason code, so an alert can
+/// say which roots are degraded and why without reading the logs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DataStoreFailedRoots {
+    count: usize,
+    /// `(project_root, reason)` in path order, at most
+    /// [`HEALTH_DATA_STORE_FAILED_NAMED`]. Long paths are abbreviated with
+    /// [`abbreviated_health_path`], as the `roots` rows abbreviate theirs.
+    named: Vec<(String, &'static str)>,
+}
+
+impl DataStoreFailedRoots {
+    fn collect<'a>(
+        roots: impl IntoIterator<Item = (&'a str, &'a crate::data_layer::surfaces::DataStoreHealth)>,
+    ) -> Self {
+        let mut failed = roots
+            .into_iter()
+            .filter_map(|(root, store)| Some((root, data_store_failure_reason(store)?)))
+            .collect::<Vec<_>>();
+        failed.sort_unstable();
+        let count = failed.len();
+        let named = failed
+            .into_iter()
+            .take(HEALTH_DATA_STORE_FAILED_NAMED)
+            .map(|(root, reason)| (abbreviated_health_path(root), reason))
+            .collect();
+        Self { count, named }
+    }
+
+    /// Adds `data_store_failed_roots` (the count), `data_store_failed` (the
+    /// named roots) and `data_store_failed_omitted` (the rest) to the
+    /// rollup's metrics; nothing while no store failed.
+    fn insert_into(&self, metrics: &mut Value) {
+        if self.count == 0 {
+            return;
+        }
+        metrics["data_store_failed_roots"] = json!(self.count);
+        metrics["data_store_failed"] = Value::Array(
+            self.named
+                .iter()
+                .map(|(root, reason)| json!({ "project_root": root, "reason": reason }))
+                .collect(),
+        );
+        metrics["data_store_failed_omitted"] = json!(self.count - self.named.len());
+    }
+
+    /// `: /a (build_failed), /b (bind_failed) and 3 more` for the health
+    /// detail, at most [`HEALTH_DATA_STORE_FAILED_DETAIL_BYTES`] long: a
+    /// name that would pass the cap is counted among the rest instead.
+    fn detail_names(&self) -> String {
+        // Leave room for the longest possible tail, so the tail never
+        // pushes the names past the cap.
+        let tail_room = format!(" and {} more", self.count).len();
+        let mut names = String::new();
+        let mut listed = 0usize;
+        for (root, reason) in &self.named {
+            let separator = if listed == 0 { ": " } else { ", " };
+            let entry = format!("{separator}{root} ({reason})");
+            if names.len() + entry.len() + tail_room > HEALTH_DATA_STORE_FAILED_DETAIL_BYTES {
+                break;
+            }
+            names.push_str(&entry);
+            listed += 1;
+        }
+        let rest = self.count - listed;
+        if listed > 0 && rest > 0 {
+            names.push_str(&format!(" and {rest} more"));
+        }
+        names
+    }
+}
+
 /// The fleet state with roots whose data-layer checkout failed: such a root
 /// is not warming, so a fleet otherwise ok (or only warming) is degraded
-/// and says why. A degraded state for another reason keeps its detail.
+/// and says why, naming the first roots. A degraded state for another
+/// reason keeps its detail.
 fn with_data_store_failures(
     state: (HealthStatus, Option<String>),
-    failed_roots: usize,
+    failed: &DataStoreFailedRoots,
 ) -> (HealthStatus, Option<String>) {
-    if failed_roots == 0 || state.0 != HealthStatus::Ok {
+    if failed.count == 0 || state.0 != HealthStatus::Ok {
         return state;
     }
     (
         HealthStatus::Degraded,
         Some(format!(
-            "{failed_roots} root(s) could not build or refresh their index store; see roots[].data_store"
+            "{} root(s) could not build or refresh their index store{}; see roots[].data_store",
+            failed.count,
+            failed.detail_names()
         )),
     )
 }
@@ -4768,15 +4874,24 @@ mod tests {
 
     #[test]
     fn a_failed_data_store_degrades_the_fleet_and_keeps_its_root_in_detail() {
+        let one = DataStoreFailedRoots {
+            count: 1,
+            named: vec![("/Users/u/Documents".to_string(), "bind_failed")],
+        };
         // Warming alone is ok; a root whose data store failed is not warming.
-        let (status, detail) = with_data_store_failures(root_health_rollup_state(0, 0, 1, None), 1);
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(0, 0, 1, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
-            Some("1 root(s) could not build or refresh their index store; see roots[].data_store")
+            Some(
+                "1 root(s) could not build or refresh their index store: \
+                 /Users/u/Documents (bind_failed); see roots[].data_store"
+            )
         );
         // A fleet already degraded for another reason keeps that reason.
-        let (status, detail) = with_data_store_failures(root_health_rollup_state(2, 0, 0, None), 1);
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(2, 0, 0, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
         assert_eq!(
             detail.as_deref(),
@@ -4784,7 +4899,10 @@ mod tests {
         );
         // No failure: unchanged.
         assert_eq!(
-            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), 0),
+            with_data_store_failures(
+                root_health_rollup_state(0, 0, 0, None),
+                &DataStoreFailedRoots::default()
+            ),
             (HealthStatus::Ok, None)
         );
 
@@ -4804,6 +4922,148 @@ mod tests {
         );
         assert!(abbreviate_health_root(&mut root));
         assert_eq!(root["data_store"]["failure"]["stage"], "build");
+    }
+
+    fn data_store_health(
+        reason: Option<&'static str>,
+        failure: Option<(&'static str, bool)>,
+    ) -> crate::data_layer::surfaces::DataStoreHealth {
+        crate::data_layer::surfaces::DataStoreHealth {
+            reason,
+            error: None,
+            pending_edits: 0,
+            unparsed_files: 0,
+            failure: failure.map(
+                |(stage, busy)| crate::data_layer::surfaces::DataStoreFailure {
+                    stage,
+                    error: "cannot walk the root: Operation not permitted".to_string(),
+                    busy,
+                    at_ms: 1,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn failed_index_store_roots_are_named_in_path_order_with_reasons_up_to_five() {
+        use crate::data_layer::surfaces::reason;
+        let healthy = data_store_health(None, None);
+        let not_bound = data_store_health(Some(reason::NOT_BOUND), None);
+        let bind = data_store_health(Some(reason::BIND_FAILED), None);
+        let newer = data_store_health(Some(reason::REQUIRES_NEWER_READER), None);
+        let build = data_store_health(Some(reason::BUILD_FAILED), Some(("build", false)));
+        // A failed build or refresh while the previous build still answers
+        // reports no reason code; the recorded failure decides it.
+        let busy_served = data_store_health(None, Some(("build", true)));
+        let refresh_served = data_store_health(None, Some(("refresh", false)));
+        let build_served = data_store_health(None, Some(("build", false)));
+        let failed = DataStoreFailedRoots::collect([
+            ("/r/h", &healthy),
+            ("/r/f", &build),
+            ("/r/a", &bind),
+            ("/r/nb", &not_bound),
+            ("/r/d", &refresh_served),
+            ("/r/c", &busy_served),
+            ("/r/b", &newer),
+            ("/r/e", &build_served),
+        ]);
+        assert_eq!(failed.count, 6);
+        let expected = [
+            ("/r/a", reason::BIND_FAILED),
+            ("/r/b", reason::REQUIRES_NEWER_READER),
+            ("/r/c", reason::STORE_BUSY),
+            ("/r/d", reason::REFRESH_FAILED),
+            ("/r/e", reason::BUILD_FAILED),
+        ];
+        assert_eq!(
+            failed.named,
+            expected
+                .iter()
+                .map(|(root, reason)| (root.to_string(), *reason))
+                .collect::<Vec<_>>()
+        );
+
+        let mut metrics = json!({});
+        failed.insert_into(&mut metrics);
+        assert_eq!(
+            metrics,
+            json!({
+                "data_store_failed_roots": 6,
+                "data_store_failed": expected
+                    .iter()
+                    .map(|(root, reason)| json!({"project_root": root, "reason": reason}))
+                    .collect::<Vec<_>>(),
+                "data_store_failed_omitted": 1,
+            })
+        );
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "6 root(s) could not build or refresh their index store: /r/a (bind_failed), \
+                 /r/b (storage_requires_newer_reader), /r/c (store_busy), \
+                 /r/d (refresh_failed), /r/e (build_failed) and 1 more; \
+                 see roots[].data_store"
+            )
+        );
+
+        // Nothing failed: no fields and no detail.
+        let mut metrics = json!({});
+        DataStoreFailedRoots::collect([("/r/h", &healthy), ("/r/nb", &not_bound)])
+            .insert_into(&mut metrics);
+        assert_eq!(metrics, json!({}));
+    }
+
+    #[test]
+    fn failed_index_store_root_names_add_at_most_one_kib_to_the_detail() {
+        let bind = data_store_health(Some(crate::data_layer::surfaces::reason::BIND_FAILED), None);
+        let base = |count: usize| {
+            format!(
+                "{count} root(s) could not build or refresh their index store; see roots[].data_store"
+            )
+        };
+        // Five paths just short of abbreviation, five past it with a long
+        // multi-byte basename (kept to 64 characters, up to 192 bytes here),
+        // and fifty of the latter.
+        let short_enough = (0..5)
+            .map(|index| format!("/{index}{}", "p".repeat(158)))
+            .collect::<Vec<_>>();
+        let wide = (0..50)
+            .map(|index| format!("/{index:02}/{}", "文".repeat(100)))
+            .collect::<Vec<_>>();
+        for (paths, all_named) in [
+            (&short_enough[..], true),
+            (&wide[..5], false),
+            (&wide[..], false),
+        ] {
+            let failed =
+                DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &bind)));
+            assert_eq!(failed.named.len(), 5);
+            let (_, detail) =
+                with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+            let detail = detail.expect("a degraded detail");
+            let added = detail.len() - base(paths.len()).len();
+            assert!(
+                added <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
+                "the names added {added} bytes: {detail}"
+            );
+            let listed = failed
+                .named
+                .iter()
+                .filter(|(root, _)| detail.contains(root.as_str()))
+                .count();
+            assert!(listed > 0, "{detail}");
+            assert_eq!(listed == 5, all_named, "{detail}");
+            // Every root is either named or counted.
+            let rest = paths.len() - listed;
+            assert_eq!(
+                detail.contains(&format!(" and {rest} more;")),
+                rest > 0,
+                "{detail}"
+            );
+        }
     }
 
     #[test]
@@ -8179,6 +8439,107 @@ mod tests {
             "cached reply payload scaled with roots: five={five_bytes}, fifty={fifty_bytes}"
         );
         std::hint::black_box((five_dirs, fifty_dirs));
+    }
+
+    #[test]
+    fn health_names_roots_whose_index_store_failed_within_the_reply_budgets() {
+        use crate::data_layer::surfaces::{reason, DataCheckoutProbe};
+        let app = crate::context::App::default_shared();
+        for root_count in [1usize, 50] {
+            let executor = Executor::with_config(crate::executor::ExecutorConfig {
+                pool_size: 1,
+                read_cap: 1,
+                actor_cap: 64,
+                heavy_permits: 1,
+                drr_quantum: 1,
+            });
+            let mut dirs = Vec::with_capacity(root_count);
+            let mut paths = Vec::with_capacity(root_count);
+            for index in 0..root_count {
+                let (dir, root) = test_root(&format!("store-failed-{root_count}-{index:02}"));
+                let ctx = test_ctx();
+                // The index store writes under `data` in the storage folder;
+                // a regular file there makes its bind fail, as a root the
+                // operating system keeps the daemon out of does, while the
+                // rest of the storage folder works.
+                let storage = dir.path().join("storage");
+                std::fs::create_dir(&storage).expect("create the storage folder");
+                std::fs::write(storage.join("data"), b"").expect("block the index store");
+                ctx.update_config(|config| config.storage_dir = Some(storage));
+                ctx.set_canonical_cache_root(
+                    std::fs::canonicalize(dir.path()).expect("canonical root"),
+                );
+                assert!(ctx.data_checkout().is_none(), "the bind fails");
+                assert!(matches!(
+                    ctx.probe_data_checkout(),
+                    Some(DataCheckoutProbe::BindFailed(_))
+                ));
+                paths.push(root.as_path().display().to_string());
+                assert!(executor.register_actor(root, ctx));
+                dirs.push(dir);
+            }
+            paths.sort();
+            let cache = HealthRollupCache::new();
+            let report = refresh_until_root_count(&cache, &executor, &app, root_count as u64);
+            let report_bytes = serde_json::to_vec(&report)
+                .expect("serialize health report")
+                .len();
+            assert_eq!(report.status, HealthStatus::Degraded, "{report:?}");
+            let detail = report.detail.clone().expect("a degraded detail");
+            let metrics = report.metrics.expect("health metrics");
+
+            let named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            assert_eq!(metrics["data_store_failed_roots"], json!(root_count));
+            assert_eq!(
+                metrics["data_store_failed"],
+                json!(paths[..named]
+                    .iter()
+                    .map(|path| json!({"project_root": path, "reason": reason::BIND_FAILED}))
+                    .collect::<Vec<_>>())
+            );
+            assert_eq!(
+                metrics["data_store_failed_omitted"],
+                json!(root_count - named)
+            );
+            let metrics_bytes = metrics["metrics_bytes"].as_u64().expect("metrics bytes") as usize;
+            assert_eq!(
+                metrics_bytes,
+                serde_json::to_vec(&metrics).expect("encode metrics").len()
+            );
+            assert!(
+                metrics_bytes <= HEALTH_METRICS_BUDGET_BYTES,
+                "{metrics_bytes}"
+            );
+
+            // The detail names the same roots, in the same order, and counts
+            // the rest, within its own cap.
+            let names = detail
+                .split_once("could not build or refresh their index store")
+                .and_then(|(_, rest)| rest.split_once("; see roots[].data_store"))
+                .map(|(names, _)| names)
+                .unwrap_or_else(|| panic!("the detail names no failed roots: {detail}"));
+            assert!(
+                names.len() <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
+                "{names}"
+            );
+            let expected = paths[..named]
+                .iter()
+                .map(|path| format!("{path} (bind_failed)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tail = if root_count > named {
+                format!(" and {} more", root_count - named)
+            } else {
+                String::new()
+            };
+            assert_eq!(names, format!(": {expected}{tail}"));
+            eprintln!(
+                "failed index stores: roots={root_count} metrics_bytes={metrics_bytes} \
+                 detail_bytes={} report_bytes={report_bytes}",
+                detail.len()
+            );
+            std::hint::black_box(dirs);
+        }
     }
 
     #[test]
