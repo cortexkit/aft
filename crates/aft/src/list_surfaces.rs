@@ -773,7 +773,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal corpus census, not a paginated findings list; an incomplete walk reports a named gap, marks scope_files_complete false, and renders the count as a lower bound",
     },
     ExclusionEntry {
-        file: "root_cache.rs",
+        file: "cache_location/markers.rs",
         enclosing_item: "sweep_all_read_markers_pinned, sweep_marker_generation, read_marker_protection, marker_file_is_protected",
         location_or_primitive: "shared repair traversal budget and read-marker byte limit",
         reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",

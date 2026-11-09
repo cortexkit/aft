@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use super::CACHE_DOMAINS;
+pub(crate) mod markers;
 use crate::bash_background::persistence::{PinnedDir, RepairBudget};
 
 #[cfg(test)]
@@ -1696,7 +1696,7 @@ fn ensure_cache_idle(
     ) -> io::Result<()> {
         budget.enter(depth)?;
         dir.repair_check_boundary(root, protected)?;
-        if crate::root_cache::sweep_all_read_markers_pinned(dir, budget, false)?.protected {
+        if markers::sweep_all_read_markers_pinned(dir, budget, false)?.protected {
             return Err(io::Error::other("cache has live readers"));
         }
         for name in dir.repair_names(budget)? {
@@ -3848,5 +3848,78 @@ mod prune_legacy_tests {
             report.skipped[0].reason
         );
         assert!(parent.join("aft/views/a").is_file());
+    }
+}
+
+pub const CACHE_DOMAINS: [&str; 7] = [
+    "views",
+    "blobs",
+    "callgraph",
+    "semantic",
+    "index",
+    "symbols",
+    "inspect",
+];
+
+pub(crate) fn canonical_root(project_root: &Path) -> PathBuf {
+    // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
+    // registration can precede the directory's creation (and lookups can follow
+    // it), and on macOS the raw tempdir spelling (/var/...) differs from the
+    // canonical one (/private/var/...). Keying the access registry by whichever
+    // spelling happened to win the existence race made a registered root miss
+    // its own entry and fail closed.
+    canonical_process_lease_dir(project_root)
+}
+
+pub(crate) fn canonical_process_lease_dir(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let normalized = lexical_normalize(path);
+    let mut missing_components = Vec::new();
+    let mut current = normalized.as_path();
+    while !current.exists() {
+        let Some(name) = current.file_name() else {
+            return normalized;
+        };
+        missing_components.push(name.to_os_string());
+        let Some(parent) = current.parent() else {
+            return normalized;
+        };
+        current = parent;
+    }
+
+    let mut canonical = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn existing_ancestor(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            return PathBuf::from(".");
+        };
+        current = parent;
     }
 }

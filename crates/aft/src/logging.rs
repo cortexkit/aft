@@ -2078,7 +2078,7 @@ fn pid_started_after_last_write(pid: u32, modified: Option<SystemTime>) -> bool 
     else {
         return false;
     };
-    crate::root_cache::process_start_time_ms(pid)
+    crate::process_identity::process_start_time_ms(pid)
         .is_some_and(|started_ms| started_ms > modified_ms.saturating_add(PID_REUSE_TOLERANCE_MS))
 }
 
@@ -3794,7 +3794,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         assert!(is_process_alive(1));
         assert!(
-            crate::root_cache::process_start_time_ms(1).is_some(),
+            crate::process_identity::process_start_time_ms(1).is_some(),
             "pid 1's start time must be readable from an unprivileged process"
         );
         let recycled = temp.path().join("aft-1.log");

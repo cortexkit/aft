@@ -69,6 +69,7 @@ pub mod bash_rewrite;
 pub(crate) mod bounded_io;
 pub mod build_breaker;
 pub mod cache_freshness;
+pub mod cache_location;
 pub mod callgraph;
 pub mod callgraph_extractor;
 pub mod callgraph_store;
@@ -169,6 +170,7 @@ pub(crate) mod posix_spawn;
 mod privacy_spawn;
 #[doc(hidden)]
 pub mod private_storage;
+pub mod process_identity;
 pub mod process_io;
 pub(crate) mod production_storage;
 pub(crate) mod project_content;

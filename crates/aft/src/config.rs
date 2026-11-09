@@ -736,7 +736,7 @@ impl Config {
     /// Optional artifact location for APIs that keep disk persistence opt-in.
     pub fn cache_storage_dir(&self) -> Option<PathBuf> {
         (self.cache_dir.is_some() || self.storage_dir.is_some())
-            .then(|| crate::root_cache::cache_root(self))
+            .then(|| crate::cache_location::cache_root(self))
     }
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
@@ -988,10 +988,10 @@ pub struct Config {
     #[serde(skip_deserializing)]
     pub cache_epoch: u64,
     #[serde(skip)]
-    pub cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+    pub cache_lease: Option<std::sync::Arc<crate::cache_location::CacheLease>>,
     /// A trusted process lease, never accepted from configuration or tool input.
     #[serde(skip)]
-    pub storage_lease: Option<std::sync::Arc<crate::root_cache::ProcessStorageLease>>,
+    pub storage_lease: Option<std::sync::Arc<crate::cache_location::ProcessStorageLease>>,
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
     /// Legacy serialized setting (default: 1); validation does not consume it.

@@ -1356,7 +1356,7 @@ impl Executor {
         if inserted {
             ctx.install_callgraph_executor(maintenance);
             let app = ctx.app();
-            crate::root_cache::register_live_scope(&ctx.storage_dir(), &memory_root);
+            crate::cache_location::markers::register_live_scope(&ctx.storage_dir(), &memory_root);
             app.register_memory_context(memory_root, &ctx);
             app.actor_root_registered();
         }
@@ -1379,7 +1379,10 @@ impl Executor {
         };
         if let Some(actor) = removed.as_ref() {
             let app = actor.ctx.app();
-            crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
+            crate::cache_location::markers::unregister_live_scope(
+                &actor.ctx.storage_dir(),
+                root_id.as_path(),
+            );
             app.unregister_memory_context(root_id.as_path(), &actor.ctx);
             app.actor_root_unregistered();
         }
@@ -1441,7 +1444,10 @@ impl Executor {
             return false;
         };
         let app = actor.ctx.app();
-        crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
+        crate::cache_location::markers::unregister_live_scope(
+            &actor.ctx.storage_dir(),
+            root_id.as_path(),
+        );
         app.unregister_memory_context(root_id.as_path(), &actor.ctx);
         app.actor_root_unregistered();
         std::thread::spawn(move || {

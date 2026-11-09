@@ -869,7 +869,7 @@ pub fn resolve_config_for_harness(
                 let path = std::path::PathBuf::from(raw);
                 config.cache_dir = Some(path.clone());
                 config.cache_unavailable = Some(error.clone());
-                warnings.push(crate::root_cache::unavailable_warning(&path, &error));
+                warnings.push(crate::cache_location::unavailable_warning(&path, &error));
             }
         }
     }

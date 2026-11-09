@@ -2,8 +2,8 @@
 //! ensures only one process updates the cache at a time, and read-marker files
 //! let cleanup see which readers are still using the cache.
 //!
-//! Writer leases are stored at `<storage>/callgraph/<artifact_cache_key>/writer.lease`
-//! and `<storage>/inspect/<project_scope_key>/writer.lease`. They use the
+//! Writer leases are stored at `<storage>/inspect/<project_scope_key>/writer.lease`
+//! and `<storage>/index/<artifact_cache_key>/writer.lease`. They use the
 //! `fs_lock` JSON format with a `writer_epoch` nonce so a writer can detect if
 //! another process has taken over before publishing changes or starting SQLite
 //! write transactions.
@@ -18,16 +18,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 use std::fs;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 use crate::fs_lock;
 
@@ -37,20 +34,19 @@ mod cache_paths_tests;
 #[cfg(test)]
 pub(crate) use location::prepare_cache_root_for_test;
 
-pub const CACHE_DOMAINS: [&str; 7] = [
-    "views",
-    "blobs",
-    "callgraph",
-    "semantic",
-    "index",
-    "symbols",
-    "inspect",
-];
-
-#[path = "cache_location.rs"]
-mod location;
+use crate::cache_location as location;
+pub use crate::cache_location::CACHE_DOMAINS;
+pub use crate::process_identity::process_start_time_ms;
 #[cfg(test)]
 pub(crate) use location::acquire_cache_cleanup_lease;
+pub(crate) use location::canonical_root;
+#[cfg(test)]
+pub(crate) use location::markers::sweep_all_read_markers;
+pub use location::markers::{
+    protected_read_marker_exists, read_marker_dir, sweep_read_markers, ReadMarker,
+    ReadMarkerMetadata, ReadMarkerSweep, READ_MARKER_CROSS_HOST_STALE_MS,
+    READ_MARKER_TOUCH_INTERVAL_MS,
+};
 pub use location::{
     acquire_daemon_storage_lease, cache_root, cache_unavailable, cache_unavailable_for_root,
     clean_old_caches, prepare_cache_root, prune_legacy_stores, reclaim_configured_inactive_caches,
@@ -64,32 +60,12 @@ pub(crate) use location::{
 pub(crate) use location::{
     cache_status_code, check_cache_access, durable_route, ensure_config_storage_lease,
     identity_storage_root, pin_cache_path, prepare_process_cache_root,
-    prepare_third_party_cache_dir, refuse_durable_cache_write, refuse_new_durable_cache_entry,
-    unavailable_code, unavailable_warning,
+    prepare_third_party_cache_dir, unavailable_code, unavailable_warning,
 };
-
-static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
-struct LiveScope {
-    count: usize,
-    _marker: Option<ReadMarker>,
-}
-static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), LiveScope>>> = OnceLock::new();
-
-/// Read-marker heartbeats refresh no more often than the filesystem lock
-/// heartbeat. Active readers piggyback this on normal read paths instead of
-/// spawning a thread per connection.
-pub const READ_MARKER_TOUCH_INTERVAL_MS: u64 = fs_lock::HEARTBEAT_INTERVAL_MS;
-/// Cross-host markers cannot use local PID liveness, so they expire after the
-/// same conservative 5x stale-heartbeat window used by filesystem locks.
-pub const READ_MARKER_CROSS_HOST_STALE_MS: u64 = fs_lock::STALE_HEARTBEAT_MS * 5;
-// Process start timestamps are not always millisecond-precise across OS APIs.
-// A one-second grace keeps a marker created immediately after process launch
-// attached to that process while still identifying clear PID reuse.
-const PROCESS_START_TIME_GRACE_MS: u64 = 1_000;
+use location::{canonical_process_lease_dir, existing_ancestor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {
-    Callgraph,
     Inspect,
     /// Search-index publication for an unbound standing root. This remains a
     /// root-keyed WriterLease domain, separate from the session-owned cache.
@@ -99,7 +75,6 @@ pub enum RootCacheDomain {
 impl RootCacheDomain {
     pub fn as_str(self) -> &'static str {
         match self {
-            RootCacheDomain::Callgraph => "callgraph",
             RootCacheDomain::Inspect => "inspect",
             RootCacheDomain::Index => "index",
         }
@@ -286,10 +261,7 @@ impl ArtifactAccess {
         if !self.borrow_only_shared {
             return true;
         }
-        if domain != RootCacheDomain::Callgraph
-            && writes_keyed_dir
-            && artifact_key == self.private_key
-        {
+        if writes_keyed_dir && artifact_key == self.private_key {
             return true;
         }
         if !self.registered && !writes_root_keyed_dir {
@@ -339,48 +311,6 @@ pub(crate) fn configured_artifact_key(project_root: &Path) -> Option<String> {
         .map(|access| access.shared_key.clone())
 }
 
-/// Track scope keys belonging to roots currently bound in this process. The
-/// inspect sweep snapshots this registry at publication time so a live actor's
-/// cache cannot be mistaken for a reclaimed worktree cache.
-fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), LiveScope>> {
-    LIVE_SCOPE_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn register_live_scope(storage_root: &Path, project_root: &Path) {
-    let storage_root = canonical_root(storage_root);
-    let scope_key = crate::path_identity::project_scope_key(project_root);
-    let mut scopes = match live_scope_keys().lock() {
-        Ok(scopes) => scopes,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let marker_root = storage_root.join("retention");
-    let entry = scopes
-        .entry((storage_root, scope_key.clone()))
-        .or_insert_with(|| LiveScope {
-            count: 0,
-            _marker: ReadMarker::create(&marker_root, &scope_key)
-                .map_err(|error| crate::slog_warn!("root residency marker unavailable: {error}"))
-                .ok(),
-        });
-    entry.count += 1;
-}
-
-pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
-    let storage_root = canonical_root(storage_root);
-    let scope_key = crate::path_identity::project_scope_key(project_root);
-    let mut scopes = match live_scope_keys().lock() {
-        Ok(scopes) => scopes,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let key = (storage_root, scope_key);
-    if let Some(scope) = scopes.get_mut(&key) {
-        scope.count = scope.count.saturating_sub(1);
-        if scope.count == 0 {
-            scopes.remove(&key);
-        }
-    }
-}
-
 /// Register the worktree topology already detected by configure so artifact
 /// APIs can enforce it without repeating a Git subprocess on every write path.
 pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_only_shared: bool) {
@@ -397,16 +327,6 @@ pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_o
         }
         configured.insert(access.project_root.clone(), access);
     }
-}
-
-pub(crate) fn canonical_root(project_root: &Path) -> PathBuf {
-    // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
-    // registration can precede the directory's creation (and lookups can follow
-    // it), and on macOS the raw tempdir spelling (/var/...) differs from the
-    // canonical one (/private/var/...). Keying the access registry by whichever
-    // spelling happened to win the existence race made a registered root miss
-    // its own entry and fail closed.
-    canonical_process_lease_dir(project_root)
 }
 
 fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
@@ -737,529 +657,6 @@ pub fn writer_lease_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("writer.lease")
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct ReadMarkerMetadata {
-    pub pid: u32,
-    pub hostname: String,
-    pub created_at_ms: u64,
-    /// Per-acquisition identity of a base-reference marker. Ordinary readers
-    /// leave it out, so their files are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct ReadMarker {
-    path: PathBuf,
-    generation: crate::bash_background::persistence::PinnedDir,
-    name: std::ffi::OsString,
-    metadata: ReadMarkerMetadata,
-    last_touched_at_ms: AtomicU64,
-}
-
-impl ReadMarker {
-    pub fn create(cache_dir: &Path, generation_label: &str) -> io::Result<Self> {
-        Self::create_inner(cache_dir, generation_label, None)
-    }
-
-    /// A marker whose file also records `nonce`, so its holder can later
-    /// prove the file at its unique path is still its own acquisition.
-    pub fn create_with_nonce(
-        cache_dir: &Path,
-        generation_label: &str,
-        nonce: &str,
-    ) -> io::Result<Self> {
-        Self::create_inner(cache_dir, generation_label, Some(nonce.to_owned()))
-    }
-
-    /// True when the marker file at this marker's own path still exists and
-    /// carries this marker's metadata, nonce included. A sweep that judged the
-    /// owner dead removes the file, and this then reports `false`.
-    pub fn verify_held(&self) -> io::Result<bool> {
-        use std::io::Read;
-        let mut file = match self.generation.repair_read_file(&self.name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(crate::io_accounting::at(
-                    "opening reader marker",
-                    &self.path,
-                    error,
-                ))
-            }
-        };
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(32 * 1024)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                crate::io_accounting::at("reading reader marker", &self.path, error)
-            })?;
-        Ok(serde_json::from_slice::<ReadMarkerMetadata>(&bytes)
-            .is_ok_and(|stored| stored == self.metadata))
-    }
-
-    fn create_inner(
-        cache_dir: &Path,
-        generation_label: &str,
-        nonce: Option<String>,
-    ) -> io::Result<Self> {
-        let metadata = ReadMarkerMetadata {
-            pid: std::process::id(),
-            hostname: current_hostname(),
-            created_at_ms: now_ms(),
-            nonce,
-        };
-        let dir = read_marker_dir(cache_dir, generation_label);
-        crate::private_storage::open_dir(cache_dir, &dir).map_err(|error| {
-            crate::io_accounting::at("creating reader marker directory", &dir, error)
-        })?;
-        let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "{}.{}.{}.{}.json",
-            metadata.pid,
-            sanitize_marker_component(&metadata.hostname),
-            metadata.created_at_ms,
-            seq
-        ));
-        let generation = match pin_cache_path(&dir).map_err(|error| {
-            crate::io_accounting::at("pinning reader marker directory", &dir, error)
-        })? {
-            Some(access) => access.directory(false),
-            None => crate::bash_background::persistence::PinnedDir::repair_open_path(&dir),
-        }
-        .map_err(|error| {
-            crate::io_accounting::at("opening reader marker directory", &dir, error)
-        })?;
-        let name = path.file_name().unwrap().to_os_string();
-        write_marker_file_pinned(&generation, &name, &metadata)
-            .map_err(|error| crate::io_accounting::at("writing reader marker", &path, error))?;
-        let last_touched_at_ms = AtomicU64::new(metadata.created_at_ms);
-        Ok(Self {
-            path,
-            generation,
-            name,
-            metadata,
-            last_touched_at_ms,
-        })
-    }
-
-    pub fn touch(&self) -> io::Result<()> {
-        write_marker_file_pinned(&self.generation, &self.name, &self.metadata).map_err(
-            |error| crate::io_accounting::at("writing reader marker", &self.path, error),
-        )?;
-        self.last_touched_at_ms.store(now_ms(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn touch_if_due(&self) -> io::Result<()> {
-        let now = now_ms();
-        let last = self.last_touched_at_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < READ_MARKER_TOUCH_INTERVAL_MS {
-            return Ok(());
-        }
-        self.touch()
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn metadata(&self) -> &ReadMarkerMetadata {
-        &self.metadata
-    }
-}
-
-impl Drop for ReadMarker {
-    fn drop(&mut self) {
-        let _ = self.generation.repair_remove_file(&self.name);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn reader_marker_drop_cannot_unlink_through_a_retargeted_generation_ancestor() {
-    let temp = tempfile::tempdir().unwrap();
-    let cache = temp.path().join("cache");
-    let marker = ReadMarker::create(&cache, "generation").unwrap();
-    let name = marker.path().file_name().unwrap().to_os_string();
-    let outside = temp.path().join("outside");
-    fs::create_dir_all(outside.join("generation")).unwrap();
-    let precious = outside.join("generation").join(&name);
-    fs::write(&precious, "precious").unwrap();
-    let parked = temp.path().join("parked-readers");
-    fs::rename(cache.join("readers"), &parked).unwrap();
-    std::os::unix::fs::symlink(&outside, cache.join("readers")).unwrap();
-    drop(marker);
-    assert_eq!(fs::read_to_string(&precious).unwrap(), "precious");
-    assert!(!parked.join("generation").join(name).exists());
-}
-
-pub fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
-    cache_dir.join("readers").join(generation_label)
-}
-
-/// Sweep generation markers through pinned handles without following links.
-#[cfg(test)]
-pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
-    let result = crate::bash_background::persistence::PinnedDir::open(cache_dir).and_then(|dir| {
-        sweep_all_read_markers_pinned(
-            &dir,
-            &mut crate::bash_background::persistence::RepairBudget::new(),
-            true,
-        )
-    });
-    result.unwrap_or(ReadMarkerSweep {
-        protected: true,
-        removed_stale: 0,
-    })
-}
-
-pub(crate) fn sweep_all_read_markers_pinned(
-    cache: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
-    remove_stale: bool,
-) -> io::Result<ReadMarkerSweep> {
-    let readers = match cache.repair_child(std::ffi::OsStr::new("readers")) {
-        Ok(readers) => readers,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ReadMarkerSweep::default())
-        }
-        Err(error) => {
-            return Err(io::Error::other(format!(
-                "readers is a symlink or non-directory: {error}"
-            )))
-        }
-    };
-    readers.repair_check_boundary(cache, &[])?;
-    let mut sweep = ReadMarkerSweep::default();
-    for name in readers.repair_names(budget)? {
-        let generation = readers.repair_child_same_mount(&name)?;
-        let result = sweep_marker_generation(&generation, budget, remove_stale)?;
-        sweep.protected |= result.protected;
-        sweep.removed_stale += result.removed_stale;
-    }
-    Ok(sweep)
-}
-
-fn sweep_marker_generation(
-    generation: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
-    remove_stale: bool,
-) -> io::Result<ReadMarkerSweep> {
-    sweep_marker_generation_cached(
-        generation,
-        budget,
-        remove_stale,
-        now_ms(),
-        &current_hostname(),
-        &mut HashMap::new(),
-    )
-}
-
-/// [`sweep_marker_generation`] with the caller-supplied clock, hostname and
-/// process-start cache. The storage sweep visits many generations per pass
-/// and keeps all three in its pass context instead of re-reading the hostname
-/// and each live pid's start time once per generation.
-fn sweep_marker_generation_cached(
-    generation: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
-    remove_stale: bool,
-    now: u64,
-    host: &str,
-    started: &mut HashMap<u32, Option<u64>>,
-) -> io::Result<ReadMarkerSweep> {
-    let mut sweep = ReadMarkerSweep::default();
-    let mut names = generation.repair_names(budget)?;
-    names.sort();
-    for name in names {
-        #[cfg(test)]
-        BEFORE_MARKER_OPEN.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook(&name);
-            }
-        });
-        let file = match generation.repair_read_file(&name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        match marker_file_is_protected(file, now, host, started)? {
-            MarkerProtection::Protected => sweep.protected = true,
-            MarkerProtection::Stale | MarkerProtection::Malformed if remove_stale => {
-                match generation.repair_remove_file(&name) {
-                    Ok(()) => sweep.removed_stale += 1,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(sweep)
-}
-
-#[cfg(test)]
-thread_local! { static BEFORE_MARKER_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&std::ffi::OsStr)>>> = const { std::cell::RefCell::new(None) }; }
-
-#[test]
-fn reader_census_preserves_live_protection_when_another_marker_exits() {
-    let temp = tempfile::tempdir().unwrap();
-    let marker = ReadMarker::create(temp.path(), "generation").unwrap();
-    let generation = temp.path().join("readers/generation");
-    fs::copy(marker.path(), generation.join("000-live")).unwrap();
-    let departing = generation.join("zzz-exiting");
-    fs::write(&departing, "departing").unwrap();
-    let seen_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let seen = seen_live.clone();
-    BEFORE_MARKER_OPEN.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |name| {
-            if name == "000-live" {
-                seen.store(true, Ordering::SeqCst);
-            }
-            if name == "zzz-exiting" {
-                assert!(seen.load(Ordering::SeqCst));
-                fs::remove_file(&departing).unwrap();
-            }
-        }))
-    });
-    let sweep = read_marker_protection(temp.path(), "generation", false);
-    BEFORE_MARKER_OPEN.with(|hook| hook.borrow_mut().take());
-    assert!(seen_live.load(Ordering::SeqCst));
-    assert!(
-        sweep.protected,
-        "a vanished marker erased a surviving reader's protection: {sweep:?}"
-    );
-}
-
-#[test]
-fn reader_census_does_not_treat_an_unavailable_cache_root_as_empty() {
-    let temp = tempfile::tempdir().unwrap();
-    let missing = temp.path().join("missing-cache-root");
-    assert!(read_marker_protection(&missing, "generation", false).protected);
-}
-
-#[cfg(unix)]
-#[test]
-fn marker_sweep_stays_on_pinned_generation_after_ancestor_swap() {
-    use crate::bash_background::persistence::{PinnedDir, RepairBudget};
-    let temp = tempfile::tempdir().unwrap();
-    let readers = temp.path().join("readers");
-    let generation = readers.join("generation");
-    fs::create_dir_all(&generation).unwrap();
-    fs::write(generation.join("marker.json"), "malformed-own").unwrap();
-    let outside = temp.path().join("foreign");
-    fs::create_dir_all(outside.join("generation")).unwrap();
-    let precious = outside.join("generation/marker.json");
-    fs::write(&precious, "precious").unwrap();
-    let pinned = PinnedDir::open(&generation).unwrap();
-    let parked = temp.path().join("parked");
-    fs::rename(&readers, &parked).unwrap();
-    std::os::unix::fs::symlink(&outside, &readers).unwrap();
-    let result = sweep_marker_generation(&pinned, &mut RepairBudget::new(), true).unwrap();
-    assert_eq!(result.removed_stale, 1);
-    assert_eq!(fs::read_to_string(precious).unwrap(), "precious");
-    assert!(!parked.join("generation/marker.json").exists());
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadMarkerSweep {
-    pub protected: bool,
-    pub removed_stale: usize,
-}
-
-pub fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
-    read_marker_protection(cache_dir, generation_label, false).protected
-}
-
-pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
-    read_marker_protection(cache_dir, generation_label, true)
-}
-
-// Test hook counting hostname resolutions on this thread. Reset before a
-// marker pass and read after it to prove the pass resolved the hostname
-// once instead of once per generation.
-#[cfg(test)]
-thread_local! {
-    static HOSTNAME_RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-// Test hook counting process-start-time resolutions on this thread: cache
-// misses while attributing markers, not liveness probes (which are never
-// cached). Reset before a marker pass and read after it to prove repeated
-// markers from one process resolved its start time once.
-#[cfg(test)]
-thread_local! {
-    static PROCESS_START_RESOLUTIONS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
-fn read_marker_protection(
-    cache_dir: &Path,
-    generation_label: &str,
-    remove_stale: bool,
-) -> ReadMarkerSweep {
-    #[cfg(test)]
-    READER_CENSUS.with(|reads| {
-        if let Some(reads) = reads.borrow_mut().as_mut() {
-            *reads
-                .entry((cache_dir.to_path_buf(), generation_label.to_owned()))
-                .or_default() += 1;
-        }
-    });
-    let result = (|| {
-        let cache = crate::bash_background::persistence::PinnedDir::open(cache_dir)?;
-        let readers = match cache.repair_child_same_mount(std::ffi::OsStr::new("readers")) {
-            Ok(readers) => readers,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(ReadMarkerSweep::default())
-            }
-            Err(error) => return Err(error),
-        };
-        let generation =
-            match readers.repair_child_same_mount(std::ffi::OsStr::new(generation_label)) {
-                Ok(generation) => generation,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(ReadMarkerSweep::default())
-                }
-                Err(error) => return Err(error),
-            };
-        sweep_marker_generation(
-            &generation,
-            &mut crate::bash_background::persistence::RepairBudget::new(),
-            remove_stale,
-        )
-    })();
-    match result {
-        Ok(sweep) => sweep,
-        Err(_) => ReadMarkerSweep {
-            protected: true,
-            removed_stale: 0,
-        },
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static READER_CENSUS: std::cell::RefCell<Option<std::collections::BTreeMap<(PathBuf, String), usize>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MarkerProtection {
-    Protected,
-    Stale,
-    Malformed,
-}
-
-fn marker_file_is_protected(
-    file: File,
-    now: u64,
-    current_host: &str,
-    started: &mut HashMap<u32, Option<u64>>,
-) -> io::Result<MarkerProtection> {
-    use std::io::Read;
-    let file_metadata = file.metadata()?;
-    // Marker records are tiny. Refuse oversized input rather than allocating
-    // an unbounded buffer or interpreting a partial record as stale.
-    if file_metadata.len() > 32 * 1024 {
-        return Err(io::Error::other("read marker exceeds byte limit"));
-    }
-    let mut bytes = Vec::new();
-    file.take(32 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 32 * 1024 {
-        return Err(io::Error::other("read marker exceeds byte limit"));
-    }
-    let metadata: ReadMarkerMetadata = match serde_json::from_slice(&bytes) {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(MarkerProtection::Malformed),
-    };
-    if metadata.hostname != current_host {
-        let mtime_ms = file_metadata
-            .modified()
-            .ok()
-            .map(system_time_ms)
-            .unwrap_or(now);
-        return Ok(
-            if now.saturating_sub(mtime_ms) <= READ_MARKER_CROSS_HOST_STALE_MS {
-                MarkerProtection::Protected
-            } else {
-                MarkerProtection::Stale
-            },
-        );
-    }
-    Ok(
-        if fs_lock::process_alive(metadata.pid) && marker_start_matches(&metadata, started) {
-            MarkerProtection::Protected
-        } else {
-            MarkerProtection::Stale
-        },
-    )
-}
-
-fn marker_start_matches(
-    metadata: &ReadMarkerMetadata,
-    started: &mut HashMap<u32, Option<u64>>,
-) -> bool {
-    // Same-host PID liveness is authoritative for the process instance. When the
-    // OS can tell us the live PID started after this marker was created, the PID
-    // has been reused and the marker belongs to a dead prior process; otherwise
-    // a live PID protects the marker without consulting marker mtime.
-    let started_at_ms = match started.get(&metadata.pid) {
-        Some(cached) => *cached,
-        None => {
-            #[cfg(test)]
-            PROCESS_START_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-            let resolved = process_start_time_ms(metadata.pid);
-            started.insert(metadata.pid, resolved);
-            resolved
-        }
-    };
-    // A cached start time only ever over-retains: PIDs are reused with ever
-    // newer start times, so a cached (older) start protects a superset of the
-    // markers the current start would protect. A negative answer is never
-    // cached: liveness itself is re-probed per marker above.
-    started_at_ms
-        .map(|started_at_ms| {
-            started_at_ms
-                <= metadata
-                    .created_at_ms
-                    .saturating_add(PROCESS_START_TIME_GRACE_MS)
-        })
-        .unwrap_or(true)
-}
-
-#[cfg(test)]
-fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<()> {
-    let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
-        path.parent()
-            .ok_or_else(|| io::Error::other("marker has no parent"))?,
-    )?;
-    write_marker_file_pinned(&parent, path.file_name().unwrap(), metadata)
-}
-
-fn write_marker_file_pinned(
-    generation: &crate::bash_background::persistence::PinnedDir,
-    name: &std::ffi::OsStr,
-    metadata: &ReadMarkerMetadata,
-) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec(metadata).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-    generation.repair_replace_file(name, &bytes)
-}
-
-fn sanitize_marker_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 static FORCE_NETWORK_FS_FOR_TEST: AtomicBool = AtomicBool::new(false);
 
@@ -1276,59 +673,6 @@ pub fn storage_allows_root_keyed(path: &Path) -> io::Result<bool> {
 
     let probe = existing_ancestor(path);
     filesystem_is_local(&probe)
-}
-
-fn canonical_process_lease_dir(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-
-    let normalized = lexical_normalize(path);
-    let mut missing_components = Vec::new();
-    let mut current = normalized.as_path();
-    while !current.exists() {
-        let Some(name) = current.file_name() else {
-            return normalized;
-        };
-        missing_components.push(name.to_os_string());
-        let Some(parent) = current.parent() else {
-            return normalized;
-        };
-        current = parent;
-    }
-
-    let mut canonical = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
-    for component in missing_components.iter().rev() {
-        canonical.push(component);
-    }
-    canonical
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
-
-fn existing_ancestor(path: &Path) -> PathBuf {
-    let mut current = path;
-    loop {
-        if current.exists() {
-            return current.to_path_buf();
-        }
-        let Some(parent) = current.parent() else {
-            return PathBuf::from(".");
-        };
-        current = parent;
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1386,271 +730,9 @@ fn filesystem_is_local(_path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn now_ms() -> u64 {
-    system_time_ms(SystemTime::now())
-}
-
-fn system_time_ms(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
-}
-
-#[cfg(test)]
-static PROCESS_START_TIME_OVERRIDES: OnceLock<Mutex<HashMap<u32, Option<u64>>>> = OnceLock::new();
-
-#[cfg(test)]
-fn set_process_start_time_for_test(pid: u32, started_at_ms: Option<u64>) {
-    PROCESS_START_TIME_OVERRIDES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("process start override mutex")
-        .insert(pid, started_at_ms);
-}
-
-#[cfg(test)]
-fn clear_process_start_time_for_test(pid: u32) {
-    if let Some(overrides) = PROCESS_START_TIME_OVERRIDES.get() {
-        overrides
-            .lock()
-            .expect("process start override mutex")
-            .remove(&pid);
-    }
-}
-
-#[cfg(test)]
-fn process_start_time_override(pid: u32) -> Option<Option<u64>> {
-    PROCESS_START_TIME_OVERRIDES
-        .get()
-        .and_then(|overrides| overrides.lock().ok()?.get(&pid).copied())
-}
-
-#[cfg(target_os = "linux")]
-/// Return the OS start time for `pid`, in Unix milliseconds, when available.
-pub fn process_start_time_ms(pid: u32) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(override_value) = process_start_time_override(pid) {
-        return override_value;
-    }
-
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
-    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
-    let boot_time_secs = boot_time_secs()?;
-    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_second <= 0 {
-        return None;
-    }
-    let ticks_per_second = ticks_per_second as u64;
-    Some(
-        boot_time_secs
-            .saturating_mul(1_000)
-            .saturating_add(start_ticks.saturating_mul(1_000) / ticks_per_second),
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn read_boot_time_secs() -> Option<u64> {
-    fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
-}
-
-#[cfg(target_os = "linux")]
-fn boot_time_secs() -> Option<u64> {
-    static BOOT_TIME_SECS: OnceLock<Option<u64>> = OnceLock::new();
-    cached_boot_time_secs(&BOOT_TIME_SECS, read_boot_time_secs)
-}
-
-/// Read once per process: boot time cannot change while the process runs.
-/// Shared with the platform-independent test that proves the reader runs once.
-#[cfg(any(target_os = "linux", test))]
-fn cached_boot_time_secs(
-    cache: &OnceLock<Option<u64>>,
-    reader: impl FnOnce() -> Option<u64>,
-) -> Option<u64> {
-    *cache.get_or_init(reader)
-}
-
-#[cfg(target_os = "macos")]
-/// Return the OS start time for `pid`, in Unix milliseconds, when available.
-pub fn process_start_time_ms(pid: u32) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(override_value) = process_start_time_override(pid) {
-        return override_value;
-    }
-
-    crate::fs_lock::macos_kinfo(pid)?
-        .started_at_us
-        .map(|start| start / 1_000)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-/// Return the OS start time for `pid`, in Unix milliseconds, when available.
-pub fn process_start_time_ms(pid: u32) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(override_value) = process_start_time_override(pid) {
-        return override_value;
-    }
-    #[cfg(windows)]
-    {
-        crate::fs_lock::windows_process_start_time_ms(pid)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(unix)]
-fn current_hostname() -> String {
-    #[cfg(test)]
-    HOSTNAME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-    let mut buffer = [0u8; 256];
-    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
-    if result == 0 {
-        let len = buffer
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(buffer.len());
-        if len > 0 {
-            return String::from_utf8_lossy(&buffer[..len]).into_owned();
-        }
-    }
-    "unknown-host".to_string()
-}
-
-#[cfg(windows)]
-fn current_hostname() -> String {
-    #[cfg(test)]
-    HOSTNAME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-    crate::environment::non_empty_var("COMPUTERNAME").unwrap_or_else(|| "unknown-host".to_string())
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn current_hostname() -> String {
-    "unknown-host".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn durability_read_marker_count() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::durability::take();
-        let marker = ReadMarker::create(dir.path(), "current").unwrap();
-        marker.touch().unwrap();
-        assert!(protected_read_marker_exists(dir.path(), "current"));
-        drop(marker);
-        let events = crate::durability::take();
-        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
-    }
-
-    #[test]
-    fn read_marker_file_is_private_and_touchable() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = ReadMarker::create(dir.path(), "current").unwrap();
-        assert!(marker.path().is_file());
-        marker.touch().unwrap();
-        let bytes = fs::read(marker.path()).unwrap();
-        let parsed: ReadMarkerMetadata = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed.pid, std::process::id());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(marker.path()).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn same_host_live_marker_ignores_stale_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = ReadMarker::create(dir.path(), "current").unwrap();
-        filetime::set_file_mtime(marker.path(), filetime::FileTime::from_unix_time(0, 0)).unwrap();
-
-        assert!(protected_read_marker_exists(dir.path(), "current"));
-    }
-
-    #[test]
-    fn sweep_removes_dead_same_host_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker_path = read_marker_dir(dir.path(), "old").join("dead.json");
-        let metadata = ReadMarkerMetadata {
-            pid: 0,
-            hostname: current_hostname(),
-            created_at_ms: now_ms(),
-            nonce: None,
-        };
-        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-        write_marker_file(&marker_path, &metadata).unwrap();
-
-        let sweep = sweep_read_markers(dir.path(), "old");
-
-        assert!(!sweep.protected);
-        assert_eq!(sweep.removed_stale, 1);
-        assert!(!marker_path.exists());
-    }
-
-    #[test]
-    fn sweep_removes_reused_pid_marker_when_created_at_predates_process_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker_path = read_marker_dir(dir.path(), "old").join("reused.json");
-        let pid = std::process::id();
-        let metadata = ReadMarkerMetadata {
-            pid,
-            hostname: current_hostname(),
-            created_at_ms: 1_000,
-            nonce: None,
-        };
-        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-        write_marker_file(&marker_path, &metadata).unwrap();
-        set_process_start_time_for_test(pid, Some(10_000));
-
-        let sweep = sweep_read_markers(dir.path(), "old");
-        clear_process_start_time_for_test(pid);
-
-        assert!(!sweep.protected);
-        assert_eq!(sweep.removed_stale, 1);
-        assert!(!marker_path.exists());
-    }
-
-    #[test]
-    fn sweep_removes_expired_cross_host_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker_path = read_marker_dir(dir.path(), "old").join("cross-host.json");
-        let metadata = ReadMarkerMetadata {
-            pid: 123,
-            hostname: format!("other-{}", current_hostname()),
-            created_at_ms: now_ms(),
-            nonce: None,
-        };
-        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-        write_marker_file(&marker_path, &metadata).unwrap();
-        let stale_time = SystemTime::now()
-            .checked_sub(Duration::from_millis(
-                READ_MARKER_CROSS_HOST_STALE_MS.saturating_add(1_000),
-            ))
-            .unwrap_or(UNIX_EPOCH);
-        filetime::set_file_mtime(
-            &marker_path,
-            filetime::FileTime::from_system_time(stale_time),
-        )
-        .unwrap();
-
-        let sweep = sweep_read_markers(dir.path(), "old");
-
-        assert!(!sweep.protected);
-        assert_eq!(sweep.removed_stale, 1);
-        assert!(!marker_path.exists());
-    }
-
     #[cfg(unix)]
     #[test]
     fn process_lease_dir_canonicalizes_existing_ancestor_before_cache_dir_exists() {
@@ -1675,12 +757,12 @@ mod tests {
         let parent_root = tempfile::tempdir().unwrap();
         let worktree_root = tempfile::tempdir().unwrap();
         let shared_key = "shared-artifact-key";
-        let cache_dir = storage.path().join("callgraph").join(shared_key);
+        let cache_dir = storage.path().join("inspect").join(shared_key);
         configure_artifact_access(parent_root.path(), shared_key, false);
         configure_artifact_access(worktree_root.path(), shared_key, true);
 
         let parent_lease = WriterLease::acquire_shared(
-            RootCacheDomain::Callgraph,
+            RootCacheDomain::Inspect,
             &cache_dir,
             shared_key,
             parent_root.path(),
@@ -1690,14 +772,14 @@ mod tests {
         enable_writer_lease_acquisition_counts_for_test();
 
         let worktree_lease = WriterLease::acquire_shared(
-            RootCacheDomain::Callgraph,
+            RootCacheDomain::Inspect,
             &cache_dir,
             shared_key,
             worktree_root.path(),
         )
         .unwrap();
         let unkeyed_worktree_lease = WriterLease::acquire_shared(
-            RootCacheDomain::Callgraph,
+            RootCacheDomain::Inspect,
             &storage.path().join("scratch"),
             shared_key,
             worktree_root.path(),
@@ -1709,7 +791,7 @@ mod tests {
         assert!(parent_lease.verify().unwrap());
         assert_eq!(
             writer_lease_acquisition_count_for_test(
-                RootCacheDomain::Callgraph,
+                RootCacheDomain::Inspect,
                 shared_key,
                 worktree_root.path(),
             ),
@@ -1722,11 +804,11 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let shared_key = "unregistered-shared-key";
-        let cache_dir = storage.path().join("callgraph").join(shared_key);
+        let cache_dir = storage.path().join("inspect").join(shared_key);
         enable_writer_lease_acquisition_counts_for_test();
 
         let lease = WriterLease::acquire_shared(
-            RootCacheDomain::Callgraph,
+            RootCacheDomain::Inspect,
             &cache_dir,
             shared_key,
             root.path(),
@@ -1736,7 +818,7 @@ mod tests {
         assert!(lease.is_none());
         assert_eq!(
             writer_lease_acquisition_count_for_test(
-                RootCacheDomain::Callgraph,
+                RootCacheDomain::Inspect,
                 shared_key,
                 root.path(),
             ),
@@ -1756,15 +838,15 @@ mod tests {
         std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
 
         let root = alias_parent.join("root");
-        let stale_key = crate::search_index::artifact_cache_key(&root);
+        let stale_key = crate::path_identity::project_scope_key(&root);
         fs::create_dir_all(&root).unwrap();
-        let canonical_key = crate::search_index::artifact_cache_key(&root);
+        let canonical_key = crate::path_identity::project_scope_key(&root);
         assert_ne!(stale_key, canonical_key, "fixture must exercise the alias");
 
-        let cache_dir = storage.path().join("callgraph").join(&stale_key);
+        let cache_dir = storage.path().join("inspect").join(&stale_key);
         enable_writer_lease_acquisition_counts_for_test();
         let lease = WriterLease::acquire_shared(
-            RootCacheDomain::Callgraph,
+            RootCacheDomain::Inspect,
             &cache_dir,
             &canonical_key,
             &root,
@@ -1774,7 +856,7 @@ mod tests {
         assert!(lease.is_none());
         assert_eq!(
             writer_lease_acquisition_count_for_test(
-                RootCacheDomain::Callgraph,
+                RootCacheDomain::Inspect,
                 &canonical_key,
                 &root,
             ),
@@ -1839,8 +921,8 @@ mod tests {
     #[test]
     fn writer_lease_acquire_shared_does_not_serialize_different_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let blocked_cache_dir = dir.path().join("callgraph").join("blocked");
-        let free_cache_dir = dir.path().join("callgraph").join("free");
+        let blocked_cache_dir = dir.path().join("inspect").join("blocked");
+        let free_cache_dir = dir.path().join("inspect").join("free");
         configure_artifact_access(&blocked_cache_dir, "blocked", false);
         configure_artifact_access(&free_cache_dir, "free", false);
         let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
@@ -1864,7 +946,7 @@ mod tests {
 
         let blocked_handle = std::thread::spawn(move || {
             WriterLease::acquire_shared(
-                RootCacheDomain::Callgraph,
+                RootCacheDomain::Inspect,
                 &blocked_cache_dir,
                 "blocked",
                 &blocked_cache_dir,
@@ -1879,7 +961,7 @@ mod tests {
         let (free_tx, free_rx) = std::sync::mpsc::channel();
         let free_handle = std::thread::spawn(move || {
             let result = WriterLease::acquire_shared(
-                RootCacheDomain::Callgraph,
+                RootCacheDomain::Inspect,
                 &free_cache_dir,
                 "free",
                 &free_cache_dir,
@@ -1967,35 +1049,5 @@ mod tests {
         set_force_network_fs_for_test(true);
         assert!(!storage_allows_root_keyed(Path::new(".")).unwrap());
         set_force_network_fs_for_test(false);
-    }
-
-    #[test]
-    fn audit_growth_boot_time_cache_reads_its_source_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("proc-stat-fixture");
-        fs::write(&path, "btime 1234\n").unwrap();
-        let cache = OnceLock::new();
-        let reads = std::cell::Cell::new(0);
-        let first = cached_boot_time_secs(&cache, || {
-            reads.set(reads.get() + 1);
-            fs::read_to_string(&path)
-                .ok()?
-                .lines()
-                .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
-        });
-        let second = cached_boot_time_secs(&cache, || {
-            reads.set(reads.get() + 1);
-            fs::read_to_string(&path)
-                .ok()?
-                .lines()
-                .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
-        });
-        assert_eq!(first, Some(1234));
-        assert_eq!(second, first);
-        assert_eq!(
-            reads.get(),
-            1,
-            "/proc/stat's equivalent source is read once"
-        );
     }
 }
