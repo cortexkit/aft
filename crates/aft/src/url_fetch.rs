@@ -3433,7 +3433,7 @@ pub mod timing {
             // An early return or a panic still closes the collection, so the
             // next call on this thread starts clean.
             if self.owns {
-                COLLECTOR.with(|collector| collector.borrow_mut().take());
+                COLLECTOR.with(|collector| collector.replace(None));
             }
         }
     }
