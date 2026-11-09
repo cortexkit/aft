@@ -8,11 +8,18 @@
 //! each granted path its profile allowed. A revoke then stops the holder's
 //! running local commands whose record names the revoked path; commands
 //! whose sandbox never had the folder keep running.
+//!
+//! Two moments escape that scan, and both check the record against aft.db
+//! instead: a command registered after a revoke already scanned (its sandbox
+//! was built just before the grant was deleted), and a command restored after
+//! an AFT restart (its grant may have been revoked while AFT was down).
 use super::{BgTaskRegistry, BgTaskStatus};
 use crate::db::access_grants::ScopeKey;
+use crate::db::TrackedConnection;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Status reason of a command stopped because the person revoked a saved
 /// folder grant its sandbox was built with.
@@ -33,6 +40,14 @@ pub struct TaskFolderGrants {
 }
 
 impl TaskFolderGrants {
+    fn scope(&self) -> ScopeKey {
+        ScopeKey {
+            owner: self.owner.clone(),
+            scope_ref: self.scope_ref.clone(),
+            epoch: self.epoch,
+        }
+    }
+
     fn holds(&self, scope: &ScopeKey, path: &Path) -> bool {
         self.owner == scope.owner
             && self.scope_ref == scope.scope_ref
@@ -64,6 +79,25 @@ pub(crate) fn spawn_guard(grants: Option<TaskFolderGrants>) -> SpawnGuard {
 /// The record for a task being created on this thread now.
 pub(crate) fn for_spawn() -> Option<TaskFolderGrants> {
     SPAWN.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECORD: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Run `hook` on this thread once a spawn has recorded its folder grants and
+/// before it registers the task: the moment a racing revoke can slip in.
+#[cfg(test)]
+pub(crate) fn after_record_for_test(hook: impl FnOnce() + 'static) {
+    AFTER_RECORD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn run_after_record_hook() {
+    if let Some(hook) = AFTER_RECORD.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// The saved grants of the calling route's scope that a launch profile
@@ -158,6 +192,77 @@ impl BgTaskRegistry {
         )
         .map(|snapshot| snapshot.info.status == BgTaskStatus::Killed)
         .map_err(|error| error.to_string())
+    }
+
+    /// The aft.db handle this registry keeps its task rows in, which also
+    /// holds the saved grants.
+    pub(crate) fn grant_db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
+        self.inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    /// Stop a registered, unfinished local command if a saved grant its
+    /// sandbox was built with no longer exists in aft.db. Returns whether it
+    /// started stopping it. The kill runs on its own thread so neither a
+    /// spawn reply nor a restart replay waits out its signal grace period.
+    /// Without a database to ask, or when the lookup fails, the command keeps
+    /// running: nothing shows its grant was revoked.
+    pub(crate) fn stop_if_folder_grant_revoked(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        db: Option<Arc<Mutex<TrackedConnection>>>,
+    ) -> bool {
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return false;
+        };
+        let recorded = match task.lock_state() {
+            Ok(state) if state.metadata.remote.is_none() && !state.metadata.is_terminal() => {
+                state.metadata.folder_grants.clone()
+            }
+            _ => None,
+        };
+        let (Some(recorded), Some(db)) = (recorded, db) else {
+            return false;
+        };
+        let scope = recorded.scope();
+        let revoked = match db.lock() {
+            Ok(conn) => recorded.paths.iter().any(|path| {
+                crate::db::access_grants::holds(&conn, &scope, path)
+                    .inspect_err(|error| {
+                        log::warn!("folder grant check for task {task_id} failed: {error}")
+                    })
+                    .is_ok_and(|held| !held)
+            }),
+            Err(_) => false,
+        };
+        if !revoked {
+            return false;
+        }
+        let registry = self.clone();
+        let held = HeldTask {
+            task_id: task_id.to_owned(),
+            session_id: session_id.to_owned(),
+        };
+        let kill = move || {
+            if let Err(error) = registry.kill_for_folder_revocation(&held) {
+                log::warn!(
+                    "folder revoke: could not stop task {}: {error}",
+                    held.task_id
+                );
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("aft-folder-revoke".into())
+            .spawn(kill.clone())
+        {
+            log::warn!("folder revoke: stopping inline, no thread: {error}");
+            kill();
+        }
+        true
     }
 }
 

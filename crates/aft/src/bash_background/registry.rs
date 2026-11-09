@@ -7873,6 +7873,12 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_pending))
         .then(|| metadata.task_id.clone());
+        // A saved folder grant this command's sandbox holds may have been
+        // revoked while AFT was down, when no revoke could see the command.
+        let folder_check = metadata
+            .folder_grants
+            .is_some()
+            .then(|| (metadata.task_id.clone(), metadata.session_id.clone()));
         let (marker, process_alive) = if matches!(
             metadata.status,
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
@@ -8022,6 +8028,9 @@ impl BgTaskRegistry {
             if !self.hold_remote_worker(&task_id) {
                 self.resume_remote_task(&task_id)?;
             }
+        }
+        if let Some((task_id, session)) = folder_check {
+            self.stop_if_folder_grant_revoked(&task_id, &session, self.grant_db());
         }
         Ok(())
     }

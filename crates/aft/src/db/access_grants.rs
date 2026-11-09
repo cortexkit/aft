@@ -361,6 +361,22 @@ pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Resul
     )
 }
 
+/// Whether `key` still holds a saved grant for exactly `path`, of any kind or
+/// mode. A command's sandbox records the grant paths it was built with in
+/// this stored form, so a missing row means the grant was revoked.
+pub fn holds(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND path=?4)",
+        params![
+            key.owner,
+            key.scope_ref,
+            key.epoch.to_string(),
+            path.to_string_lossy()
+        ],
+        |row| row.get(0),
+    )
+}
+
 /// Only the describe-confirmed scope-end path may call this helper. A route
 /// close, detach, or missing worktree is not proof that a scope ended. The
 /// daemon must report ended, a different live epoch, or not_live with
