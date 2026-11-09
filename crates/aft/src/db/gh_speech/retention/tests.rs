@@ -53,9 +53,11 @@ fn authorities(conn: &Connection) -> Vec<String> {
 }
 
 fn revocations(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM gh_speech_task_revocations", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT COUNT(*) FROM gh_speech_task_revocations",
+        [],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 
@@ -103,12 +105,20 @@ fn sweep_deletes_only_revoked_rows_revoked_a_day_ago_and_keeps_every_live_row() 
     let sweep = sweep(&db, &mut cursor, NOW_MS, Duration::from_secs(60), 2).unwrap();
 
     assert_eq!(
-        (sweep.batches, sweep.examined, sweep.deleted, sweep.exhausted),
+        (
+            sweep.batches,
+            sweep.examined,
+            sweep.deleted,
+            sweep.exhausted
+        ),
         (3, 5, 3, true),
         "{sweep:?}"
     );
     assert_eq!(sweep.stopped, None);
-    assert!(cursor.is_empty(), "an exhausted sweep starts over next time");
+    assert!(
+        cursor.is_empty(),
+        "an exhausted sweep starts over next time"
+    );
     let conn = db.lock().unwrap();
     assert_eq!(
         authorities(&conn),
@@ -221,7 +231,8 @@ fn candidate_selection_never_scans_authority_rows() {
             "{joined}"
         );
         assert!(
-            plan.iter().any(|step| step.starts_with("SEARCH a USING COVERING INDEX ")),
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH a USING COVERING INDEX ")),
             "{joined}"
         );
     }
@@ -298,7 +309,8 @@ fn freed_pages_are_vacuumed_only_when_the_file_uses_incremental_auto_vacuum() {
 fn bench_revoked_retention_on_large_rows() {
     let env = |name: &str| std::env::var(name).ok();
     let dir = std::path::PathBuf::from(env("AFT_SPEECH_RETENTION_BENCH_DIR").expect("bench dir"));
-    let rows: usize = env("AFT_SPEECH_RETENTION_BENCH_ROWS").map_or(100_000, |v| v.parse().unwrap());
+    let rows: usize =
+        env("AFT_SPEECH_RETENTION_BENCH_ROWS").map_or(100_000, |v| v.parse().unwrap());
     let live: usize = env("AFT_SPEECH_RETENTION_BENCH_LIVE").map_or(0, |v| v.parse().unwrap());
     let path = dir.join("aft.db");
     let payload = "7,".repeat(84 * 1024 / 2);
@@ -332,7 +344,8 @@ fn bench_revoked_retention_on_large_rows() {
             tx.commit().unwrap();
             written = (written + 1000).min(rows + live);
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
     let file_bytes = || std::fs::metadata(&path).unwrap().len();
     let wal_bytes = || std::fs::metadata(dir.join("aft.db-wal")).map_or(0, |m| m.len());
@@ -345,7 +358,10 @@ fn bench_revoked_retention_on_large_rows() {
     let db = shared(&dir);
     {
         let conn = db.lock().unwrap();
-        let pragma = |name: &str| -> i64 { conn.pragma_query_value(None, name, |row| row.get(0)).unwrap() };
+        let pragma = |name: &str| -> i64 {
+            conn.pragma_query_value(None, name, |row| row.get(0))
+                .unwrap()
+        };
         eprintln!(
             "page_size={} auto_vacuum={} secure_delete={} page_count={} freelist_count={}",
             pragma("page_size"),
@@ -390,7 +406,8 @@ fn bench_revoked_retention_on_large_rows() {
             conn.execute_batch("VACUUM").unwrap();
             let vacuumed = vacuum.elapsed();
             let checkpoint = std::time::Instant::now();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
             eprintln!(
                 "vacuum elapsed={vacuumed:?} checkpoint elapsed={:?} file_bytes={}",
                 checkpoint.elapsed(),

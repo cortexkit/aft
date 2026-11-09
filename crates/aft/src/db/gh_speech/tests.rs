@@ -852,10 +852,7 @@ fn revocation_drops_the_start_policy_copy_and_keeps_what_refusals_read() {
         "revoked"
     );
     // The manifest itself is still held once, in the policy ledger.
-    assert_eq!(
-        store.latest_policy().unwrap(),
-        active.record.policy.clone()
-    );
+    assert_eq!(store.latest_policy().unwrap(), active.record.policy.clone());
     store.revoke(&record.incarnation, "terminal").unwrap();
     assert_eq!(
         load(&conn, &record.incarnation).unwrap().generation,

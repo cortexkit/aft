@@ -18,8 +18,9 @@ use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::db::{MaintenanceWriteError, TrackedConnection};
 
-/// How long a revoked authority is kept after its revocation was recorded. Same
-/// as the start-view files the launch wrote, which are kept for 24 hours.
+/// How long a revoked authority is kept after its revocation was recorded.
+/// A revoked row authorizes nothing; the day is a margin that keeps recent rows
+/// available for diagnosis after the launch that owned them ended.
 pub(crate) const REVOKED_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Rows examined and deleted per transaction. Each transaction holds the
