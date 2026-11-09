@@ -237,6 +237,35 @@ impl Parses {
         }
     }
 
+    /// These parses read from `stored` instead, each one decoded now kept
+    /// decoded: `None` unless `stored` holds a parse of exactly these files,
+    /// each under the key it has here. A parse key names the parsed content,
+    /// so a parse decoded under a key is the one `stored` holds under it.
+    /// For moving an engine onto the publication of what it resolved.
+    pub(crate) fn rebased(&self, stored: &Arc<StoredSlices>) -> Option<Self> {
+        let mut held = stored.parsed_files();
+        let mut map = BTreeMap::new();
+        for (path, slot) in &self.map {
+            let (held_path, held_key) = held.next()?;
+            if held_path != path || self.known_key(path)? != held_key {
+                return None;
+            }
+            let value = std::sync::OnceLock::new();
+            if let Some(decoded) = slot.value.get() {
+                let _ = value.set(decoded.clone());
+            }
+            map.insert(
+                path.clone(),
+                Arc::new(ParseSlot {
+                    value,
+                    stored: Some(Arc::clone(stored)),
+                    encoded: None,
+                }),
+            );
+        }
+        held.next().is_none().then_some(Self { map })
+    }
+
     pub(crate) fn insert(&mut self, path: String, value: (BlobKey, Arc<ParseBlob>)) {
         let slot = ParseSlot {
             value: std::sync::OnceLock::from(value),
@@ -667,6 +696,37 @@ impl Resolutions {
                 slot.value.take();
             }
         }
+    }
+
+    /// Every entry read from `stored` instead, none decoded: `None` unless
+    /// `stored` holds a resolution of exactly these files and no entry is
+    /// changed and not encoded yet. Whether `stored` holds the same
+    /// resolutions is the caller's to know: the publication of what these
+    /// hold. A decoded one is not carried over, so every entry is read from
+    /// `stored` alone.
+    pub(crate) fn rebased(&self, stored: &Arc<StoredSlices>) -> Option<Self> {
+        if !self.changed.is_empty() {
+            return None;
+        }
+        let mut held = stored.parsed_files();
+        let mut map = BTreeMap::new();
+        for path in self.map.keys() {
+            let (held_path, _) = held.next()?;
+            if held_path != path {
+                return None;
+            }
+            map.insert(
+                path.clone(),
+                ResolutionSlot {
+                    value: std::sync::OnceLock::new(),
+                    source: ResolutionSource::Stored(Arc::clone(stored)),
+                },
+            );
+        }
+        held.next().is_none().then_some(Self {
+            map,
+            changed: BTreeSet::new(),
+        })
     }
 
     pub(crate) fn insert(&mut self, path: String, resolution: FileResolution) {
@@ -1701,6 +1761,21 @@ impl MethodCallInputs {
             stored: Some(stored),
             ..Self::default()
         }
+    }
+
+    /// These inputs found through `stored`'s terms from now on, as
+    /// [`Self::stored`] finds them, keeping every file's inputs computed so
+    /// far: `stored` is the publication of the parses and resolutions they
+    /// were computed from, so its terms file every file as the in-memory
+    /// filing does. `None` for inputs built from every file, which find
+    /// nothing through stored terms.
+    pub(crate) fn rebased(self, stored: Arc<super::graph_store::StoredSlices>) -> Option<Self> {
+        self.stored.as_ref()?;
+        Some(Self {
+            files: self.files,
+            stored: Some(stored),
+            ..Self::default()
+        })
     }
 
     /// Files `path` in memory as declaring `file`'s methods.

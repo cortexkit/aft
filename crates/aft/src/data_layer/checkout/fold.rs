@@ -362,9 +362,10 @@ impl Checkout {
     /// refresh resolved was laid over the old publication's segments.
     fn serve_folded(&self, snapshot: Snapshot, started: &Arc<Published>) -> Result<(), DataError> {
         self.touch_memory();
-        let folded = self
-            .open_published(snapshot)?
-            .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
+        let folded = Arc::new(
+            self.open_published(snapshot)?
+                .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?,
+        );
         {
             let mut live = self.write_live();
             if !live
@@ -377,22 +378,17 @@ impl Checkout {
             if self.planes.callgraph {
                 live.callgraph_pending = Arc::new(live.changes.keys().cloned().collect());
             }
-            live.published = Some(Arc::new(folded));
+            live.published = Some(Arc::clone(&folded));
             live.generation += 1;
             live.graph = None;
             live.refreshed = None;
             live.text_members = Arc::default();
         }
-        // The engine read the old publication's segments; the next refresh
-        // starts one from the new publication.
-        if let Ok(mut slot) = self.engine.lock() {
-            if slot
-                .as_ref()
-                .is_some_and(|engine| Arc::ptr_eq(&engine.published, started))
-            {
-                *slot = None;
-            }
-        }
+        // The fold holds what the old publication held, so an engine that
+        // has applied no change since it started from that one goes on from
+        // the fold's; one that has is dropped, and the next refresh starts a
+        // new one, as it resolved the changes over the old segments.
+        self.carry_engine(started, &folded, &BTreeMap::new());
         Ok(())
     }
 }

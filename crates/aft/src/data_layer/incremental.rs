@@ -623,6 +623,58 @@ impl LiveCheckout {
         Ok(stats)
     }
 
+    /// This engine moved onto `stored`, a publication of exactly what it
+    /// resolved, over `state`: the engine a start from that publication
+    /// gives ([`Self::from_resolved_timed`]), keeping what it bound and
+    /// computed so far. A file's binding and its method-call inputs follow
+    /// from its parse, the checkout's paths and its configuration, all
+    /// unchanged, so each stays as the new engine would compute it; every
+    /// file is found through the publication's terms again, which file it as
+    /// the engine's own index did. `Err` says why the two differ (other
+    /// paths, files or parse keys, or an engine not started from a
+    /// publication); the caller then starts a new engine instead.
+    pub(crate) fn rebased(
+        self,
+        state: aft_store::checkout::CheckoutState,
+        stored: Arc<StoredSlices>,
+    ) -> Result<Self, &'static str> {
+        if self.reverse.stored.is_none() {
+            return Err("the engine was not started from a publication");
+        }
+        let ours = &self.inputs.state;
+        if state.git != ours.git
+            || state.conversion != ours.conversion
+            || state.paths() != ours.paths()
+        {
+            return Err("the publication's paths differ from the engine's");
+        }
+        let parses = self
+            .inputs
+            .parses
+            .rebased(&stored)
+            .ok_or("the publication's parsed files or parse keys differ from the engine's")?;
+        let resolved = self
+            .resolved
+            .rebased(&stored)
+            .ok_or("the publication's resolved files differ from the engine's")?;
+        let calls = self
+            .calls
+            .rebased(Arc::clone(&stored))
+            .ok_or("the engine was not started from a publication")?;
+        Ok(Self {
+            inputs: CheckoutInputs {
+                state,
+                parses,
+                configs: self.inputs.configs,
+            },
+            bound: self.bound,
+            resolved,
+            calls,
+            reverse: ReverseInputs::new(Some(stored)),
+            pool: self.pool,
+        })
+    }
+
     /// Runs `op` on the engine's thread pool, which every engine of the
     /// process shares (see `callgraph::engine_pool`).
     pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {

@@ -40,6 +40,7 @@ use super::query::{SliceReader, SliceSource};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
+mod engines;
 mod fold;
 
 pub use fold::{FoldReport, Folded};
@@ -238,6 +239,9 @@ pub struct DataLayer {
     cache: Arc<BlockCache>,
     threads: usize,
     policy: ScanPolicy,
+    /// Every checkout's call-graph engine, kept between refreshes until it
+    /// falls idle or the engines together hold too much.
+    engines: Arc<engines::EngineKeeper>,
 }
 
 impl DataLayer {
@@ -249,7 +253,28 @@ impl DataLayer {
             cache: Arc::new(BlockCache::new(cache_bytes)),
             threads: threads.max(1),
             policy: super::content::scan_policy(),
+            engines: Arc::new(engines::EngineKeeper::new()),
         }
+    }
+
+    /// Sets how long a checkout's call-graph engine stays after the
+    /// checkout's last edit or applied refresh. For tests and measurement.
+    #[doc(hidden)]
+    pub fn set_engine_idle(&self, idle: std::time::Duration) {
+        self.engines.set_idle(idle);
+    }
+
+    /// Sets how many bytes the call-graph engines of every checkout may
+    /// hold together. For tests and measurement.
+    #[doc(hidden)]
+    pub fn set_engine_budget(&self, bytes: u64) {
+        self.engines.set_budget(bytes);
+    }
+}
+
+impl Drop for DataLayer {
+    fn drop(&mut self) {
+        self.engines.stop();
     }
 }
 
@@ -287,17 +312,19 @@ pub struct Checkout {
     checkout: CheckoutId,
     /// The last published generation, and the changes made since.
     live: RwLock<Live>,
-    /// The call graph's incremental state between publications, built from
-    /// the publication on the first refresh.
-    engine: Mutex<Option<GraphEngine>>,
+    /// The call graph's incremental state, built from the publication on
+    /// the first refresh and moved onto each publication of its changes;
+    /// shared with the data layer, which lets it go once it falls idle or
+    /// the engines of every checkout hold too much.
+    engine: Arc<engines::EngineSlot>,
     /// Orders recordings: each one brings the state the previous left up to
     /// date.
     recording: Mutex<()>,
     /// Moves whenever what the checkout holds in memory may have changed: a
-    /// recorded change, a call-graph refresh, a new publication. A memory
-    /// figure walked at one value stays right until it moves (see
-    /// [`Self::memory_epoch`]).
-    memory_epoch: std::sync::atomic::AtomicU64,
+    /// recorded change, a call-graph refresh, a new publication, an engine
+    /// let go. A memory figure walked at one value stays right until it
+    /// moves (see [`Self::memory_epoch`]).
+    memory_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -325,6 +352,74 @@ struct GraphEngine {
     overlay: OverlaySlices<Arc<StoredSlices>>,
     /// What the overlay replaces and removes, for the dead-code snapshot.
     refreshed: Refreshed,
+}
+
+impl GraphEngine {
+    /// This engine moved onto `to`, the publication of what it resolved:
+    /// the engine a start from `to` gives, keeping every file it bound and
+    /// every file's method-call inputs it computed (see
+    /// [`LiveCheckout::rebased`]). It must have applied exactly the changes
+    /// `applied` names, each changed path with its change count, which `to`
+    /// publishes; and `to` must hold the paths, parse keys and
+    /// configuration the engine resolves over, with no stored read of
+    /// either publication failed. `Err` says which does not hold.
+    fn rebased(
+        self,
+        to: &Arc<Published>,
+        applied: &BTreeMap<Vec<u8>, u64>,
+    ) -> Result<Self, String> {
+        if self.applied != *applied {
+            return Err("it applied other changes than the publication holds".to_string());
+        }
+        if !to.graph_built {
+            return Err("the publication holds no call graph".to_string());
+        }
+        let failures = [self.published.graph.failures(), to.graph.failures()].concat();
+        if !failures.is_empty() {
+            return Err(format!("a stored read failed: {}", failures.join("; ")));
+        }
+        let configs = to.graph.configs(&to.state)?;
+        if configs != self.live.inputs.configs {
+            return Err("the publication's configuration differs from the engine's".to_string());
+        }
+        let live = self
+            .live
+            .rebased(to.state.clone(), Arc::clone(&to.graph))
+            .map_err(str::to_string)?;
+        Ok(Self {
+            published: Arc::clone(to),
+            live,
+            applied: BTreeMap::new(),
+            overlay: OverlaySlices::new(Arc::clone(&to.graph)),
+            refreshed: Refreshed {
+                state: to.state.clone(),
+                replaced: BTreeMap::new(),
+                removed: BTreeSet::new(),
+                records: BTreeMap::new(),
+                dead_code: DeadCodeMemo::default(),
+            },
+        })
+    }
+
+    /// The bytes this engine holds, counted as the memory census counts an
+    /// engine's (see [`Checkout::memory`]): everything it reaches apart
+    /// from the publication it started from, which the census counts as
+    /// the checkout's.
+    fn census_bytes(&self) -> u64 {
+        use aft_store::heap::HeapBytes as _;
+        let seen = &mut aft_store::heap::Seen::new();
+        MemoryParts::default().published(&self.published, seen);
+        let (state, rest) = self.live.memory(seen);
+        let mut parts = MemoryParts::default();
+        parts.refreshed(&self.refreshed, seen);
+        let bytes = state
+            + rest
+            + self.applied.heap_bytes(seen)
+            + self.overlay.heap_bytes(seen)
+            + parts.shared
+            + parts.callgraph;
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
 }
 
 /// A checkout's current data: its last publication and the changes made
@@ -775,6 +870,10 @@ impl Checkout {
     ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
+        let memory_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let engine = layer
+            .engines
+            .slot(root.to_path_buf(), Arc::clone(&memory_epoch));
         let handle = Self {
             layer,
             planes,
@@ -782,9 +881,9 @@ impl Checkout {
             family,
             checkout,
             live: RwLock::new(Live::default()),
-            engine: Mutex::new(None),
+            engine,
             recording: Mutex::new(()),
-            memory_epoch: std::sync::atomic::AtomicU64::new(0),
+            memory_epoch,
         };
         handle.adopt_newest()?;
         Ok(handle)
@@ -1053,6 +1152,7 @@ impl Checkout {
         if paths.is_empty() {
             return Ok(());
         }
+        self.layer.engines.touch(&self.engine);
         let _order = self.recording.lock().expect("no panics while holding it");
         // An ignore file changes which files under its folder are members,
         // so that folder is scanned again whole; one at the root (or Git's
@@ -1878,11 +1978,13 @@ impl Checkout {
     /// file as it was once the scan started, so the build covers every
     /// change recorded before then. A change recorded while it ran may be
     /// newer than what it read, so it stays laid over the new publication.
-    fn serve_new(&self, snapshot: Snapshot, covered: u64) -> Result<(), DataError> {
+    /// Returns the publication it serves.
+    fn serve_new(&self, snapshot: Snapshot, covered: u64) -> Result<Arc<Published>, DataError> {
         self.touch_memory();
-        let published = self
-            .open_published(snapshot)?
-            .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
+        let published = Arc::new(
+            self.open_published(snapshot)?
+                .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?,
+        );
         let late = {
             let mut live = self.write_live();
             live.changes.retain(|_, change| change.sequence > covered);
@@ -1903,7 +2005,7 @@ impl Checkout {
                 }
             }
             live.unparsed = Arc::new(unparsed);
-            live.published = Some(Arc::new(published));
+            live.published = Some(Arc::clone(&published));
             live.generation += 1;
             // The new publication's graph replaces the old one and whatever
             // was laid over it; the next refresh starts from it. So every
@@ -1927,7 +2029,7 @@ impl Checkout {
         // Paths reported before anything was published, after the scan
         // started: the scan may have read them before they changed.
         self.record_paths(&late)?;
-        Ok(())
+        Ok(published)
     }
 
     /// Segments of the current generation that no other checkout's state
@@ -2300,7 +2402,16 @@ impl Checkout {
                 }));
             }
         };
+        // An engine a refresh changed is kept for the next one, and counts
+        // against the budget every checkout's engine shares.
+        let kept = stats.is_some().then(|| {
+            self.layer.engines.touch(&self.engine);
+            slot.as_ref().map_or(0, GraphEngine::census_bytes)
+        });
         drop(slot);
+        if let Some(bytes) = kept {
+            self.layer.engines.kept(&self.engine, bytes);
+        }
         let mut live = self.write_live();
         if live
             .published
@@ -2369,6 +2480,7 @@ impl Checkout {
         }
         if slot.is_none() {
             *slot = Some(self.start_engine(published)?);
+            self.engine.note_start();
         }
         let engine = slot.as_mut().expect("started");
         let changed = changes
@@ -2773,23 +2885,87 @@ impl Checkout {
             retired_checkouts,
             ms: 0.0,
         };
-        self.serve_new(snapshot, covered)?;
-        // The engine started from the publication this one replaces, so the
-        // next refresh would start a new one anyway; dropping it now gives
-        // back what it decoded and resolved as soon as the checkout goes
-        // quiet, instead of holding it until the next edit.
-        if let Ok(mut slot) = self.engine.lock() {
-            if slot
-                .as_ref()
-                .is_some_and(|engine| Arc::ptr_eq(&engine.published, &published))
-            {
-                *slot = None;
-            }
-        }
+        let served = self.serve_new(snapshot, covered)?;
+        // The engine resolved what this publication holds: it goes on from
+        // there.
+        let applied = changes
+            .iter()
+            .map(|(path, change)| (path.clone(), change.sequence))
+            .collect();
+        self.carry_engine(&published, &served, &applied);
         Ok(Some(DeltaReport {
             ms: elapsed_ms(started),
             ..report
         }))
+    }
+
+    /// Moves the call-graph engine started from `from` onto `to`, the
+    /// publication now served in its place, when the engine resolved exactly
+    /// what `to` holds: it applied exactly the changes `applied` names (each
+    /// changed path with its change count), and `to` holds the paths,
+    /// parses and configuration it resolves over (see
+    /// [`GraphEngine::rebased`]). The next refresh then goes on from what
+    /// the engine bound and computed so far, which a new engine works out
+    /// again on its first refresh. An engine started from `from` that
+    /// cannot be moved is dropped, as the next refresh would start a new one
+    /// anyway; one started from another publication is left as it is.
+    fn carry_engine(
+        &self,
+        from: &Arc<Published>,
+        to: &Arc<Published>,
+        applied: &BTreeMap<Vec<u8>, u64>,
+    ) {
+        let Ok(mut slot) = self.engine.lock() else {
+            return;
+        };
+        if !slot
+            .as_ref()
+            .is_some_and(|engine| Arc::ptr_eq(&engine.published, from))
+        {
+            return;
+        }
+        let Some(engine) = slot.take() else {
+            return;
+        };
+        self.touch_memory();
+        let started = Instant::now();
+        match engine.rebased(to, applied) {
+            Ok(engine) => {
+                let bytes = engine.census_bytes();
+                *slot = Some(engine);
+                drop(slot);
+                self.layer.engines.kept(&self.engine, bytes);
+                crate::slog_info!(
+                    "perf data_layer engine_rebased: root={} {:.0}ms {} MiB",
+                    self.root.display(),
+                    elapsed_ms(started),
+                    bytes >> 20
+                );
+            }
+            Err(why) => crate::slog_info!(
+                "data layer: the call-graph engine of {} starts again on its next refresh: {why}",
+                self.root.display()
+            ),
+        }
+    }
+
+    /// The bytes the call-graph engine holds, as the budget every
+    /// checkout's engine shares counts them; `None` without an engine or
+    /// while a refresh holds it. For measurement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn engine_census_bytes(&self) -> Option<u64> {
+        let slot = self.engine.try_lock().ok()?;
+        slot.as_ref().map(GraphEngine::census_bytes)
+    }
+
+    /// How many call-graph engines refreshes of this checkout have started:
+    /// one for the first refresh after a bind, and one more after each time
+    /// the engine went. For tests and measurement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn engine_starts(&self) -> u64 {
+        self.engine.starts()
     }
 
     /// How many segments the newest generation of the family store names,
@@ -5926,6 +6102,197 @@ pub fn other() { callee(); }
         assert_eq!(view.status().callgraph, PlaneStatus::Ready);
         assert_eq!(ours, callers_of(&view, "src/util.rs", "callee"));
         assert_eq!(candidates_for(&view, "zzneedle"), ["notes.txt"]);
+    }
+
+    /// Edits `path` in `checkout`'s folder to `text` and records it.
+    fn edit(checkout: &Checkout, path: &str, text: &str) {
+        write(checkout.root(), path, text);
+        checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+    }
+
+    /// A publication of the changes a refresh resolved moves the call-graph
+    /// engine onto it: each later edit's refresh goes on with that engine
+    /// instead of starting a new one from the publication, and answers as a
+    /// cold build of the same files does, recorded reads included.
+    #[test]
+    fn a_publish_followed_by_an_edit_starts_no_new_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let edits = [
+            (
+                "src/util.rs",
+                "pub fn callee() {}\npub fn other() { callee(); }\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod util;\nmod extra;\npub fn caller() { util::callee(); }\n",
+            ),
+            (
+                "src/extra.rs",
+                "use crate::util;\npub fn more() { util::other(); }\n",
+            ),
+            (
+                "src/util.rs",
+                "pub fn callee() {}\npub fn other() { callee(); }\npub fn third() { other(); }\n",
+            ),
+        ];
+        for (round, (path, text)) in edits.iter().enumerate() {
+            edit(&checkout, path, text);
+            assert!(
+                checkout.refresh_callgraph().unwrap().is_some(),
+                "round {round}"
+            );
+            assert_eq!(
+                checkout.engine_starts(),
+                1,
+                "round {round}: the refresh started another engine"
+            );
+            let cold_store = tempfile::tempdir().unwrap();
+            let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path())
+                .unwrap();
+            cold.build().unwrap();
+            for (file, symbol) in [
+                ("src/util.rs", "callee"),
+                ("src/util.rs", "other"),
+                ("src/lib.rs", "caller"),
+            ] {
+                assert_eq!(
+                    callers_of(&checkout.view().unwrap(), file, symbol),
+                    callers_of(&cold.view().unwrap(), file, symbol),
+                    "round {round}: callers of {file} {symbol}"
+                );
+            }
+            let stale = checkout
+                .inspect_engine(LiveCheckout::stale_recordings)
+                .unwrap()
+                .unwrap();
+            assert!(stale.is_empty(), "round {round}: stale {stale:?}");
+            checkout.publish_changes().unwrap().expect("published");
+            assert!(
+                checkout.engine_census_bytes().is_some(),
+                "round {round}: the publication dropped the engine"
+            );
+        }
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "other");
+        assert!(
+            callers.contains("more") && callers.contains("third"),
+            "{callers}"
+        );
+    }
+
+    /// Waits up to ten seconds for `holds` to turn false.
+    fn wait_until_not(mut holds: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while holds() {
+            assert!(Instant::now() < deadline, "still holds after ten seconds");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A kept engine goes once its checkout has gone the idle period with no
+    /// edit recorded and no refresh applying anything, and not before: an
+    /// edit starts the period again. The next refresh starts a new engine.
+    #[test]
+    fn an_idle_engine_is_released_after_its_quiet_period() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let idle = std::time::Duration::from_secs(2);
+        layer.set_engine_idle(idle);
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn callee() {}\npub fn other() {}\n",
+        );
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        assert!(checkout.engine_census_bytes().is_some());
+        std::thread::sleep(idle / 2);
+        let edited = Instant::now();
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn callee() {}\npub fn third() {}\n",
+        );
+        std::thread::sleep(idle * 3 / 4);
+        // Past the period since the refresh, within it since the edit.
+        assert!(edited.elapsed() < idle, "the test machine is too slow");
+        assert!(
+            checkout.engine_census_bytes().is_some(),
+            "the engine went though its checkout was edited within the period"
+        );
+        let epoch = checkout.memory_epoch();
+        wait_until_not(|| checkout.engine_census_bytes().is_some());
+        assert!(edited.elapsed() >= idle);
+        assert!(checkout.memory_epoch() > epoch, "the census was not told");
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        assert_eq!(checkout.engine_starts(), 2);
+    }
+
+    /// Past the budget the engines of every checkout share, a refresh lets
+    /// the least recently used other checkout's engine go, and only as many
+    /// as bring them under it: here the one whose checkout went longest
+    /// without an edit or a refresh, not the one started first.
+    #[test]
+    fn over_budget_the_least_recently_used_idle_engine_goes_first() {
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut folders = Vec::new();
+        let mut checkouts = Vec::new();
+        for _ in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let store = tempfile::tempdir().unwrap();
+            demo(root.path());
+            let checkout =
+                Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+            checkout.build().unwrap();
+            edit(
+                &checkout,
+                "src/util.rs",
+                "pub fn callee() {}\npub fn other() {}\n",
+            );
+            checkout.refresh_callgraph().unwrap().expect("applied");
+            checkouts.push(checkout);
+            folders.push((root, store));
+            // Uses are told apart by the millisecond.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let bytes = checkouts
+            .iter()
+            .map(|checkout| checkout.engine_census_bytes().expect("kept"))
+            .collect::<Vec<_>>();
+        assert!(bytes.iter().all(|bytes| *bytes > 0), "{bytes:?}");
+        // The first checkout is edited again, so the second one's engine is
+        // now the least recently used.
+        edit(
+            &checkouts[0],
+            "src/lib.rs",
+            "mod util;\npub fn caller() {}\n",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Room for the first and third engines, and half the second's.
+        layer.set_engine_budget(bytes[0] + bytes[2] + bytes[1] / 2);
+        edit(
+            &checkouts[2],
+            "src/util.rs",
+            "pub fn callee() {}\npub fn third() {}\n",
+        );
+        checkouts[2].refresh_callgraph().unwrap().expect("applied");
+        let kept = checkouts
+            .iter()
+            .map(|checkout| checkout.engine_census_bytes().is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, [true, false, true], "bytes {bytes:?}");
+        assert!(checkouts
+            .iter()
+            .all(|checkout| checkout.engine_starts() == 1));
     }
 
     /// The live segments of the family store at `checkout`'s.
