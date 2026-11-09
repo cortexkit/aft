@@ -1682,6 +1682,75 @@ async fn remote_progress_is_requested_only_with_the_advertised_capability() {
     }
 }
 
+/// One submission checks several capabilities of the executor (submission
+/// keys, progress, the return cap). A route reads the daemon catalog once for
+/// all of them; a reopened route reads it again.
+#[tokio::test]
+async fn capability_checks_read_the_catalog_once_per_route() {
+    let daemon = daemon_with_capabilities(
+        Script::Utf8,
+        &[
+            client::CAPABILITY,
+            PROGRESS_CAPABILITY,
+            SUBMISSION_KEY_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let catalog_lists = || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["op"] == "catalog.list")
+            .count()
+    };
+    let client = client(&daemon).await;
+    // Connecting resolves the executor through the catalog.
+    let connected = catalog_lists();
+    for _ in 0..3 {
+        assert!(client.supports_submission_key().await.unwrap());
+        assert_eq!(
+            client.return_max_bytes().await.unwrap(),
+            super::return_max_bytes(),
+            "the executor does not advertise large returns"
+        );
+    }
+    let request = RunRequest::new("/workspace", "/src/repo", "/workspace", "test")
+        .with_submission_key("aft:bash-0000000000000001");
+    let mut stream = client.run(&request).await.unwrap();
+    assert_eq!(
+        drain(&mut stream, &mut MemorySink::default())
+            .await
+            .unwrap(),
+        Verdict::Exited { code: 0 }
+    );
+    let run = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .unwrap();
+    assert_eq!(
+        run["progress"], true,
+        "the cached catalog still enables progress"
+    );
+    assert_eq!(catalog_lists(), connected + 1);
+    #[cfg(unix)]
+    {
+        let reopened = client
+            .reopen_route(BindIdentity::new("aft-test", "session"))
+            .await
+            .unwrap();
+        assert!(reopened.supports_submission_key().await.unwrap());
+        // The reopened route resolves the executor and reads its capabilities.
+        assert_eq!(catalog_lists(), connected + 3);
+    }
+}
+
 #[tokio::test]
 async fn dotted_capability_is_not_a_discovery_claim() {
     let daemon = daemon(Script::Lost, "exec.remote/v1").await;

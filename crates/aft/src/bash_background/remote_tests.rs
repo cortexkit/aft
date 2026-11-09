@@ -4692,7 +4692,11 @@ fn exec_remote_bash_state_transitions_are_durable() {
         RemotePhase::Queued { position: 7 }
     );
     assert!(work_counts::get().syncs >= 2);
-    assert!(work_counts::get().renames >= 1);
+    assert_eq!(
+        work_counts::get().renames,
+        1,
+        "the job id and the execution note are saved in one record write"
+    );
 
     work_counts::reset();
     // An older runner's first output is a running transition, not just progress.
@@ -16434,6 +16438,9 @@ async fn runon_monitor_polls_without_a_change_write_nothing_and_list_no_catalog(
         running, started,
         "a quiet running job's polls changed nothing"
     );
+    // Launching resolves the executor, then reads its capabilities once for
+    // every check the submission makes.
+    assert_eq!(launch.1, 2, "catalog lists at launch");
 }
 
 /// A running job that streams output steadily saves its output cursor at
@@ -16489,5 +16496,64 @@ async fn runon_monitor_steady_output_writes_only_checkpoints_and_lists_no_catalo
     assert!(
         streamed.0 - started.0 <= 1,
         "at most one output checkpoint in 3 s: {started:?} -> {streamed:?}"
+    );
+}
+
+/// A draining wait polls once a second and only the elapsed time in its note
+/// changes. The record is saved when the wait begins and then at most once
+/// per `DRAINING_NOTE_SAVE_INTERVAL_MS`, while the note shown in this process
+/// still moves every second.
+#[tokio::test]
+async fn runon_draining_wait_saves_its_record_at_a_coarse_step() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(60_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    let first = clock.now();
+    clock.expect_sleep(first, first + 1000).await;
+    let wait_began = crate::bash_background::persistence::record_writes::get(&task_id);
+    // A simulated minute of the wait: 59 more one-second passes.
+    for second in 1..60 {
+        clock.advance(1000);
+        clock
+            .expect_sleep(first + second * 1000, first + (second + 1) * 1000)
+            .await;
+    }
+    let waited = crate::bash_background::persistence::record_writes::get(&task_id);
+    let waiting = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert!(
+        waiting
+            .output_preview
+            .contains("draining for maintenance; retrying (attempt 2, 59s of 10m used)"),
+        "the note shown here still moves every second: {waiting:?}"
+    );
+    clock.advance(1000);
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    eprintln!(
+        "draining wait: {} record writes over 59 one-second passes",
+        waited - wait_began
+    );
+    assert!(
+        waited - wait_began <= 59 / (DRAINING_NOTE_SAVE_INTERVAL_MS / 1000) as usize,
+        "59 one-second passes saved the record {} times",
+        waited - wait_began
     );
 }

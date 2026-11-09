@@ -78,6 +78,13 @@ pub struct ExecRemoteClient {
     consumer: Arc<SubcConsumer>,
     route: subc_client_rs::RouteHandle,
     module_id: String,
+    /// The capabilities the daemon catalog lists for `module_id`, read by the
+    /// first capability check and reused by every later check on this route
+    /// (one submission makes several). A provider announces its capabilities
+    /// when it registers, and registering again ends its routes; recovery then
+    /// opens a new route ([`Self::reopen_route`]) or connection, whose first
+    /// check reads the catalog again.
+    provided: Arc<std::sync::OnceLock<Arc<[String]>>>,
 }
 
 impl ExecRemoteClient {
@@ -129,6 +136,7 @@ impl ExecRemoteClient {
             consumer,
             route,
             module_id,
+            provided: Arc::default(),
         })
     }
 
@@ -235,20 +243,9 @@ impl ExecRemoteClient {
     }
 
     pub(crate) async fn supports_submission_key(&self) -> Result<bool, Error> {
-        let catalog = self
-            .consumer
-            .catalog_list()
+        self.advertises(SUBMISSION_KEY_CAPABILITY)
             .await
-            .map_err(Error::Transport)?;
-        Ok(catalog.modules.iter().any(|module| {
-            module.module_id == self.module_id
-                && module.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|capability| capability == SUBMISSION_KEY_CAPABILITY)
-                })
-        }))
+            .map_err(Error::Transport)
     }
 
     #[cfg(unix)]
@@ -259,16 +256,35 @@ impl ExecRemoteClient {
     /// Whether the module serving this route advertises `capability` in the
     /// daemon catalog.
     async fn advertises(&self, capability: &str) -> Result<bool, subc_client_rs::CallError> {
+        Ok(self
+            .provided()
+            .await?
+            .iter()
+            .any(|provided| provided == capability))
+    }
+
+    /// The capabilities the catalog lists for this route's module, read once
+    /// per route (see the `provided` field).
+    async fn provided(&self) -> Result<Arc<[String]>, subc_client_rs::CallError> {
+        if let Some(provided) = self.provided.get() {
+            return Ok(Arc::clone(provided));
+        }
         let catalog = self.consumer.catalog_list().await?;
-        Ok(catalog.modules.iter().any(|module| {
-            module.module_id == self.module_id
-                && module.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|provided| provided == capability)
-                })
-        }))
+        let mut listed = false;
+        let provided: Arc<[String]> = catalog
+            .modules
+            .iter()
+            .filter(|module| module.module_id == self.module_id)
+            .inspect(|_| listed = true)
+            .filter_map(|module| module.capabilities.as_ref())
+            .flat_map(|capabilities| capabilities.provides.iter().cloned())
+            .collect();
+        if !listed {
+            // The module is missing from this listing (it may be registering
+            // again): it advertises nothing now, and the next check looks again.
+            return Ok(provided);
+        }
+        Ok(Arc::clone(self.provided.get_or_init(|| provided)))
     }
 
     /// Resume from the last durably delivered seq, not from the last received
