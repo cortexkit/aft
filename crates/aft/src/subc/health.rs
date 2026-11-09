@@ -1855,7 +1855,9 @@ const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
-const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
+/// The rollup reuses its allocator observation for at least this long, and
+/// longer when the walk that produced it was expensive.
+const HEALTH_ALLOCATOR_MIN_REUSE_MS: u64 = 30_000;
 /// How long the health rollup carries the full memory census forward while
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
@@ -2299,6 +2301,17 @@ struct PlaneTiming {
     progress_signature: String,
 }
 
+/// The rollup's last allocator observation, reused across refreshes until it
+/// is older than `reuse_ms`.
+struct CachedAllocatorObservation {
+    /// Cache clock time when the walk finished.
+    cached_at_ms: u64,
+    /// How long this observation may be reused: longer when its walk was
+    /// expensive (see `crate::memory::allocator_reuse_window_ms`).
+    reuse_ms: u64,
+    observation: crate::memory::AllocatorObservation,
+}
+
 struct RetentionCountSample {
     database: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
     measured_at_ms: u64,
@@ -2324,7 +2337,11 @@ pub(super) struct HealthRollupCache {
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
-    allocator: std::sync::Mutex<Option<(u64, crate::memory::AllocatorObservation)>>,
+    allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
+    /// Replaces the measured duration of the rollup's allocator walk when not
+    /// `u64::MAX`, so tests can model an expensive walk.
+    #[cfg(test)]
+    allocator_walk_ms_for_test: AtomicU64,
     retention_count: std::sync::Mutex<Option<RetentionCountSample>>,
     #[cfg(test)]
     retention_count_reads: AtomicU64,
@@ -2396,6 +2413,8 @@ impl HealthRollupCache {
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
             allocator: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            allocator_walk_ms_for_test: AtomicU64::new(u64::MAX),
             retention_count: std::sync::Mutex::new(None),
             #[cfg(test)]
             retention_count_reads: AtomicU64::new(0),
@@ -2414,20 +2433,35 @@ impl HealthRollupCache {
             .allocator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((cached_at_ms, observation)) = cached.as_ref() {
-            let elapsed_ms = self.now_ms().saturating_sub(*cached_at_ms);
+        if let Some(cached) = cached.as_ref() {
+            let observation = &cached.observation;
+            let elapsed_ms = self.now_ms().saturating_sub(cached.cached_at_ms);
             let age_ms = observation.age_ms.unwrap_or(0).saturating_add(elapsed_ms);
-            if age_ms <= HEALTH_ALLOCATOR_MAX_AGE_MS {
+            if age_ms <= cached.reuse_ms {
                 let mut reused = observation.clone();
                 // Unsupported platforms keep a null age, not a measured zero.
                 reused.age_ms = observation.age_ms.map(|_| age_ms);
                 return reused;
             }
         }
+        let walk_started = Instant::now();
         let observation = crate::memory::AllocatorObservation::measure();
+        let walk_ms = duration_millis_u64(walk_started.elapsed());
+        #[cfg(test)]
+        let walk_ms = match self.allocator_walk_ms_for_test.load(Ordering::Relaxed) {
+            u64::MAX => walk_ms,
+            stubbed => stubbed,
+        };
         // The observation already includes time spent walking the allocator.
         // Start the reuse clock after that walk so its duration is not counted twice.
-        *cached = Some((self.now_ms(), observation.clone()));
+        *cached = Some(CachedAllocatorObservation {
+            cached_at_ms: self.now_ms(),
+            reuse_ms: crate::memory::allocator_reuse_window_ms(
+                HEALTH_ALLOCATOR_MIN_REUSE_MS,
+                walk_ms,
+            ),
+            observation: observation.clone(),
+        });
         observation
     }
 
@@ -3255,6 +3289,10 @@ fn build_health_diagnostic_rollup(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "health_rollup_bench.rs"]
 mod rollup_bench;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "health/rollup_stage_profile.rs"]
+mod rollup_stage_profile;
 
 macro_rules! rollup_mark {
     ($timer:ident, $step:literal) => {
@@ -6980,6 +7018,9 @@ mod tests {
     #[test]
     fn rollup_allocator_remeasures_expired_observation() {
         let cache = HealthRollupCache::new();
+        // Model a cheap walk, so the reuse window stays at its 30 s floor even
+        // if a loaded test host makes the real walk slow.
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
         cache.clock_ms.store(0, Ordering::Relaxed);
         allocator_rollup(&cache);
         let before = crate::memory::allocator_snapshot_calls_for_test();
@@ -6989,6 +7030,39 @@ mod tests {
             crate::memory::allocator_snapshot_calls_for_test() - before,
             1
         );
+    }
+
+    #[test]
+    fn rollup_allocator_reuse_window_stretches_with_walk_cost() {
+        let cache = HealthRollupCache::new();
+        let walks = || crate::memory::allocator_snapshot_calls_for_test();
+        let refresh_at = |now_ms: u64| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            allocator_rollup(&cache);
+        };
+        // A one-second walk, as glibc takes on a fragmented multi-GiB heap:
+        // the next walk waits 200 times as long.
+        cache
+            .allocator_walk_ms_for_test
+            .store(1_000, Ordering::Relaxed);
+        let before = walks();
+        for now_ms in (0..=198_000).step_by(3_000) {
+            refresh_at(now_ms);
+        }
+        assert_eq!(
+            walks() - before,
+            1,
+            "67 refreshes over 198 s must share one expensive walk"
+        );
+        // Past the stretched window the rollup walks again; this walk is
+        // cheap, so the window drops back to its 30 s floor.
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
+        refresh_at(200_001);
+        assert_eq!(walks() - before, 2);
+        refresh_at(227_001);
+        assert_eq!(walks() - before, 2);
+        refresh_at(230_002);
+        assert_eq!(walks() - before, 3);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
