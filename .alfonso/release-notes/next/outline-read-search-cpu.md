@@ -1,0 +1,3 @@
+- `aft_outline` builds the method previews for Rust traits with a single pass over each file's syntax tree, and skips files that never mention `trait`. The first outline of a large Rust file uses less CPU, and the outline is unchanged.
+- `aft_read` with line tags, and edits that refer to those tags, no longer hash a file's whole content each time they record a tagged version of the file. The hash is computed only in the rare case where an earlier version of the same file with the same tag has been dropped. Results are unchanged.
+- When nothing new has been published, a meaning-search refresh now lists the store's folder and stops there. It no longer opens and checks the newest manifest.
