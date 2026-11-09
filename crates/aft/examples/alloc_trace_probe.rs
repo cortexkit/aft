@@ -11,7 +11,7 @@
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
 //!     restart <repo> <dir> [threads]
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
-//!     replay <pack.jsonl.gz> [publish_every] [threads]
+//!     replay <pack.jsonl.gz> [publish_every|daemon] [threads]
 //! ```
 //!
 //! `overhead` runs two workloads in one process and prints one JSON line
@@ -604,13 +604,19 @@ fn with_cache_counts(layer: &DataLayer, work: impl FnOnce() -> String) -> String
 
 /// Replays an edit pack through one checkout built from its base files, as
 /// the runtime drives it: each edit recorded and refreshed, its changes
-/// published every `publish_every` edits and at each commit's end. Prints
-/// how many refreshes found no engine and started one, and the time each
-/// kind took.
+/// published every `publish_every` edits and at each commit's end, or with
+/// `daemon`, as the runtime publishes them: once 64 paths changed or 256
+/// files were resolved again since the publication, and at each commit's
+/// end, which stands for the agent pausing long enough for the checkout to
+/// go quiet. Prints how many refreshes found no engine and started one,
+/// the time each kind took, and each refresh's wall time percentiles.
 fn replay(mut args: impl Iterator<Item = String>) {
     use std::io::BufRead as _;
     let pack = PathBuf::from(args.next().unwrap());
-    let publish_every = args.next().map_or(8, |count| count.parse().unwrap());
+    let publish_every = args.next().map_or(Some(8), |count| match count.as_str() {
+        "daemon" => None,
+        count => Some(count.parse::<usize>().unwrap()),
+    });
     let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
     start_tracing();
     let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(
@@ -643,6 +649,7 @@ fn replay(mut args: impl Iterator<Item = String>) {
     // engine and for those that reused one.
     let mut started = (0usize, 0.0f64, 0.0f64);
     let mut reused = (0usize, 0.0f64, 0.0f64);
+    let mut walls = Vec::new();
     let mut publications = 0usize;
     phase("replay", || {
         let mut since = 0usize;
@@ -661,28 +668,46 @@ fn replay(mut args: impl Iterator<Item = String>) {
                 kind.0 += 1;
                 kind.1 += wall;
                 kind.2 += cpu;
+                walls.push(wall * 1000.0);
             }
             since += 1;
             let commit_ends = edits
                 .get(index + 1)
                 .is_none_or(|next| next["commit"] != edit["commit"]);
-            if since >= publish_every || commit_ends {
+            let due = match publish_every {
+                Some(every) => since >= every,
+                None => checkout.changed_paths() >= 64 || checkout.refreshed_files() >= 256,
+            };
+            if due || commit_ends {
                 if checkout.publish_changes().unwrap().is_some() {
                     publications += 1;
                 }
                 since = 0;
             }
         }
+        walls.sort_by(f64::total_cmp);
+        let at = |p: f64| {
+            walls
+                .get(((walls.len().saturating_sub(1)) as f64 * p).round() as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
         format!(
             "{} edits, {publications} publications; refreshes that started an engine: {} \
-             ({:.1} s wall, {:.1} s CPU); that reused one: {} ({:.1} s wall, {:.1} s CPU)",
+             ({:.1} s wall, {:.1} s CPU); that reused one: {} ({:.1} s wall, {:.1} s CPU); \
+             all: {:.1} s wall, {:.1} s CPU, per refresh p50 {:.0} ms, p90 {:.0} ms, max {:.0} ms",
             edits.len(),
             started.0,
             started.1,
             started.2,
             reused.0,
             reused.1,
-            reused.2
+            reused.2,
+            started.1 + reused.1,
+            started.2 + reused.2,
+            at(0.5),
+            at(0.9),
+            at(1.0)
         )
     });
 }
