@@ -38,6 +38,33 @@ pub(crate) struct FileFacts {
     pub(crate) type_targets: BTreeMap<String, (String, String)>,
 }
 
+#[derive(Default, PartialEq)]
+struct NamedFacts<'a> {
+    types: Vec<&'a TypeHint>,
+    target: Option<&'a (String, String)>,
+    imports: Vec<(&'a str, Vec<&'a str>, bool, Option<&'a String>)>,
+}
+
+fn grouped<'a, T, K: Ord>(items: &'a [T], key: impl Fn(&'a T) -> K) -> BTreeMap<K, Vec<&'a T>> {
+    let mut groups = BTreeMap::<K, Vec<&T>>::new();
+    for item in items {
+        groups.entry(key(item)).or_default().push(item);
+    }
+    groups
+}
+
+fn changed_groups<K: Ord, V: PartialEq>(
+    old: &BTreeMap<K, V>,
+    new: &BTreeMap<K, V>,
+    mut emit: impl FnMut(&K),
+) {
+    for key in old.keys().chain(new.keys()) {
+        if old.get(key) != new.get(key) {
+            emit(key);
+        }
+    }
+}
+
 impl FileFacts {
     pub(crate) fn new(parse: &ParseBlob) -> Self {
         Self {
@@ -143,56 +170,90 @@ impl FileFacts {
         }
     }
 
-    /// Like [`Self::changed_keys`], but when only some of a non-Go file's
-    /// methods change, names only the method names whose methods changed.
-    ///
-    /// That is enough because of what a resolution that found this file
-    /// through a method name reads without recording this file's key: the
-    /// methods of that name, and the file's other facts (language, types,
-    /// Go package). When any of those other facts change, every method name
-    /// is named, as before. A Go resolution also reads the file's other
-    /// methods (an interface's required set), so a Go file names every
-    /// method name.
+    /// Diff name-addressed reads when the file keeps its identity and language.
+    /// Go interface checks read whole method sets, so Go retains the coarse diff.
     pub(crate) fn changed_keys_by_method(
         path: &str,
         old: Option<&Self>,
         new: Option<&Self>,
         keys: &mut BTreeSet<String>,
     ) {
+        if old == new {
+            return;
+        }
         let (Some(old), Some(new)) = (old, new) else {
             return Self::changed_keys(path, old, new, keys);
         };
-        let without_methods = |facts: &Self| Self {
-            methods: Vec::new(),
-            ..facts.clone()
-        };
-        if old.language == "go"
-            || new.language == "go"
-            || without_methods(old) != without_methods(new)
+        if old.language == "go" || old.language != new.language || old.go_package != new.go_package
         {
             return Self::changed_keys(path, Some(old), Some(new), keys);
         }
-        if old.methods == new.methods {
-            return;
-        }
-        keys.insert(dependency::file(path));
-        keys.insert(dependency::directory(path));
-        let by_name = |facts: &'_ Self| {
-            let mut names = BTreeMap::<String, Vec<MethodHint>>::new();
-            for method in &facts.methods {
-                names
-                    .entry(method.name.clone())
-                    .or_default()
-                    .push(method.clone());
-            }
-            names
-        };
-        let (old, new) = (by_name(old), by_name(new));
-        for name in old.keys().chain(new.keys()) {
-            if old.get(name) != new.get(name) {
+        changed_groups(
+            &grouped(&old.methods, |m| m.name.as_str()),
+            &grouped(&new.methods, |m| m.name.as_str()),
+            |name| {
                 keys.insert(dependency::method(name));
+            },
+        );
+        let (old_named, new_named) = (old.named_facts(), new.named_facts());
+        changed_groups(&old_named, &new_named, |name| {
+            keys.insert(dependency::type_name(path, name));
+        });
+        if old.default_export_symbol != new.default_export_symbol {
+            keys.insert(dependency::type_name(path, "@default"));
+        }
+        changed_groups(
+            &grouped(&old.types, |t| t.name.as_str()),
+            &grouped(&new.types, |t| t.name.as_str()),
+            |name| {
+                keys.insert(dependency::directory_type(path, name));
+            },
+        );
+        changed_groups(
+            &grouped(&old.fields, |f| (f.owner.as_str(), f.name.as_str())),
+            &grouped(&new.fields, |f| (f.owner.as_str(), f.name.as_str())),
+            |(owner, name)| {
+                keys.insert(dependency::field(path, owner, name));
+            },
+        );
+        changed_groups(
+            &grouped(&old.returns, |r| r.symbol.as_str()),
+            &grouped(&new.returns, |r| r.symbol.as_str()),
+            |symbol| {
+                keys.insert(dependency::return_hint(path, symbol));
+            },
+        );
+    }
+
+    fn named_facts(&self) -> BTreeMap<&str, NamedFacts<'_>> {
+        let mut names = BTreeMap::<&str, NamedFacts<'_>>::new();
+        for ty in &self.types {
+            names.entry(&ty.name).or_default().types.push(ty);
+        }
+        for (name, target) in &self.type_targets {
+            names.entry(name).or_default().target = Some(target);
+        }
+        for import in &self.imports {
+            let mut locals = BTreeMap::<&str, Vec<&str>>::new();
+            for specifier in &import.names {
+                locals
+                    .entry(crate::imports::specifier_local_name(specifier))
+                    .or_default()
+                    .push(specifier);
+            }
+            if let Some(default) = &import.default_import {
+                locals.entry(default).or_default();
+            }
+            for (name, specifiers) in locals {
+                names.entry(name).or_default().imports.push((
+                    &import.module_path,
+                    specifiers,
+                    import.default_import.as_deref() == Some(name),
+                    self.import_targets.get(&import.module_path),
+                ));
             }
         }
+        names
     }
 }
 aft_store::heap_bytes_of_fields!(ImportFact {

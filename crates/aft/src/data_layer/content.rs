@@ -52,7 +52,7 @@ use crate::parser::LangId;
 /// each file's TODO markers, and records holding only the markers of the
 /// files whose comments are counted but which the call graph does not parse
 /// (see [`MARKERS_PREFIX`]), so counting TODOs never parses a file.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-12";
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-13";
 
 /// The start of the language of a file whose record holds only its TODO
 /// markers: a Markdown file, a minified bundle, or a C header no grammar

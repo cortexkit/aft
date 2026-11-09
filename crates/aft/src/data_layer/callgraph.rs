@@ -1848,7 +1848,9 @@ impl MethodCallInputs {
             new.as_ref().map(|new| &new.facts),
             &mut keys,
         );
-        let own_changed = keys.contains(&dependency::file(path))
+        // Own facts are pass-4 inputs even when the precise diff emits no whole-file key.
+        // Content edits also seed pass 4 directly in the incremental engine.
+        let own_changed = old.as_ref().map(|old| &old.facts) != new.as_ref().map(|new| &new.facts)
             || old.as_ref().map(|old| &old.ordinary) != new.as_ref().map(|new| &new.ordinary);
         if let Some(old) = &old {
             self.unfile(path, old);

@@ -547,3 +547,70 @@ fn a_crate_src_symlink_retarget_resolves_like_a_cold_build() {
         "the fixture must move the call: {rows:?}"
     );
 }
+
+#[test]
+fn name_keys_edited_file_resolves_its_new_site_without_emitting_reader_keys() {
+    let before = checkout(
+        &[(
+            "a.ts",
+            "export class A { run() {} }\nexport function caller(a: A) {}\n",
+        )],
+        &[],
+    );
+    let after = checkout(
+        &[(
+            "a.ts",
+            "export class A { run() {} }\nexport function caller(a: A) { a.run(); }\n",
+        )],
+        &[],
+    );
+    let (stats, cold) = update_checked(before, after, &["a.ts"]);
+    assert_eq!(
+        stats.facts_changed, 0,
+        "adding only a site emits no reader keys"
+    );
+    assert_eq!(stats.sites_resolved, 1, "the edited file still runs pass 4");
+    assert!(cold["a.ts"]
+        .sites
+        .iter()
+        .any(|site| site.site.member.as_deref() == Some("run")
+            && !site.resolution.targets.is_empty()));
+}
+
+#[test]
+fn name_keys_unrelated_rust_return_hint_refreshes_only_its_own_file() {
+    let caller = (
+        "main.rs",
+        "mod types; use types::A; fn caller(a: A) { a.run(); }\n",
+    );
+    let before = checkout(
+        &[
+            caller,
+            (
+                "types.rs",
+                "pub struct A; impl A { pub fn run(&self) {} }\n",
+            ),
+        ],
+        &[],
+    );
+    let after = checkout(
+        &[
+            caller,
+            (
+                "types.rs",
+                "pub struct A; impl A { pub fn run(&self) {} }\npub fn fresh() -> A { A }\n",
+            ),
+        ],
+        &[],
+    );
+    let (stats, cold) = update_checked(before, after, &["types.rs"]);
+    assert_eq!(
+        stats.sites_resolved, 1,
+        "unrelated return hints do not refresh readers of A or run"
+    );
+    assert!(cold["main.rs"]
+        .sites
+        .iter()
+        .any(|site| site.site.member.as_deref() == Some("run")
+            && !site.resolution.targets.is_empty()));
+}
