@@ -311,10 +311,13 @@ pub(super) fn answer(
             .map_err(|_| unavailable("grant database lock poisoned"))
     };
     if request.operation() == LIST_OPERATION {
-        return list(&lock()?, request.agent_id(), &home_folders());
+        let conn = lock()?;
+        return list(&conn, request.agent_id(), &home_folders());
     }
-    let row = crate::db::access_grant_rows::revoke_live(&lock()?, request.grant_id())
-        .map_err(unavailable)?;
+    let row = {
+        let conn = lock()?;
+        crate::db::access_grant_rows::revoke_live(&conn, request.grant_id()).map_err(unavailable)?
+    };
     Ok(match row {
         None => not_found(),
         Some(row) => revoked(stop(&row)),
