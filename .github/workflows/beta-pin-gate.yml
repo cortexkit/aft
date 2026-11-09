@@ -1,12 +1,17 @@
 name: Beta-pin gate
 
 # Path-filtered gate: runs the full OpenCode V2 load and acceptance matrix
-# when matrix paths or version pins change.
+# when matrix paths, version pins, or the plugin and bridge code the real host
+# exercises change. A plugin change once broke how OpenCode 2 files a refused
+# shell command and went unnoticed for two weeks because only the matrix's own
+# files triggered this gate.
 # Per branch-protection rules: paths-filtered jobs must never be a required check on main.
 
 on:
   pull_request:
     paths:
+      - "packages/opencode-plugin/src/**"
+      - "packages/aft-bridge/src/**"
       - "packages/opencode-plugin/test/matrix/**"
       - "packages/opencode-plugin/test/load-matrix/**"
       - ".github/opencode-version.txt"
