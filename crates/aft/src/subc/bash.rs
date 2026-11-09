@@ -6275,6 +6275,375 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
+    mod held_bash_contract {
+        use super::*;
+        use crate::bash_background::{registry::SCOPE_REVOKED_REASON, BgTaskStatus};
+        use crate::exec_remote::wire_tests::{Daemon, Script};
+
+        struct HeldCall {
+            task_id: String,
+            metrics: Arc<DispatchPathMetrics>,
+            cancel: BashWaitCancel,
+            replies: mpsc::Receiver<BashDeferredCompletion>,
+        }
+
+        async fn start(
+            executor: &Arc<Executor>,
+            root: &ProjectRootId,
+            ctx: &AppContext,
+            dispatch: DispatchFn,
+            arguments: Value,
+            worker: bool,
+        ) -> HeldCall {
+            let waits = if arguments.get("runon").is_some() {
+                2
+            } else {
+                1
+            };
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (events_tx, mut events) = mpsc::unbounded_channel();
+            *metrics.lifecycle_probe.lock().unwrap() =
+                Some(super::super::super::SubcTestLifecycleProbe::new(events_tx));
+            let (_, mut cancel, _, head) = codemode_run_call(root);
+            cancel.run_scope = None;
+            cancel.scope = Some(head);
+            let replies =
+                with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                    deadline_test_call_controlled(
+                        executor,
+                        root,
+                        dispatch,
+                        arguments,
+                        Instant::now(),
+                        true,
+                        worker,
+                        metrics.clone(),
+                        cancel.clone(),
+                    )
+                });
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let mut observed = 0;
+                while let Some(event) = events.recv().await {
+                    if matches!(
+                        event,
+                        super::super::super::SubcLifecycleEvent::BashForegroundWait { .. }
+                    ) {
+                        observed += 1;
+                        // Remote capture publishes a detach target before the
+                        // ordinary foreground wait publishes its own target.
+                        if observed == waits {
+                            return;
+                        }
+                    }
+                }
+                panic!("held call must reach its foreground wait");
+            })
+            .await
+            .unwrap();
+            let task_id = ctx.bash_background().list(0)[0].info.task_id.clone();
+            HeldCall {
+                task_id,
+                metrics,
+                cancel,
+                replies,
+            }
+        }
+
+        fn job_cancels(daemon: &Daemon) -> usize {
+            // Request-level Cancel only closes an observation at ck-motor;
+            // exec.cancel is the operation that stops the remote job.
+            daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, body)| body["method"] == "exec.cancel")
+                .count()
+        }
+
+        async fn answer_from_loop(call: &HeldCall, root: &ProjectRootId, cancel: bool) {
+            let route = RouteChannel {
+                channel: 1,
+                epoch: 1,
+            };
+            if cancel {
+                assert!(call.metrics.held_bash_calls.request_cancel(route, 1));
+            }
+            let routes = HashMap::from([(
+                route,
+                super::super::super::test_support::route_identity(root, "deadline-session"),
+            )]);
+            let (tx, mut rx) = mpsc::channel(8);
+            assert_eq!(
+                answer_held_bash_calls_from_module_loop(&tx, &routes, &call.metrics, !cancel,)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let frame = rx.recv().await.unwrap().frame;
+            if cancel {
+                assert_eq!(frame.header.ty, FrameType::Error);
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["code"], "cancelled");
+                assert_eq!(body["detail"]["task_id"], call.task_id);
+            }
+        }
+
+        async fn settled(ctx: &AppContext, task_id: &str) -> crate::bash_background::BgTaskInfo {
+            wait_for_task_state(ctx, "held command terminal", |registry| {
+                registry.is_task_terminal(task_id)
+            })
+            .await;
+            owner_status(ctx, task_id)
+        }
+
+        #[tokio::test]
+        async fn held_local_worker_cancel_stops_the_command() {
+            let (dir, root, executor, ctx) = local_codemode_fixture();
+            let release = dir.path().join("release");
+            let _release = DeferredWaitReleaseGuard(vec![release.clone()]);
+            let call = start(&executor, &root, &ctx, local_bash_stub,
+                json!({"command":format!("until [ -e '{}' ]; do sleep 0.02; done", release.display()), "timeout":60000}), true).await;
+            answer_from_loop(&call, &root, true).await;
+            assert_eq!(
+                settled(&ctx, &call.task_id).await.status,
+                BgTaskStatus::Killed
+            );
+        }
+
+        #[tokio::test]
+        async fn held_runon_worker_cancel_sends_one_job_cancel() {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::GatedStages { position: 1 }).await;
+            let call = start(
+                &executor,
+                &root,
+                &ctx,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "timeout":60000}),
+                true,
+            )
+            .await;
+            daemon.wait_for_requests("exec.run", 1).await;
+            wait_for_task_state(&ctx, "remote job accepted", |registry| {
+                registry
+                    .task_for_test(&call.task_id)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .accepted
+            })
+            .await;
+            answer_from_loop(&call, &root, true).await;
+            assert_eq!(
+                settled(&ctx, &call.task_id).await.status,
+                BgTaskStatus::Killed
+            );
+            assert_eq!(
+                job_cancels(&daemon),
+                1,
+                "one cancellation intent must send one exec.cancel"
+            );
+        }
+
+        #[tokio::test]
+        async fn held_worker_call_refuses_yield_with_scope() {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::GatedStages { position: 1 }).await;
+            let call = start(
+                &executor,
+                &root,
+                &ctx,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "timeout":60000}),
+                true,
+            )
+            .await;
+            assert!(matches!(
+                call.metrics.held_bash_calls.claim_for_yield(
+                    RouteChannel {
+                        channel: 1,
+                        epoch: 1
+                    },
+                    1,
+                ),
+                Err(super::super::super::call_yield::NotYieldable::Scope)
+            ));
+            assert_eq!(job_cancels(&daemon), 0);
+            daemon.output_gate.notify_one();
+            daemon.completion_gate.notify_one();
+            assert_eq!(
+                settled(&ctx, &call.task_id).await.status,
+                BgTaskStatus::Completed
+            );
+        }
+
+        #[tokio::test]
+        async fn held_runon_carrier_changes_and_yield_detach_without_job_cancel() {
+            for change in ["route-close", "rebind", "drain", "restart", "yield"] {
+                let (daemon, _dir, root, executor, ctx) =
+                    capture_fixture(Script::GatedStages { position: 1 }).await;
+                let mut call = start(
+                    &executor,
+                    &root,
+                    &ctx,
+                    remote_runon_stub,
+                    json!({"command":"uname -s", "runon":"linux", "timeout":60000}),
+                    change != "yield",
+                )
+                .await;
+                daemon.wait_for_requests("exec.run", 1).await;
+                match change {
+                    // GOODBYE and rebind both cancel the old route's wait signal;
+                    // connection loss cancels the connection's signal instead.
+                    "route-close" | "rebind" => call.cancel.route.cancel(),
+                    "restart" => call.cancel.connection.cancel(),
+                    "drain" => answer_from_loop(&call, &root, false).await,
+                    "yield" => {
+                        let route = RouteChannel {
+                            channel: 1,
+                            epoch: 1,
+                        };
+                        let target = call
+                            .metrics
+                            .held_bash_calls
+                            .claim_for_yield(route, 1)
+                            .unwrap();
+                        let identity = super::super::super::test_support::route_identity(
+                            &root,
+                            "deadline-session",
+                        );
+                        let (tx, mut rx) = mpsc::channel(8);
+                        answer_yielded_bash_call(&tx, &identity, &call.metrics, route, 1, target)
+                            .await
+                            .unwrap();
+                        let body: Value =
+                            serde_json::from_slice(&rx.recv().await.unwrap().frame.body).unwrap();
+                        assert_eq!(body["structuredContent"]["task_id"], call.task_id);
+                    }
+                    _ => unreachable!(),
+                }
+                let reply = tokio::time::timeout(Duration::from_secs(30), call.replies.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    reply.result.is_none(),
+                    "transport handoff does not complete the command"
+                );
+                assert!(
+                    !owner_status(&ctx, &call.task_id).status.is_terminal(),
+                    "{change}"
+                );
+                assert_eq!(job_cancels(&daemon), 0, "{change}");
+                daemon.output_gate.notify_one();
+                daemon.completion_gate.notify_one();
+                assert_eq!(
+                    settled(&ctx, &call.task_id).await.status,
+                    BgTaskStatus::Completed,
+                    "{change}"
+                );
+                assert_eq!(job_cancels(&daemon), 0, "{change}");
+            }
+        }
+
+        #[tokio::test]
+        async fn held_runon_confirmed_scope_end_sends_one_job_cancel() {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::GatedStages { position: 1 }).await;
+            let call = start(
+                &executor,
+                &root,
+                &ctx,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "timeout":60000}),
+                true,
+            )
+            .await;
+            wait_for_task_state(&ctx, "remote job accepted", |registry| {
+                registry
+                    .task_for_test(&call.task_id)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .accepted
+            })
+            .await;
+            let scope = call.cancel.scope.unwrap();
+            let registry = ctx.bash_background().clone();
+            // scope.describe's confirmed-ended handler invokes this same kill.
+            tokio::task::spawn_blocking(move || registry.kill_scope(&scope))
+                .await
+                .unwrap();
+            let done = settled(&ctx, &call.task_id).await;
+            assert_eq!(done.status, BgTaskStatus::Killed);
+            assert_eq!(done.status_reason.as_deref(), Some(SCOPE_REVOKED_REASON));
+            assert_eq!(job_cancels(&daemon), 1);
+        }
+
+        #[tokio::test]
+        async fn held_runon_bash_kill_sends_one_job_cancel() {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::GatedStages { position: 1 }).await;
+            let call = start(
+                &executor,
+                &root,
+                &ctx,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "timeout":60000}),
+                true,
+            )
+            .await;
+            wait_for_task_state(&ctx, "remote job accepted", |registry| {
+                registry
+                    .task_for_test(&call.task_id)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .accepted
+            })
+            .await;
+            let task_id = call.task_id.clone();
+            let kill_ctx = ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::commands::bash_kill::handle(
+                    &RawRequest {
+                        id: "explicit-kill".into(),
+                        command: "bash_kill".into(),
+                        lsp_hints: None,
+                        session_id: Some("deadline-session".into()),
+                        params: json!({"task_id":task_id}),
+                    },
+                    &kill_ctx,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(result.success, "{result:?}");
+            assert_eq!(
+                settled(&ctx, &call.task_id).await.status,
+                BgTaskStatus::Killed
+            );
+            assert_eq!(job_cancels(&daemon), 1);
+        }
+    }
+
+    #[cfg(unix)]
     async fn capture_fixture(
         script: crate::exec_remote::wire_tests::Script,
     ) -> (
