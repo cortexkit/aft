@@ -508,12 +508,12 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
     )
     .await
     .unwrap();
-    if app.db().is_none() {
-        app.set_db(Arc::new(Mutex::new(
-            crate::db::open(&dir.path().join("aft.db")).unwrap(),
-        )));
-    }
-    let db = app.db().unwrap();
+    // Share the database the module opens itself: on macOS its startup opens
+    // `<storage>/aft.db` (to withdraw earlier builds' macOS cards), and that
+    // open replaces a handle installed under any other path. Opening the same
+    // path returns the one shared handle, whichever side opens it first.
+    std::fs::create_dir_all(&storage).unwrap();
+    let db = app.open_db(&storage.join("aft.db")).unwrap();
     let folder = crate::access_policy::policy_path(dir.path()).join("notes");
     {
         let conn = db.lock().unwrap();
@@ -561,6 +561,10 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
         .await,
     );
     let rows = listed["grants"].as_array().unwrap();
+    assert!(
+        Arc::ptr_eq(&app.db().unwrap(), &db),
+        "the handler reads the module's one shared database"
+    );
     assert_eq!(rows.len(), 1, "{listed}");
     assert_contract_row(&rows[0]);
     let id = rows[0]["id"].clone();
