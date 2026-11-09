@@ -127,6 +127,15 @@ impl NestedWorktreeBoundary {
     }
 }
 
+/// Whether the repository holding `root` keeps Git data for submodules
+/// (`<common git dir>/modules`). The index store's scan skips a submodule
+/// checkout below its root as it skips a nested linked worktree, while
+/// project walks descend into it (see [`NestedWorktreeBoundary`]), so only
+/// in such a repository can the store's file list differ from a walk's.
+pub(crate) fn repository_has_submodules(root: &Path) -> bool {
+    project_git_common_dir(root).is_some_and(|common| common.join("modules").is_dir())
+}
+
 /// This repository's common git dir for walks rooted at `root`: the `.git`
 /// directory of a main checkout, the `commondir` target of a linked-worktree
 /// checkout, or a submodule admin dir for a submodule checkout. `None` when

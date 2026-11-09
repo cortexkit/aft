@@ -6079,14 +6079,18 @@ mod guard_tests {
     /// A tree where every rule of the source walk decides something: files
     /// ignored by `.gitignore`, `.aftignore` and a nested repository's own
     /// `.gitignore`, a nested linked worktree (skipped), a nested independent
-    /// repository and a submodule-style checkout (both walked), skipped
-    /// folders, non-source files and symlinks. Returns the root, the folder
-    /// holding it, and the sorted list a walk of it finds.
-    fn store_list_fixture() -> (PathBuf, tempfile::TempDir, Vec<PathBuf>) {
+    /// repository (walked), skipped folders, non-source files and symlinks;
+    /// with `submodule`, also a submodule checkout (walked). Returns the
+    /// root, the folder holding it, and the sorted list a walk of it finds.
+    fn store_list_fixture(submodule: bool) -> (PathBuf, tempfile::TempDir, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let fixture =
             crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "store_list");
         let root = canonicalize_for_snapshot(&fixture.root);
+        if !submodule {
+            std::fs::remove_dir_all(&fixture.submodule).unwrap();
+            std::fs::remove_dir_all(root.join(".git/modules")).unwrap();
+        }
         for (path, contents) in [
             ("src/lib.ts", "export const lib = 1;\n"),
             (".gitignore", "ignored/\n"),
@@ -6110,14 +6114,10 @@ mod guard_tests {
         }
         let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         walked.sort();
-        for kept in [
-            "src/main.rs",
-            "src/lib.ts",
-            "vendor/independent/inner.rs",
-            "submod/code.rs",
-        ] {
+        for kept in ["src/main.rs", "src/lib.ts", "vendor/independent/inner.rs"] {
             assert!(walked.contains(&root.join(kept)), "{kept}: {walked:?}");
         }
+        assert_eq!(walked.contains(&root.join("submod/code.rs")), submodule);
         for left_out in [
             "ignored/skip.rs",
             "aftignored/skip.rs",
@@ -6137,7 +6137,6 @@ mod guard_tests {
         );
         (root, dir, walked)
     }
-
     /// A context whose index-store checkout of `root` is bound and has
     /// published its scan, as the daemon's is once a root is configured.
     fn bound_store_context(root: &Path) -> crate::context::AppContext {
@@ -6159,7 +6158,7 @@ mod guard_tests {
     /// of the folder finds.
     #[test]
     fn background_todo_refresh_lists_files_from_the_bound_store_without_walking() {
-        let (root, _dir, walked) = store_list_fixture();
+        let (root, _dir, walked) = store_list_fixture(false);
         let ctx = bound_store_context(&root);
         assert!(ctx
             .data_checkout()
@@ -6198,12 +6197,13 @@ mod guard_tests {
     }
 
     /// While the store's list can miss changes (a rescan against the disk is
-    /// pending) or there is no store to ask, the files are walked, giving the
-    /// same list; once the rescan ends the store's list is used again.
+    /// pending), could differ from the walk's (the repository has
+    /// submodules) or there is no store to ask, the files are walked, giving
+    /// the walk's list; once the rescan ends the store's list is used again.
     #[test]
     fn scope_files_walks_only_while_the_store_cannot_stand_in() {
         use super::super::inventory::StoreListMiss;
-        let (root, _dir, walked) = store_list_fixture();
+        let (root, _dir, walked) = store_list_fixture(false);
         let unbound = tempfile::tempdir().unwrap();
         let unbound = canonicalize_for_snapshot(unbound.path());
         assert_eq!(
@@ -6224,6 +6224,21 @@ mod guard_tests {
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
         checkout.checkout().end_rescan();
         assert_same_files(&root, &scope_files(&root, &project), &walked);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+
+        // The store's scan skips the submodule checkout the walk lists.
+        let (root, _dir, walked) = store_list_fixture(true);
+        let _ctx = bound_store_context(&root);
+        assert_eq!(
+            crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+            Some(StoreListMiss::Submodules)
+        );
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(
+            scope_files(&root, &JobScope::for_project(root.clone())),
+            walked
+        );
+        assert!(walked.contains(&root.join("submod/code.rs")));
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
     }
 
