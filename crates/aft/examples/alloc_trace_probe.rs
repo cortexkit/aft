@@ -45,7 +45,14 @@
 //! `replay <pack.jsonl.gz> [publish_every] [threads]` replays an edit pack
 //! through one checkout, publishing its changes every `publish_every` edits
 //! (8 by default) and at each commit's end, and counts the refreshes that
-//! had to start a call-graph engine because a publication dropped it.
+//! had to start a call-graph engine: before engines moved onto each
+//! publication of their changes, every publication dropped one.
+//!
+//! Each phase also prints its user and system CPU apart, its minor page
+//! faults and what glibc's allocator holds at its start and end; the first
+//! refreshes print the block reads they made through the layer's cache.
+//! With `PROBE_TRIM=1`, `refresh` hands the allocator's free memory back
+//! before the restart's refresh.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -135,6 +142,14 @@ fn cpu_seconds() -> f64 {
 /// User and system CPU seconds this process has spent, its threads included.
 #[cfg(unix)]
 fn cpu_seconds() -> f64 {
+    let (user, system, _) = usage();
+    user + system
+}
+
+/// User and system CPU seconds and minor page faults this process has had,
+/// its threads included.
+#[cfg(unix)]
+fn usage() -> (f64, f64, u64) {
     // SAFETY: getrusage only fills the struct it is given.
     let usage = unsafe {
         let mut usage = std::mem::zeroed::<libc::rusage>();
@@ -142,7 +157,72 @@ fn cpu_seconds() -> f64 {
         usage
     };
     let seconds = |time: libc::timeval| time.tv_sec as f64 + f64::from(time.tv_usec as i32) / 1e6;
-    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    (
+        seconds(usage.ru_utime),
+        seconds(usage.ru_stime),
+        u64::try_from(usage.ru_minflt).unwrap_or(0),
+    )
+}
+
+#[cfg(not(unix))]
+fn usage() -> (f64, f64, u64) {
+    (0.0, 0.0, 0)
+}
+
+/// glibc's `struct mallinfo2`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+#[derive(Default)]
+struct MallInfo2 {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn mallinfo2() -> MallInfo2;
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+/// What glibc's allocator holds: bytes taken from the system for its heaps,
+/// bytes in use, bytes free in its heaps, free chunks, and bytes mapped for
+/// large allocations. Main arena only for the counts glibc keeps per arena
+/// (`mallinfo2` sums every arena for the byte totals).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_figures() -> serde_json::Value {
+    // SAFETY: mallinfo2 only reads the allocator's own counters.
+    let info = unsafe { mallinfo2() };
+    serde_json::json!({
+        "heap_mib": info.arena >> 20,
+        "used_mib": info.uordblks >> 20,
+        "free_mib": info.fordblks >> 20,
+        "free_chunks": info.ordblks,
+        "fast_chunks": info.smblks,
+        "mapped_mib": info.hblkhd >> 20,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_figures() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+/// Hands the allocator's free pages back to the system and merges its free
+/// chunks, as the daemon's periodic relief does; a no-op off glibc.
+fn trim_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only works on the allocator's own state.
+    unsafe {
+        malloc_trim(0);
+    }
 }
 
 fn measure(phase: &str, arm: &str, work: impl FnOnce() -> String) {
@@ -269,25 +349,34 @@ fn label_peaks() -> serde_json::Value {
         .into()
 }
 
-/// Runs `work` as one phase and prints its wall and CPU seconds, the peak
-/// resident memory sampled while it ran, and each label's peak live bytes.
+/// Runs `work` as one phase and prints its wall and CPU seconds (user and
+/// system apart, with its minor page faults), the peak resident memory
+/// sampled while it ran, each label's peak live bytes, and what the
+/// allocator holds at its start and end.
 fn phase(name: &str, work: impl FnOnce() -> String) {
     let _ = label_peaks();
     let at_start = take_resident_peak();
-    let cpu = cpu_seconds();
+    let malloc_at_start = malloc_figures();
+    let (user, system, faults) = usage();
     let started = Instant::now();
     let detail = work();
     let wall = started.elapsed().as_secs_f64();
-    let cpu = cpu_seconds() - cpu;
+    let (user_end, system_end, faults_end) = usage();
+    let (user, system) = (user_end - user, system_end - system);
     println!(
         "{}",
         serde_json::json!({
             "phase": name,
             "wall_s": (wall * 100.0).round() / 100.0,
-            "cpu_s": (cpu * 100.0).round() / 100.0,
+            "cpu_s": ((user + system) * 100.0).round() / 100.0,
+            "user_s": (user * 100.0).round() / 100.0,
+            "sys_s": (system * 100.0).round() / 100.0,
+            "minor_faults": faults_end.saturating_sub(faults),
             "resident_mib_at_start": mib(at_start),
             "resident_peak_mib": mib(take_resident_peak()),
             "label_peak_mib": label_peaks(),
+            "malloc_at_start": malloc_at_start,
+            "malloc_at_end": malloc_figures(),
             "detail": detail,
         })
     );
@@ -474,29 +563,50 @@ fn refresh(mut args: impl Iterator<Item = String>) {
         format!("started from sibling {:?}", report.started_from_sibling)
     });
     phase("worktree_first_refresh", || {
-        edit_and_refresh(&worktree, &dir)
+        with_cache_counts(&layer, || edit_and_refresh(&worktree, &dir))
     });
     println!("engine parts {:?}", worktree.engine_memory_parts());
     // A restart: a new layer, so nothing the first process decoded or
-    // cached is reused, and the sibling bound again from the store.
+    // cached is reused, and the sibling bound again from the store. With
+    // `PROBE_TRIM=1` the allocator's free memory is handed back first, to
+    // tell what the first refresh left in the allocator from what it left
+    // elsewhere in the process.
     drop(sibling);
-    let restarted = Checkout::bind(
-        Arc::new(DataLayer::new(256 << 20, threads)),
-        &store,
-        family,
-        &sibling_dir,
-    )
-    .unwrap();
+    if std::env::var("PROBE_TRIM").is_ok_and(|value| value == "1") {
+        phase("trim", || {
+            trim_allocator();
+            String::new()
+        });
+    }
+    let restart_layer = Arc::new(DataLayer::new(256 << 20, threads));
+    let restarted =
+        Checkout::bind(Arc::clone(&restart_layer), &store, family, &sibling_dir).unwrap();
     phase("restart_first_refresh", || {
-        edit_and_refresh(&restarted, &sibling_dir)
+        with_cache_counts(&restart_layer, || {
+            edit_and_refresh(&restarted, &sibling_dir)
+        })
     });
+}
+
+/// `work`'s detail, followed by the block reads it made through `layer`'s
+/// cache: how many found their block cached, and how many read and
+/// checked it from its segment.
+fn with_cache_counts(layer: &DataLayer, work: impl FnOnce() -> String) -> String {
+    let before = layer.cache_stats();
+    let detail = work();
+    let after = layer.cache_stats();
+    format!(
+        "{detail}; block cache hits {}, misses {}",
+        after.hits - before.hits,
+        after.misses - before.misses
+    )
 }
 
 /// Replays an edit pack through one checkout built from its base files, as
 /// the runtime drives it: each edit recorded and refreshed, its changes
-/// published every `publish_every` edits and at each commit's end. A
-/// publication drops the call-graph engine, so the next refresh starts one
-/// again; prints how many refreshes did, and the time each kind took.
+/// published every `publish_every` edits and at each commit's end. Prints
+/// how many refreshes found no engine and started one, and the time each
+/// kind took.
 fn replay(mut args: impl Iterator<Item = String>) {
     use std::io::BufRead as _;
     let pack = PathBuf::from(args.next().unwrap());
@@ -602,9 +712,9 @@ fn restart(mut args: impl Iterator<Item = String>) {
         return;
     }
     std::fs::copy(&original, checkout_dir.join(EDITED)).unwrap();
-    let checkout = Checkout::bind(layer, &store, family, &checkout_dir).unwrap();
+    let checkout = Checkout::bind(Arc::clone(&layer), &store, family, &checkout_dir).unwrap();
     phase("process_restart_first_refresh", || {
-        edit_and_refresh(&checkout, &checkout_dir)
+        with_cache_counts(&layer, || edit_and_refresh(&checkout, &checkout_dir))
     });
 }
 

@@ -2406,7 +2406,9 @@ impl Checkout {
         // against the budget every checkout's engine shares.
         let kept = stats.is_some().then(|| {
             self.layer.engines.touch(&self.engine);
-            slot.as_ref().map_or(0, GraphEngine::census_bytes)
+            slot.as_ref()
+                .filter(|_| self.layer.engines.measure_due(&self.engine))
+                .map(GraphEngine::census_bytes)
         });
         drop(slot);
         if let Some(bytes) = kept {
@@ -2931,15 +2933,18 @@ impl Checkout {
         let started = Instant::now();
         match engine.rebased(to, applied) {
             Ok(engine) => {
-                let bytes = engine.census_bytes();
+                let bytes = self
+                    .layer
+                    .engines
+                    .measure_due(&self.engine)
+                    .then(|| engine.census_bytes());
                 *slot = Some(engine);
                 drop(slot);
                 self.layer.engines.kept(&self.engine, bytes);
                 crate::slog_info!(
-                    "perf data_layer engine_rebased: root={} {:.0}ms {} MiB",
+                    "perf data_layer engine_rebased: root={} {:.0}ms",
                     self.root.display(),
-                    elapsed_ms(started),
-                    bytes >> 20
+                    elapsed_ms(started)
                 );
             }
             Err(why) => crate::slog_info!(

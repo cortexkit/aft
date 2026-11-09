@@ -928,6 +928,56 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The replay's quick dependency check agrees with the full list for
+    /// every kind of surface query, whichever of its dependencies changed.
+    #[test]
+    fn a_surface_query_depends_on_exactly_its_listed_dependencies() {
+        let file = "crates/demo/src/a/b.rs".to_string();
+        let symbol = "f".to_string();
+        let queries = [
+            ViewSurfaceQuery::Language(file.clone()),
+            ViewSurfaceQuery::Module(file.clone(), symbol.clone()),
+            ViewSurfaceQuery::MacroUse(file.clone()),
+            ViewSurfaceQuery::Parent(file.clone()),
+            ViewSurfaceQuery::Reexports(file.clone()),
+            ViewSurfaceQuery::Node(file.clone(), symbol.clone()),
+            ViewSurfaceQuery::Callable(file.clone(), symbol.clone()),
+            ViewSurfaceQuery::Alias(file.clone(), symbol.clone()),
+            ViewSurfaceQuery::Export(file.clone(), symbol.clone()),
+            ViewSurfaceQuery::Default(file.clone()),
+            ViewSurfaceQuery::Contains(file.clone()),
+            ViewSurfaceQuery::Crate("demo".to_string()),
+            ViewSurfaceQuery::CrateRoot(file.clone()),
+            ViewSurfaceQuery::Inline(
+                file.clone(),
+                vec!["a".to_string(), "b".to_string()],
+                symbol.clone(),
+            ),
+            ViewSurfaceQuery::GoPackage(file.clone(), Some("example.com/m".to_string())),
+        ];
+        let mut candidates = queries
+            .iter()
+            .flat_map(ViewSurfaceQuery::dependencies)
+            .collect::<BTreeSet<_>>();
+        candidates.insert("crates/demo/src/other.rs".to_string());
+        candidates.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
+        candidates.insert(VIEW_GO_PACKAGE_DOMAIN.to_string());
+        candidates.insert(VIEW_GO_MODULES_DOMAIN.to_string());
+        for query in &queries {
+            let listed = query.dependencies();
+            assert!(!query.depends_on_any(&BTreeSet::new()), "{query:?}");
+            for candidate in &candidates {
+                let changed = BTreeSet::from([candidate.clone()]);
+                assert_eq!(
+                    query.depends_on_any(&changed),
+                    listed.contains(candidate),
+                    "{query:?} with {candidate:?} changed"
+                );
+            }
+        }
+    }
+
     #[test]
     fn blob_extraction_is_deterministic_for_nested_callers() {
         let source = include_str!("../../../../benchmarks/aft-search/author_real_query.py");
@@ -1865,11 +1915,7 @@ impl DispatchTypeTargetTrace {
         answers: &mut BTreeMap<ViewSurfaceQuery, String>,
     ) -> bool {
         self.queries.iter().all(|(query, expected)| {
-            !query
-                .dependencies()
-                .iter()
-                .any(|dependency| changed.contains(dependency))
-                || answer_is(query, expected, index, answers)
+            !query.depends_on_any(changed) || answer_is(query, expected, index, answers)
         })
     }
 
@@ -1962,11 +2008,7 @@ impl ViewBindingDependencies {
         answers: &mut BTreeMap<ViewSurfaceQuery, String>,
     ) -> bool {
         self.surface_queries.iter().all(|(query, expected)| {
-            !query
-                .dependencies()
-                .iter()
-                .any(|dependency| changed.contains(dependency))
-                || answer_is(query, expected, index, answers)
+            !query.depends_on_any(changed) || answer_is(query, expected, index, answers)
         })
     }
 
@@ -2923,6 +2965,35 @@ impl ViewSurfaceQuery {
             | Self::Export(file, _)
             | Self::Default(file)
             | Self::Contains(file) => vec![file.clone()],
+        }
+    }
+
+    /// Whether one of [`Self::dependencies`] is in `changed`, without
+    /// building the list for the queries whose dependencies are their file
+    /// and fixed domain keys: a replay asks this of every recorded query of
+    /// every file it replays, most of them naming one file.
+    fn depends_on_any(&self, changed: &BTreeSet<String>) -> bool {
+        match self {
+            Self::Parent(file) => {
+                changed.contains(file) || changed.contains(VIEW_RUST_MODULE_DOMAIN)
+            }
+            Self::GoPackage(..) => {
+                changed.contains(VIEW_GO_PACKAGE_DOMAIN) || changed.contains(VIEW_GO_MODULES_DOMAIN)
+            }
+            Self::Language(file)
+            | Self::MacroUse(file)
+            | Self::Module(file, _)
+            | Self::Reexports(file)
+            | Self::Node(file, _)
+            | Self::Callable(file, _)
+            | Self::Alias(file, _)
+            | Self::Export(file, _)
+            | Self::Default(file)
+            | Self::Contains(file) => changed.contains(file),
+            Self::Crate(..) | Self::CrateRoot(..) | Self::Inline(..) => self
+                .dependencies()
+                .iter()
+                .any(|dependency| changed.contains(dependency)),
         }
     }
 

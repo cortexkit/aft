@@ -32,6 +32,15 @@ pub(super) const ENGINE_IDLE: Duration = Duration::from_secs(10 * 60);
 /// the least recently used idle ones go.
 pub(super) const ENGINE_BUDGET: u64 = 1 << 30;
 
+/// How old an engine's measured bytes may be before a refresh measures it
+/// again. Walking a large engine takes tens of milliseconds, a few percent
+/// of a refresh, and an engine grows slowly between publications; the
+/// memory census walks no more often.
+const MEASURE_EVERY_MS: u64 = 30_000;
+
+/// [`EngineSlot::measured_ms`] for an engine not measured yet.
+const NEVER: u64 = u64::MAX;
+
 /// One checkout's engine, shared by the checkout and its data layer's
 /// [`EngineKeeper`]. Dereferences to the engine's lock.
 pub(super) struct EngineSlot {
@@ -44,6 +53,9 @@ pub(super) struct EngineSlot {
     /// The engine's bytes when it was last measured (see
     /// [`EngineKeeper::kept`]).
     bytes: AtomicU64,
+    /// When they were measured, in milliseconds since the keeper started;
+    /// [`NEVER`] until the slot's engine is first measured.
+    measured_ms: AtomicU64,
     /// The checkout's memory epoch, moved when the keeper lets the engine
     /// go so the census walks the checkout again.
     memory_epoch: Arc<AtomicU64>,
@@ -60,9 +72,11 @@ impl std::ops::Deref for EngineSlot {
 }
 
 impl EngineSlot {
-    /// Notes that a refresh started a new engine in this slot.
+    /// Notes that a refresh started a new engine in this slot, which is
+    /// measured when it is first kept.
     pub(super) fn note_start(&self) {
         self.starts.fetch_add(1, Ordering::AcqRel);
+        self.measured_ms.store(NEVER, Ordering::Release);
     }
 
     /// How many engines refreshes have started in this slot.
@@ -164,6 +178,7 @@ impl EngineKeeper {
             root,
             used_ms: AtomicU64::new(self.now_ms()),
             bytes: AtomicU64::new(0),
+            measured_ms: AtomicU64::new(NEVER),
             memory_epoch,
             starts: AtomicU64::new(0),
         });
@@ -179,13 +194,25 @@ impl EngineKeeper {
         slot.used_ms.store(self.now_ms(), Ordering::Release);
     }
 
-    /// Notes that `slot` keeps an engine of `bytes`, measured as the census
-    /// counts them, now that a refresh applied something to it or it moved
-    /// onto a new publication. Lets the least recently used other engines
-    /// go while all of them together hold more than the budget, and makes
-    /// sure the thread that lets idle engines go is running.
-    pub(super) fn kept(self: &Arc<Self>, slot: &Arc<EngineSlot>, bytes: u64) {
-        slot.bytes.store(bytes, Ordering::Release);
+    /// Whether the engine in `slot` is to be measured as it is kept: it has
+    /// not been yet, or its figure is older than [`MEASURE_EVERY_MS`].
+    pub(super) fn measure_due(&self, slot: &EngineSlot) -> bool {
+        let measured = slot.measured_ms.load(Ordering::Acquire);
+        measured == NEVER || self.now_ms().saturating_sub(measured) >= MEASURE_EVERY_MS
+    }
+
+    /// Notes that `slot` keeps an engine, now that a refresh applied
+    /// something to it or it moved onto a new publication, with its bytes
+    /// as the census counts them when [`Self::measure_due`] had it measured
+    /// (the last figure stands otherwise). Lets the least recently used
+    /// other engines go while all of them together hold more than the
+    /// budget, and makes sure the thread that lets idle engines go is
+    /// running.
+    pub(super) fn kept(self: &Arc<Self>, slot: &Arc<EngineSlot>, bytes: Option<u64>) {
+        if let Some(bytes) = bytes {
+            slot.bytes.store(bytes, Ordering::Release);
+            slot.measured_ms.store(self.now_ms(), Ordering::Release);
+        }
         self.enforce_budget(slot);
         let mut state = self.lock();
         if state.stopped {
