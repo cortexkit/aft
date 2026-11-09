@@ -16352,3 +16352,142 @@ async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
     assert_eq!(exec_runs(&daemon).len(), 2);
     assert!(!dir.path().join("dist/hello.txt").exists());
 }
+
+/// Requests the daemon received to list its catalog.
+fn catalog_lists(daemon: &crate::exec_remote::wire_tests::Daemon) -> usize {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["op"] == "catalog.list")
+        .count()
+}
+
+/// Task record writes and daemon catalog lists so far, for one task.
+fn monitor_counts(
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    task_id: &str,
+) -> (usize, usize) {
+    (
+        crate::bash_background::persistence::record_writes::get(task_id),
+        catalog_lists(daemon),
+    )
+}
+
+/// An accepted build-server job that is queued, then running, then quiet
+/// writes its task record and lists the daemon catalog only when its state
+/// changes: the worker's 50 ms polls in between cost neither.
+#[tokio::test]
+async fn runon_monitor_polls_without_a_change_write_nothing_and_list_no_catalog() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::GatedStages { position: 2 },
+        &[
+            "exec-remote/v1",
+            exec::types::SUBMISSION_KEY_CAPABILITY,
+            exec::types::PROGRESS_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    wait_for("the runner must accept the job", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Queued { position: 2 })
+    })
+    .await;
+    let launch = monitor_counts(&daemon, &task_id);
+    // Many polls of a queued job with nothing new from the runner.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let queued = monitor_counts(&daemon, &task_id);
+    daemon.output_gate.notify_one();
+    wait_for("the first output must mark the job running", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Running)
+    })
+    .await;
+    let started = monitor_counts(&daemon, &task_id);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let running = monitor_counts(&daemon, &task_id);
+    daemon.completion_gate.notify_one();
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    eprintln!(
+        "monitor counts (record writes, catalog lists): launch {launch:?}, queued {queued:?}, started {started:?}, running {running:?}"
+    );
+    assert_eq!(queued, launch, "a queued job's polls changed nothing");
+    assert_eq!(
+        running, started,
+        "a quiet running job's polls changed nothing"
+    );
+}
+
+/// A running job that streams output steadily saves its output cursor at
+/// most once per checkpoint interval and never lists the catalog.
+#[tokio::test]
+async fn runon_monitor_steady_output_writes_only_checkpoints_and_lists_no_catalog() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Continuous,
+        &[
+            "exec-remote/v1",
+            exec::types::SUBMISSION_KEY_CAPABILITY,
+            exec::types::PROGRESS_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    let task = registry.task(&task_id).unwrap();
+    wait_for("the job must start streaming output", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Running)
+    })
+    .await;
+    let started = monitor_counts(&daemon, &task_id);
+    let bytes = fs::metadata(&task.paths.stdout).unwrap().len();
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let streamed = monitor_counts(&daemon, &task_id);
+    let streamed_bytes = fs::metadata(&task.paths.stdout).unwrap().len() - bytes;
+    assert!(registry.record_remote_cancel(&task).unwrap());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::Killed
+    );
+    eprintln!(
+        "steady output counts (record writes, catalog lists): started {started:?}, after 3 s {streamed:?}, {streamed_bytes} output bytes"
+    );
+    assert!(
+        streamed_bytes > 100,
+        "the runner kept streaming: {streamed_bytes}"
+    );
+    assert_eq!(streamed.1, started.1, "streaming output lists no catalog");
+    assert!(
+        streamed.0 - started.0 <= 1,
+        "at most one output checkpoint in 3 s: {started:?} -> {streamed:?}"
+    );
+}

@@ -3007,6 +3007,8 @@ fn write_task_in_dir(
 ) -> io::Result<()> {
     crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
+    record_writes::record(&task.task_id);
+    #[cfg(test)]
     TASK_IO_FAULT.with(|slot| {
         if matches!(slot.get(), Some(TaskIoFault::RecordWriteNotFound)) {
             // Fail one record write without moving live output directories.
@@ -4824,6 +4826,39 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
 #[cfg(test)]
 #[path = "metadata_persistence_test.rs"]
 mod metadata_persistence_tests;
+
+/// Task record writes per task id, counted across threads. A remote task's
+/// record is written by its worker thread, which the thread-local
+/// [`work_counts`] of the test thread never sees.
+#[cfg(test)]
+pub(crate) mod record_writes {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<String, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record(task_id: &str) {
+        *counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(task_id.to_owned())
+            .or_default() += 1;
+    }
+
+    /// Record writes started for `task_id`, including writes whose content
+    /// was unchanged (those still sync the record).
+    pub(crate) fn get(task_id: &str) -> usize {
+        counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod work_counts {
