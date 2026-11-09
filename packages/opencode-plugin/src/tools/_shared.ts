@@ -149,7 +149,7 @@ function canonicalizeDirectory(dir: string): string {
  * OpenCode 2's per-call `directory` is the session's current Location, so it
  * wins over the cache after a session move. Only a call without a directory
  * falls back to the cache. Its `worktree` is the main checkout, which is the
- * wrong root for a session in a linked git worktree (issue #387).
+ * wrong root for a session in a linked git worktree.
  *
  * OpenCode 1 still prefers the cached session directory: its `ctx.directory`
  * can be the launch cwd rather than the resumed session's project. Without
