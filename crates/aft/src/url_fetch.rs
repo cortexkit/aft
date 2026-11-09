@@ -3423,7 +3423,7 @@ pub mod timing {
             }
             self.owns = false;
             COLLECTOR
-                .with(|collector| collector.borrow_mut().take())
+                .with(|collector| collector.replace(None))
                 .filter(|times| times.fetches > 0)
         }
     }
