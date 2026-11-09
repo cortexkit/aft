@@ -57,15 +57,13 @@ const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 /// ([`ManifestJoinError::Cancelled`]) reports the same text.
 pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publication refused";
 
-/// An error raised while decoding or assembling manifest-addressed callgraph data.
+/// An error raised while decoding parse payloads or resolving checkout references.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestJoinError {
     Cancelled,
     UnsupportedLanguage(String),
     Parse(String),
     InvalidBlob(String),
-    MissingBlob(String),
-    InvalidConfig { path: Vec<u8>, reason: String },
 }
 
 impl fmt::Display for ManifestJoinError {
@@ -77,15 +75,6 @@ impl fmt::Display for ManifestJoinError {
             }
             Self::Parse(reason) => write!(formatter, "callgraph blob parse failed: {reason}"),
             Self::InvalidBlob(reason) => write!(formatter, "invalid callgraph blob: {reason}"),
-            Self::MissingBlob(key) => write!(
-                formatter,
-                "manifest references missing callgraph blob {key}"
-            ),
-            Self::InvalidConfig { path, reason } => write!(
-                formatter,
-                "invalid manifest config {}: {reason}",
-                String::from_utf8_lossy(path)
-            ),
         }
     }
 }

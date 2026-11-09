@@ -41,10 +41,9 @@ pub use crate::process_identity::process_start_time_ms;
 pub(crate) use location::acquire_cache_cleanup_lease;
 pub(crate) use location::canonical_root;
 #[cfg(test)]
-pub(crate) use location::markers::sweep_all_read_markers;
+pub(crate) use location::markers::{sweep_all_read_markers, sweep_read_markers};
 pub use location::markers::{
-    protected_read_marker_exists, read_marker_dir, sweep_read_markers, ReadMarker,
-    ReadMarkerMetadata, ReadMarkerSweep, READ_MARKER_CROSS_HOST_STALE_MS,
+    ReadMarker, ReadMarkerMetadata, ReadMarkerSweep, READ_MARKER_CROSS_HOST_STALE_MS,
     READ_MARKER_TOUCH_INTERVAL_MS,
 };
 pub use location::{

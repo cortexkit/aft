@@ -102,43 +102,6 @@ impl ReadMarker {
         Self::create_inner(cache_dir, generation_label, None)
     }
 
-    /// A marker whose file also records `nonce`, so its holder can later
-    /// prove the file at its unique path is still its own acquisition.
-    pub fn create_with_nonce(
-        cache_dir: &Path,
-        generation_label: &str,
-        nonce: &str,
-    ) -> io::Result<Self> {
-        Self::create_inner(cache_dir, generation_label, Some(nonce.to_owned()))
-    }
-
-    /// True when the marker file at this marker's own path still exists and
-    /// carries this marker's metadata, nonce included. A sweep that judged the
-    /// owner dead removes the file, and this then reports `false`.
-    pub fn verify_held(&self) -> io::Result<bool> {
-        use std::io::Read;
-        let mut file = match self.generation.repair_read_file(&self.name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(crate::io_accounting::at(
-                    "opening reader marker",
-                    &self.path,
-                    error,
-                ))
-            }
-        };
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(32 * 1024)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                crate::io_accounting::at("reading reader marker", &self.path, error)
-            })?;
-        Ok(serde_json::from_slice::<ReadMarkerMetadata>(&bytes)
-            .is_ok_and(|stored| stored == self.metadata))
-    }
-
     fn create_inner(
         cache_dir: &Path,
         generation_label: &str,
@@ -235,7 +198,7 @@ fn reader_marker_drop_cannot_unlink_through_a_retargeted_generation_ancestor() {
     assert!(!parked.join("generation").join(name).exists());
 }
 
-pub fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
+fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
     cache_dir.join("readers").join(generation_label)
 }
 
@@ -408,11 +371,13 @@ pub struct ReadMarkerSweep {
     pub removed_stale: usize,
 }
 
-pub fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
+#[cfg(test)]
+fn protected_read_marker_exists(cache_dir: &Path, generation_label: &str) -> bool {
     read_marker_protection(cache_dir, generation_label, false).protected
 }
 
-pub fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
+#[cfg(test)]
+pub(crate) fn sweep_read_markers(cache_dir: &Path, generation_label: &str) -> ReadMarkerSweep {
     read_marker_protection(cache_dir, generation_label, true)
 }
 
@@ -434,6 +399,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
 fn read_marker_protection(
     cache_dir: &Path,
     generation_label: &str,
