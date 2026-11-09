@@ -6611,7 +6611,7 @@ pub fn other() { callee(); }
     /// resolved again. The update still lists and binds the module-declaring
     /// files and checks the recorded answers of every module that reads the
     /// root, but keeps none of the stored parses and resolutions it reads
-    /// for that decoded: kept, they took over a gigabyte on AFT's own
+    /// decoded; keeping them decoded took over a gigabyte on AFT's own
     /// checkout. Answers stay a cold build's.
     #[test]
     fn a_fresh_worktree_keeps_decoded_only_what_its_first_edit_resolves_again() {
