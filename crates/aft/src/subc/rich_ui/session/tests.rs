@@ -1060,3 +1060,54 @@ mod read_tests;
 
 #[path = "samples.rs"]
 mod samples;
+
+/// The HELLO manifest AFT registers must declare both capabilities the head
+/// proof reads; a hand-built capability list cannot catch a capability
+/// missing from the real one. With either removed, a core head's carried
+/// `bash_status` is refused as `unknown_tool` before anything is dispatched.
+#[tokio::test]
+async fn hello_capabilities_are_required_for_core_head_carrier_status() {
+    let f = Fixture::new("head");
+    let hello = crate::subc::manifest::build_manifest_without(&[]);
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    reads_and_calls(&f, ProofCapabilities::from_manifest(&hello), true);
+    for missing in ["call-modes/v1", "scope-on-behalf-of/v1"] {
+        let mut incomplete = hello.clone();
+        incomplete
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .provides
+            .retain(|capability| capability != missing);
+        let proofs = ProofCapabilities::from_manifest(&incomplete);
+        reads_and_calls(&f, proofs, false);
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(f.carrier.root.clone(), f.ctx.clone()));
+        let routes = HashMap::from([
+            (route_key(41, 9), f.carrier.clone()),
+            (route_key(43, 9), f.policy.clone()),
+        ]);
+        let reply = tool_provider::route_tests::exchange_decoded_with_capabilities(
+            decoded_request(
+                "bash_status",
+                json!({"rich_ui_op":"bash_status@1", "task":"not-started"}),
+                "head",
+                None,
+                42,
+            ),
+            &routes,
+            &executor,
+            &Arc::new(DispatchPathMetrics::new()),
+            |_, _| panic!("a missing proof capability must refuse before dispatch"),
+            proofs,
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
+        assert_eq!(
+            body,
+            super::super::carrier::error_body("unknown_tool"),
+            "{missing}"
+        );
+    }
+}

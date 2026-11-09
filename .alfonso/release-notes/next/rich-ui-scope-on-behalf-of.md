@@ -1,0 +1,1 @@
+- Groundwork for the CortexKit apps' Rich UI: AFT now declares `scope-on-behalf-of/v1`, so the daemon passes along which agent a session works for. AFT uses it only to tell a session's own head from an agent working for another, never as permission; nothing changes for users yet.
