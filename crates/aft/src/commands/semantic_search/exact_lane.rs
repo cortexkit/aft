@@ -884,14 +884,20 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
     )
 }
 
-/// Lexical verification and the exact lane normalize the same freshly read
-/// bytes. Share their existing bounded preparation, not their phrase, window or
-/// definition match decisions. Keep both disk reads so intervening edits remain
-/// visible to the lane that reads the changed bytes.
+/// Lexical verification and the exact lane normalize the same bytes, which
+/// one search request reads once (see `request_files`). Share their existing
+/// bounded preparation, keyed by the bytes' digest, not their phrase, window
+/// or definition match decisions; a later request that reads changed bytes
+/// gets a new digest and prepares them afresh.
 pub(super) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
     static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
+    // Prepared text runs about twice the size of its source (the normalized
+    // copy plus the symbol list). On AFT's own tree, about 18 MB of text,
+    // that is 36-40 MB, and a 32 MiB cap evicted an entry on every miss
+    // (hit rate 66-80% under eight concurrent searches). The cache is
+    // process-wide, so this cap is its whole memory cost.
     CACHE
-        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
+        .get_or_init(|| PreparedExactCache::new(64 * 1024 * 1024))
         .prepare(digest, text)
 }
 
