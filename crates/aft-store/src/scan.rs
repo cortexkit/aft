@@ -743,13 +743,23 @@ fn git_common_dir(root: &Path) -> Option<PathBuf> {
 /// Whether `dir` is a linked worktree of the repository whose common Git
 /// directory is `common`: it has a `.git` file pointing into that
 /// directory. Its files belong to its own checkout.
+///
+/// Only a `.git` file naming `<common>/worktrees/<name>` (the layout
+/// `git worktree add` creates) counts. A submodule's `.git` file names
+/// `<common>/modules/<name>`: it is not a linked worktree, and its files stay
+/// members, as AFT's project walk keeps them.
 fn is_nested_worktree(dir: &Path, common: Option<&Path>) -> bool {
     let Some(common) = common else {
         return false;
     };
     gitdir_of_file(&dir.join(".git"))
         .and_then(|git_dir| std::fs::canonicalize(git_dir).ok())
-        .is_some_and(|git_dir| git_dir.starts_with(common))
+        .is_some_and(|git_dir| {
+            git_dir.parent().is_some_and(|worktrees| {
+                worktrees.file_name() == Some(OsStr::new("worktrees"))
+                    && worktrees.parent() == Some(common)
+            })
+        })
 }
 
 /// The directory a `.git` file points at.
@@ -1035,6 +1045,33 @@ mod tests {
             );
             assert!(partial.changed.is_empty(), "{:?}", partial.changed);
         }
+    }
+
+    #[test]
+    fn a_submodule_is_a_member_and_a_linked_worktree_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |path: &str, bytes: &[u8]| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(".git/HEAD", b"ref: refs/heads/main\n");
+        write("src/a.rs", b"fn a() {}\n");
+        // A submodule: its git dir lives under the common dir's `modules/`.
+        std::fs::create_dir_all(root.join(".git/modules/sub")).unwrap();
+        write("sub/.git", b"gitdir: ../.git/modules/sub\n");
+        write("sub/lib.rs", b"pub fn lib() {}\n");
+        // A linked worktree of this repository: another checkout's files.
+        std::fs::create_dir_all(root.join(".git/worktrees/w")).unwrap();
+        write("w/.git", b"gitdir: ../.git/worktrees/w\n");
+        write("w/inner.rs", b"fn inner() {}\n");
+
+        let scanned = scan(root, &ScanPolicy::default(), None, &Collect::default()).unwrap();
+        assert_eq!(
+            paths(&scanned.state),
+            vec!["src/a.rs".to_string(), "sub/lib.rs".to_string()]
+        );
     }
 
     #[test]
