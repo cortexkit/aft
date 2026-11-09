@@ -17,6 +17,7 @@ vectors are the acceptance artifact, the Rust tests only drive them.
 | `redirect` | M3 | re-evaluation of every hop |
 | `scrub` | S1, S2 | encodings of a key and a streaming scrubber with an overlap window |
 | `audit` | A1 | audit record v1 |
+| `scope` | vault multi-host scopes | strict input parse, stored decode, literal target matching and pinned PSL identity |
 
 Vector file names are the contract: each group has committed inputs and
 expected outputs, so a behavior change shows up as a vector diff rather than
@@ -31,3 +32,27 @@ refuses a record whose text fields hold any of the keys passed to it, raw or
 in any spelling the scrubber decodes. The guarantee covers the keys the caller
 passes, so a caller passes every key it holds. `Debug` on the record prints
 field lengths, not field text.
+
+## Vault scopes
+
+`scope::SecretScope::parse_input(kind, fields)` accepts only scope fields:
+`host`/`path_prefix`, `rules`, `origin`, or `origins`. Transport metadata and
+location remain the caller's responsibility. It checks shape, count, entries in
+sent order, exact-rule singletons, duplicates, and then the public suffix policy;
+`ScopeRefusal::code()` maps refusals to `invalid_params` or `limit_exceeded`.
+Successful scopes emit canonical fields through `to_value()`.
+
+`decode_stored` instead requires canonical order and both fields in emitted
+rules, treats empty prefixes as absent, and never consults the PSL. `matches`
+compares one concrete `UseTarget` without decoding paths, for both legacy and
+extended scopes. These vault rules are separate from the existing proxy wire
+normalization in `target`. For the vault's `admin.secret_put` operation, callers
+omit null legacy optional fields before parsing. For `secret.deposit` requests
+from the phone, callers preserve field presence even when a value is null.
+
+The creation-only PSL is parsed once lazily, including PRIVATE, wildcard and
+exception rules, with IDNA conversion. `scope::PSL_SNAPSHOT` exposes its URL,
+date and SHA-256. The unmodified file `src/scope/public_suffix_list.dat` is
+MPL-2.0, from publicsuffix/list commit
+`ab73a956765706dc3f42dbac5c7e48df2297e1ac`; its original license header is
+preserved. The rest of this crate remains MIT. Tests pin the file's SHA-256.

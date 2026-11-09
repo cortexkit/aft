@@ -14,6 +14,7 @@ pub mod location;
 pub mod material;
 pub mod placeholder;
 pub mod redirect;
+pub mod scope;
 pub mod scrub;
 pub mod target;
 mod work;
