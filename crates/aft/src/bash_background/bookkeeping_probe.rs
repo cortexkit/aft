@@ -15,6 +15,7 @@ fn cpu_micros() -> u64 {
 }
 
 fn phase(name: &str, tasks: usize, run: impl FnOnce()) -> work_counts::Counts {
+    eprintln!("bookkeeping begin {name}: tasks={tasks}");
     work_counts::reset();
     let cpu = cpu_micros();
     let wall = Instant::now();
