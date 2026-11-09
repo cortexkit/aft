@@ -29,7 +29,13 @@ use super::GraphEngine;
 pub(super) const ENGINE_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// How many bytes the engines of one data layer may hold together before
-/// the least recently used idle ones go.
+/// the least recently used idle ones go. Measured as the budget counts
+/// them: on AFT's own checkout (7,456 files) an engine holds about 105 MB
+/// after its first refresh, nearly all of it the files it bound; kept
+/// across every publication of a 430-edit replay of AFT's history it held
+/// 158 MiB at the median, 307 MiB at the 90th percentile and 344 MiB at
+/// most. A gibibyte keeps the engines of three worktrees refreshing at
+/// once, and of a few more agents' worktrees, without letting any go.
 pub(super) const ENGINE_BUDGET: u64 = 1 << 30;
 
 /// How old an engine's measured bytes may be before a refresh measures it
@@ -40,6 +46,33 @@ const MEASURE_EVERY_MS: u64 = 30_000;
 
 /// [`EngineSlot::measured_ms`] for an engine not measured yet.
 const NEVER: u64 = u64::MAX;
+
+/// Why an engine went, for the count the release log line carries.
+#[derive(Clone, Copy)]
+enum Release {
+    Idle,
+    Budget,
+    Unbind,
+}
+
+/// How many engines this process let go for each [`Release`], so the log
+/// shows how often the budget, rather than idleness or an unbind, sends
+/// one away.
+static RELEASED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Counts a release for `reason` and logs it with every count so far.
+fn log_release(root: &std::path::Path, bytes: u64, reason: Release, why: &str) {
+    RELEASED[reason as usize].fetch_add(1, Ordering::AcqRel);
+    let [idle, budget, unbind] = &RELEASED;
+    crate::slog_info!(
+        "data layer released the call-graph engine of {} ({} MiB): {why}; engines released so far: {} idle, {} over budget, {} unbound",
+        root.display(),
+        bytes >> 20,
+        idle.load(Ordering::Acquire),
+        budget.load(Ordering::Acquire),
+        unbind.load(Ordering::Acquire)
+    );
+}
 
 /// One checkout's engine, shared by the checkout and its data layer's
 /// [`EngineKeeper`]. Dereferences to the engine's lock.
@@ -71,6 +104,25 @@ impl std::ops::Deref for EngineSlot {
     }
 }
 
+impl Drop for EngineSlot {
+    /// The checkout is unbound: its engine goes with it.
+    fn drop(&mut self) {
+        let engine = self
+            .engine
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if engine.take().is_some() {
+            let bytes = *self.bytes.get_mut();
+            log_release(
+                &self.root,
+                bytes,
+                Release::Unbind,
+                "its checkout was unbound",
+            );
+        }
+    }
+}
+
 impl EngineSlot {
     /// Notes that a refresh started a new engine in this slot, which is
     /// measured when it is first kept.
@@ -84,9 +136,9 @@ impl EngineSlot {
         self.starts.load(Ordering::Acquire)
     }
 
-    /// Lets the engine go, unless a refresh holds it now; true when one
-    /// went.
-    fn release(&self, why: &str) -> bool {
+    /// Lets the engine go for `reason`, unless a refresh holds it now; true
+    /// when one went.
+    fn release(&self, reason: Release, why: &str) -> bool {
         let mut engine = match self.engine.try_lock() {
             Ok(engine) => engine,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -99,11 +151,7 @@ impl EngineSlot {
         let bytes = self.bytes.swap(0, Ordering::AcqRel);
         drop(released);
         self.memory_epoch.fetch_add(1, Ordering::AcqRel);
-        crate::slog_info!(
-            "data layer released the call-graph engine of {} ({} MiB): {why}",
-            self.root.display(),
-            bytes >> 20
-        );
+        log_release(&self.root, bytes, reason, why);
         true
     }
 
@@ -273,7 +321,7 @@ impl EngineKeeper {
                 total >> 20,
                 budget >> 20
             );
-            if slot.release(&why) {
+            if slot.release(Release::Budget, &why) {
                 total = total.saturating_sub(bytes);
             }
         }
@@ -299,7 +347,7 @@ impl EngineKeeper {
                 };
                 if due <= now {
                     let why = format!("no edit or refresh for {} s", idle / 1000);
-                    if slot.release(&why) {
+                    if slot.release(Release::Idle, &why) {
                         continue;
                     }
                     // A refresh took it meanwhile.
