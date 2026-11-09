@@ -23,19 +23,21 @@ use std::time::{Duration, Instant};
 use super::GraphEngine;
 
 /// How long an engine stays after its checkout's last edit or applied
-/// refresh. An agent's edits come seconds to minutes apart, and a checkout
-/// publishes its changes two minutes after its last edit; an engine kept
-/// past that serves the next burst of edits without starting again.
+/// refresh. A coding agent's edits come seconds to minutes apart, and a
+/// checkout publishes its changes two minutes after its last edit; an
+/// engine kept past that serves the next burst of edits without starting
+/// again.
 pub(super) const ENGINE_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// How many bytes the engines of one data layer may hold together before
 /// the least recently used idle ones go. Measured as the budget counts
 /// them: on AFT's own checkout (7,456 files) an engine holds about 105 MB
 /// after its first refresh, nearly all of it the files it bound; kept
-/// across every publication of a 430-edit replay of AFT's history it held
-/// 158 MiB at the median, 307 MiB at the 90th percentile and 344 MiB at
-/// most. A gibibyte keeps the engines of three worktrees refreshing at
-/// once, and of a few more agents' worktrees, without letting any go.
+/// across every publication of its changes (62 of them) in a 430-edit
+/// replay of AFT's history it held 158 MiB at the median, 307 MiB at the
+/// 90th percentile and 344 MiB at most. A gibibyte keeps the engines of
+/// three worktrees refreshing at once, and of a few more agents'
+/// worktrees, without letting any go.
 pub(super) const ENGINE_BUDGET: u64 = 1 << 30;
 
 /// How old an engine's measured bytes may be before a refresh measures it

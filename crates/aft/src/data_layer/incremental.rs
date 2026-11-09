@@ -629,8 +629,10 @@ impl LiveCheckout {
     /// computed so far. A file's binding and its method-call inputs follow
     /// from its parse, the checkout's paths and its configuration, all
     /// unchanged, so each stays as the new engine would compute it; every
-    /// file is found through the publication's terms again, which file it as
-    /// the engine's own index did. `Err` says why the two differ (other
+    /// file is found through the input terms the publication stored for it
+    /// again (the hashed keys each file's fragment is filed under, see
+    /// `graph_store`), which file it as the engine's own index did. `Err`
+    /// says why the two differ (other
     /// paths, files or parse keys, or an engine not started from a
     /// publication); the caller then starts a new engine instead.
     pub(crate) fn rebased(

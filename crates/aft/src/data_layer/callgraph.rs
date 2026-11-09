@@ -1763,8 +1763,9 @@ impl MethodCallInputs {
         }
     }
 
-    /// These inputs found through `stored`'s terms from now on, as
-    /// [`Self::stored`] finds them, keeping every file's inputs computed so
+    /// These inputs found through `stored`'s method terms from now on (the
+    /// hashed method names a publication files each file's fragment under),
+    /// as [`Self::stored`] finds them, keeping every file's inputs computed so
     /// far: `stored` is the publication of the parses and resolutions they
     /// were computed from, so its terms file every file as the in-memory
     /// filing does. `None` for inputs built from every file, which find
