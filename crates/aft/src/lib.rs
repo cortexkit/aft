@@ -182,7 +182,7 @@ pub mod reader_floor;
 pub mod response_finalize;
 pub(crate) mod revision_read;
 pub mod root_cache;
-pub(crate) mod root_identity;
+pub mod root_identity;
 pub mod run_tool_call;
 pub mod runtime_drain;
 pub mod runtime_registry;

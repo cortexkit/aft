@@ -1,6 +1,8 @@
 //! A root's first bound identity survives missing Git and process restarts.
 //! Path identities never become repository identities implicitly.
 
+pub mod key;
+
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -213,7 +215,7 @@ pub(crate) fn bind_with_recheck(
     // With Git available, resolve again under the record lock: a different
     // repository can replace a checkout without changing its canonical path.
     let before = crate::developer_tools::git_usable()
-        .then(|| crate::search_index::repository_identity_stamp(&root))
+        .then(|| crate::root_identity::key::repository_identity_stamp(&root))
         .flatten();
     // A saved record already holds this root's identity, so the older aft.db
     // pin is not consulted and a busy database cannot delay the bind.
@@ -247,7 +249,7 @@ pub(crate) fn bind_with_recheck(
     let probe_stamp = if choice.verified {
         if matches!(&identity, Identity::Git { .. }) {
             before.filter(|stamp| {
-                Some(stamp) == crate::search_index::repository_identity_stamp(&root).as_ref()
+                Some(stamp) == crate::root_identity::key::repository_identity_stamp(&root).as_ref()
             })
         } else {
             None
@@ -286,7 +288,7 @@ fn reusable(record: &Record, root: &Path, force: bool) -> bool {
         || !crate::developer_tools::git_usable()
         || (!force
             && record.probe_stamp.as_ref().is_some_and(|stamp| {
-                crate::search_index::repository_identity_stamp(root).as_ref() == Some(stamp)
+                crate::root_identity::key::repository_identity_stamp(root).as_ref() == Some(stamp)
             }))
 }
 
@@ -468,12 +470,12 @@ impl Identity {
 
     pub(crate) fn key(&self, root: &Path, standing: bool) -> String {
         match self {
-            Self::Path => crate::search_index::artifact_path_identity_key(root),
+            Self::Path => crate::root_identity::key::artifact_path_identity_key(root),
             Self::Git {
                 root_commit,
                 relative: None,
                 ..
-            } => crate::search_index::artifact_key_from_git_identity(root_commit),
+            } => crate::root_identity::key::artifact_key_from_git_identity(root_commit),
             Self::Git {
                 root_commit,
                 relative: Some(relative),
@@ -626,7 +628,7 @@ mod tests {
         )
         .unwrap();
         crate::developer_tools::with_git_usable_for_test(false, || {
-            let error = crate::search_index::artifact_cache_key_with_memo(
+            let error = crate::root_identity::key::artifact_cache_key_with_memo(
                 &root,
                 &root,
                 storage.path(),
