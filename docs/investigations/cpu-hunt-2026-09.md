@@ -122,7 +122,7 @@ Reproduce the graph measurements:
 AFT_CALLGRAPH_REFRESH_STORE=/path/to/source-or-copied/root-key-directory \
 AFT_CALLGRAPH_REFRESH_ROOT="$PWD" \
 AFT_CALLGRAPH_REFRESH_FILE=crates/aft/tests/engine_comparator_test.rs \
-cargo test -p agent-file-tools --test callgraph_refresh_bench \
+cargo test --features test-hooks -p agent-file-tools --test callgraph_refresh_bench \
   bench_refresh_files_on_store_copy -- --ignored --nocapture
 ```
 
@@ -166,8 +166,8 @@ Tool response rendering and the parity fixture are unchanged. Health diagnostics
 ## Gates
 
 - `cargo test -p agent-file-tools --lib`: **3,147 passed, 19 ignored** after the bind fix. Subsequent full-suite reruns after CPU-only benchmark instrumentation exposed unrelated environment/test-order failures: the live default database advanced to schema 10 while this source supports 9 (`standing_roots::tests::daemon_startup_empty_pass_marks_existing_snapshot_strict_on_first_configured_pass`). Rerunning with `XDG_DATA_HOME` inside the worktree avoids that live database; one default-parallel run then failed a semantic HTTP transient-classification test and two configure-tail timeout tests. A four-thread full run passed 3,146 tests and failed only `commands::configure::tests::cold_configure_starts_callgraph_before_semantic`; that test passed when rerun alone under the same isolated storage. These are recorded rather than weakening those tests or modifying the operator database.
-- `cargo test -p agent-file-tools --test integration subc_`: **117 passed, 5 ignored** (bridge, storm, detach and other matching subc integration coverage).
-- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: **12 passed**.
+- `cargo test --features test-hooks -p agent-file-tools --test integration subc_`: **117 passed, 5 ignored** (bridge, storm, detach and other matching subc integration coverage).
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test`: **12 passed**.
 - `git diff --exit-code 427895e45278924df01fee8353fb36806ec2c1ae -- crates/aft/tests/integration/tool_call_parity_test.rs`: **byte-identical source**.
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --all-targets`: passed.
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --target x86_64-pc-windows-gnu --all-targets`: passed.
@@ -242,8 +242,8 @@ A separate run of the copied-store probe against the same mutation also failed e
 ### Final gates for the projection fix
 
 - Full library with isolated default storage and serial test execution: `XDG_DATA_HOME=... cargo test -p agent-file-tools --lib -- --test-threads=1` — **3,149 passed, 20 ignored**. This avoids the default-database schema mismatch and the parallel/order failures described above, without changing tests.
-- `cargo test -p agent-file-tools --test integration callgraph`: initially **67 passed, 10 failed** because in-repository fixtures inherited this checkout's read-only worktree identity; the diagnostic error explicitly said the persisted store was unavailable in a read-only worktree. With `GIT_CEILING_DIRECTORIES="$PWD/crates/aft/tests/fixtures"` and isolated default storage, the same suite passed **77 tests**. This fences only fixture ancestor discovery; no parent checkout or daemon is warmed to make the test pass.
-- `cargo test -p agent-file-tools --test integration inspect`: **222 passed, 5 ignored**.
-- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: **12 passed**; parity source remains byte-identical to the task base.
+- `cargo test --features test-hooks -p agent-file-tools --test integration callgraph`: initially **67 passed, 10 failed** because in-repository fixtures inherited this checkout's read-only worktree identity; the diagnostic error explicitly said the persisted store was unavailable in a read-only worktree. With `GIT_CEILING_DIRECTORIES="$PWD/crates/aft/tests/fixtures"` and isolated default storage, the same suite passed **77 tests**. This fences only fixture ancestor discovery; no parent checkout or daemon is warmed to make the test pass.
+- `cargo test --features test-hooks -p agent-file-tools --test integration inspect`: **222 passed, 5 ignored**.
+- `cargo test --features test-hooks -p agent-file-tools --test integration tool_call_parity_test`: **12 passed**; parity source remains byte-identical to the task base.
 - Native and `--target x86_64-pc-windows-gnu` **all-target** Cargo checks with `RUSTFLAGS='-D warnings'`: passed after the final code edits.
 - Comment clarity review: no flagged changed comments. Formatter and diff whitespace checks: passed.

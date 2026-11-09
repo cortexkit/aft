@@ -58,7 +58,7 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     // Integration fixtures pin only the unpredictable producer input. Formatting
     // and legacy/result-body serialization below the handler remain unchanged.
-    #[cfg(feature = "test-conformance-result-inputs")]
+    #[cfg(feature = "test-hooks")]
     if let Ok(input) = std::env::var("AFT_TEST_CONFORMANCE_STATUS_SNAPSHOT") {
         snapshot = serde_json::from_str(&input).expect("conformance status snapshot is JSON");
     }

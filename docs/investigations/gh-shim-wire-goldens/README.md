@@ -48,7 +48,7 @@ rewritten):
 
 ```sh
 AFT_GH_SHIM_WIRE_GOLDENS_REGEN=1 CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
-  cargo test -p agent-file-tools --test gh_shim_wire_goldens_test -- --test-threads=1
+  cargo test --features test-hooks -p agent-file-tools --test gh_shim_wire_goldens_test -- --test-threads=1
 ```
 
 Without the variable the same test compares instead: each captured request

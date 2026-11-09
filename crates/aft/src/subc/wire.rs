@@ -1025,9 +1025,9 @@ fn serialize_tool_response_body_with_text(
         let response_id = data.and_then(|data| data.get("id"));
         // Early orchestration errors have no native dispatch. Pin only their
         // outgoing ID too; the remaining legacy/result body is serialized normally.
-        #[cfg(feature = "test-conformance-result-inputs")]
+        #[cfg(feature = "test-hooks")]
         let fixture_id = serde_json::json!("conformance-result-probe");
-        #[cfg(feature = "test-conformance-result-inputs")]
+        #[cfg(feature = "test-hooks")]
         let response_id = if std::env::var_os("AFT_TEST_CONFORMANCE_RESPONSE_ID").is_some() {
             Some(&fixture_id)
         } else {

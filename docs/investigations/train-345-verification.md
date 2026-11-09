@@ -66,14 +66,14 @@ Rust commands ran on Linux via `runon: "linux"`, each starting with `[ "$(uname)
 | `cargo check --target x86_64-pc-windows-gnu --tests -p agent-file-tools` | Unavailable: remote target is not installed; E0463 cannot find `core`/`std`. No Windows compile pass claimed. |
 | `cargo test -p agent-file-tools --lib` | 5415 passed, 18 failed, 48 ignored (5481 total). |
 | `cargo test -p agent-file-tools --bin aft` | 120 passed, 0 failed. |
-| `cargo test -p agent-file-tools --test integration` | Initial run: 2193 passed, 19 failed, 28 ignored (2240 total). Two contract mismatches corrected as described above; only impacted tests rerun. |
-| `cargo test -p agent-file-tools --test rest` | Initial E0063 corrected; subsequent full run: 247 passed, 3 failed, 6 ignored (256 total). |
-| `cargo test -p agent-file-tools --test semantic` | 52 passed, 0 failed, 2 ignored. |
-| `cargo test -p agent-file-tools --test list_envelope` | 175 passed, 0 failed. |
-| `cargo test -p agent-file-tools --test integration config_parity` | 1 passed, verifies the parity fixture corpus. |
-| `cargo test -p agent-file-tools --test integration rust_complex_use_lists_survive_edits_and_compile` | Final restored run: 1 passed. |
-| `cargo test -p agent-file-tools --test integration embed_counts_views_and_sessions_share_identical_content` | Final restored run: 1 passed. |
-| `cargo test -p agent-file-tools --test rest status_counts_inspect_seams` | 4 passed. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration` | Initial run: 2193 passed, 19 failed, 28 ignored (2240 total). Two contract mismatches corrected as described above; only impacted tests rerun. |
+| `cargo test --features test-hooks -p agent-file-tools --test rest` | Initial E0063 corrected; subsequent full run: 247 passed, 3 failed, 6 ignored (256 total). |
+| `cargo test --features test-hooks -p agent-file-tools --test semantic` | 52 passed, 0 failed, 2 ignored. |
+| `cargo test --features test-hooks -p agent-file-tools --test list_envelope` | 175 passed, 0 failed. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration config_parity` | 1 passed, verifies the parity fixture corpus. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration rust_complex_use_lists_survive_edits_and_compile` | Final restored run: 1 passed. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration embed_counts_views_and_sessions_share_identical_content` | Final restored run: 1 passed. |
+| `cargo test --features test-hooks -p agent-file-tools --test rest status_counts_inspect_seams` | 4 passed. |
 | `cargo test -p agent-file-tools --lib category_off_helper_preserves_active_and_retired_categories` | 1 passed; also passed in the full lib run. |
 | `cargo test -p agent-file-tools --lib disabled_inspect_category_starts_zero_jobs` | 1 passed; also passed in the full lib run. |
 

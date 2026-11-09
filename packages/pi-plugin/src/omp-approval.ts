@@ -171,19 +171,24 @@ function unquote(value: string): string {
     : value;
 }
 
+/** One `[path#TAG]` section of a hashline patch and the `MV` destinations it names. */
+export interface HashlinePatchSection {
+  path: string;
+  moves: string[];
+}
+
 /**
- * Every file a hashline patch names: each `[path#TAG]` section header and each
- * `MV` destination (grammar: docs/hashline.md). Lines are classified in the
- * engine parser's order (envelope, header, directive, `+` body row), so every
- * path the engine would act on is listed. It extracts targets and does not
- * validate the rest of the grammar, so it may list paths for a patch the
- * engine later rejects. Undefined when a line fits none of those forms or a
- * header or `MV` target is malformed: the caller must then fail toward asking.
+ * The sections of a hashline patch, in patch order: each `[path#TAG]` section
+ * header with the `MV` destinations that follow it (grammar: docs/hashline.md).
+ * Lines are classified in the engine parser's order (envelope, header,
+ * directive, `+` body row), so every path the engine would act on is listed. It
+ * extracts targets and does not validate the rest of the grammar, so it may
+ * list paths for a patch the engine later rejects. Undefined when a line fits
+ * none of those forms or a header or `MV` target is malformed.
  */
-export function hashlinePatchPaths(patch: string): string[] | undefined {
+export function hashlinePatchSections(patch: string): HashlinePatchSection[] | undefined {
   if (patch.trim().length === 0) return undefined;
-  const paths: string[] = [];
-  let sections = 0;
+  const sections: HashlinePatchSection[] = [];
   const rows = patch.split("\n");
   for (let index = 0; index < rows.length; index++) {
     const raw = rows[index] as string;
@@ -196,24 +201,34 @@ export function hashlinePatchPaths(patch: string): string[] | undefined {
       const inner = trimmed.slice(1, -1);
       const hash = inner.indexOf("#");
       if (hash <= 0) return undefined;
-      paths.push(inner.slice(0, hash));
-      sections++;
+      sections.push({ path: inner.slice(0, hash), moves: [] });
       continue;
     }
     const directive = /^(PUT|CUT|REM|MV)(?:\s|$)/.exec(line);
     if (directive) {
-      if (sections === 0) return undefined;
+      const current = sections[sections.length - 1];
+      if (current === undefined) return undefined;
       if (directive[1] === "MV") {
         const destination = line.slice(2).trim();
         if (destination.length === 0 || /\s/.test(destination)) return undefined;
-        paths.push(unquote(destination));
+        current.moves.push(unquote(destination));
       }
       continue;
     }
-    if (trimmed.length === 0 && sections === 0) continue;
-    if (sections === 0 || !line.startsWith("+")) return undefined;
+    if (trimmed.length === 0 && sections.length === 0) continue;
+    if (sections.length === 0 || !line.startsWith("+")) return undefined;
   }
-  return sections > 0 ? paths : undefined;
+  return sections.length > 0 ? sections : undefined;
+}
+
+/**
+ * Every file a hashline patch names: each `[path#TAG]` section header and each
+ * `MV` destination, in patch order (see `hashlinePatchSections`). Undefined
+ * when the patch cannot be read: the approval tier must then treat the call as
+ * one that names an outside path, so OMP asks before running it.
+ */
+export function hashlinePatchPaths(patch: string): string[] | undefined {
+  return hashlinePatchSections(patch)?.flatMap((section) => [section.path, ...section.moves]);
 }
 
 const APPLY_PATCH_TARGETS = [

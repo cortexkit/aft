@@ -49,7 +49,7 @@ test result: ok. 2 passed; 0 failed
 The overflow test holds the completion consumer while 5,000 files are created with the test-only 256-byte buffer, then routes the native overflow through the production filter. It receives exactly one `RescanRequired(BufferOverflow)`. Replacing the buffer-overflow mapping with `Unknown` under the `NON-VACUITY BREAK` mutation made that exact test fail alone (`0 passed; 1 failed`); restoring the file returned the diff stat to empty.
 
 ```text
-cargo nextest run -p agent-file-tools --test watcher_integration --no-fail-fast
+cargo nextest run --features test-hooks -p agent-file-tools --test watcher_integration --no-fail-fast
 Starting 23 tests across 1 binary
 Summary [113.705s] 23 tests run: 23 passed (1 slow), 0 skipped
 ```

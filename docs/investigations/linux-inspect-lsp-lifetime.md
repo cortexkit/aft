@@ -5,9 +5,9 @@
 Reproduced in Ubuntu 24.04, Linux x86_64 under OrbStack on an arm64 host, with the task worktree mounted at `/work` and isolated Cargo and target volumes. The container uses Rust 1.98.1 and the native C build dependencies described in [the Linux search-readiness investigation](linux-search-readiness.md); Python 3 is also required by the protocol-server fixtures in the broader LSP suite. All builds ran with `CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER=`.
 
 ```sh
-cargo test -p agent-file-tools --test integration inspect_command_test::a_typescript_file_still_starts_typescript -- --nocapture
-cargo test -p agent-file-tools --test integration inspect_command_test::blocking_inspect_returns_before_the_configured_request_deadline -- --nocapture
-cargo test -p agent-file-tools --test integration inspect_command_test::blocking_inspect_indexing_gap_names_elapsed_wait_and_retry -- --nocapture
+cargo test --features test-hooks -p agent-file-tools --test integration inspect_command_test::a_typescript_file_still_starts_typescript -- --nocapture
+cargo test --features test-hooks -p agent-file-tools --test integration inspect_command_test::blocking_inspect_returns_before_the_configured_request_deadline -- --nocapture
+cargo test --features test-hooks -p agent-file-tools --test integration inspect_command_test::blocking_inspect_indexing_gap_names_elapsed_wait_and_retry -- --nocapture
 ```
 
 At train 235 tip `a32b4e53ff666cd7e84e5e64241ff25888ecb93d`, `a_typescript_file_still_starts_typescript` failed four consecutive runs. Three failed the unscoped assertion (expected active Rust and TypeScript servers); one already failed the scoped assertion (expected an active TypeScript server). Both blocking deadline tests also failed at their reported assertions. CPU load was unnecessary. All three passed on main/train 234, `17f2c807c9f5df1b55e40b4efce3bd54e3262ecc`.
@@ -42,8 +42,8 @@ Linux LSP process creation is dispatched onto one process-lifetime spawning thre
 On the fixed Linux build:
 
 - New lifecycle regression: passed (and failed with `BrokenPipe` on the old implementation).
-- `cargo test -p agent-file-tools --test integration inspect_command_test:: -- --nocapture`: 72 passed, 4 ignored, including all three original failures.
-- `cargo test -p agent-file-tools --test integration lsp_manager_test:: -- --nocapture`: 26 passed, including delayed initialization, initialize timeout/retry, graceful shutdown, and forced group cleanup.
+- `cargo test --features test-hooks -p agent-file-tools --test integration inspect_command_test:: -- --nocapture`: 72 passed, 4 ignored, including all three original failures.
+- `cargo test --features test-hooks -p agent-file-tools --test integration lsp_manager_test:: -- --nocapture`: 26 passed, including delayed initialization, initialize timeout/retry, graceful shutdown, and forced group cleanup.
 - `cargo test -p agent-file-tools --lib lsp::client:: -- --nocapture`: 14 passed.
 - `cargo test -p agent-file-tools --lib lsp::child_registry:: -- --nocapture`: 13 passed.
 - `cargo check -p agent-file-tools --tests`: passed.

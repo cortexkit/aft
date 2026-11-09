@@ -17,7 +17,8 @@ lookup, rather than panicking or permitting the write. Symlink aliases and
 not-yet-created descendants are checked against every protected root.
 
 Debug assertions identify the builds that tests and development rigs normally
-run: plain `cargo test` and the `target/debug/aft` children spawned by Bun tests.
+run: `cargo test --features test-hooks` and the `target/debug/aft` children spawned
+by Bun tests.
 Those builds cannot write the account's production store by default. The fence
 uses `cfg!(debug_assertions)` directly; it does not require a release-card
 feature, a compile-time environment marker, or a packaging-specific build path.

@@ -1,3 +1,6 @@
+#[cfg(not(feature = "test-hooks"))]
+compile_error!("the integration test suite requires --features test-hooks");
+
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 mod context_storage_test;

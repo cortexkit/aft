@@ -256,7 +256,7 @@ Tools: `cargo 1.99.0 (5f94df478 2026-08-27)`,
 | `cargo test -p agent-file-tools --lib -- lock_diagnostics::` | 1 passed, 0 failed. |
 | `cargo test -p agent-file-tools --lib -- executor::` | 109 passed, 2 ignored, 0 failed. |
 | `cargo test -p agent-file-tools --bin aft --` | 122 passed, 0 failed. |
-| `cargo test -p agent-file-tools --test integration -- subc_` | 171 passed, 5 ignored, 0 failed. |
+| `cargo test --features test-hooks -p agent-file-tools --test integration -- subc_` | 171 passed, 5 ignored, 0 failed. |
 | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu` | Finished dev profile; compile-only, not Windows runtime coverage. |
 | Scoped AFT diagnostics | Authoritative diagnostics for 5/5 inspected files: 0 errors/warnings. Overall inspection remains PARTIAL because the checkout call-graph analysis is unavailable. |
 

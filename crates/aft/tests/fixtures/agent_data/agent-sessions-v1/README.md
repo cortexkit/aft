@@ -211,9 +211,9 @@ a backfill makes the data local.
 From the repository root, generate the vector files with:
 
 ```sh
-ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_records_match_published_files -- --nocapture
-ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_lifecycle_records_match_published_files -- --nocapture
-ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_rekey_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --features test-hooks --locked session_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --features test-hooks --locked session_lifecycle_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --features test-hooks --locked session_rekey_records_match_published_files -- --nocapture
 ```
 
 Refresh their hashes from the repository root with:

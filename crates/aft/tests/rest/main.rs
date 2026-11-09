@@ -1,3 +1,6 @@
+#[cfg(not(feature = "test-hooks"))]
+compile_error!("the rest test suite requires --features test-hooks");
+
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;

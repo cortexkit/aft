@@ -8,7 +8,7 @@ Compared **main `d286c3d3000bbd0d52b0a2f45043de332078b1c9`** with the original a
 
 All 40 previously reported failing Rust tests ran individually with exact-name selection on **ck-motor**, using the same command structure, toolchain, sandbox, serial execution (`RUST_TEST_THREADS=1`), and fresh disposable HOME/XDG namespaces. Every selected case executed exactly one test: there were no absent tests, zero-match passes, or skipped cases.
 
-Commands were `cargo test -p agent-file-tools --lib -- <name> --exact --nocapture` or `cargo test -p agent-file-tools --test <integration|rest> -- <name> --exact --nocapture`. Every remote shell command started with `[ "$(uname)" = Linux ] || exit 99`.
+Commands were `cargo test -p agent-file-tools --lib -- <name> --exact --nocapture` or `cargo test --features test-hooks -p agent-file-tools --test <integration|rest> -- <name> --exact --nocapture`. Every remote shell command started with `[ "$(uname)" = Linux ] || exit 99`.
 
 HOME and XDG_DATA/CONFIG/STATE/CACHE_HOME were created with `mkdir -p` under a fresh `/motor-home/aft-train345-ci.*` directory, outside the checkout and outside the runner's ordinary temporary-directory exemption. This reproduces CI's non-temp HOME classification without opening the real account database. `AFT_STORAGE_DIR` and `AFT_ALLOW_PRODUCTION_MIGRATION` were unset; existing CARGO_HOME/RUSTUP_HOME were retained for the toolchain. A new namespace was used for each revision so baseline writes could not seed the train's state.
 

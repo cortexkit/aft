@@ -140,7 +140,7 @@ listed below; Cargo commands used three-hour timeouts and were run sequentially.
 | `cargo test -p agent-file-tools --lib callgraph -- --test-threads=1` | 340 passed, 0 failed, 5 ignored |
 | `cargo test -p agent-file-tools --lib views:: -- --test-threads=1` | 159 passed, 0 failed, 6 ignored |
 | `cargo test -p agent-file-tools --bin aft -- callgraph` | 6 passed, 0 failed |
-| `cargo test -p agent-file-tools --test rest -- callgraph` | 83 passed, 0 failed, 6 ignored |
+| `cargo test --features test-hooks -p agent-file-tools --test rest -- callgraph` | 83 passed, 0 failed, 6 ignored |
 | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu` | Finished successfully, including test targets; compile-only, not Windows runtime verification |
 | `cargo fmt --all -- --check` | Passed, silent success |
 

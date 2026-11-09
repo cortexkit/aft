@@ -199,8 +199,8 @@ an empty unstaged diff. No existing test was rewritten to accept changed behavio
 All Cargo test commands used the temporary HOME/XDG setup described above.
 
 * `cargo test -p agent-file-tools --lib -- watcher`: 100 passed, 8 ignored.
-* `cargo test -p agent-file-tools --test integration -- watcher`: 22 passed.
-* `cargo test -p agent-file-tools --test watcher_integration`: 29 passed on macOS,
+* `cargo test --features test-hooks -p agent-file-tools --test integration -- watcher`: 22 passed.
+* `cargo test --features test-hooks -p agent-file-tools --test watcher_integration`: 29 passed on macOS,
   including config live reload, Git branch switching, and ignored-event floods.
 * `cargo test -p agent-file-tools --lib -- config_live --test-threads=1`:
   33 passed, including replacement directories and late directory creation.

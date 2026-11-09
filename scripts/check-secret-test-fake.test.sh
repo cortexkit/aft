@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Proves `scripts/check-secret-test-fake.sh` fails when the fake would ship.
+# Proves the release guard fails when either test-only feature would ship.
 #
 # Runs the guard against a throwaway copy of the workspace manifests, with one
 # change each time: a dependency edge that requests the feature, a `default`
@@ -50,24 +50,28 @@ clean="$work/clean"
 copy_manifests "$clean"
 expect_ok "the committed manifests" "$clean"
 
-# 1. A dependency edge in another crate requests the fake.
+# Check both features independently so protecting the fake cannot mask a missing
+# fixture-hook guard.
+for feature in secret-test-fake test-hooks; do
+# 1. A dependency edge in another crate requests the feature.
 edge="$work/edge"
 copy_manifests "$edge"
-printf '\n[dev-dependencies]\nagent-file-tools = { path = "../aft", features = ["secret-test-fake"] }\n' \
+printf '\n[dev-dependencies]\nagent-file-tools = { path = "../aft", features = ["%s"] }\n' "$feature" \
   >>"$edge/crates/aft-tokenizer/Cargo.toml"
-expect_fail "a dependency edge requesting the fake" "$edge"
+expect_fail "a dependency edge requesting $feature" "$edge"
 
-# 2. A default feature set names the fake.
+# 2. A default feature set names the test-only feature.
 default="$work/default"
 copy_manifests "$default"
-perl -0pi -e 's/\[features\]\n/[features]\ndefault = ["secret-test-fake"]\n/' \
+FEATURE="$feature" perl -0pi -e 's/\[features\]\n/[features]\ndefault = ["$ENV{FEATURE}"]\n/' \
   "$default/crates/aft/Cargo.toml"
-expect_fail "a default feature naming the fake" "$default"
+expect_fail "a default feature naming $feature" "$default"
 
 # 3. Another crate declares its own feature of the same name.
 impostor="$work/impostor"
 copy_manifests "$impostor"
-printf '\n[features]\nsecret-test-fake = []\n' >>"$impostor/crates/aft-tokenizer/Cargo.toml"
-expect_fail "an impostor feature in another crate" "$impostor"
+printf '\n[features]\n%s = []\n' "$feature" >>"$impostor/crates/aft-tokenizer/Cargo.toml"
+expect_fail "an impostor $feature in another crate" "$impostor"
+done
 
-printf 'secret-test-fake guard self-test: ok (1 pass, 3 failures)\n'
+printf 'secret-test-fake guard self-test: ok (1 pass, 6 failures)\n'

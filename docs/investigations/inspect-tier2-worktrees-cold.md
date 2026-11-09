@@ -122,7 +122,7 @@ Tool versions: Cargo 1.99.0, rustc 1.99.0, rust-analyzer 1.99.0 (all the install
 2026-09-28 toolchain). The isolated samples required the real server with:
 
 ```text
-AFT_TEST_REQUIRE_RUST_ANALYZER=1 cargo test -p agent-file-tools --test integration scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer
+AFT_TEST_REQUIRE_RUST_ANALYZER=1 cargo test --features test-hooks -p agent-file-tools --test integration scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer
 ```
 
 Unchanged base `205903927a5cc717199cb6c8085560e5070f8265`: **12 invocations,

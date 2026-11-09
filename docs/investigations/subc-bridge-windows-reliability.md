@@ -245,7 +245,7 @@ Unrelated failures, individually:
 Linux: `cargo test -p agent-file-tools --lib subc::` passed 338 tests (7 existing
 ignores). That combined run lost remote monitoring during integration; its
 integration outcome is recorded as unknown, not passed. The reviewer authorized
-one fresh read-only integration run; `cargo test -p agent-file-tools --test
+one fresh read-only integration run; `cargo test --features test-hooks -p agent-file-tools --test
 integration subc_bridge_test::` then passed 101 tests (2 existing ignores), in
 167.83 seconds. The final drain slice passed 7 tests. Rustfmt 1.10.0-stable
 `cargo fmt --all -- --check` passed. Final scoped rust-analyzer diagnostics were

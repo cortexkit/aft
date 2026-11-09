@@ -104,10 +104,10 @@ waiting for a legacy build.
 Commands:
 
 ```
-cargo test -p agent-file-tools --features test-timing-hooks --test integration standalone_ -- --nocapture
+cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration standalone_ -- --nocapture
 cargo test -p agent-file-tools --lib commands::configure::tests:: -- --test-threads=4
 cargo test -p agent-file-tools --lib -- commands::configure::tests:: context::callgraph_store_for_ops_tests:: runtime_drain::tests:: views::semantic_runtime::
-cargo test -p agent-file-tools --features test-timing-hooks --test integration -- per_checkout_9:: standalone_search_deferred_test::
+cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- per_checkout_9:: standalone_search_deferred_test::
 bun run --cwd packages/aft-bridge build
 bun run --cwd packages/aft-bridge typecheck
 bun run --cwd packages/pi-plugin typecheck
