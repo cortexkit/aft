@@ -224,7 +224,8 @@ export function hashlinePatchSections(patch: string): HashlinePatchSection[] | u
 /**
  * Every file a hashline patch names: each `[path#TAG]` section header and each
  * `MV` destination, in patch order (see `hashlinePatchSections`). Undefined
- * when the patch cannot be read: the caller must then fail toward asking.
+ * when the patch cannot be read: the approval tier must then treat the call as
+ * one that names an outside path, so OMP asks before running it.
  */
 export function hashlinePatchPaths(patch: string): string[] | undefined {
   return hashlinePatchSections(patch)?.flatMap((section) => [section.path, ...section.moves]);
