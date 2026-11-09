@@ -125,6 +125,14 @@ describe("taskKillDeadlineText", () => {
     );
   });
 
+  test("scope deadlines cannot be extended by worker waits", () => {
+    for (const source of ["scope", "scoped_default"]) {
+      const text = taskKillDeadlineText(running({ limit_ms: 1000, source }), "worker", startedAtMs);
+      expect(text).toContain("fixed Linux task scope limit");
+      expect(text).not.toContain("so it is not killed while you keep waiting");
+    }
+  });
+
   test("a remote task names its build-server phase instead of a missing deadline", () => {
     const queued = { ...running(), remote_phase_note: "queued on the runner (12 s, position 3)" };
     expect(taskKillDeadlineText(queued, "worker", defaultNowMs)).toBe(
