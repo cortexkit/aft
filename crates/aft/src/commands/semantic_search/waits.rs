@@ -168,6 +168,31 @@ pub struct SearchWaits {
     /// What the call's request file sets read from disk and kept, summed
     /// over nested requests (see `request_files`).
     pub files: super::request_files::RequestFilesReport,
+    /// How the exact lane's prepared-text cache served this call.
+    pub prepared: PreparedTextCounts,
+}
+
+/// Lookups of the exact lane's prepared-text cache during one search call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreparedTextCounts {
+    /// Text found prepared, or being prepared by another request.
+    pub hits: u32,
+    /// Text this call prepared.
+    pub misses: u32,
+    /// Entries this call's inserts evicted because the cache held its most
+    /// entries.
+    pub evicted_by_count: u32,
+    /// Entries evicted because the cache held its most bytes.
+    pub evicted_by_bytes: u32,
+}
+
+impl PreparedTextCounts {
+    const EMPTY: Self = Self {
+        hits: 0,
+        misses: 0,
+        evicted_by_count: 0,
+        evicted_by_bytes: 0,
+    };
 }
 
 impl SearchWaits {
@@ -211,12 +236,24 @@ impl SearchWaits {
             let files = &self.files;
             let _ = write!(
                 out,
-                " files=read:{}/{}B,repeat:{},served:{},peak:{}B",
+                " files=read:{}/{}B,repeat:{},served:{},peak:{}B,line_hits:{}",
                 files.disk_reads,
                 files.disk_bytes,
                 files.repeat_reads,
                 files.served,
-                files.peak_bytes
+                files.peak_bytes,
+                files.matching_line_hits
+            );
+        }
+        let prepared = &self.prepared;
+        if prepared.hits > 0 || prepared.misses > 0 {
+            let _ = write!(
+                out,
+                " prepared=hit:{},miss:{},evict:{}/{}",
+                prepared.hits,
+                prepared.misses,
+                prepared.evicted_by_count,
+                prepared.evicted_by_bytes
             );
         }
         out
@@ -233,6 +270,7 @@ struct Collector {
     depth: [u8; KINDS],
     slots: [WaitSlot; KINDS],
     files: super::request_files::RequestFilesReport,
+    prepared: PreparedTextCounts,
 }
 
 const EMPTY_SLOT: WaitSlot = WaitSlot {
@@ -251,6 +289,7 @@ thread_local! {
             depth: [0; KINDS],
             slots: [EMPTY_SLOT; KINDS],
             files: super::request_files::RequestFilesReport::EMPTY,
+            prepared: PreparedTextCounts::EMPTY,
         })
     };
 }
@@ -293,6 +332,7 @@ fn open(wait_cpu: bool) -> WaitScope {
         collector.depth = [0; KINDS];
         collector.slots = [EMPTY_SLOT; KINDS];
         collector.files = super::request_files::RequestFilesReport::EMPTY;
+        collector.prepared = PreparedTextCounts::EMPTY;
         true
     });
     WaitScope {
@@ -310,10 +350,15 @@ impl WaitScope {
             cpu_started,
             crate::run_tool_call::ThreadCpuSample::now(),
         );
-        let (slots, wait_cpu_sampled, files) = COLLECTOR.with(|collector| {
+        let (slots, wait_cpu_sampled, files, prepared) = COLLECTOR.with(|collector| {
             let mut collector = collector.borrow_mut();
             collector.active = false;
-            (collector.slots, collector.wait_cpu, collector.files)
+            (
+                collector.slots,
+                collector.wait_cpu,
+                collector.files,
+                collector.prepared,
+            )
         });
         Some(SearchWaits {
             slots,
@@ -321,6 +366,7 @@ impl WaitScope {
             cpu,
             wait_cpu_sampled,
             files,
+            prepared,
         })
     }
 }
@@ -378,6 +424,16 @@ pub(crate) fn record_request_files(report: super::request_files::RequestFilesRep
         let mut collector = collector.borrow_mut();
         if collector.active {
             collector.files.add(report);
+        }
+    });
+}
+
+/// Count one prepared-text cache lookup in this thread's open scope, if any.
+pub(crate) fn record_prepared_text(update: impl FnOnce(&mut PreparedTextCounts)) {
+    COLLECTOR.with(|collector| {
+        let mut collector = collector.borrow_mut();
+        if collector.active {
+            update(&mut collector.prepared);
         }
     });
 }

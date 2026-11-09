@@ -466,6 +466,40 @@ struct PhaseReport {
     load_start: f64,
     load_end: f64,
     embed_requests: u64,
+    /// Bytes the whole process read through `read(2)` during the phase
+    /// (`rchar` of /proc/self/io; zero where that file does not exist).
+    bytes_read: u64,
+    searches: usize,
+}
+
+/// Bytes this process has read through `read(2)` and friends so far, from
+/// `rchar` in /proc/self/io; zero where that file does not exist.
+fn process_bytes_read() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|io| {
+            io.lines()
+                .find_map(|line| line.strip_prefix("rchar:")?.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// The numbers of one field of the slow-call rendering of `waits`, for
+/// example ` files=read:3/1200B,repeat:0,...` gives `[3, 1200, 0, ...]`.
+/// Empty when the call did not report the field (or the build predates it),
+/// so the same example runs against older builds.
+fn rendered_numbers(waits: &SearchWaits, key: &str) -> Vec<u64> {
+    let line = waits.render();
+    let Some(start) = line.find(key) else {
+        return Vec::new();
+    };
+    line[start + key.len()..]
+        .split(' ')
+        .next()
+        .unwrap_or_default()
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|number| number.parse().ok())
+        .collect()
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -553,6 +587,43 @@ fn summarize(title: &str, samples: &[&Sample]) {
             distribution(total),
             percentile(&off, 0.5),
             percentile(&off, 0.9)
+        );
+    }
+    // What the request file set read and kept, and how the exact lane's
+    // prepared-text cache served the calls, when the build reports them.
+    let files = samples
+        .iter()
+        .map(|sample| rendered_numbers(&sample.waits, " files="))
+        .collect::<Vec<_>>();
+    let column = |rows: &[Vec<u64>], index: usize| {
+        rows.iter()
+            .map(|row| row.get(index).copied().unwrap_or(0) as f64)
+            .collect::<Vec<_>>()
+    };
+    if files.iter().any(|row| row.len() >= 6) {
+        let total = |index| column(&files, index).iter().sum::<f64>();
+        println!(
+            "\nfile set per call (p50 | p90 | max): disk reads {}; bytes read {}; peak kept bytes {}. Totals: repeat reads {:.0}, served from the set {:.0}, matching-line answers reused {:.0}",
+            distribution(column(&files, 0)),
+            distribution(column(&files, 1)),
+            distribution(column(&files, 4)),
+            total(2),
+            total(3),
+            total(5)
+        );
+    }
+    let prepared = samples
+        .iter()
+        .map(|sample| rendered_numbers(&sample.waits, " prepared="))
+        .collect::<Vec<_>>();
+    if prepared.iter().any(|row| row.len() >= 4) {
+        let total = |index| column(&prepared, index).iter().sum::<f64>();
+        let (hits, misses) = (total(0), total(1));
+        println!(
+            "\nprepared exact text: {hits:.0} hits, {misses:.0} misses (hit rate {:.1}%), evicted at the entry cap {:.0}, at the byte cap {:.0}",
+            100.0 * hits / (hits + misses).max(1.0),
+            total(2),
+            total(3)
         );
     }
 }
@@ -702,6 +773,7 @@ fn main() {
     let mut reports = Vec::new();
     for phase in &args.phases {
         let (cpu_before, load_start) = process_cpu_and_load();
+        let read_before = process_bytes_read();
         let embeds_before = embed_requests.load(Ordering::Relaxed);
         let phase_started = Instant::now();
         let samples = match phase.as_str() {
@@ -852,6 +924,8 @@ fn main() {
             load_start,
             load_end,
             embed_requests: embed_requests.load(Ordering::Relaxed) - embeds_before,
+            bytes_read: process_bytes_read().saturating_sub(read_before),
+            searches: samples.len(),
         });
         eprintln!("phase {phase}: {} searches", samples.len());
         all.extend(samples);
@@ -868,17 +942,21 @@ fn main() {
         ready_after.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
-    println!("\n| phase | seconds | process CPU s | load 1m start/end | embed requests |");
-    println!("| --- | ---: | ---: | ---: | ---: |");
+    println!(
+        "\n| phase | seconds | process CPU s | load 1m start/end | embed requests | process bytes read MiB | per search KiB |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for report in &reports {
         println!(
-            "| {} | {:.1} | {:.1} | {:.1} / {:.1} | {} |",
+            "| {} | {:.1} | {:.1} | {:.1} / {:.1} | {} | {:.1} | {:.1} |",
             report.name,
             report.seconds,
             report.process_cpu_seconds,
             report.load_start,
             report.load_end,
-            report.embed_requests
+            report.embed_requests,
+            report.bytes_read as f64 / (1024.0 * 1024.0),
+            report.bytes_read as f64 / 1024.0 / report.searches.max(1) as f64
         );
     }
     let mut groups: BTreeMap<(String, String), Vec<&Sample>> = BTreeMap::new();

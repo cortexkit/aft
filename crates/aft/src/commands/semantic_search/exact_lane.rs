@@ -811,16 +811,19 @@ impl PreparedExactCache {
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
                 entry.last_used = clock;
+                waits::record_prepared_text(|counts| counts.hits += 1);
                 if let Some(prepared) = entry.text.get() {
                     return Arc::clone(prepared);
                 }
                 (Arc::clone(&entry.text), true)
             } else {
+                waits::record_prepared_text(|counts| counts.misses += 1);
                 // Bound placeholders as well as prepared bytes. A placeholder
                 // single-flights parallel queries without holding the map lock
                 // during normalization and symbol scanning.
                 if state.entries.len() >= 1024 {
                     state.evict_oldest();
+                    waits::record_prepared_text(|counts| counts.evicted_by_count += 1);
                 }
                 let cell = Arc::new(OnceLock::new());
                 state.entries.insert(
@@ -853,6 +856,7 @@ impl PreparedExactCache {
         }
         while state.bytes > self.max_bytes {
             state.evict_oldest();
+            waits::record_prepared_text(|counts| counts.evicted_by_bytes += 1);
         }
         Arc::clone(prepared)
     }
