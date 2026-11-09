@@ -411,6 +411,7 @@ pub(crate) struct Guard {
     _not_send: PhantomData<Rc<()>>,
 }
 
+#[cfg(test)]
 impl Guard {
     pub(crate) fn files(&self) -> &Arc<RequestFiles> {
         &self.files
@@ -581,10 +582,10 @@ pub(crate) use read_probe::{record_disk_read, ReadProbe};
 mod tests {
     use super::*;
 
-    fn read_counted(
-        counter: &AtomicUsize,
+    fn read_counted<'a>(
+        counter: &'a AtomicUsize,
         bytes: &'static [u8],
-    ) -> impl FnOnce(&Path) -> io::Result<(Vec<u8>, Option<FileStat>)> + '_ {
+    ) -> impl FnOnce(&Path) -> io::Result<(Vec<u8>, Option<FileStat>)> + 'a {
         move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok((bytes.to_vec(), None))
