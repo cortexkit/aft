@@ -647,9 +647,7 @@ impl SpawnPlan {
         }
         #[cfg(target_os = "linux")]
         {
-            secret_ptrace_scope_unavailable(std::fs::read_to_string(
-                "/proc/sys/kernel/yama/ptrace_scope",
-            ))
+            secret_ptrace_scope_unavailable(secret_ptrace_scope_value())
         }
         #[cfg(target_os = "macos")]
         {
@@ -763,6 +761,37 @@ fn secret_ptrace_scope_unavailable(value: std::io::Result<String>) -> Option<Str
         Ok(value) => Some(format!("Linux Yama ptrace_scope is {:?}; a positive ptrace_scope is required to protect vault memory", value.trim())),
         Err(error) => Some(format!("Linux Yama ptrace_scope could not be read: {error}")),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn secret_ptrace_scope_value() -> std::io::Result<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_SECRET_PTRACE_SCOPE.with(|slot| slot.borrow().clone()) {
+        return value.ok_or_else(|| std::io::ErrorKind::NotFound.into());
+    }
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    // Unset uses the kernel; an explicit None models an unreadable Yama setting.
+    static TEST_SECRET_PTRACE_SCOPE: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_secret_ptrace_scope_for_test<R>(
+    value: Option<&str>,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SECRET_PTRACE_SCOPE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore =
+        Restore(TEST_SECRET_PTRACE_SCOPE.with(|slot| slot.replace(Some(value.map(str::to_owned)))));
+    run()
 }
 
 /// One resolver invocation captured by the project-keyed test seam.
