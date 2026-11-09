@@ -23,6 +23,7 @@ pub mod old_index;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;
+pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;

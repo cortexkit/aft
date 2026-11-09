@@ -1184,7 +1184,7 @@ pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
     if let Some(root) = ctx.canonical_cache_root_opt() {
         // A folder of repositories is checked first: configure switches its
         // own indexes off, which alone would withhold it.
-        let kind = if crate::views::parent::session_for(ctx).is_some() {
+        let kind = if crate::data_layer::parent_session::session_for(ctx).is_some() {
             RootKind::Repositories
         } else if ctx.data_layer_withheld().is_some() {
             RootKind::Withheld

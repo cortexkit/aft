@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 
 use crate::context::AppContext;
 use crate::data_layer::checkout::DataError;
+use crate::data_layer::parent_session::Plane;
 use crate::data_layer::runtime::DataCheckout;
 use crate::protocol::{RawRequest, Response};
-use crate::views::parent::Plane;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 /// A line each committed crate holds twice.
@@ -141,7 +141,8 @@ fn glob(ctx: &AppContext, pattern: &str) -> Value {
 
 /// A call-graph command as the parent session answers it.
 fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
-    crate::views::parent::route(req, ctx).expect("a parent folder answers this command itself")
+    crate::data_layer::parent_session::route(req, ctx)
+        .expect("a parent folder answers this command itself")
 }
 
 fn gaps(reply: &Value) -> Vec<Value> {
@@ -192,11 +193,11 @@ fn settled<T: std::fmt::Debug>(ask: impl Fn() -> T, done: impl Fn(&T) -> bool) -
 
 /// The parent session `ctx` is bound to, once its worker's first round
 /// has loaded the children.
-fn parent_session(ctx: &AppContext) -> Arc<crate::views::parent::ParentSession> {
+fn parent_session(ctx: &AppContext) -> Arc<crate::data_layer::parent_session::ParentSession> {
     let deadline = Instant::now() + DEADLINE;
     let session = loop {
         crate::runtime_drain::drain_deferred_configure_maintenance(ctx);
-        if let Some(session) = crate::views::parent::session_for(ctx) {
+        if let Some(session) = crate::data_layer::parent_session::session_for(ctx) {
             break session;
         }
         assert!(Instant::now() < deadline, "no parent session started");
@@ -249,7 +250,7 @@ fn relative_files(root: &Path, files: Vec<String>) -> Vec<String> {
 /// cap and the files outside every child.
 #[test]
 fn a_parent_folder_answers_from_its_childrens_checkouts() {
-    crate::views::parent::set_default_refresh_interval(Duration::from_millis(100));
+    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
@@ -562,7 +563,7 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
 fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::data_layer::meaning::MeaningState;
-    crate::views::parent::set_default_refresh_interval(Duration::from_millis(100));
+    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");

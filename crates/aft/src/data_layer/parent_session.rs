@@ -35,8 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-/// Most child repositories one parent folder serves. The operator's own
-/// projects folder holds 39 repositories, so the cap leaves room above that.
+/// Most child repositories one parent folder serves.
 /// Children past the cap are reported as a named gap, never silently dropped.
 pub const DEFAULT_MAX_CHILD_REPOS: usize = 64;
 

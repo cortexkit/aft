@@ -484,8 +484,8 @@ fn include_tests(req: &RawRequest) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolves a request path through the session's own path checks (project
-/// restriction and the untrusted-bind guard), then to an absolute path.
+/// Applies the session's read-path authorization before resolving the path
+/// to an absolute path within the parent folder.
 fn resolve_path(
     req: &RawRequest,
     ctx: &AppContext,

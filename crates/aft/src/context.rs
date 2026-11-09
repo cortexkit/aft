@@ -7798,7 +7798,7 @@ impl AppContext {
         // A parent folder of repositories builds nothing of its own: each
         // child repository has a checkout of its own instead, which this
         // context keeps only while it is bound to that parent folder.
-        let parent = crate::views::parent::session_for(self);
+        let parent = crate::data_layer::parent_session::session_for(self);
         self.data_children
             .keep_only(parent.as_ref().map(|session| session.root()));
         if parent.is_some() {
@@ -7969,7 +7969,7 @@ impl AppContext {
     /// admitted for it.
     pub(crate) fn data_layer_serves_meaning(&self) -> bool {
         self.data_layer_withheld().is_none()
-            && crate::views::parent::session_for(self).is_none()
+            && crate::data_layer::parent_session::session_for(self).is_none()
             && self.data_meaning_config().is_some()
     }
 

@@ -8441,7 +8441,7 @@ mod tests {
             );
             assert_eq!(configured_connection_file(), Some(connection_path));
             assert_eq!(read_user_config_doc(), Some(doc));
-            assert!(crate::views::parent::discover(&profile, 1).is_none());
+            assert!(crate::data_layer::parent_session::discover(&profile, 1).is_none());
 
             // With neither home available, do not read a config relative to cwd.
             std::env::set_var("USERPROFILE", "");

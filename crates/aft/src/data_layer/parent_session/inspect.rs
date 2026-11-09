@@ -1,7 +1,7 @@
 //! Inspect for parent folder sessions.
 //!
 //! The project-wide categories (dead code, unused exports, duplicates and the
-//! other Tier-2 analyses) are read from each child's persisted inspect
+//! other project-wide analyses) are read from each child's persisted inspect
 //! aggregates through a read-only handle the worker opened once, then merged:
 //! counts add up and item lists concatenate with parent-relative paths. A
 //! child without a current aggregate is a named gap. The per-file categories

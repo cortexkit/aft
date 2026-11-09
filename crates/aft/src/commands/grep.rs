@@ -277,7 +277,9 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
+        crate::data_layer::parent_session::grep_fan_out(
+            ctx, &compiled, &scope, &params, &filters, order,
+        )
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
@@ -473,7 +475,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::views::parent::attach_gaps(&mut body, parent_gaps);
+    crate::data_layer::parent_session::attach_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {

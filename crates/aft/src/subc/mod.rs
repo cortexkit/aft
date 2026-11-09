@@ -2259,7 +2259,7 @@ fn quiesce_unbound_root_with(
         // Parent folders have no local build progress to retain. Their watcher
         // owns exclusion retries independently of the child-reader session, so
         // release both lifetimes when the final route closes.
-        if crate::views::parent::release_context(ctx) || ctx.root_too_broad() {
+        if crate::data_layer::parent_session::release_context(ctx) || ctx.root_too_broad() {
             ctx.stop_watcher_runtime();
             ctx.invalidate_artifacts_after_watcher_gap();
         }
@@ -17789,7 +17789,7 @@ mod tests {
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let parent = crate::views::parent::session_for(&ctx).expect("parent session");
+        let parent = crate::data_layer::parent_session::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
@@ -17832,7 +17832,7 @@ mod tests {
             parent.stopped(),
             "last parent route must release its child readers"
         );
-        assert!(crate::views::parent::session_for_root(root.as_path()).is_none());
+        assert!(crate::data_layer::parent_session::session_for_root(root.as_path()).is_none());
         assert!(ctx.watcher_rx().lock().is_none());
         crate::commands::configure::ensure_project_watcher(&ctx);
         assert!(
@@ -17843,7 +17843,8 @@ mod tests {
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
+        let rebound =
+            crate::data_layer::parent_session::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);

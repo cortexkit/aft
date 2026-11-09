@@ -8,8 +8,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub mod parent;
-
 /// Version number for the byte encoding used to identify manifest paths.
 /// Increment it whenever that encoding changes.
 pub const PATH_IDENTITY_VERSION: u8 = 1;

@@ -47,8 +47,7 @@ impl ChildEngine {
 // ---------------------------------------------------------------------------
 
 /// Whether the parent's children answer from their checkouts in the data
-/// layer: when the process runs it, unless a test asked this thread for
-/// today's route.
+/// layer: always, unless a test hook disables that path for this thread.
 fn data_layer_answers() -> bool {
     #[cfg(test)]
     if crate::data_layer::tools::grep::test_hooks::today_only() {
@@ -91,7 +90,7 @@ fn prefix_row(row: &mut Value, parent: &Path, child: &Child) {
 
 /// Merges the children's ranked lists without reordering any one of them:
 /// at each step the child whose next row has the highest engine score
-/// (fused score, or the lane score the engine reports instead) gives its
+/// (combined score, or an individual search score when available) gives its
 /// next row. Ties prefer the higher semantic similarity, which uses the same
 /// model in every child, then the earlier child.
 fn merge(mut lists: Vec<VecDeque<Value>>, limit: usize) -> Vec<Value> {

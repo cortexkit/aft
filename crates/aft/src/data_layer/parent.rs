@@ -1,13 +1,13 @@
 //! Parent folders on the data layer.
 //!
 //! A session bound to a folder of repositories that is not a repository
-//! itself builds nothing of its own (see [`crate::views::parent`]). When
+//! itself builds nothing of its own (see [`crate::data_layer::parent_session`]). When
 //! the process runs the data layer, each child repository that session
 //! found gets a checkout of its own, bound the first time a query reaches
 //! it, and grep, glob and the call-graph commands answer from the
-//! children's views (`views::parent::query`), as does `aft_search`
-//! (`views::parent::engine`), whose meaning lane reads each child's meaning
-//! plane without ever filling it ([`search_children`]). The parent folder's
+//! children's views, as does `aft_search`, which reads each child's stored
+//! vectors for semantic search without filling its meaning plane
+//! ([`search_children`]). The parent folder's
 //! own root binds no checkout.
 //!
 //! The children are bound with the parent root's executor, so each child's
@@ -29,10 +29,10 @@ use std::time::Duration;
 use crate::config::SemanticBackendConfig;
 use crate::context::AppContext;
 use crate::data_layer::checkout::{CheckoutView, PlaneStatus, Planes};
+use crate::data_layer::parent_session::Plane;
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::executor::RootMaintenanceExecutor;
 use crate::semantic_index::SemanticIndexFingerprint;
-use crate::views::parent::Plane;
 
 /// One child's checkout, bound on first use. Each child has a lock of its
 /// own, so a slow bind holds up only the queries of that child.
