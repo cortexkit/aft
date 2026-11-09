@@ -4691,12 +4691,13 @@ fn exec_remote_bash_state_transitions_are_durable() {
         RemotePhase::of(&remote),
         RemotePhase::Queued { position: 7 }
     );
-    assert!(work_counts::get().syncs >= 2);
+    // One record write: the new record file and its directory are synced.
     assert_eq!(
-        work_counts::get().renames,
-        1,
+        work_counts::get().syncs,
+        2,
         "the job id and the execution note are saved in one record write"
     );
+    assert_eq!(work_counts::get().renames, 1);
 
     work_counts::reset();
     // An older runner's first output is a running transition, not just progress.
