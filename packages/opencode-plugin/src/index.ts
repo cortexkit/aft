@@ -79,6 +79,7 @@ import {
 import { AftRpcServer } from "./shared/rpc-server.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
 import {
+  clearSessionDirectory,
   closeDeletedSessionRoutes,
   getSessionDirectory,
   getSessionDirectoryCached,
@@ -868,6 +869,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       const eventType = eventInput.event.type;
       observeOpenCodeBgNotificationEvent(eventInput.event);
       const sessionID = extractSessionID(eventInput.event.properties);
+      if (eventType === "session.moved" && sessionID) {
+        clearSessionDirectory(sessionID);
+        return;
+      }
       if (eventType === "session.created" && sessionID) {
         const sessionDir =
           (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;

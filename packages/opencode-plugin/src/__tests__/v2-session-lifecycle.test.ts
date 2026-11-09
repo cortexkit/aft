@@ -3,6 +3,12 @@ import { Effect, Exit, PubSub, Scope, Stream } from "effect";
 
 import { sessionBgStates, trackBgTask } from "../bg-notifications.js";
 import * as logger from "../logger.js";
+import {
+  _resetSessionDirectoryCacheForTest,
+  getSessionDirectory,
+  getSessionDirectoryCached,
+  verifySessionDirectory,
+} from "../shared/session-directory.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { isSyncWatchAborted, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
@@ -20,6 +26,29 @@ import {
   v2WatchWakeAllowed,
 } from "../v2-session-lifecycle.js";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+
+test("V2 session.moved clears the cached directory without deleting the session", async () => {
+  _resetSessionDirectoryCacheForTest();
+  const r = await rig();
+  let directory = "/old-repository";
+  const client = { session: { get: async () => ({ data: { directory } }) } };
+  try {
+    await getSessionDirectory(client, "child", directory);
+    await verifySessionDirectory(client, "child");
+    expect(getSessionDirectoryCached("child")).toBe("/old-repository");
+
+    await r.event("session.moved");
+    expect(getSessionDirectoryCached("child")).toBeUndefined();
+    directory = "/new-repository";
+    expect(await verifySessionDirectory(client, "child")).toBe(directory);
+    expect(getSessionDirectoryCached("child")).toBe(directory);
+    await r.event("session.execution.started");
+    expect(v2SubagentStopped(r.host, "child")).toBe(false);
+  } finally {
+    await r.close();
+    _resetSessionDirectoryCacheForTest();
+  }
+});
 
 async function rig(parentID: string | undefined = "parent", persistedTaskIds?: string[]) {
   _resetSubagentCacheForTest();

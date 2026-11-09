@@ -12,8 +12,8 @@
  *
  * The session itself stores the correct directory in OpenCode's SQLite
  * (`Session.directory` in the SDK). This helper looks it up once per
- * session and caches the result — sessions don't change directory
- * across their lifetime, so the cache never needs invalidation.
+ * session and caches the result. A session.moved event invalidates the
+ * cached root because OpenCode 2 sessions can change Location.
  *
  * The bug should also be fixed upstream in OpenCode's
  * `packages/opencode/src/session/registry.ts`. Until then this
@@ -385,6 +385,13 @@ async function boundedVerification(client: unknown, sessionId: string): Promise<
   return dir;
 }
 
+/** Forget directory snapshots when the host moves or removes a session. */
+export function clearSessionDirectory(sessionId: string): void {
+  cache.delete(sessionId);
+  lookupGenerations.delete(sessionId);
+  verifyCache.delete(sessionId);
+}
+
 /** Release transport routes on deletion without querying a session the host has already removed. */
 export async function closeDeletedSessionRoutes(
   pool: AftTransportPool,
@@ -395,9 +402,7 @@ export async function closeDeletedSessionRoutes(
   const roots = new Set(pool.activeBridges().map((bridge) => bridge.getCwd()));
   roots.add(getSessionDirectoryCached(sessionId) ?? fallbackDirectory);
   await Promise.allSettled([...roots].map((root) => pool.closeSession(root, sessionId)));
-  cache.delete(sessionId);
-  lookupGenerations.delete(sessionId);
-  verifyCache.delete(sessionId);
+  clearSessionDirectory(sessionId);
 }
 
 /** Test-only: clear the cache between unit tests. */
