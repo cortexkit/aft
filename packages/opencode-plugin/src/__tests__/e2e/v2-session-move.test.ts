@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { bootV2Host, messageText, type ModelRequest, type ModelScript, until } from "./v2-host.js";
+import { bootV2Host, type ModelRequest, type ModelScript, messageText, until } from "./v2-host.js";
 
 const hostBinary = process.env.AFT_V2_HOST_BINARY;
 
