@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use aft::callgraph_store::join::CallgraphBlob;
-use aft::data_layer::content::language_for;
+use aft::data_layer::content::{is_parsed_language, language_for};
 use aft::data_layer::extract_gate::{self, CorpusFile, Extractor};
 
 /// The checkout scan's size limit: it never reads a larger file, so no
@@ -73,7 +73,8 @@ struct Inventory {
     files: Vec<CorpusFile>,
     skipped: Vec<Skipped>,
     /// Listed paths the call graph does not parse: other languages,
-    /// resolver configuration (stored raw), symlinks and folders.
+    /// resolver configuration (stored raw), files whose record holds only
+    /// their TODO markers, symlinks and folders.
     not_parsed: usize,
 }
 
@@ -96,7 +97,7 @@ fn inventory(root: &Path, paths: &[String]) -> Inventory {
         };
         // A file that cannot be read gets the language its path names.
         let language = language_for(path, bytes.as_deref().unwrap_or_default())
-            .filter(|language| language != "config");
+            .filter(|language| is_parsed_language(language));
         let Some(language) = language else {
             found.not_parsed += 1;
             continue;
