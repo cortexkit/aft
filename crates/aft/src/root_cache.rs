@@ -41,11 +41,13 @@ pub use crate::process_identity::process_start_time_ms;
 pub(crate) use location::acquire_cache_cleanup_lease;
 pub(crate) use location::canonical_root;
 #[cfg(test)]
-pub(crate) use location::markers::{sweep_all_read_markers, sweep_read_markers};
+pub(crate) use location::markers::sweep_all_read_markers;
 pub use location::markers::{
     ReadMarker, ReadMarkerMetadata, ReadMarkerSweep, READ_MARKER_CROSS_HOST_STALE_MS,
     READ_MARKER_TOUCH_INTERVAL_MS,
 };
+#[cfg(all(test, unix))]
+pub(crate) use location::pin_cache_path;
 pub use location::{
     acquire_daemon_storage_lease, cache_root, cache_unavailable, cache_unavailable_for_root,
     clean_old_caches, prepare_cache_root, prune_legacy_stores, reclaim_configured_inactive_caches,
@@ -58,8 +60,8 @@ pub(crate) use location::{
 };
 pub(crate) use location::{
     cache_status_code, check_cache_access, durable_route, ensure_config_storage_lease,
-    identity_storage_root, pin_cache_path, prepare_process_cache_root,
-    prepare_third_party_cache_dir, unavailable_code, unavailable_warning,
+    identity_storage_root, prepare_process_cache_root, prepare_third_party_cache_dir,
+    unavailable_code, unavailable_warning,
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
 
