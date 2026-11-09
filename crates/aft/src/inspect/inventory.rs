@@ -325,10 +325,9 @@ impl InspectInventory {
     /// applied here to each member's path.
     ///
     /// `None` when the view cannot stand in for a walk: it is of another
-    /// folder, a rescan against the disk is still pending, the root is one
+    /// folder, a rescan against the disk is still pending, or the root is one
     /// where the source walk uses other ignore settings (confinement, or a
-    /// Jujutsu-only repository), or its repository has submodules, whose
-    /// checkouts the store's scan skips and the walks descend into.
+    /// Jujutsu-only repository).
     pub(crate) fn from_checkout(
         root: &Path,
         view: &crate::data_layer::checkout::CheckoutView,
@@ -348,9 +347,6 @@ impl InspectInventory {
         }
         if walks_use_other_ignore_settings(root) {
             return Err(StoreListMiss::OtherIgnoreSettings);
-        }
-        if crate::project_content::repository_has_submodules(root) {
-            return Err(StoreListMiss::Submodules);
         }
         if view.rescanning() {
             return Err(StoreListMiss::Rescanning);
@@ -529,9 +525,6 @@ pub(crate) enum StoreListMiss {
     /// The source walk uses ignore settings the store's scan does not
     /// (confinement, or a Jujutsu-only repository).
     OtherIgnoreSettings,
-    /// The repository has submodules: the store's scan skips a submodule
-    /// checkout below the root, which the walks descend into.
-    Submodules,
 }
 
 impl StoreListMiss {
@@ -545,7 +538,6 @@ impl StoreListMiss {
             Self::Rescanning => "rescanning",
             Self::OtherRoot => "other_root",
             Self::OtherIgnoreSettings => "other_ignore_settings",
-            Self::Submodules => "submodules",
         }
     }
 }
