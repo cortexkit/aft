@@ -2,6 +2,9 @@ use super::*;
 use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
 
+#[path = "bookkeeping_probe.rs"]
+mod bookkeeping_probe;
+
 #[test]
 fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
     use exec::types::{Progress, ProgressPhase};
