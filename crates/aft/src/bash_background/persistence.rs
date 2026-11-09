@@ -2209,10 +2209,28 @@ fn status_name(status: &BgTaskStatus) -> &'static str {
 }
 
 fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
+    // Both streams belong to one verified layout. Resolving each artifact
+    // separately rereads and reparses the same task record for every DB row.
+    let resolved = retry_artifact_read(|| {
+        let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+        if resolved.paths.layout != paths.layout {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background task layout identity changed",
+            ));
+        }
+        Ok(resolved)
+    })
+    .ok()?;
     let len = |artifact| {
-        open_task_artifact(paths, artifact)
-            .ok()
-            .and_then(|file| file.len().ok())
+        retry_artifact_read(|| {
+            let file = resolved
+                .dirs
+                .io
+                .open_file(&resolved.paths.artifact_name(artifact), false)?;
+            ValidatedArtifact::new(file)?.len()
+        })
+        .ok()
     };
     match mode {
         BgMode::Pipes => match (len(TaskArtifact::Stdout), len(TaskArtifact::Stderr)) {

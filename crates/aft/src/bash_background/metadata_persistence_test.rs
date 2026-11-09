@@ -14,6 +14,23 @@ fn metadata(task: &ResolvedTask) -> PersistedTask {
 }
 
 #[test]
+fn metadata_persistence_db_row_resolves_both_streams_once() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    fs::write(&task.paths.stdout, b"stdout").unwrap();
+    fs::write(&task.paths.stderr, b"err").unwrap();
+    work_counts::reset();
+    let row = metadata.to_bash_task_row("runner", &task.paths).unwrap();
+    let counts = work_counts::get();
+    assert_eq!(row.output_bytes, Some(9));
+    assert_eq!(counts.metadata_reads, 1, "one layout verification per row");
+    assert_eq!(counts.parses, 2, "one version check and one task decode");
+    assert_eq!(counts.artifact_opens, 2, "both output files are sampled");
+}
+
+#[test]
 fn metadata_persistence_equal_bytes_skip_replacement_and_changed_bytes_write() {
     let storage = tempfile::tempdir().unwrap();
     let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
