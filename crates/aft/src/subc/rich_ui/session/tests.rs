@@ -1061,10 +1061,11 @@ mod read_tests;
 #[path = "samples.rs"]
 mod samples;
 
-/// The HELLO manifest AFT registers must declare both capabilities the head
-/// proof reads; a hand-built capability list cannot catch a capability
-/// missing from the real one. With either removed, a core head's carried
-/// `bash_status` is refused as `unknown_tool` before anything is dispatched.
+/// A carried head scope gets head calls only when AFT's HELLO manifest
+/// declares both `call-modes/v1` and `scope-on-behalf-of/v1`. Build the real
+/// manifest, because a hand-built capability list cannot notice one missing
+/// from it. With either removed, a core head's carried `bash_status` is
+/// refused as `unknown_tool` before anything is dispatched.
 #[tokio::test]
 async fn hello_capabilities_are_required_for_core_head_carrier_status() {
     let f = Fixture::new("head");
