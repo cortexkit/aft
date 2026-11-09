@@ -38,10 +38,18 @@ fn tool_call(aft: &mut AftProcess, id: &str, name: &str, arguments: Value) -> Va
     resp
 }
 
+/// The tool's own reply text, without the status bar AFT appends after it.
+/// The bar (`[AFT E.. W.. | T..]`) is added only when a count changes, for
+/// example once the TODO count becomes known in the background, so whether a
+/// given reply carries it depends on timing, not on the tool.
 fn text(resp: &Value) -> &str {
-    resp["text"]
+    let text = resp["text"]
         .as_str()
-        .unwrap_or_else(|| panic!("tool call reply has no text: {resp:?}"))
+        .unwrap_or_else(|| panic!("tool call reply has no text: {resp:?}"));
+    match text.rsplit_once("\n\n[AFT ") {
+        Some((before, bar)) if bar.ends_with(']') && !bar.contains('\n') => before,
+        _ => text,
+    }
 }
 
 #[test]
