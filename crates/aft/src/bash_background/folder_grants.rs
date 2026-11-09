@@ -88,7 +88,7 @@ thread_local! {
 
 /// Run `hook` on this thread once a spawn has recorded its folder grants and
 /// before it registers the task: the moment a racing revoke can slip in.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn after_record_for_test(hook: impl FnOnce() + 'static) {
     AFTER_RECORD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
