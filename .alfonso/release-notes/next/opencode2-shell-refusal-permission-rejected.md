@@ -1,0 +1,1 @@
+- On OpenCode 2, a shell command refused by a permission rule or a rejected prompt is reported as a permission rejection again, not as a tool failure.
