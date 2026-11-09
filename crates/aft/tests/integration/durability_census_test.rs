@@ -248,16 +248,33 @@ impl Census {
             let (store, expected) = if label.starts_with("bash ") {
                 ("storage: opencode/bash-tasks", 0)
             } else if label.starts_with("edit 1:") {
-                ("storage: opencode/backups", 6)
+                // Three directory flushes for the new backup folders, then the
+                // snapshot: its content file takes a full flush, the undo index
+                // file and its folder take ordinary fsyncs, and meta.json's
+                // full flush then commits all of them to the drive.
+                self.assert_full_flushes(&events, &roots, label, 5);
+                ("storage: opencode/backups", 7)
             } else if label.starts_with("edit ") {
-                ("storage: opencode/backups", 3)
+                // The snapshot alone: two full flushes (content, meta.json)
+                // and two ordinary fsyncs ordered before the last one.
+                self.assert_full_flushes(&events, &roots, label, 2);
+                ("storage: opencode/backups", 4)
             } else if label.starts_with("undo ") {
-                // Include the user-file sync, not just stack metadata.
-                let count = count_syncs(&events, |event| {
+                // Include the user-file sync, not just stack metadata. The
+                // restored file and meta.json take full flushes; the undo
+                // index file and its folder take ordinary fsyncs that
+                // meta.json's full flush commits.
+                let in_scope = |event: &Event| {
                     let store = store_of(&event.path, &roots, &self.project);
                     store == "storage: opencode/backups" || store == "project (user files)"
-                });
-                assert_eq!(count, 3, "{label}: undo syncs including restored file");
+                };
+                let count = count_syncs(&events, in_scope);
+                assert_eq!(count, 4, "{label}: undo syncs including restored file");
+                let full = events
+                    .iter()
+                    .filter(|event| in_scope(event) && event.op == "F_FULLFSYNC")
+                    .count();
+                assert_eq!(full, 2, "{label}: undo full drive flushes");
                 return;
             } else if label.starts_with("checkpoint create") {
                 ("storage: opencode/checkpoints", 8)
@@ -274,6 +291,29 @@ impl Census {
             });
             assert_eq!(count, expected, "{label}: {store} sync count");
         }
+    }
+}
+
+impl Census {
+    /// Full drive flushes (`F_FULLFSYNC`) an edit makes under the backup store:
+    /// the expensive kind on macOS, which an edit must not add back.
+    fn assert_full_flushes(
+        &self,
+        events: &[Event],
+        roots: &[(&str, &str)],
+        label: &str,
+        expected: u64,
+    ) {
+        let full = events
+            .iter()
+            .filter(|event| {
+                let store = store_of(&event.path, roots, &self.project);
+                (store == "storage: opencode/backups"
+                    || (label.starts_with("edit 1:") && store == "storage: opencode"))
+                    && event.op == "F_FULLFSYNC"
+            })
+            .count() as u64;
+        assert_eq!(full, expected, "{label}: backup full drive flushes");
     }
 }
 
