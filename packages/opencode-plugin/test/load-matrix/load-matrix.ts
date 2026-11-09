@@ -2949,9 +2949,9 @@ export default { id: original.id, effect };
     });
 
     expect(describeServicePlugin(servicePlugin)).toMatch(/ as active, with features \S*tui/);
-    // The delay has to have kept AFT out of the first three reconciliations,
-    // where a run that counted them used to stop; otherwise this row did not
-    // exercise a late arrival at all.
+    // The delay has to have kept AFT out of the TUI's first three
+    // reconciliations, the passes a stop condition that counts reconciliations
+    // would end on; otherwise this row did not exercise a late arrival at all.
     const firstRead = transcript
       .split(/\r?\n/)
       .find((line) => line.includes("stage=read") && line.includes(`target=${packageRoot} `));
@@ -3416,6 +3416,7 @@ export default entry;
       "v2-host-tool-names",
       "v2-subc-tool-names",
       "v2-tui-keymap",
+      "v2-tui-late-service",
       "v2-theme-capture",
       "v2-tui-light-theme",
       "v2-tui-badge-light",
