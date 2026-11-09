@@ -18,6 +18,7 @@ pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
+pub mod request_files;
 pub(crate) mod rerank;
 pub mod scoring;
 pub(crate) mod snippet_bounds;
@@ -561,6 +562,9 @@ fn handle_semantic_search_with_disk_fallback(
 ) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
+    // Every phase of this request reads its candidate files through one set,
+    // so each file is read from disk once (see `request_files`).
+    let _request_files = request_files::install();
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
@@ -2630,14 +2634,15 @@ fn lexical_candidate_exactness(
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
     let _cost = telemetry::CostPhase::start("lexical_exactness");
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    let Ok(bytes) = waits::timed(waits::SearchWait::FileRead, || fs::read(file)) else {
+    let files = request_files::current();
+    let Ok(fetched) = waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), file, read_whole_source_file)
+    }) else {
         return (false, 0, None);
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = fetched.file.lossy_text();
     let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
-    let prepared = exact_lane::prepare_exact_text(&text, blake3::hash(&bytes));
+    let prepared = exact_lane::prepare_exact_text(text, fetched.file.digest());
     let normalized_text = prepared.normalized();
     drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
@@ -2660,10 +2665,20 @@ fn lexical_candidate_exactness(
         return (false, 0, None);
     }
 
-    if let Some(width) = query_shape::minimum_content_token_window(&text, content_tokens) {
+    if let Some(width) = query_shape::minimum_content_token_window(text, content_tokens) {
         return (true, 0, Some(width));
     }
     (false, 0, None)
+}
+
+/// Read a whole source file as `std::fs::read` does, for a phase whose
+/// file the request's set does not hold yet.
+fn read_whole_source_file(
+    path: &Path,
+) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(path);
+    request_files::read_whole_file(path)
 }
 
 fn exact_phrase(query: &str) -> &str {
@@ -3461,10 +3476,9 @@ impl PresenceReads {
         }
         #[cfg(test)]
         LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
-        let stamp = file_stamp(path);
-        let text = crate::search_index::read_searchable_text(path)?;
+        let (stamp, holds) = presence_check(path, &self.normalized)?;
         self.read.push((path.to_path_buf(), stamp));
-        Some(exact_lane::normalize_exact_phrase(&text).contains(&self.normalized))
+        Some(holds)
     }
 
     fn entry(
@@ -3484,6 +3498,51 @@ impl PresenceReads {
             candidates,
         }
     }
+}
+
+/// Whether `path`'s text holds `normalized`, with the file's stamp from
+/// before its bytes were read; `None` when the file cannot be read or is
+/// binary or not UTF-8 (as `read_searchable_text`).
+///
+/// The request's set serves bytes an earlier phase read only when that
+/// phase stamped them first. Bytes kept without a stamp are read again: a
+/// stamp taken now could be newer than those bytes, and the memo would then
+/// keep an answer about older text as if it described the current file.
+fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, bool)> {
+    let files = request_files::current();
+    let kept = files.as_ref().and_then(|files| files.kept(path));
+    let file = match kept {
+        Some(file) if file.stat().is_some() => file,
+        Some(_) => {
+            #[cfg(test)]
+            request_files::record_disk_read(path);
+            let stamp = file_stamp(path);
+            let text = crate::search_index::read_searchable_text(path)?;
+            return Some((
+                stamp,
+                exact_lane::normalize_exact_phrase(&text).contains(normalized),
+            ));
+        }
+        None => {
+            request_files::read_through(files.as_deref(), path, |path| {
+                let stat = fs::metadata(path)
+                    .ok()
+                    .map(|metadata| request_files::FileStat::of(&metadata));
+                Ok((crate::bounded_io::read(path, None)?, stat))
+            })
+            .ok()?
+            .file
+        }
+    };
+    let stamp = file.stat().map(|stat| (stat.size, stat.modified));
+    if crate::search_index::is_binary_bytes(file.bytes()) {
+        return None;
+    }
+    let text = file.utf8()?;
+    Some((
+        stamp,
+        exact_lane::normalize_exact_phrase(text).contains(normalized),
+    ))
 }
 
 /// Settle whether some file holds the literal, reading as little as
@@ -3627,15 +3686,33 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
-    let read_cost = telemetry::CostPhase::start("matching_read");
-    let source = waits::timed(waits::SearchWait::FileRead, || {
-        std::fs::read_to_string(file)
-    })
-    .ok()?;
-    drop(read_cost);
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    matching_line_in_text(&source, query, symbol_range)
+    let Some(files) = request_files::current() else {
+        let read_cost = telemetry::CostPhase::start("matching_read");
+        let source = waits::timed(waits::SearchWait::FileRead, || {
+            request_files::read_through(None, file, read_whole_source_file)
+        })
+        .ok()?;
+        drop(read_cost);
+        return matching_line_in_text(source.file.utf8()?, query, symbol_range);
+    };
+    // The reranker's candidate text asks for the same line of the same file;
+    // the request's set answers both from one search of the text.
+    files.matching_line(
+        file,
+        query,
+        symbol_range.map(|range| (range.start, range.end)),
+        || {
+            let read_cost = telemetry::CostPhase::start("matching_read");
+            let fetched = waits::timed(waits::SearchWait::FileRead, || {
+                files.read(file, read_whole_source_file)
+            })?;
+            drop(read_cost);
+            Ok(fetched
+                .file
+                .utf8()
+                .and_then(|source| matching_line_in_text(source, query, symbol_range)))
+        },
+    )
 }
 
 /// Preparation is addressed by the bytes just read, not a path or watcher
@@ -3963,13 +4040,18 @@ fn definition_line_from_source(
     file: &Path,
     symbol_range: SymbolOffsetRange,
 ) -> Option<(u32, String)> {
-    let source = waits::timed(waits::SearchWait::FileRead, || {
-        std::fs::read_to_string(file)
+    let source = request_source_file(file).ok()?;
+    line_at_offset(source.utf8()?, symbol_range.start)
+}
+
+/// `path`'s bytes from the current request's set, read whole (as
+/// `std::fs::read` does) when the set does not hold them yet.
+fn request_source_file(path: &Path) -> std::io::Result<Arc<request_files::RequestFile>> {
+    let files = request_files::current();
+    waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), path, read_whole_source_file)
     })
-    .ok()?;
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    line_at_offset(&source, symbol_range.start)
+    .map(|fetched| fetched.file)
 }
 
 pub(crate) fn definition_matches_identifier_token(
@@ -3979,14 +4061,10 @@ pub(crate) fn definition_matches_identifier_token(
     let Some(range) = candidate.symbol_range else {
         return false;
     };
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(&candidate.path);
-    let Ok(source) = waits::timed(waits::SearchWait::FileRead, || {
-        std::fs::read(&candidate.path)
-    }) else {
+    let Ok(source) = request_source_file(&candidate.path) else {
         return false;
     };
-    let Some(symbol) = source.get(range.start..range.end) else {
+    let Some(symbol) = source.bytes().get(range.start..range.end) else {
         return false;
     };
     definition_identifier_tokens(query)
@@ -4020,14 +4098,17 @@ fn identifier_has_code_reference(
     identifier: &str,
     parser: &mut crate::parser::FileParser,
 ) -> bool {
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(path);
-    let Ok(source) = waits::timed(waits::SearchWait::FileRead, || {
-        std::fs::read_to_string(path)
-    }) else {
+    let Ok(file) = request_source_file(path) else {
         return false;
     };
-    let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || parser.parse(path)) else {
+    let Some(source) = file.utf8() else {
+        return false;
+    };
+    // Parse the bytes just checked, not a fresh read of the path, so the tree
+    // and the text agree even if the file changes meanwhile.
+    let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || {
+        parser.parse_source_text(path, source)
+    }) else {
         return false;
     };
     source.match_indices(identifier).any(|(start, _)| {
@@ -8189,14 +8270,27 @@ fn snippet_read_plans(
 }
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+    // A file an earlier phase of this request read is cut into lines from
+    // those bytes; otherwise only the lines the plan needs are read.
+    if let Some(file) = request_files::current().and_then(|files| files.kept(path)) {
+        return bounded_snippet_lines_from(&mut file.bytes(), plan);
+    }
     let _read = waits::time(waits::SearchWait::FileRead);
     let file = fs::File::open(path).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    let mut reader = std::io::BufReader::new(file);
+    #[cfg(test)]
+    request_files::record_disk_read(path);
+    bounded_snippet_lines_from(&mut std::io::BufReader::new(file), plan)
+}
+
+fn bounded_snippet_lines_from(
+    reader: &mut impl std::io::BufRead,
+    plan: SnippetReadPlan,
+) -> Option<Vec<String>> {
     let mut lines = Vec::new();
     let mut nonempty_lines = 0usize;
-    while let Some((line, nonempty)) = read_bounded_snippet_line(&mut reader).ok()? {
+    while let Some((line, nonempty)) = read_bounded_snippet_line(reader).ok()? {
         nonempty_lines += usize::from(nonempty);
         lines.push(line);
         if plan.is_satisfied(lines.len() - 1, nonempty_lines) {

@@ -165,6 +165,9 @@ pub struct SearchWaits {
     pub cpu: Option<Duration>,
     /// Each slot's `cpu` was sampled (see [`begin_with_wait_cpu`]).
     pub wait_cpu_sampled: bool,
+    /// What the call's request file sets read from disk and kept, summed
+    /// over nested requests (see `request_files`).
+    pub files: super::request_files::RequestFilesReport,
 }
 
 impl SearchWaits {
@@ -204,6 +207,18 @@ impl SearchWaits {
             }
             None => out.push_str(" search_cpu=?"),
         }
+        if self.files.disk_reads > 0 || self.files.served > 0 {
+            let files = &self.files;
+            let _ = write!(
+                out,
+                " files=read:{}/{}B,repeat:{},served:{},peak:{}B",
+                files.disk_reads,
+                files.disk_bytes,
+                files.repeat_reads,
+                files.served,
+                files.peak_bytes
+            );
+        }
         out
     }
 }
@@ -217,6 +232,7 @@ struct Collector {
     generation: u32,
     depth: [u8; KINDS],
     slots: [WaitSlot; KINDS],
+    files: super::request_files::RequestFilesReport,
 }
 
 const EMPTY_SLOT: WaitSlot = WaitSlot {
@@ -234,6 +250,7 @@ thread_local! {
             generation: 0,
             depth: [0; KINDS],
             slots: [EMPTY_SLOT; KINDS],
+            files: super::request_files::RequestFilesReport::EMPTY,
         })
     };
 }
@@ -275,6 +292,7 @@ fn open(wait_cpu: bool) -> WaitScope {
         collector.generation = collector.generation.wrapping_add(1);
         collector.depth = [0; KINDS];
         collector.slots = [EMPTY_SLOT; KINDS];
+        collector.files = super::request_files::RequestFilesReport::EMPTY;
         true
     });
     WaitScope {
@@ -292,16 +310,17 @@ impl WaitScope {
             cpu_started,
             crate::run_tool_call::ThreadCpuSample::now(),
         );
-        let (slots, wait_cpu_sampled) = COLLECTOR.with(|collector| {
+        let (slots, wait_cpu_sampled, files) = COLLECTOR.with(|collector| {
             let mut collector = collector.borrow_mut();
             collector.active = false;
-            (collector.slots, collector.wait_cpu)
+            (collector.slots, collector.wait_cpu, collector.files)
         });
         Some(SearchWaits {
             slots,
             wall,
             cpu,
             wait_cpu_sampled,
+            files,
         })
     }
 }
@@ -350,6 +369,17 @@ pub fn time(kind: SearchWait) -> WaitTimer {
             (Instant::now(), generation, cpu)
         }),
     }
+}
+
+/// Add a finished request's file-set report to this thread's open scope, if
+/// any.
+pub(crate) fn record_request_files(report: super::request_files::RequestFilesReport) {
+    COLLECTOR.with(|collector| {
+        let mut collector = collector.borrow_mut();
+        if collector.active {
+            collector.files.add(report);
+        }
+    });
 }
 
 /// Run `f` as one wait of `kind`.

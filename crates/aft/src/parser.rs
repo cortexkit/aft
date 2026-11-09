@@ -1911,6 +1911,58 @@ impl FileParser {
         Ok((&cached.tree, cached.lang))
     }
 
+    /// Parse `source`, the text a caller already read from `path`, without
+    /// reading the file again. The tree cache is shared with
+    /// [`FileParser::parse`]: a cached tree is reused only when it was parsed
+    /// from the same text (same size and content hash), so the tree always
+    /// describes `source`.
+    pub(crate) fn parse_source_text(
+        &mut self,
+        path: &Path,
+        source: &str,
+    ) -> Result<(&Tree, LangId), AftError> {
+        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
+            message: format!(
+                "unsupported file extension: {}",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("<none>")
+            ),
+        })?;
+        let size = source.len() as u64;
+        let content_hash = content_hash_for_source(source);
+        let reusable = size <= cache_freshness::CONTENT_HASH_SIZE_CAP
+            && self
+                .cache
+                .get(path)
+                .is_some_and(|cached| cached.size == size && cached.content_hash == content_hash);
+        if !reusable {
+            let (tree, lang) = parse_resolved_source(path, source, lang)?;
+            #[cfg(test)]
+            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
+            self.cache.insert(
+                path.to_path_buf(),
+                CachedTree {
+                    // No stat was taken for this text. The epoch never equals
+                    // a real mtime, so a later `parse` of the path checks the
+                    // content hash before reusing this tree.
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size,
+                    content_hash,
+                    tree,
+                    lang,
+                    source: self
+                        .capture_source
+                        .then(|| captured_source(source.to_string())),
+                },
+            );
+        }
+        let cached = self.cache.get(path).ok_or_else(|| AftError::ParseError {
+            message: format!("parser cache missing entry for {}", path.display()),
+        })?;
+        Ok((&cached.tree, cached.lang))
+    }
+
     /// Like [`FileParser::parse`] but returns an owned `Tree` clone.
     ///
     /// Useful when the caller needs to hold the tree while also calling

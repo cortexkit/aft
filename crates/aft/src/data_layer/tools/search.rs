@@ -28,7 +28,7 @@ use crate::commands::semantic_search::exact_lane::{self, ExactEvidenceScope};
 use crate::commands::semantic_search::waits::{self, SearchWait};
 use crate::data_layer::checkout::{CheckoutView, DataError, PlaneStatus};
 use crate::search_index::{
-    read_search_corpus_file, ExactPassMatch, SearchCorpusEligibility, SearchIndexSnapshot,
+    read_request_corpus_file, ExactPassMatch, RequestCorpusFile, SearchIndexSnapshot,
 };
 
 /// A data-layer view whose text plane covers every path of the checkout,
@@ -705,6 +705,7 @@ fn exact_pass(
     drop(candidate_wait);
 
     let search_root_canon = canonicalize_for_search_membership(search_root);
+    let request_files = crate::commands::semantic_search::request_files::current();
     let mut matches = Vec::new();
     for relative in candidates {
         let path = text.absolute(&relative);
@@ -717,26 +718,38 @@ fn exact_pass(
         if !in_scope || candidate_filter.is_some_and(|include| !include(&path)) {
             continue;
         }
-        let SearchCorpusEligibility::Eligible(file) = waits::timed(SearchWait::FileRead, || {
-            read_search_corpus_file(&path, text.max_file_size)
-        }) else {
+        let RequestCorpusFile::Eligible {
+            file,
+            generated,
+            fresh,
+        } = waits::timed(SearchWait::FileRead, || {
+            read_request_corpus_file(request_files.as_deref(), &path, text.max_file_size)
+        })
+        else {
             continue;
         };
-        let content = String::from_utf8_lossy(&file.bytes);
-        let digest = blake3::hash(&file.bytes);
-        let Some(found) = exact_lane::verify_cached_exact_matches_in_text_with_member(
+        let digest = file.digest();
+        let found = exact_lane::verify_cached_exact_matches_in_text_with_member(
             &path,
-            &content,
+            file.lossy_text(),
             digest,
             &norm_phrase,
             &content_tokens,
             member.as_ref().map(|member| member.member.as_str()),
-        ) else {
+        );
+        let Some(found) = found else {
+            if fresh {
+                // Read only for this check, and it found nothing: later
+                // phases are not expected to want the file.
+                if let Some(files) = &request_files {
+                    files.release(&path);
+                }
+            }
             continue;
         };
         let digest = digest.to_hex().to_string();
         for mut candidate in found {
-            candidate.evidence.generated = file.generated;
+            candidate.evidence.generated = generated;
             matches.push(ExactPassMatch {
                 path: candidate.path,
                 symbol_range: candidate.symbol_range,
