@@ -170,7 +170,13 @@ fn secret_bash_sandbox_raise_host_refuses_before_scope_or_execution() {
 #[cfg(unix)]
 #[test]
 fn secret_bash_sandbox_raise_role_and_task_plans_are_command_local() {
-    with_safe_ptrace(secret_bash_sandbox_raise_role_and_task_plans);
+    with_safe_ptrace(|| with_isolated_account(7, secret_bash_sandbox_raise_role_and_task_plans));
+}
+
+#[cfg(unix)]
+fn with_isolated_account<R>(expected_reads: usize, run: impl FnOnce() -> R) -> R {
+    let account = tempfile::tempdir().unwrap();
+    crate::worker_jail_canary::with_test_preparation_home(account.path(), expected_reads, run)
 }
 
 #[cfg(unix)]
@@ -239,6 +245,11 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
 #[cfg(target_os = "linux")]
 #[test]
 fn secret_bash_sandbox_raise_linux_yama_refusals_precede_authorization() {
+    with_isolated_account(2, secret_bash_sandbox_raise_linux_yama_refusals);
+}
+
+#[cfg(target_os = "linux")]
+fn secret_bash_sandbox_raise_linux_yama_refusals() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let _launcher = native_launcher(root.path());
@@ -312,57 +323,58 @@ fn secret_bash_sandbox_raise_setup_refusals_name_the_cause() {
 #[test]
 fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
     with_safe_ptrace(|| {
-        use crate::sandbox_spawn::{AuthenticatedPrincipal, SandboxRequirement};
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let _launcher = native_launcher(root.path());
-        let ctx = context(root.path(), storage.path());
-        ctx.update_config(|config| config.sandbox = Default::default());
-        let preflight = preflight(
-            &ctx,
-            "sandbox-raise-snapshot",
-            false,
-            true,
-            SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
-        )
-        .unwrap();
-        let task = preflight.task.as_ref().unwrap();
-        let principal = AuthenticatedPrincipal::FirstParty;
-        let shell = Path::new("/bin/sh");
-        let prepared = crate::sandbox_spawn::prepare_task_payload(
-            task,
-            b"printf probe",
-            root.path(),
-            root.path(),
-            &principal,
-            shell,
-            &Default::default(),
-        )
-        .unwrap();
-        let plan = preflight.plan.clone().with_prepared_task(prepared);
-        let digest = crate::sandbox_spawn::save_local_launch(
-            &plan,
-            root.path(),
-            root.path(),
-            &principal,
-            shell,
-            false,
-            None,
-        )
-        .unwrap();
-        let (restored, ..) = crate::sandbox_spawn::restore_local_launch(task, &digest).unwrap();
-        assert!(restored.protects_secret_memory(), "{restored:?}");
-        assert_eq!(
-            crate::sandbox_spawn::effective_sandbox_mode(&ctx, &principal),
-            crate::config::SandboxMode::Off
-        );
+        with_isolated_account(1, || {
+            use crate::sandbox_spawn::{AuthenticatedPrincipal, SandboxRequirement};
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let _launcher = native_launcher(root.path());
+            let ctx = context(root.path(), storage.path());
+            ctx.update_config(|config| config.sandbox = Default::default());
+            let preflight = preflight(
+                &ctx,
+                "sandbox-raise-snapshot",
+                false,
+                true,
+                SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
+            )
+            .unwrap();
+            let task = preflight.task.as_ref().unwrap();
+            let principal = AuthenticatedPrincipal::FirstParty;
+            let shell = Path::new("/bin/sh");
+            let prepared = crate::sandbox_spawn::prepare_task_payload(
+                task,
+                b"printf probe",
+                root.path(),
+                root.path(),
+                &principal,
+                shell,
+                &Default::default(),
+            )
+            .unwrap();
+            let plan = preflight.plan.clone().with_prepared_task(prepared);
+            let digest = crate::sandbox_spawn::save_local_launch(
+                &plan,
+                root.path(),
+                root.path(),
+                &principal,
+                shell,
+                false,
+                None,
+            )
+            .unwrap();
+            let (restored, ..) = crate::sandbox_spawn::restore_local_launch(task, &digest).unwrap();
+            assert!(restored.protects_secret_memory(), "{restored:?}");
+            assert_eq!(
+                crate::sandbox_spawn::effective_sandbox_mode(&ctx, &principal),
+                crate::config::SandboxMode::Off
+            );
+        })
     });
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
-    use std::ffi::{OsStr, OsString};
     const CHILD: &str = "AFT_SANDBOX_RAISE_PROBE";
     if std::env::var_os(CHILD).is_none() {
         let home = tempfile::tempdir().unwrap();
@@ -389,6 +401,12 @@ fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
         );
         return;
     }
+    with_isolated_account(1, secret_bash_sandbox_raise_real_spawn_probe);
+}
+
+#[cfg(target_os = "macos")]
+fn secret_bash_sandbox_raise_real_spawn_probe() {
+    use std::ffi::{OsStr, OsString};
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
