@@ -80,10 +80,9 @@ pub struct ExecRemoteClient {
     module_id: String,
     /// The capabilities the daemon catalog lists for `module_id`, read by the
     /// first capability check and reused by every later check on this route
-    /// (one submission makes several). A provider announces its capabilities
-    /// when it registers, and registering again ends its routes; recovery then
-    /// opens a new route ([`Self::reopen_route`]) or connection, whose first
-    /// check reads the catalog again.
+    /// (one submission makes several). Recovery after a failed call opens a
+    /// new route ([`Self::reopen_route`]) or connection, whose first check
+    /// reads the catalog again.
     provided: Arc<std::sync::OnceLock<Arc<[String]>>>,
 }
 
