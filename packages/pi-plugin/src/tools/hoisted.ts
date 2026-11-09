@@ -44,6 +44,7 @@ import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui"
 import { type Static, type TObject, Type } from "typebox";
 import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
 import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
+import { hashlinePatchSections } from "../omp-approval.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -59,9 +60,12 @@ import {
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 import {
+  asNumber,
   asRecord,
+  asRecords,
   asString,
   collapsibleResult,
+  formatUnifiedDiffForPi,
   normalizeTerminalText,
   type RenderResultOptionsLike,
 } from "./render-helpers.js";
@@ -555,6 +559,25 @@ interface FileMutationDetails {
    * See GitHub #45.
    */
   noOp?: boolean;
+  /**
+   * One row per file a hashline patch changed, in patch order. Set only for
+   * hashline `edit` results, whose call arguments carry no `path`, so the
+   * renderer names the files from here and shows each file's diff under its
+   * own header.
+   */
+  files?: MutationFileDetails[];
+}
+
+/** One file of a hashline `edit` result (see `buildHashlineMutationResult`). */
+interface MutationFileDetails {
+  /** The path as the patch named it (project-relative when inside the project). */
+  path: string;
+  /** For a move, the file the content moved from; `path` is the destination. */
+  sourcePath?: string;
+  /** Pi line-numbered diff of this file; absent when the file content did not change. */
+  diff?: string;
+  additions: number;
+  deletions: number;
 }
 
 function readPathArg(args: unknown): string | undefined {
@@ -853,7 +876,15 @@ export function registerHoistedTools(
         }
         const response = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx);
         if (response.success === false) throw toolErrorFromResponse("edit", response);
-        return buildMutationResult(response);
+        return buildHashlineMutationResult(response);
+      },
+      // Without these Pi renders this tool with its built-in `edit` renderer,
+      // which reads `path` and so shows nothing for a `{patch}` call.
+      renderCall(args, theme, context) {
+        return renderHashlineEditCall(args, theme, context);
+      },
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderMutationResult(result, theme, context, options);
       },
     });
   }
@@ -1106,6 +1137,105 @@ export function buildMutationResult(
   };
 }
 
+/**
+ * Shape a hashline `edit` reply into an `AgentToolResult`. A hashline reply
+ * carries its diff as one unified patch per file in `metadata.files` rather
+ * than the top-level `diff: {before, after}` object `buildMutationResult`
+ * reads, so this maps those rows into the same `details` fields. The text
+ * returned to the model is exactly what `buildMutationResult` produces.
+ */
+export function buildHashlineMutationResult(
+  response: Record<string, unknown>,
+): AgentToolResult<FileMutationDetails> {
+  const result = buildMutationResult(response);
+  const rows = asRecords(asRecord(response.metadata)?.files);
+  const files = rows.map(hashlineFileDetails);
+  if (files.length === 0) return result;
+
+  const changed = files.filter((file) => file.diff !== undefined);
+  // With several files each diff restarts its line numbers, so the combined
+  // diff names every file above its part.
+  const diff =
+    changed.length === 0
+      ? undefined
+      : files.length === 1
+        ? files[0]?.diff
+        : files
+            .map((file) =>
+              file.diff === undefined
+                ? mutationFileHeader(file)
+                : `${mutationFileHeader(file)}\n${file.diff}`,
+            )
+            .join("\n");
+  const firstChangedLine = rows
+    .map((row) => firstChangedLineOfPatch(asString(row.patch) ?? ""))
+    .find((line) => line !== undefined);
+  return {
+    ...result,
+    details: {
+      ...result.details,
+      diff,
+      firstChangedLine,
+      additions: files.reduce((sum, file) => sum + file.additions, 0),
+      deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+      files,
+    },
+  };
+}
+
+/** One `metadata.files` row of a hashline reply, in the renderer's shape. */
+function hashlineFileDetails(row: Record<string, unknown>): MutationFileDetails {
+  const patch = asString(row.patch) ?? "";
+  const diff = formatUnifiedDiffForPi(patch);
+  return {
+    path: asString(row.relativePath) ?? "",
+    sourcePath: asString(row.sourcePath) ?? asString(row.movePath),
+    diff: diff.length > 0 ? diff : undefined,
+    additions: asNumber(row.additions) ?? 0,
+    deletions: asNumber(row.deletions) ?? 0,
+  };
+}
+
+/**
+ * The new-file line number of the first changed line in a unified patch, the
+ * same line `formatDiffForPi` reports. Undefined when the patch has no change.
+ */
+function firstChangedLineOfPatch(patch: string): number | undefined {
+  let newLine: number | undefined;
+  for (const line of patch.split("\n")) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    // File headers (`---`/`+++`) come before the first hunk header.
+    if (newLine === undefined) continue;
+    if (line.startsWith("+") || line.startsWith("-")) return Math.max(1, newLine);
+    if (line.startsWith(" ")) newLine++;
+  }
+  return undefined;
+}
+
+/** The file's display path, or `source → destination` for a move. */
+function mutationFileName(file: MutationFileDetails): string {
+  return file.sourcePath
+    ? `${shortenPath(file.sourcePath)} → ${shortenPath(file.path)}`
+    : shortenPath(file.path);
+}
+
+/** `path (+a/-d)`: the line above each file's part of a multi-file diff. */
+function mutationFileHeader(file: MutationFileDetails): string {
+  return `${mutationFileName(file)} (+${file.additions}/-${file.deletions})`;
+}
+
+/** The first file's name plus how many more files there are, for one-line summaries. */
+function mutationFilesLabel(files: MutationFileDetails[] | undefined): string | undefined {
+  const first = files?.[0];
+  if (!first || !files) return undefined;
+  const name = mutationFileName(first);
+  return files.length > 1 ? `${name} and ${files.length - 1} more` : name;
+}
+
 function formatGlobSkipReasonsNote(reasons: unknown): string | undefined {
   if (!Array.isArray(reasons)) return undefined;
   const actionable = reasons
@@ -1189,6 +1319,46 @@ export function renderMutationCall(
   return text;
 }
 
+/**
+ * The call row of a hashline `edit`: its arguments are only `{patch}`, so the
+ * file comes from the patch's first `[path#TAG]` section header (with its `MV`
+ * destination when it moves), followed by how many other files it names.
+ */
+export function renderHashlineEditCall(
+  args: unknown,
+  theme: Theme,
+  context: RenderContextLike,
+): Text {
+  const text = reuseText(context.lastComponent);
+  const target = hashlinePatchTarget(asString(asRecord(args)?.patch));
+  const targetDisplay = target
+    ? `${theme.fg("accent", target.name)}${target.more > 0 ? theme.fg("muted", ` and ${target.more} more`) : ""}`
+    : theme.fg("toolOutput", "...");
+  text.setText(`${theme.fg("toolTitle", theme.bold("edit"))} ${targetDisplay}`);
+  return text;
+}
+
+function hashlinePatchTarget(
+  patch: string | undefined,
+): { name: string; more: number } | undefined {
+  if (!patch) return undefined;
+  // Pi re-renders the call row while the model is still writing the patch, so
+  // its last line can be incomplete; read the patch without it in that case.
+  const sections =
+    hashlinePatchSections(patch) ??
+    hashlinePatchSections(patch.slice(0, patch.lastIndexOf("\n") + 1));
+  const first = sections?.[0];
+  if (!sections || !first) return undefined;
+  const destination = first.moves[first.moves.length - 1];
+  const name = destination
+    ? `${shortenPath(first.path)} → ${shortenPath(destination)}`
+    : shortenPath(first.path);
+  const others = new Set(sections.flatMap((section) => [section.path, ...section.moves]));
+  others.delete(first.path);
+  if (destination) others.delete(destination);
+  return { name, more: others.size };
+}
+
 export function renderMutationResult(
   result: AgentToolResult<FileMutationDetails>,
   theme: Theme,
@@ -1248,6 +1418,40 @@ export function renderMutationResult(
   const container = reuseContainer(context.lastComponent);
   container.clear();
   container.addChild(new Spacer(1));
+  const files = details?.files ?? [];
+  if (files.length > 1) {
+    // A multi-file hashline patch: each file's diff restarts its line
+    // numbers, so name every file above its diff.
+    for (const file of files) {
+      const counts = theme.fg("muted", ` (+${file.additions}/-${file.deletions})`);
+      container.addChild(new Text(`${theme.fg("accent", mutationFileName(file))}${counts}`, 1, 0));
+      if (file.diff !== undefined) {
+        container.addChild(new Text(renderTerminalDiff(file.diff), 1, 0));
+      }
+    }
+  } else {
+    container.addChild(new Text(renderTerminalDiff(diff), 1, 0));
+  }
+  const rawPath =
+    context.args &&
+    typeof context.args === "object" &&
+    typeof (context.args as { path?: unknown }).path === "string"
+      ? (context.args as { path: string }).path
+      : undefined;
+  // Hashline calls carry no `path` argument; their result names the files.
+  const summaryLabel = rawPath ? shortenPath(rawPath) : mutationFilesLabel(details?.files);
+  const summaryPath = summaryLabel ? ` ${summaryLabel}` : "";
+  const summary = `edited${summaryPath} (+${details?.additions ?? 0}/-${details?.deletions ?? 0})`;
+  return collapsibleResult({
+    summary,
+    full: container,
+    expanded: options.expanded,
+    context,
+  });
+}
+
+/** A Pi line-numbered diff colored by Pi's diff renderer, safe for the terminal. */
+function renderTerminalDiff(diff: string): string {
   let renderedDiff: string;
   try {
     renderedDiff = renderDiff(diff);
@@ -1257,21 +1461,7 @@ export function renderMutationResult(
   }
   // Normalize before Text wraps the lines, then collapsibleResult applies the
   // same safeguard to every renderer's final terminal-bound output.
-  container.addChild(new Text(normalizeTerminalText(renderedDiff), 1, 0));
-  const rawPath =
-    context.args &&
-    typeof context.args === "object" &&
-    typeof (context.args as { path?: unknown }).path === "string"
-      ? (context.args as { path: string }).path
-      : undefined;
-  const summaryPath = rawPath ? ` ${shortenPath(rawPath)}` : "";
-  const summary = `edited${summaryPath} (+${details?.additions ?? 0}/-${details?.deletions ?? 0})`;
-  return collapsibleResult({
-    summary,
-    full: container,
-    expanded: options.expanded,
-    context,
-  });
+  return normalizeTerminalText(renderedDiff);
 }
 
 /** Resolve a path argument to an absolute path if it exists, decoding file:
