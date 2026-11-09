@@ -4706,7 +4706,6 @@ mod tests {
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
-    use crate::search_index::CacheLock;
 
     use std::process::Command;
 
@@ -7835,15 +7834,20 @@ mod tests {
         std::fs::write(&artifact, b"generation-a").unwrap();
         let generation_a = cache_freshness::artifact_generation(&artifact);
         let ticket = cache_freshness::capture_verify_ticket(&root);
-        let lock = CacheLock::acquire(&cache_dir, &root).unwrap();
+        let lock =
+            crate::fs_lock::try_acquire(&cache_dir.join("cache.lock"), Duration::from_secs(2))
+                .unwrap();
         let (attempted_tx, attempted_rx) = crossbeam_channel::bounded(1);
         let (acquired_tx, acquired_rx) = crossbeam_channel::bounded(1);
         let writer_cache = cache_dir.clone();
-        let writer_root = root.clone();
         let writer_artifact = artifact.clone();
         let writer = std::thread::spawn(move || {
             attempted_tx.send(()).unwrap();
-            let _lock = CacheLock::acquire(&writer_cache, &writer_root).unwrap();
+            let _lock = crate::fs_lock::try_acquire(
+                &writer_cache.join("cache.lock"),
+                Duration::from_secs(2),
+            )
+            .unwrap();
             acquired_tx.send(()).unwrap();
             std::fs::write(writer_artifact, b"generation-b-longer").unwrap();
         });
