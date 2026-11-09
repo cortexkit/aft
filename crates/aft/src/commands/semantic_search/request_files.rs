@@ -309,19 +309,29 @@ impl RequestFiles {
         }
         let file = Arc::new(RequestFile::new(bytes, stat));
         let size = file.retained_bytes();
-        let reserved = self
-            .kept_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
-                kept.checked_add(size).filter(|total| *total <= self.budget)
-            });
-        match reserved {
-            Ok(before) => {
-                self.peak_bytes.fetch_max(before + size, Ordering::Relaxed);
-                *kept = Some(Arc::clone(&file));
+        let mut before = self.kept_bytes.load(Ordering::Relaxed);
+        let reserved = loop {
+            let Some(total) = before
+                .checked_add(size)
+                .filter(|total| *total <= self.budget)
+            else {
+                break false;
+            };
+            match self.kept_bytes.compare_exchange_weak(
+                before,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break true,
+                Err(current) => before = current,
             }
-            Err(_) => {
-                self.over_budget.fetch_add(1, Ordering::Relaxed);
-            }
+        };
+        if reserved {
+            self.peak_bytes.fetch_max(before + size, Ordering::Relaxed);
+            *kept = Some(Arc::clone(&file));
+        } else {
+            self.over_budget.fetch_add(1, Ordering::Relaxed);
         }
         file
     }
@@ -332,7 +342,8 @@ impl RequestFiles {
         let Some(slot) = self.slots.lock().get(path).cloned() else {
             return;
         };
-        if let Some(file) = slot.file.lock().take() {
+        let taken = slot.file.lock().take();
+        if let Some(file) = taken {
             self.kept_bytes
                 .fetch_sub(file.retained_bytes(), Ordering::Relaxed);
         }
@@ -429,6 +440,14 @@ impl Drop for Guard {
 pub(crate) fn install() -> Guard {
     let execution = current_execution();
     let files = Arc::new(RequestFiles::default());
+    #[cfg(test)]
+    if OFF_FOR_TEST.with(std::cell::Cell::get) {
+        return Guard {
+            execution,
+            files,
+            _not_send: PhantomData,
+        };
+    }
     active()
         .lock()
         .entry(execution)
@@ -439,6 +458,22 @@ pub(crate) fn install() -> Guard {
         files,
         _not_send: PhantomData,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Requests started on this thread run without a set, each phase reading
+    /// on its own as before the set existed.
+    static OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `run` with requests on this thread reading without a set.
+#[cfg(test)]
+pub(crate) fn without_request_files_for_test<R>(run: impl FnOnce() -> R) -> R {
+    OFF_FOR_TEST.with(|off| off.set(true));
+    let result = run();
+    OFF_FOR_TEST.with(|off| off.set(false));
+    result
 }
 
 /// The set of the request running on this thread or task, if any.
@@ -644,5 +679,138 @@ mod tests {
         assert!(Arc::ptr_eq(&current().unwrap(), outer.files()));
         drop(outer);
         assert!(current().is_none());
+    }
+}
+
+/// Whole searches, counting every read of file content per path.
+#[cfg(test)]
+mod search_read_tests {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use super::{without_request_files_for_test, ReadProbe};
+    use crate::commands::semantic_search::handle_semantic_search;
+    use crate::config::Config;
+    use crate::context::{AppContext, SemanticIndexStatus};
+    use crate::parser::TreeSitterProvider;
+    use crate::protocol::RawRequest;
+
+    const FILES: &[(&str, &str)] = &[
+        (
+            "src/cache_store.rs",
+            "/// Keeps prepared text by digest.\npub fn cache_sharing_marker() -> usize {\n    // the cache sharing marker keeps prepared text\n    42\n}\n",
+        ),
+        (
+            "src/reader.rs",
+            "use crate::cache_store::cache_sharing_marker;\n\npub fn read_files() -> usize {\n    // cache sharing happens while reading files\n    cache_sharing_marker() + 1\n}\n",
+        ),
+        (
+            "src/writer.rs",
+            "pub fn write_files() {\n    // writers never use the shared cache marker\n}\n",
+        ),
+        (
+            "docs/cache.md",
+            "# Cache sharing\n\nThe cache sharing marker is read once per request.\n",
+        ),
+        ("data/sample.json", "{\"cache\": \"sharing\", \"marker\": 1}\n"),
+    ];
+
+    fn project() -> (tempfile::TempDir, PathBuf, AppContext) {
+        let project = tempfile::tempdir().expect("project");
+        let root = std::fs::canonicalize(project.path()).expect("canonical root");
+        for (relative, text) in FILES {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(path, text).expect("write fixture");
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        (project, root, ctx)
+    }
+
+    /// Reads per path, under `root`, of one search with `params`.
+    fn reads_of_one_search(
+        ctx: &AppContext,
+        root: &Path,
+        params: &serde_json::Value,
+    ) -> BTreeMap<PathBuf, usize> {
+        let mut request = serde_json::json!({
+            "id": "request-files-read-count",
+            "command": "semantic_search",
+            "top_k": 10,
+        });
+        for (key, value) in params.as_object().expect("params object") {
+            request[key] = value.clone();
+        }
+        let request: RawRequest = serde_json::from_value(request).expect("request");
+        let probe = ReadProbe::new(root);
+        let response = serde_json::to_value(handle_semantic_search(&request, ctx)).unwrap();
+        assert_eq!(response["success"], true, "{params}: {response}");
+        assert!(
+            response["results"]
+                .as_array()
+                .is_some_and(|results| !results.is_empty()),
+            "{params} must find results: {response}"
+        );
+        probe.reads()
+    }
+
+    fn searches() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"query": "where is the cache sharing marker kept"}),
+            serde_json::json!({"query": "cache_sharing_marker"}),
+            serde_json::json!({"query": "cache_sharing_marker()"}),
+            serde_json::json!({"query": "how does cache_sharing_marker read files"}),
+            serde_json::json!({"pattern": "cache_sharing_marker"}),
+            serde_json::json!({"query": "cache sharing", "pattern": "marker"}),
+        ]
+    }
+
+    #[test]
+    fn one_search_reads_each_candidate_file_at_most_once() {
+        let (_project, root, ctx) = project();
+        for params in searches() {
+            // Twice: the second search also meets the exact memo's digest
+            // checks and the other cross-request caches.
+            for _ in 0..2 {
+                let reads = reads_of_one_search(&ctx, &root, &params);
+                assert!(!reads.is_empty(), "{params} read no file");
+                let repeated = reads
+                    .iter()
+                    .filter(|(_, count)| **count > 1)
+                    .collect::<Vec<_>>();
+                assert!(
+                    repeated.is_empty(),
+                    "{params} read files more than once: {repeated:?}"
+                );
+            }
+        }
+    }
+
+    /// The probe sees the reads the set saves: without the set, each phase
+    /// reads the file again, as every search did before the set existed.
+    #[test]
+    fn without_the_set_phases_read_the_same_file_again() {
+        let (_project, root, ctx) = project();
+        let most = without_request_files_for_test(|| {
+            searches()
+                .iter()
+                .flat_map(|params| reads_of_one_search(&ctx, &root, params).into_values())
+                .max()
+                .unwrap_or_default()
+        });
+        assert!(
+            most > 1,
+            "some search must read a file twice without the set"
+        );
     }
 }
