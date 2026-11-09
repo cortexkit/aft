@@ -675,8 +675,9 @@ impl StandingActor {
                 if crate::executor::current_job_cancelled() {
                     break;
                 }
-                // A successful full scan clears the durable observation gap;
-                // a failed or interrupted attempt leaves the strict flag set.
+                // The strict flag records that this root may have changed while
+                // nothing watched it. A successful full scan clears it; a failed
+                // or interrupted attempt leaves it set for the next pass.
                 let verified = if crate::data_layer::standing::builds(kind) {
                     // The data layer's own writer orders its publications, so
                     // no search cache is read or written and no writer lease

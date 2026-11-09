@@ -4371,8 +4371,9 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
     run_git(root, &["rev-parse", "HEAD"])
 }
 
-/// `storage_dir` is the cache artifact root (see
-/// [`crate::bash_background::cache_artifact_root`]), not the durable root.
+/// `storage_dir` is the root for rebuildable cache artifacts (see
+/// [`crate::bash_background::cache_artifact_root`]), not AFT's storage root
+/// for data that must survive (aft.db, backups).
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
     crate::bash_background::cache_artifact_root(storage_dir)
         .join("index")
@@ -4465,8 +4466,9 @@ fn collect_ignore_rule_files(
     keep_going: &dyn Fn() -> bool,
 ) -> bool {
     let mut builder = WalkBuilder::new(root);
-    // Nested ignore discovery is a background recursive walk; a disappearing
-    // mount must not turn ReadDir::drop's ENXIO into a daemon abort.
+    // Nested ignore discovery is a background recursive walk. Staying on one
+    // filesystem keeps a mount that disappears mid-walk from aborting the
+    // daemon when its directory listing is dropped.
     builder.same_file_system(true).hidden(false);
     // Same rules as the project walk, so rule files inside ignored trees
     // (which cannot change what is indexed) are not discovered.
@@ -4529,7 +4531,7 @@ pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     dirs
 }
 
-/// Legacy stack-based discovery (pre ignore-walker fix); used only in perf tests.
+/// The older stack-based discovery, kept only so perf tests can compare it.
 #[cfg(test)]
 pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usize {
     let mut stack = vec![root.to_path_buf()];
@@ -4965,7 +4967,8 @@ pub(crate) fn line_details_bytes_with_cr_policy(
         None => (content.len(), content.len()),
     };
     let mut line_slice = &content[line_start..line_end];
-    // Fallback trims every trailing CR; indexed grep removes only the CR in CRLF.
+    // The folder-walk grep path (`trim_all_cr`) trims every trailing CR;
+    // indexed grep removes only the CR of a CRLF line ending.
     while line_slice.ends_with(b"\r") {
         line_slice = &line_slice[..line_slice.len() - 1];
         if !trim_all_cr {
@@ -5371,8 +5374,8 @@ mod tests {
         }
     }
 
-    /// An external-root query must not admit a sibling project's files
-    /// through an update, whichever caller sends it.
+    /// An update for a path outside the project root must not add a sibling
+    /// project's files to the index, whichever caller sends it.
     #[test]
     fn update_for_a_path_outside_the_root_is_not_admitted() {
         let dir = tempfile::tempdir().expect("create temp dir");
