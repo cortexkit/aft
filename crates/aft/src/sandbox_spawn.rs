@@ -55,8 +55,10 @@ use crate::context::AppContext;
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
 
+mod requirement;
 #[cfg(unix)]
 mod task_temp;
+pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -614,35 +616,48 @@ impl SpawnPlan {
     /// for consent safely. Windows has no enforcing backend.
     #[cfg(unix)]
     pub(crate) fn protects_secret_memory(&self) -> bool {
+        self.secret_memory_unavailable().is_none()
+    }
+
+    #[cfg(unix)]
+    fn secret_memory_unavailable(&self) -> Option<String> {
         let Self::Launcher { profile, .. } = self.policy() else {
-            return false;
+            return Some("the resolved plan has no strict native launcher".into());
         };
-        if profile.v != crate::sandbox_profile::SANDBOX_PROFILE_VERSION
-            || !profile.temp_dir.is_absolute()
+        if profile.mode != SandboxMode::Strict {
+            return Some(format!(
+                "the resolved sandbox profile is {} rather than strict",
+                profile.mode
+            ));
+        }
+        if profile.v != crate::sandbox_profile::SANDBOX_PROFILE_VERSION {
+            return Some("the strict sandbox profile version is unsupported".into());
+        }
+        if !profile.temp_dir.is_absolute()
             || std::fs::canonicalize(&profile.temp_dir).ok().as_ref() != Some(&profile.temp_dir)
             || profile
                 .read_deny
                 .iter()
                 .any(|deny| profile.temp_dir.starts_with(deny))
         {
-            return false;
+            return Some(
+                "the strict sandbox profile has an invalid or inaccessible private temp directory"
+                    .into(),
+            );
         }
         #[cfg(target_os = "linux")]
         {
-            profile.mode == SandboxMode::Strict
-                && secret_ptrace_scope_safe(
-                    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-                        .ok()
-                        .as_deref(),
-                )
+            secret_ptrace_scope_unavailable(std::fs::read_to_string(
+                "/proc/sys/kernel/yama/ptrace_scope",
+            ))
         }
         #[cfg(target_os = "macos")]
         {
-            profile.mode == SandboxMode::Strict
+            None
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            false
+            Some("this platform cannot protect vault memory with a strict native sandbox".into())
         }
     }
 
@@ -739,6 +754,15 @@ fn secret_ptrace_scope_safe(value: Option<&str>) -> bool {
     value
         .and_then(|value| value.trim().parse::<u32>().ok())
         .is_some_and(|value| value > 0)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn secret_ptrace_scope_unavailable(value: std::io::Result<String>) -> Option<String> {
+    match value {
+        Ok(value) if secret_ptrace_scope_safe(Some(&value)) => None,
+        Ok(value) => Some(format!("Linux Yama ptrace_scope is {:?}; a positive ptrace_scope is required to protect vault memory", value.trim())),
+        Err(error) => Some(format!("Linux Yama ptrace_scope could not be read: {error}")),
+    }
 }
 
 /// One resolver invocation captured by the project-keyed test seam.
@@ -1484,7 +1508,30 @@ pub fn resolve_sandbox_spawn(
     task_bundle_dir: &Path,
     host_escalation: Option<&HostEscalationAttempt>,
 ) -> SpawnPlan {
+    resolve_command_sandbox_spawn(
+        ctx,
+        principal,
+        requested_tier,
+        task_kind,
+        task_bundle_dir,
+        host_escalation,
+        None,
+    )
+}
+
+fn resolve_sandbox_spawn_with_mode(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    requested_tier: RequestedSandboxTier,
+    task_kind: SandboxTaskKind,
+    task_bundle_dir: &Path,
+    host_escalation: Option<&HostEscalationAttempt>,
+    mode: SandboxMode,
+    requirement: Option<SandboxRequirement>,
+) -> SpawnPlan {
     note_test_observation(ctx, principal, requested_tier, task_kind);
+    #[cfg(not(unix))]
+    let _ = requirement;
 
     // This check must remain ahead of every platform and production-policy
     // branch. Windows tests use it to avoid entering process paths that cannot
@@ -1496,7 +1543,6 @@ pub fn resolve_sandbox_spawn(
 
     // Strict must fail closed without a backend. Relaxed explicitly reports
     // unenforced denies instead, so Windows workers can run their default profile.
-    let mode = effective_sandbox_mode(ctx, principal);
     if let Some(plan) = platform_sandbox_plan(mode, requested_tier, cfg!(unix)) {
         return plan;
     }
@@ -1514,7 +1560,7 @@ pub fn resolve_sandbox_spawn(
         if requested_tier != RequestedSandboxTier::Native {
             return worker_jail_refusal("the command asked to leave the sandbox");
         }
-        if !native_sandbox_enforced(ctx, principal) {
+        if !cfg!(unix) {
             return worker_jail_refusal("the route's principal cannot use the native launcher");
         }
     }
@@ -1574,22 +1620,27 @@ pub fn resolve_sandbox_spawn(
 
     #[cfg(unix)]
     {
+        let setup_refusal = |cause: String| {
+            requirement.map_or_else(
+                || sandbox_setup_refusal(ctx, principal, &cause),
+                |requirement| {
+                    requirement
+                        .refused(format!("the strict sandbox could not be prepared: {cause}"))
+                },
+            )
+        };
         let resolved = crate::pinned_executable::with_task_image(task_bundle_dir, || {
-            let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
+            let profile = match build_native_profile(ctx, principal, task_bundle_dir, mode) {
                 Ok(profile) => profile,
                 Err(error) => {
-                    return sandbox_setup_refusal(ctx, principal, error);
+                    return setup_refusal(error);
                 }
             };
             let launcher_path = match native_launcher_path(ctx) {
                 Ok(path) => path,
                 Err(error) => {
                     let _ = cleanup_task_temp_dir(&profile.temp_dir);
-                    return sandbox_setup_refusal(
-                        ctx,
-                        principal,
-                        format!("failed to locate the aft executable: {error}"),
-                    );
+                    return setup_refusal(format!("failed to locate the aft executable: {error}"));
                 }
             };
             crate::slog_info!(
@@ -1613,11 +1664,9 @@ pub fn resolve_sandbox_spawn(
         });
         match resolved {
             Ok(plan) => plan,
-            Err(error) => sandbox_setup_refusal(
-                ctx,
-                principal,
-                format!("failed to retain the startup executable for the task: {error}"),
-            ),
+            Err(error) => setup_refusal(format!(
+                "failed to retain the startup executable for the task: {error}"
+            )),
         }
     }
 
@@ -1672,6 +1721,7 @@ fn build_native_profile(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
     task_bundle_dir: &Path,
+    mode: SandboxMode,
 ) -> Result<SandboxProfile, String> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -1733,7 +1783,7 @@ fn build_native_profile(
         .map_err(|error| format!("failed to canonicalize task io directory: {error}"))?;
     let session_store = session_store_for_task_io(&task_io_dir)?;
 
-    if effective_sandbox_mode(ctx, principal) == SandboxMode::Off {
+    if mode == SandboxMode::Off {
         let temp = create_task_temp_dir(&task_io_dir)?;
         let result = SandboxProfile::build(
             project_roots,
@@ -1767,7 +1817,7 @@ fn build_native_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
-        if effective_sandbox_mode(ctx, principal) == SandboxMode::Relaxed {
+        if mode == SandboxMode::Relaxed {
             return build_relaxed_profile(
                 ctx,
                 &home,
@@ -7005,7 +7055,13 @@ mod tests {
         }
         for value in ["1", " 2\n", "3"] {
             assert!(secret_ptrace_scope_safe(Some(value)));
+            assert!(secret_ptrace_scope_unavailable(Ok(value.into())).is_none());
         }
+        assert_eq!(secret_ptrace_scope_unavailable(Ok("0\n".into())).unwrap(), "Linux Yama ptrace_scope is \"0\"; a positive ptrace_scope is required to protect vault memory");
+        assert_eq!(
+            secret_ptrace_scope_unavailable(Err(std::io::Error::other("test denied"))).unwrap(),
+            "Linux Yama ptrace_scope could not be read: test denied"
+        );
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

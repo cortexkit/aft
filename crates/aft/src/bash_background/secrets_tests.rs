@@ -151,6 +151,189 @@ fn code(response: &Response) -> Option<&str> {
 }
 
 #[test]
+fn secret_bash_sandbox_raise_host_refuses_before_scope_or_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let vault = Vault::new(443);
+    let mut req = request("echo '{{ck-secret:test}}' > must-not-run");
+    req.params["params"]["sandbox"] = json!("host");
+    let reply = with_vault(vault.clone(), || crate::commands::bash::handle(&req, &ctx));
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but a host-escalation request would bypass the strict sandbox. No command was started.");
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("must-not-run").exists());
+    assert!(!storage.path().join("tasks").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_sandbox_raise_role_and_task_plans_are_command_local() {
+    use crate::sandbox_spawn::{
+        AuthenticatedPrincipal, RequestedSandboxTier, SandboxRequirement, SandboxTaskKind,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let requirement = SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap();
+    for worker in [false, true] {
+        crate::sandbox_spawn::with_worker_jail(worker, || {
+            let expected = if worker {
+                crate::config::SandboxMode::Relaxed
+            } else {
+                crate::config::SandboxMode::Off
+            };
+            for (pty, background) in [(false, false), (false, true), (true, true)] {
+                let plan = preflight(&ctx, "sandbox-raise", pty, background, requirement).unwrap();
+                assert!(plan.plan.protects_secret_memory(), "{:?}", plan.plan);
+                assert_eq!(
+                    crate::sandbox_spawn::effective_sandbox_mode(
+                        &ctx,
+                        &AuthenticatedPrincipal::FirstParty
+                    ),
+                    expected
+                );
+            }
+        });
+    }
+    let task = super::super::persistence::allocate_task_layout(
+        &super::super::task_storage_dir(&ctx),
+        "ordinary",
+    )
+    .unwrap();
+    let ordinary = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+        &ctx,
+        &AuthenticatedPrincipal::FirstParty,
+        RequestedSandboxTier::Native,
+        SandboxTaskKind::BashForeground,
+        &task.paths.io_dir,
+        None,
+        SandboxRequirement::for_command("echo ordinary"),
+    );
+    assert_eq!(ordinary, SpawnPlan::Unsandboxed);
+    let reply = crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx);
+    assert_eq!(code(&reply), Some("secret_refused"), "{reply:?}");
+    super::super::persistence::delete_resolved_task(&task).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_bash_sandbox_raise_setup_refusals_name_the_cause() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let vault = Vault::new(443);
+    let unavailable = SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message: "the native launcher executable is unavailable".into(),
+        mismatch_class: None,
+    };
+    let reply = with_vault(vault.clone(), || {
+        crate::sandbox_spawn::with_spawn_plan_for_test(unavailable, || {
+            crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+        })
+    });
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the strict sandbox could not be prepared: the native launcher executable is unavailable. No command was started.");
+    ctx.update_config(|config| config.project_root = Some(root.path().join("missing")));
+    let reply = with_vault(vault.clone(), || {
+        crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
+    });
+    assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+    assert!(
+        reply.data["message"].as_str().unwrap().contains(
+            "the strict sandbox could not be prepared: project root is not an existing directory:"
+        ),
+        "{reply:?}"
+    );
+    assert!(!reply.data["message"]
+        .as_str()
+        .unwrap()
+        .contains("select sandbox.profile off"));
+    assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
+    use std::ffi::{OsStr, OsString};
+    const CHILD: &str = "AFT_SANDBOX_RAISE_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "bash_background::secrets::tests::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("HOME", home.path());
+        for key in [
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let path = home.path().join(key);
+            std::fs::create_dir(&path).unwrap();
+            command.env(key, path);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("ungranted-write");
+    let _launcher = native_launcher(root.path());
+    let ctx = context(root.path(), storage.path());
+    ctx.update_config(|config| config.sandbox = Default::default());
+    let raised = preflight(
+        &ctx,
+        "sandbox-raise",
+        false,
+        false,
+        crate::sandbox_spawn::SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
+    )
+    .unwrap();
+    let args = [
+        OsString::from("-c"),
+        OsString::from("printf probe > \"$1\""),
+        OsString::from("probe"),
+        target.as_os_str().to_owned(),
+    ];
+    let run = |plan: &SpawnPlan| {
+        crate::sandbox_spawn::probe_command_for_plan(
+            plan,
+            OsStr::new("/bin/sh"),
+            &args,
+            root.path(),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .output()
+        .unwrap()
+    };
+    let off = run(&SpawnPlan::Unsandboxed);
+    assert!(off.status.success(), "{off:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"probe");
+    std::fs::remove_file(&target).unwrap();
+    let denied = run(&raised.plan);
+    assert!(!denied.status.success(), "{denied:?}");
+    assert!(!target.exists());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
+        "{denied:?}"
+    );
+}
+
+#[test]
 fn secret_bash_scan_and_environment_conflicts() {
     assert_eq!(
         labels("echo '{{ck-secret:a}} {{ck-secret:a}} {{ck-secret:b}} {{ck-secret:BAD}}'"),
@@ -245,6 +428,7 @@ fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
             })
         });
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+        assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the resolved plan has no strict native launcher. No command was started.");
         assert!(!root.path().join("must-not-be-rewritten").exists());
     }
     assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
@@ -273,6 +457,7 @@ fn secret_bash_windows_refuses_all_profiles_without_a_job() {
             crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
         });
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
+        assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but this platform has no strict native sandbox (Windows is unsupported). No command was started.");
         assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);
     }
 }

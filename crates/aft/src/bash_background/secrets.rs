@@ -16,14 +16,13 @@ use crate::protocol::Response;
 #[cfg(any(unix, test))]
 use crate::sandbox_spawn::SpawnPlan;
 #[cfg(unix)]
-use crate::sandbox_spawn::{RequestedSandboxTier, SandboxTaskKind};
+use crate::sandbox_spawn::{RequestedSandboxTier, SandboxRequirement, SandboxTaskKind};
 use crate::secret::{SecretVault, UnavailableVault};
 #[cfg(unix)]
 use crate::secret_proxy::{GrantedLabel, ProxyConfig, SecretProxy};
 
 pub(crate) const REMOTE_REFUSED: &str =
     "Secret placeholders stay local; remote commands cannot use them.";
-pub(crate) const SANDBOX_REQUIRED: &str = "Secret placeholder commands require a protected sandbox on Linux or macOS; Windows cannot run them.";
 pub(crate) const ENV_CONFLICT: &str =
     "Secret placeholder commands cannot set proxy variables in env or bash.env.";
 #[cfg(unix)]
@@ -88,6 +87,7 @@ pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) ->
 pub(crate) struct Preflight {
     pub(crate) plan: SpawnPlan,
     pub(crate) task: Option<super::persistence::ResolvedTask>,
+    requirement: SandboxRequirement,
 }
 
 #[cfg(unix)]
@@ -106,16 +106,16 @@ pub(crate) fn preflight(
     session: &str,
     pty: bool,
     background: bool,
-) -> Result<Preflight, ()> {
+    requirement: SandboxRequirement,
+) -> Result<Preflight, String> {
     let task = super::persistence::allocate_task_layout(&super::task_storage_dir(ctx), session)
         .map_err(|error| {
-            #[cfg(test)]
-            eprintln!("secret preflight layout refused: {error}");
-            #[cfg(not(test))]
-            let _ = error;
+            requirement.refusal_message(format!(
+                "the task artifact directory could not be created: {error}"
+            ))
         })?;
     let principal = crate::sandbox_spawn::current_authenticated_principal();
-    let plan = crate::sandbox_spawn::resolve_sandbox_spawn(
+    let plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
         ctx,
         &principal,
         RequestedSandboxTier::Native,
@@ -128,20 +128,15 @@ pub(crate) fn preflight(
         },
         &task.paths.io_dir,
         None,
+        Some(requirement),
     );
     let preflight = Preflight {
         plan,
         task: Some(task),
+        requirement,
     };
-    if !preflight.plan.protects_secret_memory() {
-        #[cfg(test)]
-        eprintln!(
-            "secret preflight refused: code={:?}, message={:?}, scratch={:?}",
-            preflight.plan.refusal_code(),
-            preflight.plan.refusal_message(),
-            preflight.plan.temp_dir()
-        );
-        return Err(());
+    if let Some(message) = preflight.plan.refusal_message() {
+        return Err(message.to_owned());
     }
     Ok(preflight)
 }
@@ -289,11 +284,29 @@ pub(crate) fn authorize(
     preflight
         .plan
         .enable_secret_proxy(proxy.address().port())
-        .map_err(|_| refusal(id, labels, "secrets_sandbox_required", SANDBOX_REQUIRED))?;
+        .map_err(|_| {
+            refusal(
+                id,
+                labels,
+                "secrets_sandbox_required",
+                &preflight
+                    .requirement
+                    .refusal_message("the strict sandbox could not enable the vault proxy"),
+            )
+        })?;
     let bundle = preflight
         .plan
         .temp_dir()
-        .ok_or_else(|| refusal(id, labels, "secrets_sandbox_required", SANDBOX_REQUIRED))?
+        .ok_or_else(|| {
+            refusal(
+                id,
+                labels,
+                "secrets_sandbox_required",
+                &preflight.requirement.refusal_message(
+                    "the strict sandbox has no private temp directory for the vault trust bundle",
+                ),
+            )
+        })?
         .join("secret-trust.pem");
     write_bundle(&bundle, proxy.ca_pem())
         .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;

@@ -95,6 +95,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let secret_labels = crate::bash_background::secrets::labels(&params.command);
     let has_secrets = !secret_labels.is_empty();
+    let sandbox_requirement =
+        crate::sandbox_spawn::SandboxRequirement::for_command(&params.command);
     // Remote runs are resolved later, but whether `bash.env` travels with the
     // job depends only on the request, so decide it up front: a `runon` job
     // receives no configured value unless the user listed the name in
@@ -117,14 +119,22 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             crate::bash_background::secrets::REMOTE_REFUSED,
         );
     }
-    // Host escalation can never protect the daemon's memory, even if approved.
-    if has_secrets && (cfg!(windows) || params.sandbox.is_some()) {
-        return crate::bash_background::secrets::refusal(
-            &req.id,
-            &secret_labels,
-            "secrets_sandbox_required",
-            crate::bash_background::secrets::SANDBOX_REQUIRED,
-        );
+    if let Some(requirement) = sandbox_requirement {
+        let tier = if params.sandbox.is_some() {
+            crate::sandbox_spawn::RequestedSandboxTier::Host
+        } else {
+            crate::sandbox_spawn::RequestedSandboxTier::Native
+        };
+        if let Err(message) =
+            requirement.check_request(tier, cfg!(any(target_os = "macos", target_os = "linux")))
+        {
+            return crate::bash_background::secrets::refusal(
+                &req.id,
+                &secret_labels,
+                requirement.refusal_code(),
+                &message,
+            );
+        }
     }
     #[cfg(unix)]
     let secret_preflight = if has_secrets {
@@ -133,14 +143,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             req.session(),
             params.pty,
             params.background,
+            sandbox_requirement.expect("vault placeholders require a sandbox"),
         ) {
             Ok(preflight) => Some(preflight),
-            Err(()) => {
+            Err(message) => {
                 return crate::bash_background::secrets::refusal(
                     &req.id,
                     &secret_labels,
                     "secrets_sandbox_required",
-                    crate::bash_background::secrets::SANDBOX_REQUIRED,
+                    &message,
                 )
             }
         }
@@ -511,7 +522,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
-    if !has_secrets
+    if sandbox_requirement.is_none()
         && !params.shell.is_powershell()
         && ctx.config().bash.changed_files == crate::config::BashChangedFiles::Off
         && host_escalation.is_none()

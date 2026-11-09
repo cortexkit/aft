@@ -28,8 +28,7 @@ use crate::protocol::Response;
 #[cfg(unix)]
 use crate::sandbox_spawn::native_sandbox_enforced;
 use crate::sandbox_spawn::{
-    current_authenticated_principal, resolve_sandbox_spawn, HostEscalationAttempt,
-    RequestedSandboxTier, SandboxTaskKind,
+    current_authenticated_principal, HostEscalationAttempt, RequestedSandboxTier, SandboxTaskKind,
 };
 use persistence::BgMode;
 use serde::{Deserialize, Serialize};
@@ -1289,9 +1288,10 @@ pub(crate) fn spawn_with_secrets(
         SandboxTaskKind::BashForeground
     };
     let principal = current_authenticated_principal();
+    let sandbox_requirement = crate::sandbox_spawn::SandboxRequirement::for_command(command);
     let requested_tier = if host_escalation.is_some() {
         RequestedSandboxTier::Host
-    } else if crate::sandbox_spawn::sandbox_required(ctx) {
+    } else if sandbox_requirement.is_some() || crate::sandbox_spawn::sandbox_required(ctx) {
         RequestedSandboxTier::Native
     } else {
         RequestedSandboxTier::Disabled
@@ -1299,6 +1299,7 @@ pub(crate) fn spawn_with_secrets(
     let session_dir = persistence::session_tasks_dir(&storage_dir, session_id);
     #[cfg(unix)]
     let (spawn_plan, unregistered_task) = if secret_launch.is_some()
+        || sandbox_requirement.is_some()
         || (native_sandbox_enforced(ctx, &principal) && host_escalation.is_none())
     {
         enter_bash_startup_step(BashStartupStep::TaskDirectory);
@@ -1324,13 +1325,14 @@ pub(crate) fn spawn_with_secrets(
             .as_ref()
             .map(|launch| launch.preflight.plan.clone())
             .unwrap_or_else(|| {
-                resolve_sandbox_spawn(
+                crate::sandbox_spawn::resolve_command_sandbox_spawn(
                     ctx,
                     &principal,
                     requested_tier,
                     task_kind,
                     &task.paths.io_dir,
                     None,
+                    sandbox_requirement,
                 )
             });
         if plan.refusal_code().is_some() {
@@ -1378,13 +1380,14 @@ pub(crate) fn spawn_with_secrets(
     } else {
         enter_bash_startup_step(BashStartupStep::Profile);
         (
-            resolve_sandbox_spawn(
+            crate::sandbox_spawn::resolve_command_sandbox_spawn(
                 ctx,
                 &principal,
                 requested_tier,
                 task_kind,
                 &session_dir,
                 host_escalation.as_ref(),
+                sandbox_requirement,
             ),
             None,
         )
@@ -1392,13 +1395,14 @@ pub(crate) fn spawn_with_secrets(
     #[cfg(not(unix))]
     enter_bash_startup_step(BashStartupStep::Profile);
     #[cfg(not(unix))]
-    let spawn_plan = resolve_sandbox_spawn(
+    let spawn_plan = crate::sandbox_spawn::resolve_command_sandbox_spawn(
         ctx,
         &principal,
         requested_tier,
         task_kind,
         &session_dir,
         host_escalation.as_ref(),
+        sandbox_requirement,
     );
     if let Some(code) = spawn_plan.refusal_code() {
         #[cfg(unix)]
