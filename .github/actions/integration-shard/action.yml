@@ -30,6 +30,7 @@ runs:
       if: inputs.platform != 'windows'
       with:
         node-version: "24"
+        package-manager-cache: ${{ runner.environment == 'github-hosted' }}
     - name: Install Pyright integration dependency
       if: inputs.platform == 'linux'
       shell: bash
@@ -38,11 +39,12 @@ runs:
       if: inputs.platform != 'windows'
       with:
         bun-version: latest
+        no-cache: ${{ runner.environment == 'self-hosted' }}
 
     # Install TypeScript 7's native server and the TypeScript 5 fallback server;
     # without these pinned binaries, the TypeScript LSP integration tests skip.
     - uses: actions/cache/restore@v4
-      if: inputs.platform != 'windows'
+      if: inputs.platform != 'windows' && runner.environment == 'github-hosted'
       id: typescript-servers
       with:
         path: ${{ runner.temp }}/typescript-test-servers
@@ -53,9 +55,10 @@ runs:
       run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
 
     - uses: ./.github/actions/download-artifact-retry
+      if: runner.environment == 'github-hosted'
       with:
         name: ${{ inputs.platform }}-nextest-archive
-        path: ${{ runner.temp }}
+        path: ${{ env.AFT_CI_ARCHIVE_DIR || runner.temp }}
         # A transfer that passes the artifact digest can still leave a truncated
         # zstd frame on this runner; test the archive and download again if so.
         verify-zstd: ${{ inputs.platform }}-nextest.tar.zst
@@ -72,7 +75,7 @@ runs:
       env:
         NEXTEST_TEST_THREADS: "num-cpus"
         AFT_GATE_PHASES: nextest
-        AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/${{ inputs.platform }}-nextest.tar.zst
+        AFT_NEXTEST_ARCHIVE_FILE: ${{ env.AFT_CI_ARCHIVE_DIR || runner.temp }}/${{ inputs.platform }}-nextest.tar.zst
         # Restore helper binaries to the compile-time checkout paths in the archive.
         AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
         AFT_NEXTEST_PARTITION: hash:${{ inputs.shard }}/3
@@ -87,19 +90,19 @@ runs:
         AFT_TEST_DIAG: "1"
         NEXTEST_TEST_THREADS: "4"
         AFT_GATE_PHASES: nextest
-        AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+        AFT_NEXTEST_ARCHIVE_FILE: ${{ env.AFT_CI_ARCHIVE_DIR || runner.temp }}/windows-nextest.tar.zst
         AFT_NEXTEST_PARTITION: hash:${{ inputs.shard }}/3
         AFT_GATE_SKIP_RELEASE_STORM: "1"
 
     - name: Save TypeScript test servers on main
-      if: ${{ inputs.platform != 'windows' && github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.platform != 'windows' && github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' && runner.environment == 'github-hosted' }}
       uses: actions/cache/save@v4
       with:
         path: ${{ runner.temp }}/typescript-test-servers
         key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
 
     - name: Upload integration crash cores
-      if: failure() && inputs.platform != 'windows' && inputs.shard == '2'
+      if: failure() && inputs.platform != 'windows' && inputs.shard == '2' && runner.environment == 'github-hosted'
       uses: ./.github/actions/upload-artifact-retry
       with:
         name: ${{ inputs.platform }}-integration-crash-${{ inputs.shard }}

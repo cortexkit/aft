@@ -12,6 +12,7 @@ runs:
   using: composite
   steps:
     - name: Cache cargo-nextest
+      if: runner.environment == 'github-hosted'
       id: nextest-cache
       uses: actions/cache@v4
       with:
@@ -52,6 +53,13 @@ runs:
         if [[ "$NEXTEST_VERSION" != "0.9.138" ]]; then
           echo "No pinned cargo-nextest checksum is available for $NEXTEST_VERSION" >&2
           exit 1
+        fi
+
+        # Dedicated runners retain the verified install between jobs without a
+        # round trip to GitHub's cache service. Hosted runners keep their cache.
+        if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]] && \
+           cargo-nextest --version 2>/dev/null | grep -q "^cargo-nextest ${NEXTEST_VERSION} "; then
+          exit 0
         fi
 
         mkdir -p "$HOME/.cargo/bin"

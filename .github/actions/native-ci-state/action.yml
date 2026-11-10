@@ -1,0 +1,15 @@
+name: Native CI state
+description: Keep native build outputs outside checkout and clean leaked test processes
+inputs:
+  phase:
+    description: setup, cleanup, or finalize
+    default: setup
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        AFT_CI_PHASE: ${{ inputs.phase }}
+      run: |
+        if command -v python3 >/dev/null 2>&1; then python=python3; else python=python; fi
+        "$python" scripts/ci-native-state.py "$AFT_CI_PHASE"
