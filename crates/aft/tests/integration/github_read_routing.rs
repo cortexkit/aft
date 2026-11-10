@@ -168,7 +168,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
     );
     assert_eq!(
         pull_request["content"].as_str(),
-        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n")
+        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\nReview thread state couldn't be read; unresolved threads may still block the merge.\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n")
     );
 
     assert!(aft.shutdown().success());
