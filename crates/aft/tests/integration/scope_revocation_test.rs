@@ -389,8 +389,10 @@ fn call_modes_refuse_flow_writes_and_unknown_but_serve_read_and_classic() {
             )
             .await;
             let reply = read_frame_timeout(&mut daemon.stream, "classic bash").await;
-            assert_eq!(reply.header.ty, FrameType::Response);
-            assert!(String::from_utf8_lossy(&reply.body).contains("classic-ok"));
+            let body = String::from_utf8_lossy(&reply.body);
+            eprintln!("classic bash reply ({:?}): {body}", reply.header.ty);
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert!(body.contains("classic-ok"), "classic bash reply: {body}");
             send_connection_goodbye(&mut daemon.stream).await;
         },
         |_, _, _| {},
