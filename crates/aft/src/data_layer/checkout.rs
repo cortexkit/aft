@@ -6028,8 +6028,13 @@ pub fn other() { callee(); }
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
-        // One cached block cannot retain the parse body while its surface is
-        // read. Publication therefore reads the changed disk bytes below.
+        // A full surface block evicts the old body from a one-block cache.
+        // Small partial blocks could otherwise all remain cached together.
+        let mut source = std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap();
+        for n in 0..2000 {
+            source.push_str(&format!("pub fn padding_function_{n}() {{}}\n"));
+        }
+        write(root.path(), "src/lib.rs", &source);
         let layer = Arc::new(DataLayer::new(64 << 10, 2));
         let checkout =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
@@ -6083,11 +6088,19 @@ pub fn other() { callee(); }
             bytes[offsets[0] + body.len() / 2] ^= 0x40;
             std::fs::write(segment.path(), bytes).unwrap();
             // Evict the old cached body without decoding the damaged parse.
-            content.surface(ordinal).unwrap();
+            assert!(content.surface(ordinal).unwrap().len() >= 64 << 10);
+            assert!(
+                content.body(ordinal).is_err(),
+                "the damaged body must not be cached"
+            );
             damaged = true;
             break;
         }
         assert!(damaged, "the stored parse was found");
+        assert!(
+            published.graph.failures().is_empty(),
+            "publication has not read the damaged parse yet"
+        );
         let before = checkout
             .family
             .snapshot()
