@@ -580,8 +580,9 @@ impl StoredSlices {
 
     /// [`Self::open_files`], telling apart a file whose record or fragment
     /// no segment holds ([`Held::Missing`]) from a segment that cannot be
-    /// read (the error). A state an older extractor version published names
-    /// records this build keys differently, so its records are all missing.
+    /// read (the error). The caller must validate a published state's graph
+    /// producer before pairing its fragment keys with current record keys:
+    /// shared segments can hold records from more than one extractor.
     ///
     /// # Errors
     ///

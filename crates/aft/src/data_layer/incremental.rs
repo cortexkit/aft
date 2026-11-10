@@ -542,7 +542,7 @@ impl LiveCheckout {
             bound.bind_missing(&inputs, &paths)?;
             let mut resolved = resolve_files(&inputs, &bound, &paths)?;
             let mut calls = MethodCallInputs::build(&inputs, &resolved);
-            for (path, sites, dependencies) in calls.resolve_sites(&inputs, &resolved, &paths) {
+            for (path, sites, dependencies) in calls.resolve_sites(&inputs, &resolved, &paths)? {
                 let file = resolved.get_mut(&path).expect("resolved");
                 file.sites = sites;
                 file.site_dependencies = dependencies;
@@ -1158,7 +1158,9 @@ impl LiveCheckout {
                 old.parses.get(path).map(|(_, parse)| &**parse),
                 self.resolved.get(path),
             );
-            let file = self.resolved.get_mut(path).expect("kept");
+            let file = self.resolved.get_mut(path).ok_or_else(|| {
+                ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
+            })?;
             file.dispatch = dispatch;
             self.reverse
                 .note_resolution(path, file, &CheckoutFacts { inputs });
@@ -1196,8 +1198,12 @@ impl LiveCheckout {
         sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
         let paths = sites.iter().collect::<Vec<_>>();
-        for (path, kept, dependencies) in self.calls.resolve_sites(inputs, &self.resolved, &paths) {
-            let file = self.resolved.get_mut(&path).expect("resolved");
+        for (path, kept, dependencies) in
+            self.calls.resolve_sites(inputs, &self.resolved, &paths)?
+        {
+            let file = self.resolved.get_mut(&path).ok_or_else(|| {
+                ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
+            })?;
             file.sites = kept;
             file.site_dependencies = dependencies;
             self.reverse

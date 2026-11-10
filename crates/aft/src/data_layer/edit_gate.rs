@@ -391,7 +391,7 @@ pub fn bench_file(root: &Path, file: &str, iterations: usize) -> Result<(), Stri
             let one = super::callgraph::resolve_files(&inputs, &bound, &[target]).map_err(error)?;
             let resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
             let started = std::time::Instant::now();
-            let sites = calls.resolve_sites(&inputs, &resolved, &[target]);
+            let sites = calls.resolve_sites(&inputs, &resolved, &[target]).map_err(error)?;
             let sites_ms = started.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "round {round}: resolve {resolve_ms:.0} ms ({} rows), sites {sites_ms:.0} ms ({} sites)",

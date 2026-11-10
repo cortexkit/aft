@@ -1624,7 +1624,9 @@ impl Checkout {
                     .map(|key| key.digest())
             })
             .collect();
-        let state = state.with_fragments(per_path).map_err(DataError::store)?;
+        let state = state
+            .with_fragments_for(per_path, EXTRACTOR_VERSION)
+            .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
             .map_err(DataError::store)?;
@@ -1705,7 +1707,8 @@ impl Checkout {
             }
             match snapshot.checkout_state(state_ref.checkout) {
                 Ok(Some(state))
-                    if state.has_fragments() && !state.root().is_some_and(folder_is_gone) =>
+                    if state.has_fragments_for(EXTRACTOR_VERSION)
+                        && !state.root().is_some_and(folder_is_gone) =>
                 {
                     siblings.push((*state_ref, state));
                 }
@@ -1759,7 +1762,7 @@ impl Checkout {
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
                 .map_err(DataError::store)?
                 .with_root_of(&scanned.state)
-                .with_fragments(fragments)
+                .with_fragments_for(fragments, EXTRACTOR_VERSION)
                 .map_err(DataError::store)?;
         let scan_ms = elapsed_ms(started);
         checkpoint()?;
@@ -2595,19 +2598,15 @@ impl Checkout {
             // The engine reads stored parses and resolutions as it goes; a
             // read that failed made it work from an empty one.
             let failures = published.graph.failures();
-            let update = match update {
-                Ok(update) if failures.is_empty() => update,
-                // A failed update may have changed some of the engine's state
-                // and not the rest; the caller drops it, so the next refresh
-                // starts a new engine from the publication.
-                Err(error) => return Err(DataError::Resolve(error.to_string())),
-                Ok(_) => {
-                    return Err(DataError::Damaged(format!(
-                        "reading the stored call graph failed: {}",
-                        failures.join("; ")
-                    )))
-                }
-            };
+            if !failures.is_empty() {
+                return Err(DataError::Damaged(format!(
+                    "reading the stored call graph failed: {}",
+                    failures.join("; ")
+                )));
+            }
+            // The caller drops a partly updated engine after either error,
+            // so the next refresh starts again from the publication.
+            let update = update.map_err(|error| DataError::Resolve(error.to_string()))?;
             // Only the files this update touched get new slices; every file
             // touched by an earlier update keeps the slice it got then. Each
             // is laid over the publication encoded, as a publication stores
@@ -2909,7 +2908,7 @@ impl Checkout {
         let state = inputs
             .state
             .clone()
-            .with_fragments(per_path)
+            .with_fragments_for(per_path, EXTRACTOR_VERSION)
             .map_err(DataError::store)?;
         let written = session
             .write_checkout_state(self.checkout, &state)
@@ -3268,6 +3267,11 @@ impl Checkout {
         published: &Arc<Published>,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<GraphEngine, DataError> {
+        if !published.state.has_fragments_for(EXTRACTOR_VERSION) || !published.graph_built {
+            return Err(DataError::Damaged(
+                "the call graph was not built by this extractor".to_string(),
+            ));
+        }
         // Every parse and resolution is decoded the first time an update
         // reads it.
         let parses = super::callgraph::Parses::stored(&published.graph);
@@ -3493,12 +3497,16 @@ impl Published {
         let text = TextLocator::build(&texts).map_err(DataError::store)?;
         let membership = TextMembership::build(&state, &text);
         drop(texts);
-        // Each parsed path's record key follows from its content and
-        // language; its fragment is the one the state names.
+        // Validate the graph's producer before pairing any state fragment
+        // with a current record. Another checkout in the shared family can
+        // supply current records while this publication names old fragments.
         let mut files = Vec::new();
         let mut unparsed = BTreeSet::new();
-        let graph_built = state.has_fragments();
+        let graph_built = state.has_fragments_for(EXTRACTOR_VERSION);
         for (index, record) in state.paths().iter().enumerate() {
+            if !graph_built {
+                break;
+            }
             let Some(fragment) = state.fragment(index) else {
                 if graph_built && is_unparsed(record) {
                     unparsed.insert(record.path.clone());
@@ -3515,10 +3523,9 @@ impl Published {
                 FragmentKey::from_digest(fragment),
             ));
         }
-        // A state an older extractor version published names records this
-        // build keys differently, so none is found. Its text still serves;
-        // its call graph counts as not built, so the checkout's own bind
-        // builds it again (see `needs_build`) and a read-only bind of it
+        // A state from another extractor, or without a stamp, serves text
+        // alone. Missing records or fragments also make the graph unbuilt;
+        // the checkout's own bind builds it again (see `needs_build`), while a read-only bind
         // answers text alone instead of failing.
         let (graph, graph_built) = match StoredSlices::open_files_if_held(segments.clone(), &files)
             .map_err(DataError::Store)?
@@ -5896,6 +5903,20 @@ pub fn other() { callee(); }
             "package p\n\nfunc (T) Stop() {}\n",
         );
         checkout.record_paths(&[b"p/stop.go".to_vec()]).unwrap();
+        // Exercise the update without refresh's last-resort panic catcher:
+        // malformed stored data must return an error, not unwind a worker.
+        let (published, state, changes) = {
+            let live = checkout.live.read().unwrap();
+            (
+                live.published.clone().unwrap(),
+                live.state.clone().unwrap(),
+                live.changes.clone(),
+            )
+        };
+        assert!(matches!(
+            checkout.update_engine(&mut None, &published, &state, &changes),
+            Err(DataError::Damaged(_))
+        ));
         for attempt in 0..2 {
             let result = checkout.refresh_callgraph();
             assert!(
@@ -5918,7 +5939,7 @@ pub fn other() { callee(); }
 
     /// Publishes the older string-table representation with keys from another
     /// extractor, without running another binary or sharing process globals.
-    fn publish_legacy_graph(checkout: &Checkout) {
+    fn publish_legacy_graph(checkout: &Checkout, stamp: Option<&str>) {
         use crate::callgraph_store::join::CallgraphBlob;
         use aft_store::content::ContentSectionsBuilder;
         let version = "ruled-callgraph-v14-resolver-precision+record-12";
@@ -5988,7 +6009,11 @@ pub fn other() { callee(); }
                     .map(|key| key.digest())
             })
             .collect();
-        let state = inputs.state.with_fragments(per_path).unwrap();
+        let state = match stamp {
+            Some(version) => inputs.state.with_fragments_for(per_path, version),
+            None => inputs.state.with_fragments(per_path),
+        }
+        .unwrap();
         let written = writer
             .write_checkout_state(checkout.checkout, &state)
             .unwrap();
@@ -6003,6 +6028,15 @@ pub fn other() { callee(); }
 
     #[test]
     fn a_legacy_publication_with_current_sibling_records_rebuilds_before_refresh() {
+        legacy_restart(None);
+    }
+
+    #[test]
+    fn a_different_extractor_publication_rebuilds_before_refresh() {
+        legacy_restart(Some("ruled-callgraph-v14-resolver-precision+record-12"));
+    }
+
+    fn legacy_restart(stamp: Option<&str>) {
         fn answers(view: &CheckoutView) -> (String, String) {
             let callers = callers_of(view, "p/stop.go", "Stop");
             let tree = crate::commands::callgraph_store_adapter::call_tree_result(
@@ -6033,10 +6067,11 @@ pub fn other() { callee(); }
         }
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
         let old = Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
-        publish_legacy_graph(&old);
+        publish_legacy_graph(&old, stamp);
         drop(old);
         let other =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), sibling.path()).unwrap();
+        assert!(other.start_from_sibling(Instant::now()).unwrap().is_none());
         other.publish_text_first().unwrap();
         other.build().unwrap();
         // The new records coexist with the old fragments in one family.

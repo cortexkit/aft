@@ -128,6 +128,9 @@ pub struct CheckoutState {
     /// For each path, the call-graph fragment that holds its resolution in
     /// this checkout, when it has one. Empty, or one entry per path.
     fragments: Arc<Vec<Option<Digest128>>>,
+    /// The producer of the graph, independent of which content records a
+    /// shared family happens to hold. Legacy states have no producer stamp.
+    graph_extractor: Option<String>,
 }
 
 /// Why a state could not be built.
@@ -172,6 +175,7 @@ impl CheckoutState {
             root: Vec::new(),
             paths: Arc::new(paths),
             fragments: Arc::default(),
+            graph_extractor: None,
         })
     }
 
@@ -212,7 +216,32 @@ impl CheckoutState {
             return Err(StateError::PlaneMismatch);
         }
         self.fragments = Arc::new(fragments);
+        self.graph_extractor = None;
         Ok(self)
+    }
+
+    /// Names the producer of these fragments. Content records and fragments
+    /// can live in different shared segments, so finding a content record
+    /// does not prove that the graph was built by the same extractor.
+    ///
+    /// # Errors
+    ///
+    /// When `fragments` does not have one entry per path.
+    pub fn with_fragments_for(
+        self,
+        fragments: Vec<Option<Digest128>>,
+        extractor: &str,
+    ) -> Result<Self, StateError> {
+        let mut state = self.with_fragments(fragments)?;
+        state.graph_extractor = Some(extractor.to_string());
+        Ok(state)
+    }
+
+    /// Whether this extractor built the graph the state names. An unstamped
+    /// state is never current, even if shared segments hold current records.
+    #[must_use]
+    pub fn has_fragments_for(&self, extractor: &str) -> bool {
+        self.has_fragments() && self.graph_extractor.as_deref() == Some(extractor)
     }
 
     /// Whether the state names each path's call-graph fragment: a state
@@ -352,9 +381,16 @@ impl CheckoutState {
             out.str(&record.language);
             previous = Some(record);
         }
-        // Fragments follow the paths: a flag, then one optional digest per
-        // path.
-        out.byte(u8::from(!self.fragments.is_empty()));
+        // Flag 2 adds a producer stamp before the optional digests. Older
+        // readers reject this flag as unusable and rebuild the checkout.
+        out.byte(if self.graph_extractor.is_some() {
+            2
+        } else {
+            u8::from(!self.fragments.is_empty())
+        });
+        if let Some(extractor) = &self.graph_extractor {
+            out.blob(extractor.as_bytes());
+        }
         for fragment in self.fragments.iter() {
             match fragment {
                 Some(digest) => {
@@ -376,6 +412,10 @@ impl CheckoutState {
     /// [`STATE_FORMAT`]: a newer build wrote it, so it is refused rather than
     /// read as damaged and built again.
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, RecordError> {
+        Self::decode_layout(payload, true)
+    }
+
+    fn decode_layout(payload: &[u8], stamped_graphs: bool) -> Result<Self, RecordError> {
         let invalid = |error: DecodeError| RecordError::Invalid(error.0);
         let mut input = Decoder::new(payload).map_err(invalid)?;
         let format = input.byte().map_err(invalid)?;
@@ -474,9 +514,17 @@ impl CheckoutState {
             });
         }
         let mut fragments = Vec::new();
+        let mut graph_extractor = None;
         match input.byte().map_err(invalid)? {
             0 => {}
-            1 => {
+            flag @ (1 | 2) if flag == 1 || stamped_graphs => {
+                if flag == 2 {
+                    graph_extractor = Some(
+                        std::str::from_utf8(input.blob().map_err(invalid)?)
+                            .map_err(|_| RecordError::Invalid("graph extractor is not UTF-8"))?
+                            .to_string(),
+                    );
+                }
                 fragments.reserve(paths.len());
                 for _ in 0..paths.len() {
                     fragments.push(match input.byte().map_err(invalid)? {
@@ -501,6 +549,7 @@ impl CheckoutState {
             root,
             paths: Arc::new(paths),
             fragments: Arc::new(fragments),
+            graph_extractor,
         })
     }
 }
@@ -509,7 +558,10 @@ impl CheckoutState {
 /// the payload's string table. A reader refuses a payload naming a higher
 /// one, since a newer build wrote it. So every later layout must keep the
 /// string table's encoding and this byte where they are, and any other
-/// change to the layout must raise this number.
+/// change to the layout must raise this number, except the stamped fragment
+/// flag 2: old readers deliberately treat that flag as unusable and rebuild,
+/// rather than refusing the whole family on rollback. The record envelope
+/// and the rest of the state layout are unchanged.
 const STATE_FORMAT: u8 = 3;
 
 /// How much of a state record [`newer_state_format`] reads to find the
@@ -600,6 +652,7 @@ crate::heap_bytes_of_fields!(CheckoutState {
     root,
     paths,
     fragments,
+    graph_extractor,
 });
 
 #[cfg(test)]
@@ -622,6 +675,32 @@ mod tests {
                 ..StatEvidence::default()
             },
             language: "rust".to_string(),
+        }
+    }
+
+    #[test]
+    fn graph_producer_stamps_round_trip_and_legacy_readers_rebuild() {
+        for paths in [Vec::new(), vec![record("a.rs", "a")]] {
+            let fragments = vec![Some(Digest128::of(b"fragment")); paths.len()];
+            let state = CheckoutState::new(Vec::new(), Digest128::of(b""), paths).unwrap();
+            let legacy = state.clone().with_fragments(fragments.clone()).unwrap();
+            assert!(!legacy.has_fragments_for("current"));
+            let stamped = state.with_fragments_for(fragments, "current").unwrap();
+            let payload = stamped.encode();
+            let decoded = CheckoutState::decode(&payload).unwrap();
+            assert_eq!(decoded, stamped);
+            assert!(decoded.has_fragments_for("current"));
+            assert!(!decoded.has_fragments_for("other"));
+            // This is the old decoder's fragment-flag branch. Invalid state
+            // payloads are unusable, not newer-format refusals, on rollback.
+            assert!(matches!(
+                CheckoutState::decode_layout(&payload, false),
+                Err(RecordError::Invalid("fragment section flag"))
+            ));
+            assert_eq!(
+                CheckoutState::decode_layout(&legacy.encode(), false).unwrap(),
+                legacy
+            );
         }
     }
 

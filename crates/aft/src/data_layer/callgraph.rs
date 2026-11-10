@@ -1355,7 +1355,7 @@ pub(crate) fn resolve_checkout_into(
         for batch in paths.chunks(BATCH) {
             let started = std::time::Instant::now();
             let mut reached = calls
-                .resolve_sites(inputs, &NoResolutions, &refs(batch))
+                .resolve_sites(inputs, &NoResolutions, &refs(batch))?
                 .into_iter();
             sites_ms += started.elapsed().as_millis();
             let parses = &inputs.parses;
@@ -1874,11 +1874,11 @@ impl MethodCallInputs {
         inputs: &CheckoutInputs,
         resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
-    ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+    ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
         // Most updates reach no method-call site; the source below lists
         // every parsed file, so skip it then.
         if paths.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let source = SiteSource::new(inputs, resolved, self);
         let results = if paths.len() <= SMALL_SITE_RUN {
@@ -1900,12 +1900,20 @@ impl MethodCallInputs {
                     let resolver = Resolver::over(&source);
                     resolve_chunk(inputs, &source, &resolver, chunk)
                 })
-                .flatten()
-                .collect()
-        };
+                .collect::<Result<Vec<_>, _>>()
+                .map(|chunks| chunks.into_iter().flatten().collect())
+        }?;
+        if let Some(error) = source
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(ManifestJoinError::Parse(error));
+        }
         let loaded = source.into_loaded();
         self.files.extend(loaded);
-        results
+        Ok(results)
     }
 }
 
@@ -1913,6 +1921,9 @@ impl MethodCallInputs {
 /// run: the inputs kept, and any other file's computed the first time it is
 /// read.
 struct SiteSource<'s> {
+    /// Resolver callbacks return `Option`; keep failed stored inputs so an
+    /// unreadable file declaring a method cannot silently make calls unresolved.
+    error: Mutex<Option<String>>,
     inputs: &'s CheckoutInputs,
     resolved: &'s (dyn ResolutionLookup + Sync),
     calls: &'s MethodCallInputs,
@@ -1937,6 +1948,7 @@ impl<'s> SiteSource<'s> {
             resolved,
             calls,
             loaded,
+            error: Mutex::new(None),
         }
     }
 
@@ -1957,9 +1969,21 @@ impl<'s> SiteSource<'s> {
     /// keeping either decoded: the inputs keep only what pass 4 reads, and
     /// a site calling a common method name reads every file declaring it.
     fn compute(&self, path: &str) -> Option<Arc<SiteFile>> {
-        let (_, parse) = self.inputs.parses.read(path)?;
-        let resolution = self.resolved.read_once(path)?;
-        Some(Arc::new(SiteFile::new(&parse, &resolution)))
+        let computed = || {
+            let (_, parse) = self.inputs.parses.read(path)?;
+            let resolution = self.resolved.read_once(path)?;
+            Some(Arc::new(SiteFile::new(&parse, &resolution)))
+        };
+        let file = computed();
+        if file.is_none() {
+            *self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
+                "stored method-call inputs of {path} could not be read"
+            ));
+        }
+        file
     }
 
     /// Computes, in parallel, the inputs of every file that declares a
@@ -2073,16 +2097,21 @@ fn resolve_chunk(
     source: &SiteSource<'_>,
     resolver: &Resolver<'_>,
     paths: &[&String],
-) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
     let memoized = MemoizedResolver::new(resolver);
     resolver.take_dependencies();
     paths
         .iter()
         .map(|path| {
-            let (_, parse) = &inputs.parses[path.as_str()];
+            let (_, parse) = inputs
+                .parses
+                .get(path)
+                .ok_or_else(|| ManifestJoinError::Parse(format!("missing parse for {path}")))?;
             let calls = &source
                 .site(path)
-                .expect("every resolved file has inputs")
+                .ok_or_else(|| {
+                    ManifestJoinError::Parse(format!("missing method-call inputs for {path}"))
+                })?
                 .ordinary;
             let mut sites = Vec::new();
             for site in parse.bound_dispatch_sites() {
@@ -2106,7 +2135,7 @@ fn resolve_chunk(
             // reads without recording.
             let mut dependencies = resolver.take_dependencies();
             dependencies.insert(dependency::file(path));
-            ((*path).clone(), sites, dependencies)
+            Ok(((*path).clone(), sites, dependencies))
         })
         .collect()
 }
