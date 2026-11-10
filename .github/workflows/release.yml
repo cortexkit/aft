@@ -226,13 +226,14 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    # The macOS release jobs run on CortexKit's rented Mac (12 cores, 16 GB,
-    # one job at a time, checkouts kept warm between jobs) until the rental
-    # ends on 21 November 2026; then they move back to `macos-26`. GitHub's
-    # free 7 GB runner swaps on the shipped-profile library compile, which
-    # peaks near 12 GB, and needed close to its 360-minute maximum. The rented
-    # Mac has no Rust or Bun on its PATH, so every job installs its toolchains.
-    runs-on: [self-hosted, rented-mac]
+    # The macOS release jobs run on CortexKit's own Mac mini (Apple M6, 12
+    # cores, 16 GB, one job at a time, checkouts kept warm between jobs).
+    # GitHub's free 7 GB runner swaps on the shipped-profile library compile,
+    # which peaks near 12 GB, and needed close to its 360-minute maximum. The
+    # rented Mac used before downloads GitHub artifacts and caches at about
+    # 80 KB/s, too slow for these jobs. The Mac mini has no Rust or Bun on its
+    # PATH, so every job installs its toolchains.
+    runs-on: [self-hosted, mac-mini]
     timeout-minutes: 150
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
@@ -310,7 +311,7 @@ jobs:
   build-darwin-x64:
     name: Build macOS x64
     # Same runner and limit as the ARM64 build; see the note there.
-    runs-on: [self-hosted, rented-mac]
+    runs-on: [self-hosted, mac-mini]
     timeout-minutes: 150
     env:
       SCCACHE_GHA_ENABLED: "true"

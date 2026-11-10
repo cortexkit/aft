@@ -194,12 +194,12 @@ const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.63.0";
+const ANNOUNCEMENT_VERSION = "0.64.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Cap a shell command's total memory, background and terminal commands included, with `bash.memory_limit_mib`.",
-  "Shell results can list or diff the files a command changed: set `bash.changed_files` to `list` or `diff`.",
-  "Put rebuildable caches on another disk with `storage.cache_dir`.",
-  "Call graphs mark callback references and link constructors, Python edits keep their indentation, and many reported issues are fixed.",
+  "A new index store makes AFT much faster: call graphs build 26x faster, edits reach the call graph about 9x faster, dead-code checks run 4x faster, and the index takes 4x less disk and 3x less memory.",
+  "All worktrees of a repository share one index, so a new worktree is ready in under a second. `npx @cortexkit/aft cache prune-legacy` lists the old index folders and can remove them.",
+  "`trace_to` labels each root it reaches: main, test, attribute, public API, or no caller found.",
+  "Dead code, unused exports, duplicates, cycles and complexity run only when `aft_inspect` is called; the status bar shows errors, warnings and TODOs.",
 ];
 
 /**
