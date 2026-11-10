@@ -1,0 +1,142 @@
+{
+  "tag": "shells-v1",
+  "method": "shells.list",
+  "request": {},
+  "reply": {
+    "rows": [
+      {
+        "task_id": "bg_foreground",
+        "revision": 1,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bg_foreground",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "foreground",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 36,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bg_background",
+        "revision": 1,
+        "holder": {
+          "kind": "worker",
+          "agent_id": "agent-alf",
+          "scope_ref": "scope:worker-cedar",
+          "execution_id": "bg_worker_cedar"
+        },
+        "session": "bg_worker_cedar",
+        "call_id": "call-bg_background",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "background",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bg_pty",
+        "revision": 1,
+        "holder": {
+          "kind": "worker",
+          "agent_id": "agent-alf",
+          "scope_ref": "scope:worker-cedar",
+          "execution_id": "bg_worker_cedar"
+        },
+        "session": "bg_worker_cedar",
+        "call_id": "call-bg_pty",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "pty",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bg_remote",
+        "revision": 1,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bg_remote",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "remote",
+        "remote": {
+          "job_id": "job-before-acceptance",
+          "host": "linux",
+          "phase": "queued"
+        },
+        "state": "queued",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bg_long_command",
+        "revision": 1,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bg_long_command",
+        "title": "Run focused tests",
+        "command": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "command_truncated": true,
+        "cwd": "/work/project",
+        "kind": "background",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bg_unattributed",
+        "revision": 1,
+        "holder": {
+          "kind": "unattributed",
+          "harness": "opencode"
+        },
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "background",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      }
+    ]
+  }
+}

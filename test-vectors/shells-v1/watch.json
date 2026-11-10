@@ -1,0 +1,352 @@
+{
+  "tag": "shells-v1",
+  "method": "shells.watch",
+  "request": {
+    "status": true
+  },
+  "reply": [
+    {
+      "type": "resync",
+      "reason": "initial",
+      "part": 0,
+      "final": false,
+      "rows": [
+        {
+          "task_id": "bg_foreground",
+          "revision": 1,
+          "holder": {
+            "kind": "agent",
+            "agent_id": "agent-alf"
+          },
+          "session": "session-alf",
+          "call_id": "call-bg_foreground",
+          "title": "Run focused tests",
+          "command": "TOKEN=[REDACTED] cargo test",
+          "cwd": "/work/project",
+          "kind": "foreground",
+          "state": "running",
+          "started_at_ms": 1800000000000,
+          "last_output_at_ms": 1800000000250,
+          "output_bytes": {
+            "stdout": 36,
+            "stderr": 0
+          }
+        },
+        {
+          "task_id": "bg_background",
+          "revision": 1,
+          "holder": {
+            "kind": "worker",
+            "agent_id": "agent-alf",
+            "scope_ref": "scope:worker-cedar",
+            "execution_id": "bg_worker_cedar"
+          },
+          "session": "bg_worker_cedar",
+          "call_id": "call-bg_background",
+          "title": "Run focused tests",
+          "command": "TOKEN=[REDACTED] cargo test",
+          "cwd": "/work/project",
+          "kind": "background",
+          "state": "running",
+          "started_at_ms": 1800000000000,
+          "last_output_at_ms": 1800000000250,
+          "output_bytes": {
+            "stdout": 65552,
+            "stderr": 0
+          }
+        }
+      ]
+    },
+    {
+      "type": "resync",
+      "reason": "initial",
+      "part": 1,
+      "final": true,
+      "rows": [
+        {
+          "task_id": "bg_pty",
+          "revision": 1,
+          "holder": {
+            "kind": "worker",
+            "agent_id": "agent-alf",
+            "scope_ref": "scope:worker-cedar",
+            "execution_id": "bg_worker_cedar"
+          },
+          "session": "bg_worker_cedar",
+          "call_id": "call-bg_pty",
+          "title": "Run focused tests",
+          "command": "TOKEN=[REDACTED] cargo test",
+          "cwd": "/work/project",
+          "kind": "pty",
+          "state": "running",
+          "started_at_ms": 1800000000000,
+          "last_output_at_ms": 1800000000250,
+          "output_bytes": {
+            "stdout": 65552,
+            "stderr": 0
+          }
+        },
+        {
+          "task_id": "bg_remote",
+          "revision": 1,
+          "holder": {
+            "kind": "agent",
+            "agent_id": "agent-alf"
+          },
+          "session": "session-alf",
+          "call_id": "call-bg_remote",
+          "title": "Run focused tests",
+          "command": "TOKEN=[REDACTED] cargo test",
+          "cwd": "/work/project",
+          "kind": "remote",
+          "remote": {
+            "job_id": "job-before-acceptance",
+            "host": "linux",
+            "phase": "queued"
+          },
+          "state": "queued",
+          "started_at_ms": 1800000000000,
+          "last_output_at_ms": 1800000000250,
+          "output_bytes": {
+            "stdout": 65552,
+            "stderr": 0
+          }
+        }
+      ],
+      "status": {
+        "aft": {
+          "version": "0.64.0",
+          "card": "ready"
+        },
+        "roots": [
+          {
+            "root": "/work/project",
+            "agent_ids": [
+              "agent-alf"
+            ],
+            "text_index": {
+              "state": "ready"
+            },
+            "call_graph": {
+              "state": "building",
+              "reason": "indexing"
+            },
+            "meaning": {
+              "state": "disabled",
+              "reason": "not_configured"
+            },
+            "lsp": [
+              {
+                "server": "rust-analyzer",
+                "state": "ready"
+              }
+            ],
+            "errors": 0,
+            "warnings": 2,
+            "todos": 3
+          }
+        ]
+      },
+      "cursor": "watch-1"
+    },
+    {
+      "type": "upsert",
+      "row": {
+        "task_id": "bg_new",
+        "revision": 1,
+        "holder": {
+          "kind": "worker",
+          "agent_id": "agent-alf",
+          "scope_ref": "scope:worker-cedar",
+          "execution_id": "bg_worker_cedar"
+        },
+        "session": "bg_worker_cedar",
+        "call_id": "call-bg_new",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "background",
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      "cursor": "watch-2"
+    },
+    {
+      "type": "upsert",
+      "row": {
+        "task_id": "bg_remote",
+        "revision": 2,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bg_remote",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "remote",
+        "remote": {
+          "job_id": "job-before-acceptance",
+          "host": "linux",
+          "phase": "running"
+        },
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      "cursor": "watch-3"
+    },
+    {
+      "type": "upsert",
+      "row": {
+        "task_id": "bg_remote",
+        "revision": 3,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bg_remote",
+        "title": "Run focused tests",
+        "command": "TOKEN=[REDACTED] cargo test",
+        "cwd": "/work/project",
+        "kind": "remote",
+        "remote": {
+          "job_id": "job-before-acceptance",
+          "host": "linux",
+          "phase": "running"
+        },
+        "state": "ended",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "ended_at_ms": 1800000001000,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        },
+        "exit": {
+          "code": 0
+        },
+        "end_reason": "exited"
+      },
+      "cursor": "watch-4"
+    },
+    {
+      "type": "remove",
+      "task_id": "bg_remote",
+      "cursor": "watch-5"
+    },
+    {
+      "type": "status",
+      "status": {
+        "aft": {
+          "version": "0.64.0",
+          "card": "ready"
+        },
+        "roots": [
+          {
+            "root": "/work/project",
+            "agent_ids": [
+              "agent-alf"
+            ],
+            "text_index": {
+              "state": "ready"
+            },
+            "call_graph": {
+              "state": "building",
+              "reason": "indexing"
+            },
+            "meaning": {
+              "state": "disabled",
+              "reason": "not_configured"
+            },
+            "lsp": [
+              {
+                "server": "rust-analyzer",
+                "state": "ready"
+              }
+            ],
+            "errors": 0,
+            "warnings": 2,
+            "todos": 3
+          }
+        ]
+      },
+      "cursor": "watch-6"
+    },
+    {
+      "type": "resync",
+      "reason": "lagged",
+      "part": 0,
+      "final": true,
+      "rows": [
+        {
+          "task_id": "bg_foreground",
+          "revision": 1,
+          "holder": {
+            "kind": "agent",
+            "agent_id": "agent-alf"
+          },
+          "session": "session-alf",
+          "call_id": "call-bg_foreground",
+          "title": "Run focused tests",
+          "command": "TOKEN=[REDACTED] cargo test",
+          "cwd": "/work/project",
+          "kind": "foreground",
+          "state": "running",
+          "started_at_ms": 1800000000000,
+          "last_output_at_ms": 1800000000250,
+          "output_bytes": {
+            "stdout": 36,
+            "stderr": 0
+          }
+        }
+      ],
+      "status": {
+        "aft": {
+          "version": "0.64.0",
+          "card": "ready"
+        },
+        "roots": [
+          {
+            "root": "/work/project",
+            "agent_ids": [
+              "agent-alf"
+            ],
+            "text_index": {
+              "state": "ready"
+            },
+            "call_graph": {
+              "state": "building",
+              "reason": "indexing"
+            },
+            "meaning": {
+              "state": "disabled",
+              "reason": "not_configured"
+            },
+            "lsp": [
+              {
+                "server": "rust-analyzer",
+                "state": "ready"
+              }
+            ],
+            "errors": 0,
+            "warnings": 2,
+            "todos": 3
+          }
+        ]
+      },
+      "cursor": "watch-7"
+    }
+  ]
+}

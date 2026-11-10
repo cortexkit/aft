@@ -1,0 +1,20 @@
+{
+  "agent_scoped_route": {
+    "code": "shells_operator_required",
+    "message": "shells operations require an operator route"
+  },
+  "unknown_agent": {
+    "rows": [],
+    "unknown_agent_ids": [
+      "agent-never-seen"
+    ]
+  },
+  "shell_not_found": {
+    "code": "shell_not_found",
+    "message": "shell is not listed"
+  },
+  "invalid_params": {
+    "code": "invalid_params",
+    "message": "shells.output needs a task_id"
+  }
+}
