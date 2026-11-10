@@ -48,6 +48,7 @@ COPY . .
 RUN bun install --frozen-lockfile && \
     bun run --cwd packages/aft-bridge build && \
     bun run --cwd packages/opencode-plugin build && \
+    bun build packages/opencode-plugin/src/shared/rpc-client.ts --target bun --format esm --outfile /status-rpc-client.js && \
     mkdir -p /packs /plugin/node_modules/@cortexkit/aft-opencode /plugin/node_modules && \
     npm pack ./packages/opencode-plugin --pack-destination /packs >/dev/null && \
     tar -xzf /packs/*.tgz -C /plugin/node_modules/@cortexkit/aft-opencode --strip-components=1 && \
@@ -87,6 +88,10 @@ WORKDIR /workspace
 COPY . /workspace
 COPY --from=plugin-builder /packs/*.tgz /opt/aft/packages/aft-opencode.tgz
 COPY --from=plugin-builder /plugin/ /opt/aft/plugin/
+# Bundle the product RPC client rather than copying Bun's isolated dependency
+# symlinks into /workspace or duplicating its port discovery and root hashing.
+COPY --from=plugin-builder /status-rpc-client.js /opt/aft/status-rpc-client.js
+ENV AFT_OPENCODE2_STATUS_RPC_CLIENT=/opt/aft/status-rpc-client.js
 COPY --from=aft-builder /out/ /opt/aft/bin/
 ENV AFT_BINARY_PATH=/opt/aft/bin/aft
 ENV AFT_E2E_NATIVE_BINARY_PATH=/opt/aft/bin/aft.real

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database, SQLiteError } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -84,7 +85,7 @@ import {
   waitForAbortSettlement,
   waitForTaskStatus,
 } from "./process-observer.js";
-import { readPinnedV1HostVersion } from "./pin.js";
+import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
 import { AftTaskProbe } from "./task-probe.js";
 import {
   awaitTurnReadiness,
@@ -3216,6 +3217,27 @@ describe("a row that needs the callgraph waits for it", () => {
     expect(error.details.last_status).toMatchObject({ reason: "status_request_failed" });
   });
 
+  test("host version discovery needs no installed workspace or plugin runtime", async () => {
+    const directory = await root();
+    const harness = join(directory, "tests/docker/opencode2/harness");
+    const repoRoot = join(import.meta.dir, "../../../..");
+    await cp(import.meta.dir, harness, { recursive: true });
+    for (const relative of [
+      "packages/opencode-plugin/test/load-matrix/load-matrix.ts",
+      "packages/aft-bridge/src/__tests__/test-utils/cached-executable.ts",
+    ]) {
+      await mkdir(join(directory, relative, ".."), { recursive: true });
+      await cp(join(repoRoot, relative), join(directory, relative));
+    }
+    const result = await runCommand(process.execPath, [join(harness, "driver.ts"), "--print-host-version"], {
+      cwd: directory,
+      timeoutMs: 5_000,
+    });
+    expect(result.stderr).toBe("");
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout.trim()).toBe(await readPinnedHostVersion(repoRoot));
+  });
+
   test("the V2 status source authenticates and reads the raw product payload", async () => {
     const directory = await root();
     const endpointFile = join(directory, "status-endpoint");
@@ -3261,6 +3283,45 @@ describe("a row that needs the callgraph waits for it", () => {
       expect(await source(1_000)).toEqual(callgraphStatuses.ready);
       expect(await source(1_000)).toEqual(callgraphStatuses.ready);
       expect(new Set(sessions).size).toBe(2);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("the V1 status source loads the bundled product client without workspace packages", async () => {
+    const directory = await root();
+    const bundle = join(directory, "status-rpc-client.js");
+    const build = await Bun.build({
+      entrypoints: [join(import.meta.dir, "../../../../packages/opencode-plugin/src/shared/rpc-client.ts")],
+      target: "bun",
+      format: "esm",
+      outdir: directory,
+      naming: "status-rpc-client.js",
+    });
+    expect(build.success).toBe(true);
+    await cp(join(import.meta.dir, "status-source.ts"), join(directory, "status-source.ts"));
+    await writeFile(join(directory, "check.ts"), `
+import assert from "node:assert/strict";
+import { scenarioStatusSource } from "./status-source.ts";
+const source = scenarioStatusSource({
+  hostGeneration: "v1", projectRoot: "/fixture/project", storageDir: ${JSON.stringify(directory)},
+  endpointFile: "unused", token: "unused",
+});
+assert.deepEqual(await source(1000), ${JSON.stringify(callgraphStatuses.ready)});
+console.log("bundled V1 status RPC passed");
+`);
+    const server = new AftRpcServer(directory, "/fixture/project");
+    server.handle("status", async () => callgraphStatuses.ready);
+    await server.start();
+    try {
+      const result = await runCommand(process.execPath, [join(directory, "check.ts")], {
+        cwd: directory,
+        env: { ...process.env, AFT_OPENCODE2_STATUS_RPC_CLIENT: bundle },
+        timeoutMs: 5_000,
+      });
+      expect(result.stderr).toBe("");
+      expect(result.exit_code).toBe(0);
+      expect(result.stdout).toContain("bundled V1 status RPC passed");
     } finally {
       server.stop();
     }
