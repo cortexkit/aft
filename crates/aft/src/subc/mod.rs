@@ -15288,6 +15288,7 @@ pub(crate) mod test_support {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: None,
+            remote_oom_kill: None,
             output_incomplete: false,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
