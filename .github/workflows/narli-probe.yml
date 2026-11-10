@@ -26,7 +26,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: oven-sh/setup-bun@v2
       - name: Toolchains and machine
         run: |
           set -euo pipefail
@@ -36,7 +35,6 @@ jobs:
           python3 --version
           python --version
           bash --version | head -1
-          bun --version
           git --version
           git config --get core.longpaths || echo "core.longpaths unset"
       - name: Cold cargo check, library and all test targets (timed)
