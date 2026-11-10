@@ -233,6 +233,7 @@ pub(crate) struct WatchRestart {
     held: Option<(crate::db::call_ledger::Key, bool)>,
     reserved: bool,
     finished: bool,
+    unknown: bool,
     response: Option<crate::protocol::Response>,
     resume: Option<(crate::commands::blocking_wait::ReplyBudget, u64)>,
 }
@@ -243,6 +244,7 @@ pub(crate) struct WatchWait {
     request: crate::protocol::RawRequest,
     budget: crate::commands::blocking_wait::ReplyBudget,
     limit_ms: u64,
+    principal: crate::sandbox_spawn::AuthenticatedPrincipal,
 }
 
 impl WatchWait {
@@ -257,6 +259,7 @@ impl WatchWait {
             request,
             budget,
             limit_ms,
+            principal: crate::sandbox_spawn::current_authenticated_principal(),
         }
     }
 
@@ -269,6 +272,9 @@ impl WatchWait {
             "started_ms": wall - now.saturating_duration_since(self.budget.received_at).as_millis() as i64,
             "deadline_ms": wall + self.budget.deadline.saturating_duration_since(now).as_millis() as i64,
             "limit_ms": self.limit_ms,
+            "principal": self.principal,
+            "worker_limit_ms": crate::commands::bash_orchestrate::worker_wait_max_ms(&self.ctx),
+            "primary_cap_ms": self.ctx.config().bash.watch_sync_max_ms,
         })
     }
 }
@@ -326,17 +332,20 @@ fn copy_watch_response(response: &crate::protocol::Response) -> crate::protocol:
 pub(crate) fn watch_unknown(signal: &crate::commands::bash_watch::YieldSignal) {
     let mut state = signal.restart.lock().unwrap();
     state.finished = true;
-    if let (Some((key, _)), Some(wait)) = (state.held.take(), state.wait.take()) {
-        if let Some(db) = wait.ctx.db() {
-            if let Ok(conn) = db.lock() {
-                let _ = crate::db::call_ledger::settle(
-                    &conn,
-                    &key,
-                    &crate::db::call_ledger::unknown_held_result(),
-                    "outcome_unknown",
-                    None,
-                    crate::db::call_ledger::now_ms(),
-                );
+    state.unknown = true;
+    if state.held.is_some() {
+        if let (Some((key, _)), Some(wait)) = (state.held.take(), state.wait.take()) {
+            if let Some(db) = wait.ctx.db() {
+                if let Ok(conn) = db.lock() {
+                    let _ = crate::db::call_ledger::settle(
+                        &conn,
+                        &key,
+                        &crate::db::call_ledger::unknown_held_result(),
+                        "outcome_unknown",
+                        None,
+                        crate::db::call_ledger::now_ms(),
+                    );
+                }
             }
         }
     }
@@ -352,7 +361,7 @@ pub(super) async fn hold_watch(
     ver: u8,
     flags: subc_protocol::Flags,
 ) -> Result<subc_protocol::Frame, super::SubcError> {
-    let frame = restart_held_frame(ver, route, corr, flags)?;
+    let frame = restart_held_frame(ver, route, corr, flags, None)?;
     let retained = frame.body.clone();
     let structured = !matches!(identity.trust, super::BindTrust::Untrusted);
     tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -369,7 +378,18 @@ pub(super) async fn hold_watch(
             crate::db::call_ledger::hold_watch(&conn, &key, &body.to_string().into_bytes())
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(response) = state.response.take() {
+        if state.unknown {
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            crate::db::call_ledger::settle(
+                &conn,
+                &key,
+                &crate::db::call_ledger::unknown_held_result(),
+                "outcome_unknown",
+                None,
+                crate::db::call_ledger::now_ms(),
+            )
+            .map_err(|e| e.to_string())?;
+        } else if let Some(response) = state.response.take() {
             let wait = state.wait.take().unwrap();
             settle_watch(&wait, &key, structured, response);
         } else {
@@ -391,8 +411,9 @@ pub(super) fn restart_held_frame(
     route: RouteChannel,
     corr: u64,
     flags: subc_protocol::Flags,
+    detail: Option<Value>,
 ) -> Result<subc_protocol::Frame, super::SubcError> {
-    let frame = super::wire::build_held_frame(ver, route, corr, flags, "running", None)?;
+    let frame = super::wire::build_held_frame(ver, route, corr, flags, "running", detail)?;
     let mut body: Value = serde_json::from_slice(&frame.body).map_err(super::SubcError::Json)?;
     body["held"]["yielded"] = serde_json::json!(true);
     subc_protocol::Frame::build_with_version(
@@ -536,6 +557,9 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
                 || now_ms - started_ms >= i64::try_from(limit_ms).ok()?
                 || saved["params"]["pattern"].is_object()
                 || saved["params"]["pattern"].is_string()
+                || saved["worker_limit_ms"]
+                    != crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx)
+                || saved["primary_cap_ms"] != ctx.config().bash.watch_sync_max_ms
             {
                 return None;
             }
@@ -585,13 +609,20 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
                 limit_ms,
             ));
         }
-        let outcome = crate::commands::bash_watch::handle_deferred_yieldable(
-            &request,
-            ctx.clone(),
-            budget,
-            false,
-            Some(signal.clone()),
-        );
+        let principal = serde_json::from_value(saved["principal"].clone());
+        let Ok(principal) = principal else {
+            watch_unknown(&signal);
+            continue;
+        };
+        let outcome = crate::sandbox_spawn::with_authenticated_principal(principal, || {
+            crate::commands::bash_watch::handle_deferred_yieldable(
+                &request,
+                ctx.clone(),
+                budget,
+                false,
+                Some(signal.clone()),
+            )
+        });
         if let crate::response_finalize::DispatchOutcome::Immediate(response) = outcome {
             watch_finished(&signal, &response);
         }
@@ -602,6 +633,20 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runner_restart_refuses_calls_that_have_not_reached_their_wait() {
+        let route = super::super::route_key(1, 1);
+        let calls = super::super::drain::HeldBashCalls::default();
+        let _claim = calls.insert(route, 7);
+        assert!(matches!(
+            calls.claim_for_yield(route, 7, true),
+            Err(NotYieldable::NotWaiting)
+        ));
+        let signal = crate::commands::bash_watch::YieldSignal::default();
+        assert!(!watch_can_hold(&signal));
+        assert!(!watch_is_held(&signal));
+    }
 
     /// The role crate's shared `call-yield.json` vectors: every request the
     /// contract lists is accepted or refused naming the same field.

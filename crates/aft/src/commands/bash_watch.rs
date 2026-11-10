@@ -491,6 +491,7 @@ pub(crate) fn handle_deferred_yieldable(
                 if watch.yield_signal.as_ref().is_some_and(|signal| {
                     crate::subc::call_yield::watch_finished(signal, &response)
                 }) {
+                    let _ = tx.send(response);
                     return;
                 }
                 let _ = tx.send(response);

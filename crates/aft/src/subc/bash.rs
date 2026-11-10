@@ -1169,7 +1169,13 @@ pub(super) async fn answer_yielded_bash_call(
     restart: bool,
 ) -> Result<(), SubcError> {
     if restart {
-        let frame = super::call_yield::restart_held_frame(target.ver, route, corr, target.flags)?;
+        let frame = super::call_yield::restart_held_frame(
+            target.ver,
+            route,
+            corr,
+            target.flags,
+            Some(json!({"task_id": target.task_id})),
+        )?;
         let registry = target.registry.clone();
         let task = target.task_id.clone();
         let body = frame.body.clone();

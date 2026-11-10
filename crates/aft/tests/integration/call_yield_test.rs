@@ -166,11 +166,21 @@ async fn call(
 }
 
 async fn send_yield(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, key: &str) {
+    send_yield_reason(stream, channel, corr, key, "person_message").await;
+}
+
+async fn send_yield_reason(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    key: &str,
+    reason: &str,
+) {
     request(
         stream,
         channel,
         corr,
-        json!({"name": "tool.yield", "arguments": {"call_key": key, "reason": "person_message"}}),
+        json!({"name": "tool.yield", "arguments": {"call_key": key, "reason": reason}}),
     )
     .await;
 }
@@ -374,11 +384,22 @@ async fn yield_until_accepted(
     first_corr: u64,
     key: &str,
 ) -> (u64, Instant) {
+    yield_reason_until_accepted(stream, inbox, channel, first_corr, key, "person_message").await
+}
+
+async fn yield_reason_until_accepted(
+    stream: &mut tokio::net::TcpStream,
+    inbox: &mut Inbox,
+    channel: u16,
+    first_corr: u64,
+    key: &str,
+    reason: &str,
+) -> (u64, Instant) {
     let until = Instant::now() + Duration::from_secs(15);
     let mut corr = first_corr;
     loop {
         let sent = Instant::now();
-        send_yield(stream, channel, corr, key).await;
+        send_yield_reason(stream, channel, corr, key, reason).await;
         let reply = answer(
             &inbox
                 .reply(
@@ -671,6 +692,7 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
             let blocker = root.join("yield-blocker.txt");
             std::fs::write(&blocker, "blocked\n").unwrap();
             let read_key = unique("yield-read");
+            request(stream, 1, 104, json!({"name":"read", "preset":"head", "arguments":{"path":blocker.display().to_string()}})).await;
             call(
                 stream,
                 1,
@@ -690,7 +712,39 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
                 ),
                 json!({"answer": "not_yieldable", "reason": "tool_not_yieldable"})
             );
+            for (corr, reason, expected) in [
+                (102, "runner_restart", "tool_not_yieldable"),
+                (103, "unrecognized", "reason_not_supported"),
+            ] {
+                send_yield_reason(stream, 1, corr, &read_key, reason).await;
+                assert_eq!(
+                    answer(
+                        &inbox
+                            .reply(stream, 1, corr, Duration::from_secs(5), "restart refusal")
+                            .await
+                    ),
+                    json!({"answer":"not_yieldable", "reason":expected})
+                );
+            }
+            send_yield_reason(stream, 1, 105, "keyless", "runner_restart").await;
+            assert_eq!(
+                answer(
+                    &inbox
+                        .reply(stream, 1, 105, Duration::from_secs(5), "keyless restart")
+                        .await
+                ),
+                json!({"answer":"unknown_call"})
+            );
             std::fs::write(root.join("yield-blocker.txt.release"), "").unwrap();
+            inbox
+                .reply(
+                    stream,
+                    1,
+                    104,
+                    Duration::from_secs(30),
+                    "keyless read result",
+                )
+                .await;
             let read = inbox
                 .reply(stream, 1, 100, Duration::from_secs(30), "read result")
                 .await;
@@ -724,6 +778,21 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
                 json!({"answer": "not_yieldable", "reason": "not_negotiated"})
             );
             assert!(alive(pid));
+            send_yield_reason(stream, 2, 202, &plain_key, "runner_restart").await;
+            assert_eq!(
+                answer(
+                    &inbox
+                        .reply(
+                            stream,
+                            2,
+                            202,
+                            Duration::from_secs(5),
+                            "unnegotiated restart"
+                        )
+                        .await
+                ),
+                json!({"answer":"not_yieldable", "reason":"not_negotiated"})
+            );
             std::fs::write(&release, "").unwrap();
             let finished = inbox
                 .reply(stream, 2, 200, Duration::from_secs(30), "plain bash result")
@@ -776,6 +845,192 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
                         && [100, 200, 300].contains(&frame.header.corr)
                 }),
                 "a call was answered twice"
+            );
+            send_connection_goodbye(stream).await;
+        },
+        |_, _, _| {},
+        yield_dispatch,
+    );
+}
+
+fn restart_worker_stamp() -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+        "ref":"restart-worker", "scope_epoch":1, "kind":"worker",
+        "parent": {"owner":{"kind":"reserved", "module_id":"prefrontal-core"}, "ref":"yield-head-scope", "scope_epoch":1},
+        "parent_state":"linked", "owner_authorized":true
+    })).unwrap()
+}
+
+async fn late_result(
+    stream: &mut tokio::net::TcpStream,
+    inbox: &mut Inbox,
+    channel: u16,
+    key: &str,
+) -> Value {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut corr = 10_000;
+    loop {
+        request(
+            stream,
+            channel,
+            corr,
+            json!({"name":"late_results", "arguments":{}}),
+        )
+        .await;
+        let page = answer(
+            &inbox
+                .reply(
+                    stream,
+                    channel,
+                    corr,
+                    Duration::from_secs(5),
+                    "late results",
+                )
+                .await,
+        );
+        if let Some(entry) = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["call_key"] == key)
+        {
+            assert_eq!(entry["kind"], "result", "{entry}");
+            assert_ne!(entry["reduced"], true, "{entry}");
+            return entry["result"].clone();
+        }
+        assert!(
+            Instant::now() < until,
+            "no terminal late result for {key}: {page}"
+        );
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[test]
+fn runner_restart_holds_worker_bash_and_watch_until_their_real_results() {
+    run_subc_bridge_test_with_dispatch(
+        "call-yield-runner-restart",
+        Duration::from_secs(90),
+        |input| async move {
+            let (mut daemon, _) = open_fake_daemon_session_with_ops(input, &[]).await;
+            let root = daemon.root1.clone();
+            write_config(&root);
+            let stream = &mut daemon.stream;
+            bind_scoped(
+                stream,
+                &root,
+                1,
+                SESSION,
+                Principal::Direct,
+                &YIELD_CONSUMER,
+                restart_worker_stamp(),
+            )
+            .await;
+            let mut inbox = Inbox::default();
+            wait_for_ledger(stream, &mut inbox, 1, 900).await;
+            let pid_path = root.join("restart.pid");
+            let release = root.join("restart.release");
+            let bash_key = unique("restart-bash");
+            request(stream, 1, 100, json!({"name":"bash", "preset":"worker", "call_key":bash_key,
+                "arguments":{"command":held_command(&pid_path, &release), "wait":true, "timeout":60000}})).await;
+            let pid = read_pid(&pid_path).await;
+            let (_, sent) = yield_reason_until_accepted(
+                stream,
+                &mut inbox,
+                1,
+                200,
+                &bash_key,
+                "runner_restart",
+            )
+            .await;
+            let held = answer(
+                &inbox
+                    .reply(stream, 1, 100, Duration::from_secs(5), "worker held bash")
+                    .await,
+            );
+            assert!(sent.elapsed() < Duration::from_secs(5));
+            assert_eq!(held["held"]["reason"], "running");
+            assert_eq!(held["held"]["yielded"], true);
+            assert_eq!(held["content"], json!([{"type":"text", "text":""}]));
+            assert!(alive(pid));
+            let task = held["held"]["detail"]["task_id"]
+                .as_str()
+                .expect("held task id");
+            let watch_key = unique("restart-watch");
+            request(
+                stream,
+                1,
+                400,
+                json!({"name":"bash_watch", "preset":"worker", "call_key":watch_key,
+                "arguments":{"taskId":task, "timeoutMs":60000}}),
+            )
+            .await;
+            let (_, sent) = yield_reason_until_accepted(
+                stream,
+                &mut inbox,
+                1,
+                500,
+                &watch_key,
+                "runner_restart",
+            )
+            .await;
+            let watch_held = answer(
+                &inbox
+                    .reply(stream, 1, 400, Duration::from_secs(5), "worker held watch")
+                    .await,
+            );
+            assert!(sent.elapsed() < Duration::from_secs(5));
+            assert_eq!(
+                watch_held["held"],
+                json!({"reason":"running", "yielded":true})
+            );
+            assert!(alive(pid));
+            send_yield_reason(stream, 1, 600, &watch_key, "runner_restart").await;
+            assert_eq!(
+                answer(
+                    &inbox
+                        .reply(stream, 1, 600, Duration::from_secs(5), "repeat yield")
+                        .await
+                ),
+                json!({"answer":"unknown_call"})
+            );
+            std::fs::write(&release, "").unwrap();
+            let bash_result = late_result(stream, &mut inbox, 1, &bash_key).await;
+            let watch_result = late_result(stream, &mut inbox, 1, &watch_key).await;
+            for result in [&bash_result, &watch_result] {
+                assert!(result.get("held").is_none(), "{result}");
+                assert_ne!(result["isError"], true, "{result}");
+                assert!(
+                    result["content"].to_string().contains("released"),
+                    "{result}"
+                );
+                assert!(
+                    !result["content"].to_string().contains("Detached because"),
+                    "{result}"
+                );
+            }
+            assert!(
+                watch_result["content"].to_string().contains("task exited"),
+                "{watch_result}"
+            );
+            inbox.collect_for(stream, Duration::from_millis(500)).await;
+            assert!(
+                !inbox
+                    .frames
+                    .iter()
+                    .any(|frame| frame.header.ty == FrameType::Push
+                        && body(frame)["type"] == "bash_completed"),
+                "restart yields must not publish completion notices"
+            );
+            assert!(
+                !inbox
+                    .frames
+                    .iter()
+                    .any(|frame| frame.header.ty != FrameType::Push
+                        && matches!(frame.header.corr, 100 | 400)),
+                "a held call received a second terminal frame"
             );
             send_connection_goodbye(stream).await;
         },

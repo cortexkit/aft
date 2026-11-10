@@ -3078,7 +3078,12 @@ impl LedgerEdge {
                 // The contract never accepts a yield twice.
                 Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
                 Some((&(_, corr), call)) => {
-                    let refusal = if restart {
+                    let refusal = if identity.call_yield
+                        && !restart
+                        && yielded.reason != super::call_yield::PERSON_MESSAGE
+                    {
+                        Some(NotYieldable::Reason)
+                    } else if restart {
                         super::call_yield::restart_route_refusal(identity)
                     } else {
                         super::call_yield::route_refusal(identity)
@@ -3584,7 +3589,9 @@ impl LedgerEdge {
                         .is_ok_and(|body| body["held"]["reason"] == "running");
                     {
                         let mut calls = edge.calls.lock().unwrap();
-                        if running {
+                        let yielded = serde_json::from_slice::<Value>(&outgoing.body)
+                            .is_ok_and(|body| body["held"]["yielded"] == true);
+                        if running && !yielded {
                             calls.remove(&(route, outgoing.header.corr));
                         } else if let Some(call) = calls.get_mut(&(route, outgoing.header.corr)) {
                             call.detached = true;
