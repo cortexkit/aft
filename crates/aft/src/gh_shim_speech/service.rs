@@ -139,7 +139,7 @@ pub(crate) struct Service {
     pub(crate) store: Store,
     root: PathBuf,
     runtime: Mutex<Option<Runtime>>,
-    lease: Mutex<Option<Arc<crate::root_cache::SpeechServingLease>>>,
+    lease: Mutex<Option<Arc<crate::cache_location::SpeechServingLease>>>,
     lifecycle: Mutex<lifecycle::State>,
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
@@ -282,7 +282,7 @@ impl Service {
         }
         let mut held = self.lease.lock().unwrap_or_else(|error| error.into_inner());
         if held.is_none() {
-            *held = crate::root_cache::acquire_speech_serving_lease(&self.root).ok();
+            *held = crate::cache_location::acquire_speech_serving_lease(&self.root).ok();
         }
         held.is_some()
     }

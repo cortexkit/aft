@@ -555,7 +555,7 @@ impl ProcessIdentity {
     pub fn of(pid: u32) -> Option<Self> {
         Some(Self {
             pid,
-            started_at_ms: crate::root_cache::process_start_time_ms(pid)?,
+            started_at_ms: crate::process_identity::process_start_time_ms(pid)?,
         })
     }
 
@@ -1480,7 +1480,7 @@ pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
-    crate::root_cache::process_start_time_ms(pid).is_none_or(|started_at_ms| {
+    crate::process_identity::process_start_time_ms(pid).is_none_or(|started_at_ms| {
         started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS)
     })
 }

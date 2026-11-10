@@ -214,6 +214,7 @@ pub(crate) mod test_storage;
 pub mod tool_gate;
 pub(crate) mod tool_output;
 pub mod tool_path;
+pub(crate) mod tool_progress;
 pub mod url_fetch;
 mod view_storage_reserve;
 pub(crate) mod volume;

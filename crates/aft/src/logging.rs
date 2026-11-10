@@ -5,7 +5,7 @@
 
 use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
-use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
+use crate::tool_progress::{ToolCallPhaseDurations, WaitingOn};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -3474,7 +3474,7 @@ mod tests {
 
     fn slow_phases() -> ToolCallPhaseDurations {
         ToolCallPhaseDurations {
-            cpu: crate::run_tool_call::ToolCallPhaseCpu::default(),
+            cpu: crate::tool_progress::ToolCallPhaseCpu::default(),
             queue: Duration::ZERO,
             setup: Duration::ZERO,
             translate: Duration::ZERO,

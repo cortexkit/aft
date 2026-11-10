@@ -447,7 +447,7 @@ fn capture_inspect_root_stats_while(
                 ));
             }
         }
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
     // An exhausted iterator may mean timeout, including roots with no source
     // files at all. Never mistake a partial census for a fresh empty snapshot.
@@ -469,7 +469,7 @@ fn capture_inspect_root_stats_while(
             )
         })?;
         manifests.push((manifest.clone(), blake3::hash(&contents)));
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
     if !has_work_budget() {
         return Err(timeout_detail());
@@ -3155,7 +3155,7 @@ fn receive_tier2_completion_until(
         let next = manager.work_progress(category);
         if next.is_some() && next != progress {
             progress = next;
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
         }
         // Another category may have used this wait's budget after the worker
         // finished. Keep an already published result even at the deadline.

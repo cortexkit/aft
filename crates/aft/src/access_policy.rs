@@ -725,7 +725,7 @@ impl AccessPolicy {
         })
         .collect();
         if config.cache_dir.is_some() {
-            let path = policy_path(&crate::root_cache::cache_root(config));
+            let path = policy_path(&crate::cache_location::cache_root(config));
             floor_rules.push(PolicyFloor {
                 path: path.clone(),
                 rule: FloorRule::AftStorage,

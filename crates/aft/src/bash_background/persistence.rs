@@ -2056,7 +2056,7 @@ impl PersistedTask {
         self.status = BgTaskStatus::Running;
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
-        self.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        self.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
         crate::gh_shim_ticket::seal_spawn(self);
     }
 
@@ -5450,8 +5450,8 @@ impl std::fmt::Display for CoordinationCreateContended {
         write!(
             formatter,
             "{}: {}",
-            crate::root_cache::CACHE_DIR_BUSY,
-            crate::root_cache::CACHE_DIR_BUSY_MESSAGE
+            crate::cache_location::CACHE_DIR_BUSY,
+            crate::cache_location::CACHE_DIR_BUSY_MESSAGE
         )
     }
 }

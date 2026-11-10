@@ -11,7 +11,7 @@ mod backup_bookkeeping_tests;
 mod cpu_time;
 #[cfg(test)]
 mod outline_wait_probe;
-pub(crate) mod progress;
+pub(crate) use crate::tool_progress as progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
@@ -124,82 +124,7 @@ struct PhaseCpuTrace {
     execute_suspended: bool,
 }
 
-/// Only uninterrupted, same-thread intervals have an attributable CPU delta.
-/// Queueing, async writes, and aggregate egress span awaits or worker handoffs.
-/// Platforms without a sufficiently fine thread clock always report unknown.
-#[derive(Debug, Clone, Default)]
-pub struct ToolCallPhaseCpu {
-    pub setup: Option<Duration>,
-    pub translate: Option<Duration>,
-    pub execute: Option<Duration>,
-    pub format: Option<Duration>,
-    pub finalize: Option<Duration>,
-    pub egress_prepare: Option<Duration>,
-}
-
-/// Causal wait recorded on a tool call so slow-call logs can name the blocker.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum WaitingOn {
-    #[default]
-    None,
-    Build,
-    Limiter,
-    ArtifactLoad,
-    Resolver,
-}
-
-impl WaitingOn {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Build => "build",
-            Self::Limiter => "limiter",
-            Self::ArtifactLoad => "artifact_load",
-            Self::Resolver => "resolver",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCallPhaseDurations {
-    pub cpu: ToolCallPhaseCpu,
-    pub queue: Duration,
-    /// From executor admission to the start of argument translation: the
-    /// route's call policy (confinement admission, access-policy scope, the
-    /// formatter launch-policy handle) and repeat-breaker capture. Kept apart
-    /// from `translate` so per-call policy work is not mistaken for argument
-    /// translation.
-    pub setup: Duration,
-    /// From the start of argument translation to a dispatchable request:
-    /// disabled-tool and database gates, hashline registration, and the
-    /// translation itself.
-    pub translate: Duration,
-    pub execute: Duration,
-    pub format: Duration,
-    pub finalize: Duration,
-    pub egress_enqueue: Duration,
-    pub egress_queue: Duration,
-    pub egress_prepare: Duration,
-    pub egress_write: Duration,
-    pub egress: Duration,
-    pub frame_bytes: usize,
-    pub writer_queue_depth: usize,
-    pub writer_active_at_enqueue: bool,
-    pub writer_queue_was_full: bool,
-    pub writer_reserve_timeouts: u32,
-    pub total: Duration,
-    pub waiting_on: WaitingOn,
-    pub waiting_on_build_id: Option<String>,
-    pub wait_ms: u64,
-    /// Execution includes a requested wait, not just AFT's own work.
-    pub intentional_wait: bool,
-    /// What the call was asked to do, without any content: the target kind
-    /// and, for edits, the match and replacement sizes and the outcome code.
-    /// See [`tool_call_arg_shape`].
-    pub arg_shape: Option<String>,
-    /// Milliseconds per edit pipeline step, when the call ran any.
-    pub edit_phases: Option<String>,
-}
+pub use crate::tool_progress::{ToolCallPhaseCpu, ToolCallPhaseDurations, WaitingOn};
 
 impl PhaseTrace {
     pub(crate) fn received_at(&self) -> Instant {

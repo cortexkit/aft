@@ -8,7 +8,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
-    pub(super) keepalive: Option<crate::run_tool_call::progress::Progress>,
+    pub(super) keepalive: Option<crate::tool_progress::Progress>,
     pub(super) speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
     pub(super) scope: Option<subc_protocol::scope::ScopeStamp>,
@@ -7445,7 +7445,7 @@ mod grant_path_tests {
         let clock = Arc::new(AtomicU64::new(0));
         let origin = Instant::now();
         let (pushes, mut received) = mpsc::unbounded_channel();
-        let progress = crate::run_tool_call::progress::Progress::with_clock(
+        let progress = crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))

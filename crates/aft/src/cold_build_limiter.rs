@@ -277,7 +277,7 @@ fn acquire_blocking_while_inner(
             let wait_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             if wait_ms > 0 {
                 crate::logging::note_tool_call_wait(
-                    crate::run_tool_call::WaitingOn::Limiter,
+                    crate::tool_progress::WaitingOn::Limiter,
                     None,
                     wait_ms,
                 );

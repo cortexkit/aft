@@ -269,7 +269,7 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
         .child_pid
         .zip(metadata.child_start_time_ms)
         .and_then(|(pid, start)| {
-            if crate::root_cache::process_start_time_ms(pid) != Some(start) {
+            if crate::process_identity::process_start_time_ms(pid) != Some(start) {
                 return None;
             }
             Some(crate::gh_shim_speech::model::ExecutionSeal {
@@ -991,7 +991,8 @@ pub(crate) fn redeem_speech_cold(
         crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
     )?;
     let seal = stored.record.seal.as_ref().ok_or_else(invalid)?;
-    if crate::root_cache::process_start_time_ms(seal.child_pid) != Some(seal.child_start_time_ms)
+    if crate::process_identity::process_start_time_ms(seal.child_pid)
+        != Some(seal.child_start_time_ms)
         || crate::fs_lock::speech_process_identity(seal.child_pid).as_deref()
             != Some(seal.birth_identity.as_str())
     {

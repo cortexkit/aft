@@ -831,7 +831,7 @@ fn scan_dead_code_facts_body(
 
     let cancellation = crate::executor::current_job_cancellation();
     let canonical_paths = current_canonical_paths();
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let contributions = job
         .scope_files
         .par_iter()

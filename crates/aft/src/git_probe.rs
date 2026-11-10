@@ -73,7 +73,7 @@ pub(crate) fn supervised_output(command: &mut Command) -> io::Result<Output> {
         }
         // tool-provider CONTRACT.md §4.4: supervision is work even when Git
         // is silent. A stuck try_wait cannot emit from a separate timer.
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
         let pause = std::time::Duration::from_millis(50);
         if pipes > 0 {
             match events.recv_timeout(pause) {
@@ -697,7 +697,7 @@ mod tests {
         let (tx, pushes) = std::sync::mpsc::channel();
         let origin = Instant::now();
         let token = crate::executor::JobCancellation::new();
-        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+        token.set_progress(crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))

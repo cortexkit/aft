@@ -2241,7 +2241,7 @@ fn write_format_validate_impl(
         })?
         .warnings;
     drop(file_locks);
-    crate::run_tool_call::progress::report();
+    crate::tool_progress::report();
     if let Some(after_write) = after_write {
         after_write();
     }
@@ -2338,7 +2338,7 @@ fn write_format_validate_impl(
             .and_then(|observed| compute_reformatted_excerpt(content, &observed.text))
     };
 
-    crate::run_tool_call::progress::report();
+    crate::tool_progress::report();
     Ok(WriteResult {
         syntax_valid,
         syntax_skipped_reason,

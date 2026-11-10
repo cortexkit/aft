@@ -365,7 +365,7 @@ fn absolute_route(path: &Path) -> PathBuf {
     // storage root that owns the cache root, as if the cache were linked
     // under it. Spell it that way so it is routed, listed and cleared there,
     // and so the cache root never becomes a storage owner of its own.
-    match crate::root_cache::durable_route(&absolute) {
+    match crate::cache_location::durable_route(&absolute) {
         #[cfg(windows)]
         Some(route) => crate::windows_path::normalize_windows_path(&route),
         #[cfg(not(windows))]

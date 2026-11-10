@@ -5759,7 +5759,7 @@ impl BgTaskRegistry {
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
-        metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             let _ = child.wait();
@@ -6178,7 +6178,7 @@ impl BgTaskRegistry {
             if let Some(pid) = runtime.child_pid {
                 metadata.child_pid = Some(pid);
                 metadata.pgid = Some(pid as i32);
-                metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(pid);
+                metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(pid);
             }
             if let Err(error) = self.persist_task(&paths, &metadata) {
                 let _ = crate::gh_shim_speech::service::revoke_task_records(&session_id, &task_id);

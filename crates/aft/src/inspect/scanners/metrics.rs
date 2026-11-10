@@ -90,7 +90,7 @@ fn run_metrics_scan_with_memo(
 ) -> crate::inspect::InspectResult {
     let started = Instant::now();
     memo.reserve_for_scan(job.scope_files.len());
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let cached_files = job
         .scope_files
         .par_iter()
@@ -365,7 +365,7 @@ mod tests {
             })
             .collect();
         let mut job = metrics_job(project.path(), files);
-        let progress = crate::run_tool_call::progress::FileProgress::default();
+        let progress = crate::tool_progress::FileProgress::default();
         let guard = progress.enter();
         assert_eq!(progress.completed(), 0);
         assert!(run_metrics_scan(&job).outcome.is_ok());
@@ -381,7 +381,7 @@ mod tests {
             .is_ok());
         assert_eq!(progress.completed(), 9);
         drop(guard);
-        assert!(crate::run_tool_call::progress::FileProgress::current().is_none());
+        assert!(crate::tool_progress::FileProgress::current().is_none());
         assert_eq!(
             progress.completed(),
             9,

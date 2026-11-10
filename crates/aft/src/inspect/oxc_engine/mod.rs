@@ -269,7 +269,7 @@ pub fn analyze_files_with_cache(
     let mut cache_stats = OxcFactsCacheStats::default();
     let mut errors = Vec::new();
     let mut facts = Vec::with_capacity(files.len());
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
 
     for (idx, path) in files.iter().enumerate() {
         if crate::inspect::scanners::source_text::graph_source_excluded(&project_root, path) {

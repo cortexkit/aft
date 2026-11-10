@@ -10521,7 +10521,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
-    progress: Option<crate::run_tool_call::progress::Progress>,
+    progress: Option<crate::tool_progress::Progress>,
     speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,

@@ -324,7 +324,7 @@ fn wait_with_deadline_with_limit(
                 if status.is_none() {
                     // tool-provider CONTRACT.md §4.4: observing a live child
                     // is supervision work, even for a silent formatter/checker.
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                 }
                 let now = Instant::now();
                 if now >= deadline || cancelled() {
@@ -2884,7 +2884,7 @@ mod tests {
             let origin = Instant::now();
             let (tx, pushes) = std::sync::mpsc::channel();
             let token = crate::executor::JobCancellation::new();
-            token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+            token.set_progress(crate::tool_progress::Progress::with_clock(
                 {
                     let clock = clock.clone();
                     move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))

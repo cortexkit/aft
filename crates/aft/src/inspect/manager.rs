@@ -654,7 +654,7 @@ fn cached_tier2_aggregate_usable(
 }
 
 pub struct InspectManager {
-    file_progress: Arc<HashMap<InspectCategory, crate::run_tool_call::progress::FileProgress>>,
+    file_progress: Arc<HashMap<InspectCategory, crate::tool_progress::FileProgress>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     dispatcher: InspectDispatcher,
     result_rx: Receiver<InspectResult>,
@@ -799,12 +799,7 @@ impl InspectManager {
         let file_progress: Arc<HashMap<_, _>> = Arc::new(
             InspectCategory::active()
                 .iter()
-                .map(|category| {
-                    (
-                        *category,
-                        crate::run_tool_call::progress::FileProgress::default(),
-                    )
-                })
+                .map(|category| (*category, crate::tool_progress::FileProgress::default()))
                 .collect(),
         );
         let worker_file_progress = file_progress.clone();

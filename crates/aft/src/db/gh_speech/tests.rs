@@ -538,7 +538,7 @@ fn nonholder_child() {
         return;
     };
     let root = std::path::Path::new(&path).parent().unwrap();
-    assert!(crate::root_cache::acquire_speech_serving_lease(root).is_err());
+    assert!(crate::cache_location::acquire_speech_serving_lease(root).is_err());
     let store = Store::new(path);
     let result = store.revoke("inc-a", "nonholder-cancel");
     if std::env::var("AFT_TEST_SPEECH_DB_EXPECT").unwrap() == "busy" {
@@ -576,7 +576,7 @@ fn revoke_in_other_process(store: &Store, expected: &str) {
 #[test]
 fn two_process_revocation_committed_first_prevents_gate_admission() {
     let (dir, store, record) = fixture();
-    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let _holder = crate::cache_location::acquire_speech_serving_lease(dir.path()).unwrap();
     let preflight = activate(&store, &record);
     store
         .prepare_request("nonce-a", &record.incarnation, &[3; 32], "expect-a")
@@ -607,7 +607,7 @@ fn two_process_revocation_committed_first_prevents_gate_admission() {
 #[test]
 fn two_process_nonholder_cannot_commit_between_gate_read_and_enqueue() {
     let (dir, store, record) = fixture();
-    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let _holder = crate::cache_location::acquire_speech_serving_lease(dir.path()).unwrap();
     let preflight = activate(&store, &record);
     store
         .prepare_request("nonce-a", &record.incarnation, &[3; 32], "expect-a")
@@ -639,7 +639,7 @@ fn two_process_nonholder_cannot_commit_between_gate_read_and_enqueue() {
 #[test]
 fn legacy_bound_cancel_committed_before_enqueue_is_revoked_without_queueing() {
     let (dir, store, record) = fixture();
-    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let _holder = crate::cache_location::acquire_speech_serving_lease(dir.path()).unwrap();
     let preflight = activate(&store, &record);
     store
         .prepare_request(
@@ -766,7 +766,7 @@ fn legacy_enqueue_survives_consumer_loss_as_unknown_and_does_not_enqueue_twice()
 #[test]
 fn legacy_cancel_after_enqueue_keeps_the_unsettled_dispatch_visible() {
     let (dir, store, record) = fixture();
-    let _holder = crate::root_cache::acquire_speech_serving_lease(dir.path()).unwrap();
+    let _holder = crate::cache_location::acquire_speech_serving_lease(dir.path()).unwrap();
     let stored = activate(&store, &record);
     store
         .prepare_request(

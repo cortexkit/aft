@@ -153,7 +153,7 @@ impl Service {
             return;
         };
         if let Some(lease) = held.as_ref() {
-            if !crate::root_cache::release_quiescent_speech_serving_lease(lease) {
+            if !crate::cache_location::release_quiescent_speech_serving_lease(lease) {
                 return;
             }
         }
