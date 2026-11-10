@@ -127,6 +127,90 @@ fn grants_answer_source_does_not_change_head_authority() {
         Some(GrantSource::Person)
     );
 }
+fn assert_launch_sources_in_permissions(restore: bool) {
+    use crate::db::access_grant_rows::GrantSource;
+    let (dir, ctx, head, worker) = fixture();
+    let cases = [
+        (head.project_root.join("shared"), "head_policy"),
+        (policy_path(&dir.path().join("person")), "head_grant"),
+        (policy_path(&dir.path().join("legacy")), "unknown"),
+    ];
+    for (parent, _) in &cases {
+        std::fs::create_dir_all(parent.join("child")).unwrap();
+    }
+    {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        for ((parent, _), source) in cases[1..].iter().zip([Some(GrantSource::Person), None]) {
+            store::insert_with_source(
+                &conn,
+                &scope_key(&head),
+                &AccessGrant {
+                    path: parent.clone(),
+                    kind: GrantKind::Subtree,
+                    operation: AccessOperation::Write,
+                },
+                Some("acc_head"),
+                source,
+            )
+            .unwrap();
+        }
+    }
+    let inputs = Value::Array(
+        cases
+            .iter()
+            .map(|(parent, _)| json!({"path": parent.join("child"), "mode": "write"}))
+            .collect(),
+    );
+    remote_policy::catalog(catalog_request(inputs), &worker, &ctx).unwrap();
+    let holder = if restore {
+        let revived = at_epoch(&worker, worker.scope.as_ref().unwrap().scope_epoch + 1);
+        assert_eq!(
+            restore_launch(&revived, &ctx, "worker").unwrap(),
+            store::LaunchRestore::Materialized
+        );
+        revived
+    } else {
+        worker
+    };
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let key = scope_key(&holder);
+    assert_eq!(store::list(&conn, &key).unwrap().len(), cases.len());
+    let reply = crate::subc::permissions::list(&conn, None, &[]).unwrap();
+    let rows = reply["grants"].as_array().unwrap();
+    for (parent, expected_source) in cases {
+        let (id, card): (String, Option<String>) = conn
+            .query_row(
+                "SELECT grant_id,card_ref FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND path=?4",
+                rusqlite::params![
+                    key.owner,
+                    key.scope_ref,
+                    key.epoch.to_string(),
+                    parent.join("child").to_string_lossy(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let row = rows.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(row["source"], expected_source, "{row}");
+        assert!(row["granted_at_ms"].is_u64(), "{row}");
+        assert!(row.get("granted_at_bound").is_none(), "{row}");
+        assert!(row.get("card_ref").is_none(), "{row}");
+        assert_eq!(card, None);
+    }
+}
+
+#[test]
+fn grants_catalog_launch_sources_reach_permissions() {
+    assert_launch_sources_in_permissions(false);
+}
+
+#[test]
+fn grants_revived_launch_sources_reach_permissions() {
+    assert_launch_sources_in_permissions(true);
+}
+
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }

@@ -296,6 +296,50 @@ fn permissions_legacy_null_source_time_is_an_upper_bound_even_with_card() {
 }
 
 #[test]
+fn permissions_materialized_launch_sources_have_exact_times_without_cards() {
+    use crate::db::access_grant_rows::GrantSource;
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let grants: Vec<_> = [
+        GrantSource::HeadPolicy,
+        GrantSource::HeadGrant,
+        GrantSource::Unknown,
+    ]
+    .into_iter()
+    .map(|source| {
+        (
+            grant(
+                &dir.path().join(source.as_str()),
+                GrantKind::Subtree,
+                AccessOperation::Read,
+            ),
+            Some(source),
+        )
+    })
+    .collect();
+    let key = crate::db::remote_exec::PolicyKey {
+        project_root: dir.path().display().to_string(),
+        harness: "runner".into(),
+        session: "worker".into(),
+        principal: "reserved:broca".into(),
+        owner: worker().owner,
+        scope_ref: worker().scope_ref,
+        epoch: worker().epoch,
+        preset: "worker".into(),
+    };
+    store::materialize(&db.lock().unwrap(), &key, &json!([]), &grants).unwrap();
+    let rows = list_all(&db);
+    assert_eq!(rows.len(), grants.len());
+    for (_, source) in grants {
+        let expected = source.unwrap().as_str();
+        let row = rows.iter().find(|row| row["source"] == expected).unwrap();
+        assert_contract_row(row);
+        assert!(row.get("granted_at_bound").is_none(), "{row}");
+        assert!(row.get("card_ref").is_none(), "{row}");
+    }
+}
+
+#[test]
 fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());

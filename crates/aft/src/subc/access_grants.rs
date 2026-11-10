@@ -21,12 +21,29 @@ pub(super) fn answer_source(
     if by_user {
         return Ok(Some(GrantSource::Person));
     }
+    head_source(conn, identity, grant, head_default_allows(head, grant))
+}
+
+// Capability checks can probe the filesystem. Launch validation calls this
+// with the database lock released, then classifies saved authority under lock.
+fn head_default_allows(head: Option<&AccessPolicy>, grant: &AccessGrant) -> bool {
     if let Some(head) = head {
         let mut policy_only = head.clone();
         policy_only.grants.clear();
-        if policy_only.head_policy(grant) == crate::access_policy::HeadPolicy::Allow {
-            return Ok(Some(GrantSource::HeadPolicy));
-        }
+        return policy_only.head_policy(grant) == HeadPolicy::Allow;
+    }
+    false
+}
+
+fn head_source(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    grant: &AccessGrant,
+    default_allows: bool,
+) -> rusqlite::Result<Option<crate::db::access_grant_rows::GrantSource>> {
+    use crate::db::access_grant_rows::GrantSource;
+    if default_allows {
+        return Ok(Some(GrantSource::HeadPolicy));
     }
     if let Some(key) = consent_head(conn, identity)? {
         if store::person_grant_covers(conn, &key, grant)? {
@@ -1077,6 +1094,10 @@ pub(super) fn restore_launch_before(
                         )),
                     }
                 }
+                let grants = grants.into_iter().map(|grant| {
+                    let default_allows = head_default_allows(head.as_ref(), &grant);
+                    (grant, default_allows)
+                }).collect::<Vec<_>>();
                 Ok((grants, dropped))
             })
         }).map_err(|error| restore_refusal(&progress.lock().unwrap_or_else(|e| e.into_inner()), crate::bounded_io::timeout_code(&error), error))?;
@@ -1098,7 +1119,13 @@ pub(super) fn restore_launch_before(
                 timed_out = Some(error);
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            Ok(grants)
+            grants
+                .into_iter()
+                .map(|(grant, default_allows)| {
+                    head_source(conn, identity, &grant, default_allows)
+                        .map(|source| (grant, source))
+                })
+                .collect()
         });
         if let Some(error) = timed_out {
             return Err(error);
@@ -1235,6 +1262,13 @@ pub(super) fn catalog(
             }))
         }).collect::<Result<_, subc_protocol::ErrorBody>>()?)
         };
+        let grants = grants
+            .into_iter()
+            .map(|grant| {
+                let default_allows = head_default_allows(head.as_ref(), &grant);
+                (grant, default_allows)
+            })
+            .collect::<Vec<_>>();
         let conn = lock()?;
         let current = read_head(&conn)?;
         if current != snapshot {
@@ -1246,6 +1280,13 @@ pub(super) fn catalog(
         if launch_params(&conn, key)? != stored {
             continue;
         }
+        let grants = grants
+            .into_iter()
+            .map(|(grant, default_allows)| {
+                head_source(&conn, identity, &grant, default_allows).map(|source| (grant, source))
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         return Ok(Vec::new());
