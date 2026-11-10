@@ -215,7 +215,7 @@ pub struct GithubReadDeferred {
 /// [`GithubReadError::Pending`] when there is none. The fetch itself keeps
 /// running and stores its result in the cache.
 pub struct GithubReadLateAnswer {
-    fallback: Option<(GithubReadCacheEntry, GithubReadSelector)>,
+    fallback: Option<(GithubReadCacheEntry, GithubReadSelector, GithubResourceKind)>,
 }
 
 impl GithubReadLateAnswer {
@@ -229,8 +229,8 @@ impl GithubReadLateAnswer {
             waited.as_secs_f64().ceil() as u64
         );
         match &self.fallback {
-            Some((entry, selector)) => Ok(complete(
-                cached_fallback_text(entry, &GithubReadError::FetchFailed(still_running)),
+            Some((entry, selector, kind)) => Ok(complete(
+                cached_fallback_text(entry, &GithubReadError::FetchFailed(still_running), *kind),
                 selector.clone(),
                 GithubReadFreshness::CachedFallback,
                 Vec::new(),
@@ -532,7 +532,9 @@ impl GithubReadEngine {
     ) -> GithubReadStart {
         let slot = self.flight_slot_for_request(&request);
         let fetch_request = request.clone();
-        let timeout_fallback = fallback.clone().map(|entry| (entry, selector.clone()));
+        let timeout_fallback = fallback
+            .clone()
+            .map(|entry| (entry, selector.clone(), request.resource.kind));
         // Every coalesced caller owns its own wake-bound sender. Capturing only
         // the leader's connection would leave followers waiting on idle routes.
         let (sender, receiver) = crate::response_finalize::pending_response_channel();
@@ -593,7 +595,7 @@ impl GithubReadEngine {
                             Some(entry) => complete_with_optional_attachments(
                                 &waiter.request,
                                 waiter.selector,
-                                cached_fallback_text(&entry, error),
+                                cached_fallback_text(&entry, error, waiter.request.resource.kind),
                                 GithubReadFreshness::CachedFallback,
                                 downloader.as_ref(),
                                 waiter.view,
@@ -797,9 +799,18 @@ fn cache_failure(error: String) -> GithubReadError {
     GithubReadError::FetchFailed(format!("GitHub read cache is unavailable: {error}"))
 }
 
-fn cached_fallback_text(entry: &GithubReadCacheEntry, error: &GithubReadError) -> String {
+fn cached_fallback_text(
+    entry: &GithubReadCacheEntry,
+    error: &GithubReadError,
+    kind: GithubResourceKind,
+) -> String {
+    let thread_warning = if kind == GithubResourceKind::PullRequest {
+        super::thread_text::STALE
+    } else {
+        ""
+    };
     format!(
-        "[cached copy from {}; live fetch failed: {}]\n{}",
+        "[cached copy from {}; live fetch failed: {}]\n{thread_warning}{}",
         iso8601_utc(entry.fetched_at_ms),
         short_failure_reason(error),
         entry.canonical_text
@@ -1254,6 +1265,47 @@ mod tests {
             "[cached copy from 1970-01-01T00:00:01.234Z; live fetch failed: fixture GitHub fetch failed]\n"
         ));
         assert!(completion.content.ends_with("# Cached issue\n"));
+    }
+
+    #[test]
+    fn github_read_pr_fallback_discloses_stale_threads_without_changing_cache() {
+        let cached = "# Cached pull request\nReview threads: 0 open, 1 resolved\n";
+        let cache = Arc::new(MemoryCache::with_entry(cached, 1_234));
+        let engine = GithubReadEngine::new(
+            cache.clone(),
+            Arc::new(FailingFetcher),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let deferred = match engine
+            .start(
+                &enabled_gh_read(),
+                GithubReadRequest::parse("pr://owner/repo/1", "/fixture", "identity", None)
+                    .unwrap(),
+                GithubReadSelector::default(),
+            )
+            .unwrap()
+        {
+            GithubReadStart::Deferred(deferred) => deferred,
+            GithubReadStart::Immediate(_) => panic!("fallback requires a live fetch attempt"),
+        };
+        let late = deferred
+            .late
+            .answer(std::time::Duration::from_secs(1))
+            .unwrap();
+        let completion = wait_for(deferred).unwrap();
+        for answer in [late, completion] {
+            assert_eq!(answer.freshness, GithubReadFreshness::CachedFallback);
+            assert_eq!(
+                answer
+                    .content
+                    .matches(super::super::thread_text::STALE)
+                    .count(),
+                1
+            );
+            assert!(answer.content.ends_with(cached));
+        }
+        assert_eq!(cache.0.lock().as_ref().unwrap().canonical_text, cached);
     }
 
     #[test]

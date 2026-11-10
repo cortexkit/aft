@@ -4,7 +4,7 @@ use super::bot_compress::{compress_discussion_body, compress_document_body, stru
 use super::fetch::GithubReadError;
 use super::model::{
     GithubComment, GithubDocument, GithubDocumentKind, GithubReaction, GithubReview,
-    GithubReviewCommentSection, GithubTimelineEvent,
+    GithubTimelineEvent,
 };
 use super::resource::{GithubCommentSelector, GithubResource};
 
@@ -49,6 +49,9 @@ pub(super) fn render_document_for_resource(
     ));
     output.push_str(&format!("Repository: {}\n", document.repository));
     output.push_str(&format!("State: {}\n", document.state));
+    if document.kind == GithubDocumentKind::PullRequest {
+        output.push_str(&super::thread_text::summary(document));
+    }
     if let Some(author) = nonempty(&document.author) {
         output.push_str(&format!("Author: {}\n", format_author(author)));
     }
@@ -96,12 +99,7 @@ pub(super) fn render_document_for_resource(
     if document.kind == GithubDocumentKind::PullRequest {
         render_files(&mut output, document);
         render_reviews(&mut output, document, &discussion, resource);
-        render_review_comment_sections(
-            &mut output,
-            &document.review_comment_sections,
-            &discussion,
-            resource,
-        );
+        render_review_comment_sections(&mut output, document, &discussion, resource);
     }
     render_timeline(&mut output, &discussion);
 
@@ -141,7 +139,7 @@ fn render_comments(
                 ordinal,
                 comment.author.as_deref(),
                 comment.created_at.as_deref(),
-                None,
+                "",
                 &comment.body,
                 resource,
             );
@@ -198,7 +196,12 @@ fn render_reviews(
             ordinal,
             review.author.as_deref(),
             review.submitted_at.as_deref(),
-            review.state.as_deref(),
+            &review
+                .state
+                .as_deref()
+                .filter(|state| !state.is_empty())
+                .map(|state| format!("State: {state}\n\n"))
+                .unwrap_or_default(),
             &review.body,
             resource,
         );
@@ -207,10 +210,11 @@ fn render_reviews(
 
 fn render_review_comment_sections(
     output: &mut String,
-    sections: &[GithubReviewCommentSection],
+    document: &GithubDocument,
     discussion: &[DiscussionItem<'_>],
     resource: &GithubResource,
 ) {
+    let sections = &document.review_comment_sections;
     if !sections.iter().any(|section| {
         section.comments.iter().any(comment_is_visible)
             || section.comments_total_count.unwrap_or(0) > section.comments.len()
@@ -243,7 +247,7 @@ fn render_review_comment_sections(
                     ordinal,
                     comment.author.as_deref(),
                     comment.created_at.as_deref(),
-                    None,
+                    &super::thread_text::comment(document, comment),
                     &comment.body,
                     resource,
                 );
@@ -290,7 +294,7 @@ fn render_default_discussion_item(
     ordinal: usize,
     author: Option<&str>,
     date: Option<&str>,
-    state: Option<&str>,
+    metadata: &str,
     body: &str,
     resource: &GithubResource,
 ) {
@@ -299,9 +303,7 @@ fn render_default_discussion_item(
         return;
     }
     render_item_heading(output, ordinal, author, date);
-    if let Some(state) = state.filter(|state| !state.is_empty()) {
-        output.push_str(&format!("State: {state}\n\n"));
-    }
+    output.push_str(metadata);
     append_body(output, &compressed.body);
     if compressed.compressed {
         output.push_str(&format!(
@@ -328,6 +330,10 @@ fn render_selected_discussion(
     })?;
 
     let mut output = String::new();
+    if document.kind == GithubDocumentKind::PullRequest {
+        output.push_str(&super::thread_text::summary(document));
+        output.push('\n');
+    }
     for (index, item) in items.into_iter().enumerate() {
         let ordinal = index + 1;
         if !resolved.contains(ordinal) {
@@ -340,6 +346,9 @@ fn render_selected_discussion(
         }
         if let Some(state) = item.state().filter(|state| !state.is_empty()) {
             output.push_str(&format!("State: {state}\n\n"));
+        }
+        if let DiscussionItemKind::ReviewComment(comment) = item.kind {
+            output.push_str(&super::thread_text::comment(document, comment));
         }
         append_body(
             &mut output,

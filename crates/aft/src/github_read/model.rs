@@ -32,6 +32,8 @@ pub struct GithubDocument {
     pub files: Vec<GithubPullRequestFile>,
     pub reviews: Vec<GithubReview>,
     pub review_comment_sections: Vec<GithubReviewCommentSection>,
+    /// None means thread state was unavailable, not that all threads resolved.
+    pub review_threads: Option<GithubReviewThreads>,
     pub base_ref_name: Option<String>,
     pub head_ref_name: Option<String>,
     pub review_decision: Option<String>,
@@ -67,6 +69,7 @@ pub struct GithubReaction {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GithubComment {
+    pub id: Option<String>,
     pub author: Option<String>,
     pub body: String,
     /// Stable browser URL used to correlate a just-created comment with its read ordinal.
@@ -76,6 +79,25 @@ pub struct GithubComment {
     pub minimized: bool,
     pub path: Option<String>,
     pub line: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GithubReviewThreads {
+    pub threads: Vec<GithubReviewThread>,
+    pub omitted_threads: usize,
+    pub omitted_comment_ids: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubReviewThread {
+    pub id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
+    pub path: String,
+    pub line: Option<u64>,
+    pub comment_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

@@ -383,6 +383,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "The checkpoint status reader caps directory entries, metadata bytes and blob validations; exhaustion returns unknown, never a truncated count or result list. Authoritative list and mutations retain full recovery semantics.",
     },
     ExclusionEntry {
+        file: "github_read/threads.rs",
+        enclosing_item: "fetch_review_threads",
+        location_or_primitive: "MAX_THREAD_PAGES, MAX_EXTRA_COMMENT_PAGES",
+        reason: "GitHub read renders a canonical document rather than a ListEnvelope; bounded thread and comment-ID pagination discloses omitted counts, marks partial thread totals, and leaves unmatched comments' thread state unknown.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",

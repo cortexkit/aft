@@ -136,6 +136,7 @@ fn assert_omp_shape_with_aft_metadata(rendered: &str, document: &GithubDocument)
     let permitted_aft_metadata = [
         "Repository:",
         "State:",
+        "Review thread state couldn't be read;",
         "Author:",
         "Created:",
         "Updated:",
@@ -208,7 +209,10 @@ case "$1:$2" in
     cat "$AFT_GH_READ_FIXTURE_DIR/pr.json"
     ;;
    api:graphql)
-     cat "$AFT_GH_READ_FIXTURE_DIR/pr-review-comments.json"
+     case "$4" in
+       *AftReadReviewThreads*) printf '{"errors":[{"message":"fixture thread lookup denied"}]}\n'; exit 0 ;;
+     esac
+      cat "$AFT_GH_READ_FIXTURE_DIR/pr-review-comments.json"
      ;;
     api:repos/*)
       printf '[]\n'
@@ -407,8 +411,10 @@ fn fixture_selected_markdown_is_byte_identical_across_all_transport_harnesses() 
             [
                 "pr view",
                 "api graphql",
+                "api graphql",
                 "api repos/cortexkit/aft/issues/42/timeline?per_page=100",
                 "pr view",
+                "api graphql",
                 "api graphql",
                 "api repos/cortexkit/aft/issues/42/timeline?per_page=100",
             ]
