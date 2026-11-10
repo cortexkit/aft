@@ -268,7 +268,14 @@ fn check_admin(raw: &[&str], tuple: &str) {
             let write = unbound_write(&args, &manifest, "linux", &target, directory.path())
                 .expect("a new repository has no bot binding");
             assert!(matches!(write.target, WriteTarget::NotARepository { .. }));
-            dispatch_unbound_write(&args, &write, &paths, 1_700_000_000, run_upstream)
+            dispatch_unbound_write(
+                &args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                1_700_000_000,
+                run_upstream,
+            )
         } else {
             dispatch_r3(
                 &args,
@@ -613,9 +620,14 @@ fn v19_pr_ready_refuses_an_unbound_repository() {
         .is_none());
         let write = unbound_write(&args, &manifest, "linux", &target, directory.path()).unwrap();
         assert_eq!(
-            dispatch_unbound_write(&args, &write, &paths, 1_700_000_000, |_| panic!(
-                "unbound bot speech must not reach upstream"
-            )),
+            dispatch_unbound_write(
+                &args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                1_700_000_000,
+                |_| panic!("unbound bot speech must not reach upstream")
+            ),
             REFUSAL_EXIT_STATUS
         );
     }

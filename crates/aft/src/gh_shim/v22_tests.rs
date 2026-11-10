@@ -1604,9 +1604,14 @@ fn v22_speech_is_refused_outside_bot_bound_repositories() {
             "{argv:?}"
         );
         assert_eq!(
-            dispatch_unbound_write(&argv, &write, &paths, 1_700_000_000, |_| panic!(
-                "unbound bot speech must not reach upstream"
-            )),
+            dispatch_unbound_write(
+                &argv,
+                &write,
+                &manifest.detectors,
+                &paths,
+                1_700_000_000,
+                |_| panic!("unbound bot speech must not reach upstream")
+            ),
             REFUSAL_EXIT_STATUS
         );
         // The same verb aimed at the bound repository is left to the governed

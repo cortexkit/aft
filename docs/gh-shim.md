@@ -28,11 +28,33 @@ corresponding audit fields are `null`, not a zero count or an empty list.
 | --- | --- | --- | --- |
 | MECHANICAL | `mechanical` | none (upstream `gh`) | replaced by upstream `gh`; the shim holds no token |
 | SPEECH-AS-BOT | `governed` | the seat's bot App | canonicalized into a structured request and routed to the holder |
-| ADMINISTRATION | `admin` | the operator | refused unless `GH_SHIM_BYPASS=operator`, which records an operator-attributed audit line |
+| ADMINISTRATION | `admin` | the operator | refused unless `GH_SHIM_BYPASS=operator` and no bot credentials are detected; accepted bypasses record an operator-attributed audit line |
 
 Anything not named below is `gh_shim_unclassified` (exit 86, nothing sent). The
 refusal names the verb the classifier decided on, because the decision is made
 on the verb alone.
+
+## Operator bypass
+
+`GH_SHIM_BYPASS=operator` is asserted by the caller, not an identity check.
+Before any audited bypass, the shim checks the same ambient bot-credential
+inventory used to admit governed routing: the signed manifest's credential
+variables (including `GH_TOKEN`, `GITHUB_TOKEN` and `GH_ENTERPRISE_TOKEN`), wrapper configuration
+directories, and a `GH_CONFIG_DIR` matching a declared bot directory pattern.
+An ordinary operator `GH_CONFIG_DIR` outside those patterns is unchanged.
+
+If bot credentials are detected, the shim refuses with
+`gh_shim_bypass_bot_credentials` (exit 86): nothing is sent, upstream `gh` is
+not run, and no operator-bypass audit row is written. For example:
+
+```text
+gh-shim: gh_shim_bypass_bot_credentials: GH_TOKEN is present; operator commands must run from a shell without bot credentials
+gh-shim: gh_shim_bypass_bot_credentials: GH_CONFIG_DIR points to bot credentials; operator commands must run from a shell without bot credentials
+```
+
+This applies to every administration row and the audited unbound-write,
+credential and label-only bypasses below. Workers still cannot write to GitHub,
+even with the bypass set.
 
 ## Commands on repositories no bot is bound to
 
