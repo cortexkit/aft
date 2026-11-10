@@ -1,3 +1,5 @@
+// Only the debug-build trigram counter and test hooks use `Cell`.
+#[cfg(any(debug_assertions, test))]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
