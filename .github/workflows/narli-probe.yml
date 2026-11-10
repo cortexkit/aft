@@ -21,6 +21,9 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: never
+      # Outside the checkout, so actions/checkout's clean does not delete it and
+      # a second run shows the warm-build time narli can keep between jobs.
+      CARGO_TARGET_DIR: C:\actions-runner\_work\aft-target
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +40,7 @@ jobs:
           bash --version | head -1
           git --version
           git config --get core.longpaths || echo "core.longpaths unset"
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
       - name: Cold cargo check, library and all test targets (timed)
         run: |
           set -euo pipefail
