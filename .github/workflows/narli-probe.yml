@@ -1,0 +1,53 @@
+# One-off probe for the self-hosted Windows runner "narli": proves the runner
+# picks up AFT jobs, reports its toolchains, and times a cold Rust check and a
+# small test run so they can be compared with GitHub's windows-2022 runners.
+# Runs only on pushes to ci/narli-probe; delete the branch when done.
+name: narli probe
+
+on:
+  push:
+    branches: ["ci/narli-probe"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, narli]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: oven-sh/setup-bun@v2
+      - name: Toolchains and machine
+        run: |
+          set -euo pipefail
+          echo "runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH), cores: ${NUMBER_OF_PROCESSORS:-?}"
+          rustup show
+          cargo --version
+          python3 --version
+          python --version
+          bash --version | head -1
+          bun --version
+          git --version
+          git config --get core.longpaths || echo "core.longpaths unset"
+      - name: Cold cargo check, library and all test targets (timed)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo check -p agent-file-tools --all-targets --features test-hooks --locked
+          echo "cold check took $(( $(date +%s) - start )) s"
+      - name: Small library test run (timed)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo test -p agent-file-tools --lib --features test-hooks --locked -- windows_path
+          echo "build and test took $(( $(date +%s) - start )) s"
