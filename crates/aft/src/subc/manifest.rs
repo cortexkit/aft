@@ -501,6 +501,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 "tool-views/v1".to_string(),
                 super::tool_provider::SESSION_NOTICES.to_string(),
+                super::scope_background_tasks::CAPABILITY.to_string(),
                 super::call_yield::CALL_YIELD.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
@@ -562,6 +563,11 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             // the management route itself is not bound to that target.
             ProviderRole::ManagementSurface {
                 operations: vec![
+                    ManagementOperation {
+                        name: super::scope_background_tasks::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
                     ManagementOperation {
                         name: crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION
                             .to_string(),
@@ -898,6 +904,7 @@ mod tests {
                 "call-modes/v1".to_string(),
                 "tool-views/v1".to_string(),
                 "session-notices/v1".to_string(),
+                "scope-background-tasks/v1".to_string(),
                 "call-yield/v1".to_string(),
                 "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
@@ -916,6 +923,7 @@ mod tests {
                 "call-modes/v1",
                 "tool-views/v1",
                 "session-notices/v1",
+                "scope-background-tasks/v1",
                 "call-yield/v1",
                 "flow-scopes/v1",
                 "worker-runs/v1",

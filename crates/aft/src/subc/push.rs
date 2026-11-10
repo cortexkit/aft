@@ -37,7 +37,8 @@ type UnackedCompletions =
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
-    registries: std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
+    pub(super) registries:
+        std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
     unacked: UnackedCompletions,
     #[cfg(test)]
     settlement_gate: std::sync::Mutex<Option<completion_settlement::TestGate>>,
@@ -422,6 +423,18 @@ pub(super) fn recover_registry_completions(
             // existing memory replay behavior, but do not guess which caller
             // should receive a recovered task after restart.
             if completion.launching_identity.as_ref() != Some(&identity) {
+                continue;
+            }
+            if super::runner_notices::is_runner(&identity) {
+                let task_id = completion.task_id.clone();
+                if metrics.completion_delivery.admit(root, &task_id)
+                    && !super::runner_notices::enqueue(
+                        registry.clone(),
+                        completion.into_push_frame(),
+                    )
+                {
+                    metrics.completion_delivery.forget(root, &task_id);
+                }
                 continue;
             }
             // A queued mark may hold the task state lock while syncing storage.
@@ -1378,6 +1391,13 @@ fn matching_route_channels(
     )
     .into_iter()
     .filter(|channel| {
+        if routes
+            .get(channel)
+            .is_some_and(super::runner_notices::runner_route)
+            && (frame_is_bash_observation(frame) || root_broadcast_kind(frame).is_some())
+        {
+            return false;
+        }
         frame_task_identity(frame).is_none_or(|owner| {
             routes
                 .get(channel)
@@ -1706,6 +1726,25 @@ fn process_reliable_push_frame(
     Option<crate::bash_background::TaskIdentity>,
 )> {
     let durable_bg_session = durable_bg_session_key(&root, &frame);
+    if frame_task_identity(&frame).is_some_and(super::runner_notices::is_runner) {
+        let task = completed_task_id(&frame).map(str::to_string);
+        if task
+            .as_ref()
+            .is_some_and(|task| !metrics.completion_delivery.admit(&root, task))
+        {
+            return None;
+        }
+        if let Some(registry) = metrics.completion_delivery.registry(&root) {
+            if !super::runner_notices::enqueue(registry, frame) {
+                if let Some(task) = &task {
+                    metrics.completion_delivery.forget(&root, task);
+                }
+            }
+        } else if let Some(task) = &task {
+            metrics.completion_delivery.forget(&root, task);
+        }
+        return None;
+    }
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
         if !metrics.completion_delivery.admit(&root, task_id) {
@@ -2000,6 +2039,11 @@ impl StatusPushes {
                     false,
                 );
                 recipients.retain(|channel| !pending.queued_recipients.contains(channel));
+                recipients.retain(|channel| {
+                    !routes
+                        .get(channel)
+                        .is_some_and(super::runner_notices::runner_route)
+                });
                 recipients.sort_by_key(|route| (route.channel, route.epoch));
                 pending.recipients = recipients.into();
             }

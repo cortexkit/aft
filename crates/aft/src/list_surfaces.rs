@@ -749,6 +749,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
     },
     ExclusionEntry {
+        file: "subc/scope_background_tasks.rs",
+        enclosing_item: "running, scan_saved",
+        location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
+        reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
+    },
+    ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "try_scope_background_tasks",
+        location_or_primitive: "remaining iterator budget",
+        reason: "scope.background_tasks shares its bounded scan budget with saved records and returns complete false on exhaustion, never a complete empty done-gate snapshot",
+    },
+    ExclusionEntry {
         file: "cold_build_limiter/progress.rs",
         enclosing_item: "snapshot",
         location_or_primitive: "take(LIST_CAP)",

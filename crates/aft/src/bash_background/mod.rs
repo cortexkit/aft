@@ -598,7 +598,10 @@ impl TaskIdentity {
                 ..
             } => Some(Self {
                 principal: principal_id.clone(),
-                harness: harness.clone(),
+                harness: harness
+                    .parse::<crate::harness::Harness>()
+                    .map(|harness| harness.wire_label())
+                    .unwrap_or_else(|_| harness.clone()),
                 session: session_id.clone(),
             }),
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,

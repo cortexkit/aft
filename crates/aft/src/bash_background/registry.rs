@@ -8852,6 +8852,46 @@ impl BgTaskRegistry {
         Some(rows)
     }
 
+    pub(crate) fn try_scope_background_tasks(
+        &self,
+        scope: &crate::subc::scope_background_tasks::Selector,
+        remaining: &mut usize,
+    ) -> Result<
+        (
+            HashSet<String>,
+            Vec<crate::subc::scope_background_tasks::Running>,
+        ),
+        String,
+    > {
+        let tasks = self.inner.tasks.try_lock().map_err(|_| "registry_busy")?;
+        let mut known = HashSet::new();
+        let mut running = Vec::new();
+        for task in tasks.values() {
+            if *remaining == 0 {
+                return Err("walk_limit_reached".into());
+            }
+            *remaining -= 1;
+            let state = task.state.try_lock().map_err(|_| "task_busy")?;
+            let metadata = &state.metadata;
+            known.insert(metadata.task_id.clone());
+            if metadata
+                .scope
+                .as_ref()
+                .is_some_and(|stamp| scope.matches(stamp))
+                && !metadata.is_terminal()
+            {
+                running.push(crate::subc::scope_background_tasks::running(metadata));
+            }
+        }
+        Ok((known, running))
+    }
+
+    pub(crate) fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
+        let task = self.task(task_id)?;
+        let state = task.lock_state().ok()?;
+        Some(state.metadata.clone())
+    }
+
     fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
         self.inner
             .watch_registry

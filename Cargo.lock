@@ -78,6 +78,7 @@ dependencies = [
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
  "cortexkit-role-harness",
+ "cortexkit-role-llm-runner",
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -834,6 +835,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-rich-ui-syntax"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98509395f8f7afce4127b6c6e1f1eaf11ee20fba57a86c27a21da67e10a3bc45"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "cortexkit-role-agent-data"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -850,6 +860,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54901f6290132d5f70ffbf6bd3e06d31c128cb70566a73fb201866b8394bb8aa"
 dependencies = [
  "async-trait",
+]
+
+[[package]]
+name = "cortexkit-role-llm-runner"
+version = "0.8.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec3dd82662de68fc128ae405d914a639435e5522069a3778bd0576171bfaea64"
+dependencies = [
+ "cortexkit-rich-ui-syntax",
+ "cortexkit-role-tool-provider",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -3314,6 +3338,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags 2.11.0",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5089,6 +5124,12 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-id-start"

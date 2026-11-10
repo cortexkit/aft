@@ -249,6 +249,7 @@ pub(crate) use secret_consent::{
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
+mod bash_notice_text;
 mod keepalive;
 mod manifest;
 mod page_collect;
@@ -264,6 +265,8 @@ pub(crate) mod result_body;
 mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
+mod runner_notices;
+pub(crate) mod scope_background_tasks;
 mod scope_describe;
 #[cfg(test)]
 mod stack_budget_tests;
@@ -1665,7 +1668,11 @@ impl RouteIdentity {
         };
         crate::bash_background::TaskIdentity {
             principal,
-            harness: self.harness.clone(),
+            harness: self
+                .harness
+                .parse::<crate::harness::Harness>()
+                .map(|harness| harness.wire_label())
+                .unwrap_or_else(|_| self.harness.clone()),
             session: self.session.clone(),
         }
     }
@@ -5436,6 +5443,7 @@ where
         }
     }
     rich_ui::display::start(connection_file_path.to_path_buf());
+    runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -8896,7 +8904,10 @@ async fn handle_control_request(
                 output_scope: Default::default(),
                 root: bind_root_id.clone(),
                 project_root: PathBuf::from(&bind_project_root),
-                harness: bind_harness.clone(),
+                harness: active_harness
+                    .as_ref()
+                    .map(|harness| harness.wire_label())
+                    .unwrap_or_else(|| bind_harness.clone()),
                 session: bind_session.clone(),
                 role: route_role,
                 trust: bind_trust,
@@ -9232,6 +9243,22 @@ async fn handle_management_request(
 
     metrics.mark_frame_loop_command("handle_management_request", operation, frame.header.corr);
     let result = match operation {
+        scope_background_tasks::OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            scope_background_tasks::spawn(
+                tx,
+                frame,
+                metrics,
+                principal.cloned(),
+                params,
+                storage_dir.to_path_buf(),
+            );
+            return Ok(());
+        }
         crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
             let params = decoded
                 .as_ref()
@@ -9956,8 +9983,7 @@ async fn send_management_response(
     result: Response,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
-    let status = if result.success { "ok" } else { "error" };
-    let body = json!({ "op": operation, "status": status, "data": result.data });
+    let body = management_response_body(operation, result);
     let response = Frame::build_with_version(
         request.header.ver,
         FrameType::Response,
@@ -9969,6 +9995,11 @@ async fn send_management_response(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "management response").await
+}
+
+fn management_response_body(operation: &str, result: Response) -> Value {
+    let status = if result.success { "ok" } else { "error" };
+    json!({ "op": operation, "status": status, "data": result.data })
 }
 
 fn install_bash_compressor(ctx: &AppContext) {

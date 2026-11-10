@@ -1768,6 +1768,10 @@ pub struct PersistedTask {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launching_identity: Option<super::TaskIdentity>,
+    /// The daemon's original harness label, used only to bind notices back to
+    /// the runner. Storage and ownership continue to use the canonical harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launching_raw_harness: Option<String>,
     pub command: String,
     /// Scanner-derived segment labels retained so completion rendering does not
     /// need to parse the command again.
@@ -1970,6 +1974,12 @@ impl PersistedTask {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             launching_identity: super::TaskIdentity::current(),
+            launching_raw_harness: match crate::sandbox_spawn::current_authenticated_principal() {
+                crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { harness, .. } => {
+                    Some(harness)
+                }
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,
+            },
             task_id,
             session_id,
             command,
@@ -2145,6 +2155,7 @@ impl From<BashTaskRow> for PersistedTask {
             task_id: row.task_id,
             session_id: row.session_id,
             launching_identity: None,
+            launching_raw_harness: None,
             command: row.command,
             pipeline_segments: Vec::new(),
             pipeline_status_unavailable: None,

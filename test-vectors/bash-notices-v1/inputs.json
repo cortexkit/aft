@@ -1,0 +1,13 @@
+[
+  {"kind":"completion","input":{"task_id":"bash-short","status":"completed","exit_code":0,"duration_ms":999.5,"output_preview":"\u001b[32mok\u001b[0m\n","output_truncated":false}},
+  {"kind":"completion","input":{"task_id":"bash-failed","status":"failed","exit_code":1,"duration_ms":59999,"output_preview":"first\nlast\n\n","output_truncated":true,"output_incomplete":true,"status_reason":"capture stopped","live_descendants_summary":"2 descendants remain","_bash_changed_files":{"text":"Changed files: src/main.rs"}}},
+  {"kind":"completion","input":{"task_id":"bash-timeout","status":"timed_out","exit_code":-9,"runtime_ms":1500,"output_preview":"  \n","output_truncated":false}},
+  {"kind":"completion","input":{"task_id":"bash-huge","status":"completed","exit_code":9007199254740993,"duration_ms":1e24,"output_preview":"","output_truncated":false}},
+  {"kind":"completion","input":{"task_id":"bash-small","status":"killed","exit_code":null,"runtime":0.5,"output_incomplete":true,"output_preview":"","output_truncated":false}},
+  {"kind":"completion","input":{"task_id":"bash-negative","status":"fate_unknown","exit_code":null,"duration_ms":-1,"runtime_ms":500,"output_preview":"done\r\n","output_truncated":true}},
+  {"kind":"long_running","input":{"task_id":"bash-long","command":"cargo test","elapsed_ms":60500}},
+  {"kind":"long_running","input":{"task_id":"bash-long-title","command":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz","elapsed_ms":999.5}},
+  {"kind":"watch","input":{"task_id":"bash-watch","match_text":"ready\"now","match_offset":9007199254740993,"context":"ready\nnow","reason":"match"}},
+  {"kind":"watch","input":{"task_id":"bash-exit","match_text":"exit","match_offset":0,"context":"last line","reason":"task_exit"}},
+  {"kind":"watch","input":{"task_id":"bash-lines","reason":"match","batch":{"lines":[{"stream":"stdout","offset":42,"count":2,"text":"ready"},{"stream":"stderr","offset":99,"count":1,"text":"","unavailable":true}],"dropped_lines":3,"skipped_long_lines":1,"first_dropped_stream":"stderr","first_dropped_offset":100,"retry_gap":{"dropped_notifications":2,"known_missing_occurrences":1,"stream":"stdout","first_offset":8}}}}
+]

@@ -176,7 +176,7 @@ impl std::str::FromStr for Harness {
             // is loaded there, so they are runner sessions in everything the
             // harness decides (storage, consent, reply shape). The route
             // identity keeps the name the daemon sent.
-            "runner" | "opencode2" | "claude-code" => Ok(Harness::Runner),
+            "runner" | "opencode2" | "claude-code" | "broca" => Ok(Harness::Runner),
             other if other.starts_with("mcp:") => {
                 let client = &other[4..];
                 if client.is_empty() {
