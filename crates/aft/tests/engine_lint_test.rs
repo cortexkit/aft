@@ -215,6 +215,10 @@ pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
         }
     }
 
+    // Audit the shared plan table and query value types as well as command handlers.
+    files.push(root.join("crates/aft/src/search_b2/plan_table.rs"));
+    files.push(root.join("crates/aft/src/search_b2/contracts.rs"));
+
     // 2. Every crates/aft/tests/engine_*_test.rs
     let tests_dir = root.join("crates/aft/tests");
     if tests_dir.is_dir() {
@@ -247,6 +251,7 @@ pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
         "evidence_descriptor.rs",
         "generation_token.rs",
         "plan_table.rs",
+        "contracts.rs",
         "engine_comparator_test.rs",
         "engine_plan_table_test.rs",
     ] {
