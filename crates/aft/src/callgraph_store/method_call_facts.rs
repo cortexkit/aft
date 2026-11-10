@@ -188,41 +188,42 @@ impl FileFacts {
         {
             return Self::changed_keys(path, Some(old), Some(new), keys);
         }
+        let mut named = Vec::new();
         changed_groups(
             &grouped(&old.methods, |m| m.name.as_str()),
             &grouped(&new.methods, |m| m.name.as_str()),
-            |name| {
-                keys.insert(dependency::method(name));
-            },
+            |name| named.push(dependency::method(name)),
         );
         let (old_named, new_named) = (old.named_facts(), new.named_facts());
         changed_groups(&old_named, &new_named, |name| {
-            keys.insert(dependency::type_name(path, name));
+            named.push(dependency::type_name(path, name));
         });
         if old.default_export_symbol != new.default_export_symbol {
-            keys.insert(dependency::type_name(path, "@default"));
+            named.push(dependency::type_name(path, "@default"));
         }
         changed_groups(
             &grouped(&old.types, |t| t.name.as_str()),
             &grouped(&new.types, |t| t.name.as_str()),
-            |name| {
-                keys.insert(dependency::directory_type(path, name));
-            },
+            |name| named.push(dependency::directory_type(path, name)),
         );
         changed_groups(
             &grouped(&old.fields, |f| (f.owner.as_str(), f.name.as_str())),
             &grouped(&new.fields, |f| (f.owner.as_str(), f.name.as_str())),
-            |(owner, name)| {
-                keys.insert(dependency::field(path, owner, name));
-            },
+            |(owner, name)| named.push(dependency::field(path, owner, name)),
         );
         changed_groups(
             &grouped(&old.returns, |r| r.symbol.as_str()),
             &grouped(&new.returns, |r| r.symbol.as_str()),
-            |symbol| {
-                keys.insert(dependency::return_hint(path, symbol));
-            },
+            |symbol| named.push(dependency::return_hint(path, symbol)),
         );
+        // The facts differ, so something a resolution may read changed. If no
+        // name above accounts for it (for example the target of an import that
+        // binds no local name), fall back to the whole-file keys rather than
+        // invalidate nothing.
+        if named.is_empty() {
+            return Self::changed_keys(path, Some(old), Some(new), keys);
+        }
+        keys.extend(named);
     }
 
     fn named_facts(&self) -> BTreeMap<&str, NamedFacts<'_>> {

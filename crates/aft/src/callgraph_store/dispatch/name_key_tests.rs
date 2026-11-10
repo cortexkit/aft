@@ -221,6 +221,24 @@ fn name_keys_typescript_default_and_import_alias_reads() {
 }
 
 #[test]
+fn name_keys_unattributed_fact_change_falls_back_to_whole_file_keys() {
+    // An import target for a module that binds no local name changes the
+    // facts without changing any name-addressed read. The diff must still
+    // invalidate something, so it falls back to the whole-file keys.
+    let caller = blob("fn caller() {}", "rust");
+    let old = FileFacts::new(&caller);
+    let mut new = old.clone();
+    new.import_targets
+        .insert("./side-effect".into(), "side.ts".into());
+    let mut coarse = BTreeSet::new();
+    FileFacts::changed_keys("main.rs", Some(&old), Some(&new), &mut coarse);
+    let mut keys = BTreeSet::new();
+    FileFacts::changed_keys_by_method("main.rs", Some(&old), Some(&new), &mut keys);
+    assert!(!keys.is_empty(), "a fact change must invalidate something");
+    assert_eq!(keys, coarse);
+}
+
+#[test]
 fn name_keys_rust_type_targets_record_absence_and_emit_target_changes() {
     let caller = blob("fn caller() {}", "rust");
     let resolver = Resolver::new(BTreeMap::from([("main.rs".into(), &caller)]));
