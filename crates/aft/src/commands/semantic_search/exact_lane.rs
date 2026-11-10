@@ -67,8 +67,11 @@ pub fn exact_phrase(query: &str) -> &str {
 
 /// Normalized exact phrase for verbatim comparison.
 pub fn normalize_exact_phrase(text: &str) -> String {
-    let mut out = String::new();
+    // Normalizing never lengthens the text. Exact-size storage keeps a
+    // prepared body's cache charge within its source range.
+    let mut out = String::with_capacity(text.len());
     push_normalized_exact_phrase(text, &mut out);
+    out.shrink_to_fit();
     out
 }
 
