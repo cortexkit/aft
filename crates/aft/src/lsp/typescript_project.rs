@@ -15,7 +15,7 @@
 //! the installed compiler.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -71,12 +71,10 @@ impl ProjectTypeScript {
         self.major().is_some_and(|major| major >= 7)
     }
 
-    /// Whether the package ships the `lib/tsserver.js` that
-    /// typescript-language-server loads.
-    pub(crate) fn has_tsserver(&self) -> bool {
-        let path = self.package_dir.join("lib").join("tsserver.js");
-        super::applicability_cache::observe_path(&path);
-        path.is_file()
+    /// The lib directory containing tsserver.js, in this package or a runtime
+    /// dependency aliased to `typescript` by a shim package.
+    pub(crate) fn tsserver_lib_dir(&self) -> Option<PathBuf> {
+        find_tsserver_lib_dir(&self.package_dir, &mut HashSet::new())
     }
 
     /// Read the package at `package_dir` (a `node_modules/typescript`
@@ -99,6 +97,69 @@ impl ProjectTypeScript {
             package_dir: package_dir.to_path_buf(),
         })
     }
+}
+
+/// Limit file-system work for deeply nested alias chains.
+const MAX_TSSERVER_PACKAGES: usize = 16;
+
+fn find_tsserver_lib_dir(package_dir: &Path, visited: &mut HashSet<PathBuf>) -> Option<PathBuf> {
+    if visited.len() >= MAX_TSSERVER_PACKAGES {
+        return None;
+    }
+    let real_dir = crate::inspect::job::canonicalize_normalized(package_dir);
+    if !visited.insert(real_dir.clone()) {
+        return None;
+    }
+    let lib = package_dir.join("lib");
+    let tsserver = lib.join("tsserver.js");
+    super::applicability_cache::observe_path(&tsserver);
+    if tsserver.is_file() {
+        return Some(lib);
+    }
+    let manifest = real_dir.join("package.json");
+    super::applicability_cache::observe_path(&manifest);
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
+    ["dependencies", "optionalDependencies"]
+        .into_iter()
+        .filter_map(|section| json.get(section)?.as_object())
+        .flatten()
+        .find_map(|(name, spec)| {
+            if !spec.as_str()?.starts_with("npm:typescript@")
+                || visited.len() >= MAX_TSSERVER_PACKAGES
+            {
+                return None;
+            }
+            let dependency = resolve_node_package(&real_dir, name)?;
+            find_tsserver_lib_dir(&dependency, visited)
+        })
+}
+
+/// Resolve an installed package from its importer's real path, as Node does.
+fn resolve_node_package(real_dir: &Path, name: &str) -> Option<PathBuf> {
+    if Path::new(name)
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    for ancestor in real_dir.ancestors() {
+        // Node searches a node_modules ancestor directly, not its child.
+        let modules = if ancestor
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+        {
+            ancestor.to_path_buf()
+        } else {
+            ancestor.join("node_modules")
+        };
+        let package = modules.join(name);
+        let manifest = package.join("package.json");
+        super::applicability_cache::observe_path(&manifest);
+        if manifest.is_file() {
+            return Some(package);
+        }
+    }
+    None
 }
 
 /// Find the project's own TypeScript package for `source_file`, walking up to
@@ -517,31 +578,16 @@ pub(crate) fn resolve_native_binary(project: &ProjectTypeScript) -> Result<PathB
     };
     let real_dir = crate::inspect::job::canonicalize_normalized(&project.package_dir);
     let binary_name = if cfg!(windows) { "tsc.exe" } else { "tsc" };
-    for ancestor in real_dir.ancestors() {
-        // Node looks in `<dir>/node_modules` for every ancestor, except that
-        // a directory that is itself named node_modules is searched directly.
-        let modules = if ancestor
-            .file_name()
-            .is_some_and(|name| name == "node_modules")
-        {
-            ancestor.to_path_buf()
-        } else {
-            ancestor.join("node_modules")
-        };
-        let package = modules.join(&platform_package);
-        let manifest = package.join("package.json");
-        super::applicability_cache::observe_path(&manifest);
-        if manifest.is_file() {
-            let binary = package.join("lib").join(binary_name);
-            super::applicability_cache::observe_path(&binary);
-            if binary.is_file() {
-                return Ok(binary);
-            }
-            return Err(format!(
-                "{platform_package} is installed at {} but has no lib/{binary_name}",
-                package.display()
-            ));
+    if let Some(package) = resolve_node_package(&real_dir, &platform_package) {
+        let binary = package.join("lib").join(binary_name);
+        super::applicability_cache::observe_path(&binary);
+        if binary.is_file() {
+            return Ok(binary);
         }
+        return Err(format!(
+            "{platform_package} is installed at {} but has no lib/{binary_name}",
+            package.display()
+        ));
     }
     Err(format!(
         "{platform_package} (the optional dependency that carries the native compiler) was not found from {}; the install skipped optional dependencies or this platform is unsupported",
@@ -651,6 +697,131 @@ mod tests {
             .join(if cfg!(windows) { "tsc.exe" } else { "tsc" });
         write(&binary, "");
         package_dir
+    }
+
+    fn shim_install(package_dir: &Path, alias: &str) {
+        write(
+            &package_dir.join("package.json"),
+            &serde_json::json!({
+                "version": "6.0.2",
+                "dependencies": {alias: "npm:typescript@^6"}
+            })
+            .to_string(),
+        );
+    }
+
+    #[test]
+    fn tsserver_is_found_in_a_normal_typescript_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_dir = temp.path().join("node_modules/typescript");
+        write(
+            &package_dir.join("package.json"),
+            r#"{"name":"typescript","version":"6.0.2"}"#,
+        );
+        let lib = package_dir.join("lib");
+        write(&lib.join("tsserver.js"), "");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), Some(lib));
+    }
+
+    #[test]
+    fn tsserver_is_found_in_a_hoisted_alias_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules =
+            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
+        let package_dir = modules.join("typescript");
+        shim_install(&package_dir, "@typescript/old");
+        let lib = modules.join("@typescript/old/lib");
+        write(
+            &lib.parent().unwrap().join("package.json"),
+            r#"{"version":"6.0.3"}"#,
+        );
+        write(&lib.join("tsserver.js"), "");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), Some(lib));
+        assert_eq!(project.version, "6.0.2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tsserver_is_resolved_from_the_real_path_of_a_linked_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        for (store, app) in [(".bun", "bun-app"), (".pnpm", "pnpm-app")] {
+            let store_modules = root
+                .join("node_modules")
+                .join(store)
+                .join("@typescript+typescript6@6.0.2/node_modules");
+            let real_package = store_modules.join("@typescript/typescript6");
+            shim_install(&real_package, "@typescript/old");
+            let lib = store_modules.join("@typescript/old/lib");
+            write(
+                &lib.parent().unwrap().join("package.json"),
+                r#"{"version":"6.0.2"}"#,
+            );
+            write(&lib.join("tsserver.js"), "");
+            let project_modules = root.join(app).join("node_modules");
+            std::fs::create_dir_all(&project_modules).unwrap();
+            std::os::unix::fs::symlink(&real_package, project_modules.join("typescript")).unwrap();
+
+            let project = ProjectTypeScript::read(&project_modules.join("typescript")).unwrap();
+            assert_eq!(project.tsserver_lib_dir(), Some(lib));
+        }
+    }
+
+    #[test]
+    fn tsserver_alias_cycles_terminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_dir = temp.path().join("node_modules/typescript");
+        shim_install(&package_dir, "typescript");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), None);
+    }
+
+    #[test]
+    fn tsserver_only_follows_typescript_aliases_with_package_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules = temp.path().join("node_modules");
+        let package_dir = modules.join("typescript");
+        let dependency = modules.join("legacy");
+        write(&dependency.join("package.json"), "{}");
+        write(&dependency.join("lib/tsserver.js"), "");
+        for spec in ["npm:typescript-other@^6", "^6"] {
+            write(
+                &package_dir.join("package.json"),
+                &serde_json::json!({"version": "6.0.2", "dependencies": {"legacy": spec}})
+                    .to_string(),
+            );
+            let project = ProjectTypeScript::read(&package_dir).unwrap();
+            assert_eq!(project.tsserver_lib_dir(), None);
+        }
+        shim_install(&package_dir, "../node_modules/legacy");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), None);
+    }
+
+    #[test]
+    fn tsserver_alias_chains_have_a_package_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules =
+            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
+        let package_dir = modules.join("typescript");
+        shim_install(&package_dir, "legacy0");
+        for index in 0..MAX_TSSERVER_PACKAGES {
+            shim_install(
+                &modules.join(format!("legacy{index}")),
+                &format!("legacy{}", index + 1),
+            );
+        }
+        let far_lib = modules.join(format!("legacy{MAX_TSSERVER_PACKAGES}/lib"));
+        write(&far_lib.parent().unwrap().join("package.json"), "{}");
+        write(&far_lib.join("tsserver.js"), "");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), None);
+
+        let near_lib = modules.join("legacy1/lib");
+        write(&near_lib.join("tsserver.js"), "");
+        assert_eq!(project.tsserver_lib_dir(), Some(near_lib));
     }
 
     #[test]

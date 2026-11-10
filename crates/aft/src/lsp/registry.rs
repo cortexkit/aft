@@ -327,6 +327,13 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    pub(crate) fn has_configured_binary(&self, config: &Config) -> bool {
+        config
+            .lsp_servers
+            .iter()
+            .any(|server| server.id == self.kind.id_str() && !server.binary.is_empty())
+    }
+
     /// Return executable names in preference order. Docker's upstream server
     /// takes precedence over the older npm server, which remains the fallback.
     pub fn binary_candidates(&self) -> Vec<String> {
@@ -1424,9 +1431,11 @@ fn select_typescript_server(
     config: &Config,
     mode: RootPathMode,
 ) -> ServerDef {
-    // Only the built-in program is swapped: a user who pointed the
-    // `typescript` server at another binary has chosen their own server.
-    if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
+    // An explicit binary owns SDK selection, even when it names the built-in.
+    if server.kind != ServerKind::TypeScript
+        || server.binary != TYPESCRIPT_LANGUAGE_SERVER
+        || server.has_configured_binary(config)
+    {
         return server;
     }
     let project_root = config.project_root.as_deref();
@@ -1783,6 +1792,7 @@ mod tests {
     use super::{
         biome_includes, builtin_servers, is_config_file_path, resolve_lsp_binary,
         resolve_server_binary, servers_for_file, ServerDef, ServerKind, BIOME_PARSES,
+        TYPESCRIPT_LANGUAGE_SERVER,
     };
     use crate::config::{Config, UserServerDef};
 
@@ -2332,18 +2342,25 @@ mod tests {
         install_typescript(&root, "7.0.2");
         let file = root.join("index.ts");
         write_file(&file, "");
-        let config = Config {
-            project_root: Some(root.clone()),
-            lsp_servers: vec![UserServerDef {
-                id: "typescript".to_string(),
-                binary: "vtsls".to_string(),
-                ..UserServerDef::default()
-            }],
-            ..Config::default()
-        };
-        let server = typescript_server(&file, &config).unwrap();
-        assert_eq!(server.kind, ServerKind::TypeScript);
-        assert_eq!(server.binary, "vtsls");
+        for binary in ["vtsls", TYPESCRIPT_LANGUAGE_SERVER] {
+            let config = Config {
+                project_root: Some(root.clone()),
+                lsp_servers: vec![UserServerDef {
+                    id: "typescript".to_string(),
+                    binary: binary.to_string(),
+                    ..UserServerDef::default()
+                }],
+                ..Config::default()
+            };
+            let reads = crate::lsp::typescript_project::package_json_reads_on_this_thread();
+            let server = typescript_server(&file, &config).unwrap();
+            assert_eq!(server.kind, ServerKind::TypeScript);
+            assert_eq!(server.binary, binary);
+            assert_eq!(
+                crate::lsp::typescript_project::package_json_reads_on_this_thread(),
+                reads
+            );
+        }
     }
 
     #[test]

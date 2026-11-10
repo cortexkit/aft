@@ -7604,7 +7604,8 @@ impl LspManager {
         let mut initialization_options =
             initialization_options_for_spawn(def, source_file, root, &resolution_config)?;
         let has_binary_override = self.binary_overrides.contains_key(&def.kind)
-            || env_binary_override(&def.kind).is_some();
+            || env_binary_override(&def.kind).is_some()
+            || def.has_configured_binary(config);
         let mut runtime_note = None;
         let mut project_typescript = None;
         let mut typescript_lookup = None;
@@ -7653,7 +7654,7 @@ impl LspManager {
             initialization_options = Some(options);
             runtime_note = Some(note);
         }
-        if def.kind == ServerKind::TypeScript {
+        if def.kind == ServerKind::TypeScript && !has_binary_override {
             let boundary = config
                 .project_root
                 .as_deref()
@@ -7865,12 +7866,8 @@ fn typescript_runtime_options(
         .filter(|p| source_file.starts_with(p))
         .unwrap_or(server_root);
     let (lib, fallback) = match find_project_typescript_package(source_file, boundary) {
-        // Reached only when the `typescript` server runs a program the user
-        // chose; the built-in one is swapped for the native language server
-        // before this point. A TypeScript 7+ project must still not be
-        // served by the cached 5.x SDK: its diagnostics would silently follow
-        // another compiler's defaults and accept options TypeScript 7
-        // removed. Leave SDK discovery to the configured server.
+        // Never inject a cached JavaScript SDK for a native compiler project.
+        // Native-server selection normally handles these installations.
         Some(project) if project.is_native_compiler() => {
             return Ok((
                 options,
@@ -7881,17 +7878,13 @@ fn typescript_runtime_options(
                 ),
             ));
         }
-        Some(project) if project.major().is_some() && project.has_tsserver() => {
-            (project.package_dir.join("lib"), false)
-        }
-        // An unreadable version, or TypeScript 6 or earlier without
-        // tsserver.js: typescript-language-server would fail in initialize,
-        // and serving the project with the cached SDK would report another
-        // compiler's results. Name the installation instead of spawning.
+        // The cached SDK would report another compiler's results for this project.
         Some(project) => {
-            return Err(LspError::ServerNotReady(unservable_typescript_reason(
-                &project,
-            )));
+            let lib = project
+                .major()
+                .and_then(|_| project.tsserver_lib_dir())
+                .ok_or_else(|| LspError::ServerNotReady(unservable_typescript_reason(&project)))?;
+            (lib, false)
         }
         None => {
             let Some(lib) = config
@@ -11992,6 +11985,91 @@ exit 1
         let (options, _) =
             typescript_runtime_options(Some(configured.clone()), &file, &project, &config).unwrap();
         assert_eq!(options, configured);
+    }
+
+    #[test]
+    fn typescript_shim_uses_its_alias_sdk_and_names_a_missing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = crate::inspect::job::canonicalize_normalized(temp.path()).join("project");
+        let shim = project.join("node_modules/typescript");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(
+            shim.join("package.json"),
+            r#"{"version":"6.0.2","dependencies":{"@typescript/old":"npm:typescript@^6"}}"#,
+        )
+        .unwrap();
+        let cache = temp.path().join("cache");
+        sdk(&cache, "5.9.3");
+        let file = project.join("index.ts");
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache.join("node_modules/.bin")],
+            ..Config::default()
+        };
+        let error = typescript_runtime_options(None, &file, &project, &config).unwrap_err();
+        let LspError::ServerNotReady(reason) = error else {
+            panic!("expected a named gap, got {error}");
+        };
+        assert!(reason.contains("TypeScript 6.0.2 at "), "{reason}");
+        assert!(reason.contains("has no lib/tsserver.js"), "{reason}");
+
+        let target = project.join("node_modules/@typescript/old");
+        std::fs::create_dir_all(target.join("lib")).unwrap();
+        std::fs::write(target.join("package.json"), r#"{"version":"6.0.3"}"#).unwrap();
+        let tsserver = target.join("lib/tsserver.js");
+        std::fs::write(&tsserver, "").unwrap();
+        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
+        assert_eq!(options["tsserver"]["path"], tsserver.to_str().unwrap());
+        assert!(
+            note.contains("TypeScript 6.0.3: project installation"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn configured_typescript_binary_skips_project_sdk_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let lib = sdk(&root, "6.0.2");
+        let binary = root.join("node_modules/.bin/tsc");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, "").unwrap();
+        let file = root.join("index.ts");
+        let configured = serde_json::json!({"preferences": {"quotePreference": "single"}});
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_servers: vec![crate::config::UserServerDef {
+                id: "typescript".into(),
+                binary: binary.to_str().unwrap().into(),
+                args: vec!["--lsp".into(), "--stdio".into()],
+                initialization_options: Some(configured.clone()),
+                ..crate::config::UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let manager = LspManager::new();
+        for has_tsserver in [false, true] {
+            if has_tsserver {
+                std::fs::write(lib.join("tsserver.js"), "").unwrap();
+            } else {
+                std::fs::remove_file(lib.join("tsserver.js")).unwrap();
+            }
+            let reads = crate::lsp::typescript_project::package_json_reads_on_this_thread();
+            let def = crate::lsp::registry::servers_for_file(&file, &config)
+                .into_iter()
+                .find(|server| server.kind == ServerKind::TypeScript)
+                .unwrap();
+            let prepared = manager.prepare_spawn(&def, &root, &file, &config).unwrap();
+            assert_eq!(prepared.binary, binary);
+            assert_eq!(prepared.args, vec!["--lsp", "--stdio"]);
+            assert_eq!(prepared.initialization_options, Some(configured.clone()));
+            assert_eq!(prepared.project_typescript, None);
+            assert_eq!(prepared.typescript_lookup, None);
+            assert_eq!(
+                crate::lsp::typescript_project::package_json_reads_on_this_thread(),
+                reads
+            );
+        }
     }
 
     #[test]
