@@ -56,6 +56,14 @@ def leaked_processes(table: dict[int, tuple[int, str]], roots: list[Path], own_p
 
 def cleanup_processes(root: Path) -> None:
     roots = [root, Path(os.environ["GITHUB_WORKSPACE"]) / "target"]
+    # Native E2E injects the built executable into the plugin's versioned cache.
+    # Those copies can hold files open after their test harness has exited.
+    if os.name == "nt":
+        cache = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if cache:
+            roots.append(Path(cache) / "aft" / "bin")
+    else:
+        roots.append(Path.home() / ".cache" / "aft" / "bin")
     victims = leaked_processes(process_table(), roots, os.getpid())
     for pid in sorted(victims, reverse=True):
         print(f"Stopping leaked native CI process {pid}", flush=True)

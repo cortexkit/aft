@@ -197,7 +197,9 @@ class LightPREventGateTests(unittest.TestCase):
                 else:
                     self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v5"})
                     self.assertEqual(job["steps"][1], {"uses": "./.github/actions/native-ci-state"})
-                    self.assertEqual(job["steps"][2], step)
+                    self.assertEqual(job["steps"][2]["uses"], "oven-sh/setup-bun@v2")
+                    self.assertEqual(job["steps"][3]["uses"], "actions/setup-node@v5")
+                    self.assertEqual(job["steps"][4], step)
                     self.assertEqual(job["steps"][-1]["with"], {"phase": "cleanup"})
         action = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
         self.assertEqual(action["runs"]["using"], "composite")
@@ -514,7 +516,7 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         self.assertIn("Get-MpComputerStatus", script)
         self.assertNotIn("SilentlyContinue", script)
 
-    def test_every_windows_ci_lane_tunes_defender_before_other_setup(self) -> None:
+    def test_every_windows_ci_lane_retains_the_hosted_only_defender_action(self) -> None:
         root = Path(__file__).resolve().parents[2]
         action = "./.github/actions/windows-ci-defender"
         calls = []
@@ -530,8 +532,8 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
                 if shared:
                     self.assertEqual(shared[0]["with"]["platform"], "windows")
                 else:
-                    self.assertEqual(direct, [2], name)
-                    self.assertNotIn("continue-on-error", steps[2])
+                    self.assertEqual(direct, [4], name)
+                    self.assertNotIn("continue-on-error", steps[4])
                     calls.append(name)
         self.assertEqual(set(calls), {
             "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
@@ -1098,6 +1100,33 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         for name, job in self.native_jobs():
             check(job["steps"], name)
 
+    def test_native_jobs_install_host_tools_and_rust_components_before_use(self) -> None:
+        shard = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/integration-shard/action.yml"))
+        for name, job in self.native_jobs():
+            with self.subTest(job=name):
+                steps = job["steps"]
+                self.assertEqual(steps[2]["uses"], "oven-sh/setup-bun@v2")
+                self.assertEqual(steps[3]["uses"], "actions/setup-node@v5")
+                rust = [step for step in steps if step.get("uses") == "dtolnay/rust-toolchain@stable"]
+                if not rust:
+                    platform = next(step["with"]["platform"] for step in steps
+                                    if step.get("uses") == "./.github/actions/integration-shard")
+                    rust = [step for step in shard["runs"]["steps"]
+                            if step.get("uses") == "dtolnay/rust-toolchain@stable"
+                            and step.get("if") == f"inputs.platform == '{platform}'"]
+                self.assertEqual(len(rust), 1)
+                self.assertEqual(set(rust[0]["with"]["components"].split(", ")),
+                                 {"rustfmt", "clippy", "rust-analyzer"})
+                if rust[0] in steps:
+                    first_use = next((i for i, step in enumerate(steps)
+                                      if re.search(r"\bcargo\b|scripts/check-path-deps.py", step.get("run", ""))), len(steps))
+                    self.assertLess(steps.index(rust[0]), first_use)
+        conformance = self.suites[0]["jobs"]["unit-macos-conformance"]["steps"]
+        gh = next(step for step in conformance if step.get("name") == "Install GitHub CLI for pinned helper downloads")
+        fetch = next(step for step in conformance if step.get("name") == "Fetch pinned subc-core")
+        self.assertIn("brew install gh", gh["run"])
+        self.assertLess(conformance.index(gh), conformance.index(fetch))
+
     def test_local_archive_consumers_keep_run_scoped_paths(self) -> None:
         for name, job in self.native_jobs():
             for step in job["steps"]:
@@ -1160,6 +1189,23 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         windows = {3: (2, "C:\\Python\\python.exe"), 2: (1, "C:\\runner\\Runner.Worker.exe"),
                    10: (2, "C:\\Users\\Runner\\aft-ci\\target\\debug\\aft.exe"), 11: (10, "C:\\Windows\\cmd.exe")}
         self.assertEqual(self.state.leaked_processes(windows, [Path("c:/users/runner/aft-ci")], 3), {10, 11})
+
+    def test_cleanup_includes_the_injected_e2e_executable_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            local = home / "localappdata"
+            binary = (local / "aft/bin/v1/aft.exe" if os.name == "nt"
+                      else home / ".cache/aft/bin/v1/aft")
+            with unittest.mock.patch.object(self.state.Path, "home", return_value=home), \
+                 unittest.mock.patch.object(self.state, "process_table", return_value={10: (0, str(binary))}), \
+                 unittest.mock.patch.object(self.state.os, "kill") as kill, \
+                 unittest.mock.patch.object(self.state.subprocess, "run") as run, \
+                 unittest.mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(home / "workspace"), "LOCALAPPDATA": str(local)}):
+                self.state.cleanup_processes(home / "aft-ci")
+            if os.name == "nt":
+                self.assertEqual(run.call_args.args[0], ["taskkill", "/T", "/F", "/PID", "10"])
+            else:
+                kill.assert_called_once_with(10, self.state.signal.SIGKILL)
 
 
 class CortexkitTrackingGateTests(unittest.TestCase):

@@ -70,10 +70,10 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(job["env"]["CARGO_PROFILE_DIR"], "${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}")
         self.assertEqual(job["env"]["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
         self.assertIn('cargo build --profile "$CARGO_PROFILE"', commands(job))
-        for command in ('codesign -f -s -', 'codesign --verify --strict', '"target/$CARGO_PROFILE_DIR/aft" --version'):
+        for command in ('codesign -f -s -', 'codesign --verify --strict', '"$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version'):
             self.assertIn(command, commands(job))
         run = next(step for step in job["steps"] if step.get("run") == "bash tests/macos-e2e/run.sh")
-        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ github.workspace }}/target/${{ env.CARGO_PROFILE_DIR }}/aft")
+        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ env.CARGO_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft")
 
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):
         jobs = self.workflow("release.yml")["jobs"]

@@ -19,15 +19,18 @@ runs:
         components: rust-analyzer
     - uses: dtolnay/rust-toolchain@stable
       if: inputs.platform == 'macos'
+      with:
+        components: rustfmt, clippy, rust-analyzer
     - uses: dtolnay/rust-toolchain@stable
       if: inputs.platform == 'windows'
       with:
         targets: x86_64-pc-windows-msvc
+        components: rustfmt, clippy, rust-analyzer
 
     - uses: ./.github/actions/setup-nextest
 
     - uses: actions/setup-node@v5
-      if: inputs.platform != 'windows'
+      if: inputs.platform == 'linux'
       with:
         node-version: "24"
         package-manager-cache: ${{ runner.environment == 'github-hosted' }}
@@ -36,7 +39,7 @@ runs:
       shell: bash
       run: npm install --global --fetch-retries=5 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=60000 pyright@1.1.411
     - uses: oven-sh/setup-bun@v2
-      if: inputs.platform != 'windows'
+      if: inputs.platform == 'linux'
       with:
         bun-version: latest
         no-cache: ${{ runner.environment == 'self-hosted' }}
