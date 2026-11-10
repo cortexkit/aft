@@ -739,6 +739,26 @@ impl RunnerRecovery {
         assert!(self.registry.pending_completion_ids()[SESSION].contains(TASK));
     }
 
+    fn assert_offers(&self, expected: usize) {
+        completion_settlement::wait_for_settlements();
+        let paths =
+            crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, TASK)
+                .unwrap();
+        assert_eq!(
+            read_task_at(&paths).unwrap().runner_completion_offers,
+            expected,
+            "durable offer count"
+        );
+        assert_eq!(
+            self.registry
+                .runner_completion_state(TASK)
+                .unwrap()
+                .runner_completion_offers,
+            expected,
+            "published offer count"
+        );
+    }
+
     fn reconnect_three_times(&mut self, first: RouteChannel) {
         let mut previous = first;
         for epoch in 2..=4 {
@@ -1102,6 +1122,7 @@ fn thalamus_runner_unacked_completion_reoffers_are_bounded_across_restart() {
         recovery.live(frame.clone());
         recovery.assert_frame(first, TASK);
         recovery.assert_pending();
+        recovery.assert_offers(1);
         // Maintenance and duplicate live emissions on an open route are not
         // new offers. Only closing that recipient makes the task replayable.
         recovery.recover();
@@ -1109,13 +1130,16 @@ fn thalamus_runner_unacked_completion_reoffers_are_bounded_across_restart() {
         assert!(recovery.output.try_recv().is_err());
         recovery.close(first);
         recovery.restart_registry();
+        recovery.assert_offers(1);
         for epoch in 2..=3 {
             let next = route_key(1, epoch);
             recovery.bind(next);
             recovery.assert_frame(next, TASK);
             recovery.assert_pending();
+            recovery.assert_offers(epoch as usize);
             recovery.close(next);
             recovery.restart_registry();
+            recovery.assert_offers(epoch as usize);
         }
         for epoch in 4..=6 {
             let next = route_key(1, epoch);

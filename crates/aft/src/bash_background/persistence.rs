@@ -3196,9 +3196,15 @@ where
     update(&mut metadata);
     metadata.schema_version = SCHEMA_VERSION;
     if original_terminal {
+        // Terminal execution facts are immutable; delivery bookkeeping can
+        // still advance as a consumer receives or acknowledges the result.
         let completion_delivered = metadata.completion_delivered;
+        let runner_completion_offers = metadata
+            .runner_completion_offers
+            .max(original.runner_completion_offers);
         metadata = original;
         metadata.completion_delivered = completion_delivered;
+        metadata.runner_completion_offers = runner_completion_offers;
         metadata.schema_version = SCHEMA_VERSION;
     }
     write_task_at(task, &metadata)?;
