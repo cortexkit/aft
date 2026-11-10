@@ -7,6 +7,8 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 mod cpu_time;
+#[cfg(test)]
+mod outline_wait_probe;
 pub(crate) mod progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
@@ -842,11 +844,16 @@ pub fn run_tool_call(
             // summary, so they are collected only when that line can exist.
             let search_waits = (reports_search_plan && phase_trace.is_some())
                 .then(crate::commands::semantic_search::waits::begin);
+            // Read-only outline can wait on bookkeeping outside its handler.
+            // Keep these clocks on the diagnostic path, not in response text.
+            let outline_started =
+                (prepared.request.command == "outline" && phase_trace.is_some()).then(Instant::now);
             let skipped_before = app_ctx.backup().lock().latest_skipped_order(
                 ctx.session_id
                     .as_deref()
                     .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
             );
+            let outline_backup_before = outline_started.map(|at| at.elapsed());
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
             // URL fetch times ride on the slow-call line of the commands that
@@ -855,11 +862,14 @@ pub fn run_tool_call(
             let url_fetch_times = (phase_trace.is_some()
                 && fetches_urls(&prepared.request.command))
             .then(crate::url_fetch::timing::begin);
+            let outline_handler_started = outline_started.map(|_| Instant::now());
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            let outline_handler = outline_handler_started.map(|at| at.elapsed());
+            let outline_after_started = outline_started.map(|_| Instant::now());
             let search_waits = search_waits.and_then(|scope| scope.finish());
             response = crate::bounded_io::finish_response(response);
             crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
@@ -885,6 +895,7 @@ pub fn run_tool_call(
                     }
                 }
             }
+            let outline_after = outline_after_started.map(|at| at.elapsed());
             let url_fetch_times = url_fetch_times.and_then(|scope| scope.finish());
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
@@ -904,6 +915,14 @@ pub fn run_tool_call(
                     if let Some(times) = url_fetch_times {
                         shape.push(' ');
                         shape.push_str(&times.render());
+                    }
+                    if let Some(before) = outline_backup_before {
+                        shape.push_str(&format!(
+                            " outline_backup_before_ms={:.3} outline_handler_ms={:.3} outline_after_ms={:.3}",
+                            before.as_secs_f64() * 1000.0,
+                            outline_handler.unwrap_or_default().as_secs_f64() * 1000.0,
+                            outline_after.unwrap_or_default().as_secs_f64() * 1000.0,
+                        ));
                     }
                     trace.note_arg_shape(shape);
                 }
