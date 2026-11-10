@@ -1486,6 +1486,7 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    runner_completion_delivery_cutover: std::sync::OnceLock<u64>,
     speech_db_path: RwLock<Option<PathBuf>>,
     /// Ids of tasks whose aft.db row write found no handle attached. A
     /// configured root opens aft.db after its bind is acknowledged and
@@ -2129,6 +2130,7 @@ impl BgTaskRegistry {
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                runner_completion_delivery_cutover: std::sync::OnceLock::new(),
                 speech_db_path: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashSet::new()),
                 db_detached_logged: AtomicBool::new(false),
@@ -2533,10 +2535,23 @@ impl BgTaskRegistry {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = path;
         if let Ok(connection) = conn.lock() {
-            if let Err(error) =
-                crate::db::state::runner_completion_delivery_cutover(&connection, unix_millis())
+            if self
+                .inner
+                .runner_completion_delivery_cutover
+                .get()
+                .is_none()
             {
-                log::warn!("could not record runner completion delivery cutover: {error}");
+                match crate::db::state::runner_completion_delivery_cutover(
+                    &connection,
+                    unix_millis(),
+                ) {
+                    Ok(cutover) => {
+                        let _ = self.inner.runner_completion_delivery_cutover.set(cutover);
+                    }
+                    Err(error) => {
+                        log::warn!("could not record runner completion delivery cutover: {error}")
+                    }
+                }
             }
             crate::db::bash_watches::refresh_watch_gap_health(&connection);
         }
@@ -11678,10 +11693,11 @@ impl BgTaskRegistry {
                 if terminal {
                     self.clear_task_watch_state(task_id);
                     if task.set_completion_delivered(true, self).is_ok() {
-                        // A renderer may have inserted its pre-ack snapshot
-                        // while this ack was waiting for the task state lock.
-                        // Queue writers hold that lock through insertion, so
-                        // this second removal closes that race.
+                        // Remove only after the delivered mark persists, so a
+                        // failed mark leaves the completion pending for plugins
+                        // too. Queue writers hold the task state lock through
+                        // insertion, so this also removes any pending completion
+                        // inserted while the ack waited for that lock.
                         let _ = self.remove_pending_completion(task_id);
                         delivered.push(task_id.clone());
                     }
@@ -11779,16 +11795,11 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn runner_completion_delivery_cutover(&self) -> Result<u64, String> {
-        let pool = self
-            .inner
-            .db_pool
-            .read()
-            .map_err(|error| error.to_string())?
-            .clone()
-            .ok_or("background task database is not attached")?;
-        let conn = pool.lock().map_err(|error| error.to_string())?;
-        crate::db::state::runner_completion_delivery_cutover(&conn, unix_millis())
-            .map_err(|error| error.to_string())
+        self.inner
+            .runner_completion_delivery_cutover
+            .get()
+            .copied()
+            .ok_or_else(|| "runner completion delivery cutover is not initialized".into())
     }
 
     pub(crate) fn completion_finished_at(&self, task_id: &str) -> Option<u64> {

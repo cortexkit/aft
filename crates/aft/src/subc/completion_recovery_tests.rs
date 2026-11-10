@@ -686,6 +686,7 @@ impl RunnerRecovery {
     }
 
     fn assert_delivered(&self, task: &str) {
+        completion_settlement::wait_for_settlements();
         let paths =
             crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, task)
                 .unwrap();
@@ -889,6 +890,7 @@ fn runner_failed_durable_delivery_stays_admitted_and_unacked() {
     std::fs::create_dir(&json).unwrap();
     recovery.live(frame.clone());
     recovery.assert_frame(first, TASK);
+    completion_settlement::wait_for_settlements();
     assert!(recovery.registry.pending_completion_ids()[SESSION].contains(TASK));
     assert_eq!(
         recovery.metrics.completion_delivery.health()["unacked_total"],
@@ -932,6 +934,97 @@ fn runner_cutover_is_recorded_once_on_the_owning_database() {
             .unwrap(),
         cutoff,
         "cutover must not move on a later open"
+    );
+    registry.detach();
+}
+
+#[test]
+fn runner_recovery_returns_before_durable_settlement_and_does_not_repeat() {
+    let (_dir, root) = test_root("runner-completion-queued-settlement");
+    for backlog in [false, true] {
+        let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+        let finished = if backlog {
+            recovery.cutoff - 1
+        } else {
+            recovery.cutoff + 1
+        };
+        let frame = recovery.add_completion(TASK, finished);
+        recovery.live(frame);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *recovery
+            .metrics
+            .completion_delivery
+            .settlement_gate
+            .lock()
+            .unwrap() = Some(completion_settlement::TestGate {
+            entered,
+            release: resume,
+        });
+        let first = route_key(1, 1);
+        let (returned, bound) = std::sync::mpsc::channel();
+        let binding = std::thread::spawn(move || {
+            recovery.bind(first);
+            assert!(returned.send(recovery).is_ok());
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut recovery = bound
+            .recv_timeout(Duration::from_secs(1))
+            .expect("route recovery waited for durable completion settlement");
+        binding.join().unwrap();
+        if backlog {
+            assert!(
+                recovery.output.try_recv().is_err(),
+                "backlog must not be sent"
+            );
+        } else {
+            recovery.assert_frame(first, TASK);
+        }
+        let paths = crate::bash_background::persistence::resolve_task(
+            recovery.storage.path(),
+            SESSION,
+            TASK,
+        )
+        .unwrap();
+        assert!(
+            !read_task_at(&paths).unwrap().completion_delivered,
+            "durable mark ran while the worker was held"
+        );
+        assert_eq!(
+            recovery.metrics.completion_delivery.health()["unacked_total"],
+            1
+        );
+        recovery.reconnect_three_times(first);
+        release.send(()).unwrap();
+        recovery.assert_delivered(TASK);
+    }
+}
+
+#[test]
+fn runner_cached_cutover_does_not_wait_for_the_database_connection() {
+    let storage = tempfile::tempdir().unwrap();
+    let db = Arc::new(std::sync::Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    let registry = BgTaskRegistry::default();
+    registry.set_db_pool(db.clone());
+    let cutoff = registry.runner_completion_delivery_cutover().unwrap();
+    let locked = db.lock().unwrap();
+    let (returned, result) = std::sync::mpsc::channel();
+    let reading = registry.clone();
+    let reader = std::thread::spawn(move || {
+        returned
+            .send(reading.runner_completion_delivery_cutover())
+            .unwrap();
+    });
+    let cached = result.recv_timeout(Duration::from_secs(1));
+    drop(locked);
+    reader.join().unwrap();
+    assert_eq!(
+        cached
+            .expect("cutover read waited for the database connection")
+            .unwrap(),
+        cutoff
     );
     registry.detach();
 }
