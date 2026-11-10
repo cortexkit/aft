@@ -13,13 +13,21 @@
 //! budget counts it, and how long that walk took. Prints one JSON line
 //! every 50 edits and a summary: engine starts, refresh time, and the
 //! engine's bytes and walk times.
+//!
+//! `roots <budget_mib> <rounds> <idle_seconds> <root> <edit_path> ...`
+//! builds source-only copies, then alternates edits and publications across
+//! them. Each root must be a disposable copy: this mode rewrites edit_path.
+//! It reports component bytes before/after publication and after an idle
+//! pause, plus per-refresh CPU, wall time, starts, releases and sampled RSS.
+//! Set TMPDIR to a scratch directory to isolate its temporary index store.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::BufRead as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aft::data_layer::checkout::{Checkout, DataLayer};
 use aft_store::ids::{Digest128, FamilyId};
@@ -147,10 +155,191 @@ fn replay(mut args: impl Iterator<Item = String>) {
     );
 }
 
+fn rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse::<u64>().ok())
+        .unwrap_or_default()
+        * 1024
+}
+
+struct RssPeak {
+    bytes: AtomicU64,
+    stop: AtomicBool,
+}
+
+impl RssPeak {
+    fn sample() -> Arc<Self> {
+        let peak = Arc::new(Self {
+            bytes: AtomicU64::new(rss_bytes()),
+            stop: AtomicBool::new(false),
+        });
+        let sampler = Arc::clone(&peak);
+        std::thread::spawn(move || {
+            while !sampler.stop.load(Ordering::Acquire) {
+                sampler.bytes.fetch_max(rss_bytes(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        peak
+    }
+
+    fn take(&self) -> u64 {
+        self.bytes
+            .swap(rss_bytes(), Ordering::Relaxed)
+            .max(rss_bytes())
+    }
+}
+
+fn components(checkout: &Checkout) -> serde_json::Value {
+    serde_json::json!({
+        "census_bytes": checkout.engine_census_bytes(),
+        "parts_bytes": checkout.engine_memory_parts().map(|parts| {
+            parts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
+        }),
+        "callgraph_parts_bytes": checkout.callgraph_memory_parts().map(|parts| {
+            parts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
+        }),
+        "cache_note": "parts attribute shared allocations to the first component reaching them; census excludes publication",
+    })
+}
+
+fn roots(mut args: impl Iterator<Item = String>) {
+    let budget_mib = args.next().unwrap().parse::<u64>().unwrap();
+    let rounds = args.next().unwrap().parse::<usize>().unwrap();
+    let idle_seconds = args.next().unwrap().parse::<u64>().unwrap();
+    let paths = args.collect::<Vec<_>>();
+    assert!(!paths.is_empty() && paths.len() % 2 == 0);
+    let scratch = tempfile::tempdir().unwrap();
+    let layer = Arc::new(DataLayer::new(256 << 20, 8));
+    layer.set_engine_budget(budget_mib * (1 << 20));
+    let peak = RssPeak::sample();
+    let mut checkouts = Vec::new();
+    for (index, pair) in paths.chunks_exact(2).enumerate() {
+        let root = std::fs::canonicalize(&pair[0]).unwrap();
+        // Source archives lack .git; the scanner still needs a repository boundary.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let family = FamilyId::from_digest(Digest128::of(format!("kept root {index}").as_bytes()));
+        let checkout = Checkout::bind(Arc::clone(&layer), scratch.path(), family, &root).unwrap();
+        let cpu = cpu_seconds();
+        let wall = Instant::now();
+        peak.take();
+        let report = checkout.build().unwrap();
+        let build_wall = wall.elapsed().as_secs_f64();
+        let build_cpu = cpu_seconds() - cpu;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "build", "root": index, "files": report.files,
+                "parsed": report.parsed_files, "wall_s": build_wall, "cpu_s": build_cpu,
+                "peak_rss_bytes": peak.take(), "rss_bytes": rss_bytes(),
+            })
+        );
+        let text = std::fs::read_to_string(root.join(&pair[1])).unwrap();
+        checkouts.push((checkout, root, pair[1].clone(), text));
+        aft::memory::relieve_allocator_pressure();
+    }
+    let mut releases = 0;
+    let mut restarts = 0;
+    let (mut refresh_wall, mut refresh_cpu) = (0.0, 0.0);
+    let (mut restart_wall, mut restart_cpu) = (0.0, 0.0);
+    for round in 0..rounds {
+        for (index, (checkout, root, path, text)) in checkouts.iter().enumerate() {
+            let was_started = checkout.engine_starts() != 0;
+            let missing = checkout.engine_census_bytes().is_none();
+            std::fs::write(
+                root.join(path),
+                format!("{text}\n// kept-engine probe round {round}\n"),
+            )
+            .unwrap();
+            checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+            let held_before = checkouts
+                .iter()
+                .map(|(c, ..)| c.engine_census_bytes().is_some())
+                .collect::<Vec<_>>();
+            let starts = checkout.engine_starts();
+            let cpu = cpu_seconds();
+            let wall = Instant::now();
+            peak.take();
+            let refreshed = checkout.refresh_callgraph().unwrap();
+            assert!(refreshed.is_some(), "a recorded edit must refresh");
+            let wall = wall.elapsed().as_secs_f64();
+            let cpu = cpu_seconds() - cpu;
+            let peak_rss = peak.take();
+            let started = checkout.engine_starts() - starts;
+            let restarted = was_started && started > 0;
+            refresh_wall += wall;
+            refresh_cpu += cpu;
+            if restarted {
+                restarts += 1;
+                restart_wall += wall;
+                restart_cpu += cpu;
+            }
+            let before_publish = components(checkout);
+            let publication = Instant::now();
+            let published = checkout.publish_changes().unwrap().is_some();
+            let publish_wall = publication.elapsed().as_secs_f64();
+            assert!(published);
+            let released = checkouts
+                .iter()
+                .zip(&held_before)
+                .enumerate()
+                .filter_map(|(i, ((c, ..), held))| {
+                    (*held && c.engine_census_bytes().is_none()).then_some(i)
+                })
+                .collect::<Vec<_>>();
+            releases += released.len();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "refresh_publish", "budget_mib": budget_mib,
+                    "round": round, "root": index, "started": started, "restarted": restarted,
+                    "missing_before": missing, "released_roots": released,
+                    "wall_s": wall, "cpu_s": cpu, "publish_wall_s": publish_wall,
+                    "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss,
+                    "before_publish": before_publish, "after_publish": components(checkout),
+                })
+            );
+            aft::memory::relieve_allocator_pressure();
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "before_idle", "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+            "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+        })
+    );
+    std::thread::sleep(Duration::from_secs(idle_seconds));
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "after_idle", "seconds": idle_seconds,
+            "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+            "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+        })
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "summary", "budget_mib": budget_mib, "roots": checkouts.len(), "rounds": rounds,
+            "releases": releases, "restarts": restarts,
+            "starts": checkouts.iter().map(|(c, ..)| c.engine_starts()).sum::<u64>(),
+            "refresh_wall_s": refresh_wall, "refresh_cpu_s": refresh_cpu,
+            "restart_wall_s": restart_wall, "restart_cpu_s": restart_cpu,
+        })
+    );
+    peak.stop.store(true, Ordering::Release);
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("replay") => replay(args),
-        _ => panic!("usage: engine_keep_probe replay <pack.jsonl.gz> [publish_every] [threads]"),
+        Some("roots") => roots(args),
+        _ => panic!("usage: engine_keep_probe replay <pack.jsonl.gz> [publish_every] [threads]; roots <budget_mib> <rounds> <idle_seconds> <root> <edit_path> ..."),
     }
 }
