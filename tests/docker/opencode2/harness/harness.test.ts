@@ -89,7 +89,7 @@ import { AftTaskProbe } from "./task-probe.js";
 import {
   awaitTurnReadiness,
   CALLGRAPH_READY_TIMEOUT_MS,
-  callgraphStorePublished,
+  callgraphReadinessProbe,
   readinessBudgetMs,
 } from "./readiness.js";
 import { parentDisposition, reportTable } from "./report.js";
@@ -128,6 +128,10 @@ import {
   validateMutatingDeclarations,
 } from "./validation.js";
 import { sha256File } from "./util.js";
+import { runCommand } from "./util.js";
+import { scenarioStatusSource, statusRelayModule } from "./status-source.js";
+import callgraphStatuses from "./fixtures/callgraph-status.json";
+import { AftRpcServer } from "../../../../packages/opencode-plugin/src/shared/rpc-server.js";
 
 const roots: string[] = [];
 
@@ -3107,7 +3111,7 @@ describe("a row that needs the callgraph waits for it", () => {
     let polls = 0;
     const record = await awaitTurnReadiness(
       gatedTurn(5_000),
-      { callgraph: async () => ++polls >= 3 },
+      { callgraph: async () => ({ ready: ++polls >= 3, status: "building" }) },
       5,
     );
     expect(polls).toBe(3);
@@ -3123,7 +3127,7 @@ describe("a row that needs the callgraph waits for it", () => {
           {
             callgraph: async () => {
               polls += 1;
-              return false;
+              return { ready: false, status: "building" };
             },
           },
           10,
@@ -3153,26 +3157,200 @@ describe("a row that needs the callgraph waits for it", () => {
     expect(readinessBudgetMs([gatedTurn(1_000), gatedTurn(2_000)])).toBe(3_000);
   });
 
-  test("the store counts as ready only once AFT has published it marked ready", async () => {
-    const storage = await root();
-    expect(await callgraphStorePublished(storage)).toBe(false);
-    const directory = join(storage, "callgraph", "key123");
-    await mkdir(directory, { recursive: true });
-    const generation = "key123.g1.1.sqlite";
-    const database = new Database(join(directory, generation));
-    database.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
-    database.exec("INSERT INTO meta (k, v) VALUES ('ready', '0')");
-    // A generation file with no pointer to it is a build still in progress.
-    expect(await callgraphStorePublished(storage)).toBe(false);
-    await writeFile(join(directory, "key123.current"), `${generation}\n`);
-    // Published but not yet marked ready.
-    expect(await callgraphStorePublished(storage)).toBe(false);
-    database.exec("UPDATE meta SET v = '1' WHERE k = 'ready'");
-    database.close();
-    expect(await callgraphStorePublished(storage)).toBe(true);
-    // A pointer naming a generation that is gone is not ready.
-    await writeFile(join(directory, "key123.current"), "key123.g2.1.sqlite\n");
-    expect(await callgraphStorePublished(storage)).toBe(false);
+  test.each([
+    ["ready", true],
+    ["building", false],
+    ["unavailable", false],
+  ] as const)("product status %s determines readiness", async (state, ready) => {
+    const probe = callgraphReadinessProbe("/fixture/project", async () => callgraphStatuses[state]);
+    const observation = await probe(1_000);
+    expect(observation.ready).toBe(ready);
+    expect(observation.status).toMatchObject({ callgraph_store: callgraphStatuses[state].callgraph_store });
+  });
+
+  test("a ready graph belonging to another root cannot release the turn", async () => {
+    const probe = callgraphReadinessProbe("/other/project", async () => callgraphStatuses.ready);
+    expect((await probe(1_000)).ready).toBe(false);
+  });
+
+  test("missing graph status and failed status responses are not ready", async () => {
+    for (const status of [
+      { success: true, project_root: "/fixture/project" },
+      { ...callgraphStatuses.ready, success: false },
+      { success: true, status: "not_initialized" },
+      null,
+    ]) {
+      const probe = callgraphReadinessProbe("/fixture/project", async () => status);
+      expect((await probe(1_000)).ready).toBe(false);
+    }
+  });
+
+  test("a timeout names the last product status, including its failure reason", async () => {
+    let polls = 0;
+    const probe = callgraphReadinessProbe("/fixture/project", async () =>
+      ++polls === 1 ? callgraphStatuses.building : callgraphStatuses.unavailable,
+    );
+    const error = await expectCode(
+      () => awaitTurnReadiness(gatedTurn(30), { callgraph: probe }, 5),
+      "callgraph_never_ready",
+    );
+    expect(polls).toBeGreaterThan(1);
+    expect(error.message).toContain('"status":"unavailable"');
+    expect(error.message).toContain('"reason":"build_failed"');
+    expect(error.details.last_status).toMatchObject({
+      callgraph_store: callgraphStatuses.unavailable.callgraph_store,
+    });
+  });
+
+  test("a status transport failure is retried and named on timeout", async () => {
+    const probe = callgraphReadinessProbe("/fixture/project", async (remainingMs) => {
+      expect(remainingMs).toBeGreaterThan(0);
+      expect(remainingMs).toBeLessThanOrEqual(25);
+      throw new Error("fixture status endpoint unavailable");
+    });
+    const error = await expectCode(
+      () => awaitTurnReadiness(gatedTurn(25), { callgraph: probe }, 5),
+      "callgraph_never_ready",
+    );
+    expect(error.message).toContain("fixture status endpoint unavailable");
+    expect(error.details.last_status).toMatchObject({ reason: "status_request_failed" });
+  });
+
+  test("the V2 status source authenticates and reads the raw product payload", async () => {
+    const directory = await root();
+    const endpointFile = join(directory, "status-endpoint");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        expect(request.headers.get("authorization")).toBe("Bearer fixture-token");
+        return Response.json(callgraphStatuses.ready);
+      },
+    });
+    try {
+      await writeFile(endpointFile, `${server.url}status`);
+      const source = scenarioStatusSource({
+        hostGeneration: "v2",
+        projectRoot: "/fixture/project",
+        storageDir: directory,
+        endpointFile,
+        token: "fixture-token",
+      });
+      expect(await source(1_000)).toEqual(callgraphStatuses.ready);
+      await writeFile(endpointFile, "http://example.com/status");
+      await expect(source(1_000)).rejects.toThrow("not loopback HTTP");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("the V1 replay status source uses the existing product status RPC", async () => {
+    const directory = await root();
+    const server = new AftRpcServer(directory, "/fixture/project");
+    const sessions: unknown[] = [];
+    server.handle("status", async (params) => {
+      sessions.push(params.sessionID);
+      return callgraphStatuses.ready;
+    });
+    await server.start();
+    try {
+      const source = scenarioStatusSource({
+        hostGeneration: "v1", projectRoot: "/fixture/project", storageDir: directory,
+        endpointFile: "unused", token: "unused",
+      });
+      expect(await source(1_000)).toEqual(callgraphStatuses.ready);
+      expect(await source(1_000)).toEqual(callgraphStatuses.ready);
+      expect(new Set(sessions).size).toBe(2);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("the V2 status source cannot outwait the readiness budget", async () => {
+    const directory = await root();
+    const endpointFile = join(directory, "status-endpoint");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch() {
+        await Bun.sleep(200);
+        return Response.json(callgraphStatuses.ready);
+      },
+    });
+    try {
+      await writeFile(endpointFile, `${server.url}status`);
+      const source = scenarioStatusSource({
+        hostGeneration: "v2", projectRoot: "/fixture/project", storageDir: directory,
+        endpointFile, token: "fixture-token",
+      });
+      const started = Date.now();
+      await expect(source(20)).rejects.toThrow();
+      expect(Date.now() - started).toBeLessThan(200);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("the standalone status relay calls the registered handler without changing registration", async () => {
+    const directory = await root();
+    const pluginEntry = pathToFileURL(join(directory, "plugin.mjs")).href;
+    const endpointFile = join(directory, "status-endpoint");
+    await mkdir(join(directory, "node_modules", "effect"), { recursive: true });
+    await writeFile(join(directory, "node_modules", "effect", "index.js"),
+      "exports.Effect = { runPromise: (effect) => effect() };\n");
+    await writeFile(join(directory, "relay.mjs"), statusRelayModule({
+      pluginEntry, endpointFile, token: "fixture-token",
+    }));
+    await writeFile(join(directory, "check.mjs"), `
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { statusContext } from "./relay.mjs";
+const definition = { id: "aft" };
+const sessions = [];
+const payload = ${JSON.stringify(callgraphStatuses.ready)};
+const handlers = { getStatus: ({sessionID}) => async () => {
+  sessions.push(sessionID);
+  return payload;
+} };
+const registration = {};
+const context = { rpc: { register(actualDefinition, actualHandlers) {
+  assert.equal(actualDefinition, definition);
+  assert.equal(actualHandlers, handlers);
+  return registration;
+} } };
+assert.equal(statusContext(context).rpc.register(definition, handlers), registration);
+let endpoint;
+for (let poll = 0; poll < 100; poll++) {
+  endpoint = await readFile(${JSON.stringify(endpointFile)}, "utf8").catch(() => "");
+  if (endpoint) break;
+  await new Promise(resolve => setTimeout(resolve, 5));
+}
+assert.equal(new URL(endpoint).hostname, "127.0.0.1");
+assert.equal((await fetch(endpoint)).status, 401);
+assert.equal((await fetch(endpoint, {headers:{authorization:"Bearer wrong"}})).status, 401);
+assert.equal(sessions.length, 0);
+for (let request = 0; request < 2; request++) {
+  const response = await fetch(endpoint, {headers:{authorization:"Bearer fixture-token"}});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), payload);
+}
+assert.equal(new Set(sessions).size, 2);
+handlers.getStatus = () => async () => { throw new Error("fixture handler unavailable"); };
+const unavailable = await fetch(endpoint, {headers:{authorization:"Bearer fixture-token"}});
+assert.deepEqual(await unavailable.json(), {
+  success: false, status: "unavailable", message: "Error: fixture handler unavailable",
+});
+assert.equal((await fetch(endpoint, {method:"POST",headers:{authorization:"Bearer fixture-token"}})).status, 404);
+console.log("relay checks passed");
+process.exit(0);
+`);
+    const result = await runCommand(process.execPath, [join(directory, "check.mjs")], {
+      cwd: directory,
+      timeoutMs: 5_000,
+    });
+    expect(result.stderr).toBe("");
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout).toContain("relay checks passed");
   });
 });
 

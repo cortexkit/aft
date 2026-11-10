@@ -1,9 +1,11 @@
 import { copyFile, cp, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { basename, join, resolve } from "node:path";
 
 import { fail } from "./errors.js";
 import { runCommand } from "./util.js";
+import { statusRelayModule } from "./status-source.js";
 
 
 /** The `plugins` entry `aft setup` writes to remove OpenCode 2's own shell tool. */
@@ -124,6 +126,7 @@ export async function createScenarioIsolation(options: {
   projectConfig?: Record<string, unknown>;
   userConfig?: Record<string, unknown>;
   scenarioEnv?: Record<string, string>;
+  statusReadiness?: boolean;
   /** The provider object this host generation was observed to accept. */
   providerConfig: Record<string, unknown>;
   /** The opencode.json key that provider object goes under. */
@@ -186,6 +189,8 @@ export async function createScenarioIsolation(options: {
     fail("plugin_source_invalid", `plugin source is not a file:// tarball: ${pluginUrl}`, {}, true);
   }
   const pluginWrapper = join(paths.config, "aft-opencode-wrapper");
+  const statusToken = randomBytes(32).toString("hex");
+  const relayStatus = options.statusReadiness && options.hostGeneration === "v2";
   const pluginEntry = pathToFileURL(
     options.hostGeneration === "v2"
       ? join(options.pluginDirectory, "dist", "entry", "server.js")
@@ -214,12 +219,20 @@ export async function createScenarioIsolation(options: {
         `  return plugin(context);\n` +
         `};\n`
       : `${wrapperPreamble(resolvedEntry)}` +
+        (relayStatus ? `import { statusContext } from "./status-relay.mjs";\n` : "") +
         `const effect = plugin.effect;\n` +
         `export default { ...plugin, effect: effect && ((context) => {\n` +
         `  recordContext(context);\n` +
-        `  return effect(context);\n` +
+        `  return effect(${relayStatus ? "statusContext(context)" : "context"});\n` +
         `}) };\n`;
   await mkdir(pluginWrapper, { recursive: true });
+  if (relayStatus) {
+    await writeFile(join(pluginWrapper, "status-relay.mjs"), statusRelayModule({
+      pluginEntry,
+      endpointFile: join(root, "aft-status-endpoint"),
+      token: statusToken,
+    }));
+  }
   await Promise.all([
     writeFile(
       join(pluginWrapper, "package.json"),
@@ -294,6 +307,7 @@ export async function createScenarioIsolation(options: {
     OPENAI_API_KEY: "sk-opencode2-harness",
     AFT_E2E_PLUGIN_LOG: pluginLog,
     AFT_E2E_ISOLATION_ROOT: root,
+    AFT_E2E_STATUS_TOKEN: statusToken,
     AFT_BINARY_PATH: options.binaryPath ?? process.env.AFT_BINARY_PATH,
     AFT_CACHE_DIR: join(paths.cache, "aft-cache"),
     AFT_STORAGE_DIR: join(paths.data, "cortexkit", "aft"),
