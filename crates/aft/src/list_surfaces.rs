@@ -359,6 +359,24 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/data_search.rs",
+        enclosing_item: "lexical_rank_at_depth",
+        location_or_primitive: ".take(depth), truncate(depth)",
+        reason: "Internal lexical candidate pool at the engine's requested depth; final search pagination and completeness are reported by the search result envelope, not this intermediate pool.",
+    },
+    ExclusionEntry {
+        file: "commands/data_search.rs",
+        enclosing_item: "rarest",
+        location_or_primitive: ".take(3)",
+        reason: "Selects three trigram keys to plan an index lookup, not files or findings in an agent-visible list.",
+    },
+    ExclusionEntry {
+        file: "commands/parent_query/engine.rs",
+        enclosing_item: "search",
+        location_or_primitive: ".take()",
+        reason: "Option::take transfers the embedding model between the parent and child search contexts; it does not cut a list.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
