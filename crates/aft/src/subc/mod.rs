@@ -1640,10 +1640,13 @@ enum ManagementAdmission {
     FlowOnly,
     /// Cingulate's route: the `permissions/v1` operations and nothing else.
     PermissionsOnly,
-    /// Tool-provider metadata without a project root; grants no management authority.
+    /// Tool-provider metadata and custodian feeds without a project root;
+    /// grants no management authority or project-tool access.
     ProjectFree {
         workdir: Option<String>,
         legacy_root: Option<PathBuf>,
+        model_only: bool,
+        held_updates: bool,
     },
 }
 
@@ -6018,8 +6021,8 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
-                            if let ManagementAdmission::ProjectFree { workdir, legacy_root } = &identity.admission {
-                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, workdir.as_deref(), legacy_root.as_deref()).await {
+                            if let ManagementAdmission::ProjectFree { .. } = &identity.admission {
+                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, identity, &shared_app, storage_dir).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -8544,6 +8547,13 @@ async fn handle_control_request(
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
                         legacy_root: legacy_root.clone(),
+                        model_only: wire::ToolResponsePolicy::model_only_for_bind(
+                            principal_id(&principal).as_deref(),
+                            call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
+                        ),
+                        held_updates: cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                            consumer_capabilities.as_deref(),
+                        ),
                     }
                 } else if scope
                     .as_ref()
@@ -9079,18 +9089,25 @@ async fn handle_control_request(
     }
 }
 
-/// Metadata is static on a project-free route. A tool's views are keyed by its
-/// tool version, not by a project, so display servers that open routes without a
-/// project folder can still fetch them. Task handles, including those used to
-/// read a bash task's status, belong to a project's registry and cannot be
-/// resolved here.
+/// Metadata and the custodian's late-result feed need no project. Task handles,
+/// including those used to read bash status, still require a project registry.
 async fn handle_project_free_request(
     tx: &WriterSender,
     frame: &Frame,
-    metrics: &DispatchPathMetrics,
-    workdir: Option<&str>,
-    legacy_root: Option<&Path>,
+    metrics: &Arc<DispatchPathMetrics>,
+    identity: &ManagementIdentity,
+    shared_app: &Arc<App>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
+    let ManagementAdmission::ProjectFree {
+        workdir,
+        legacy_root,
+        model_only,
+        held_updates,
+    } = &identity.admission
+    else {
+        unreachable!()
+    };
     let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
     let operation = body
         .get("op")
@@ -9103,6 +9120,21 @@ async fn handle_project_free_request(
     } else {
         body.get("arguments").cloned().unwrap_or_else(|| json!({}))
     };
+    if let Some(op @ ("late_results" | "late_results.ack")) = operation.as_deref() {
+        tool_provider::project_free_custody(
+            tx,
+            frame,
+            metrics,
+            shared_app.clone(),
+            storage_dir.join("aft.db"),
+            op,
+            arguments,
+            principal_label(&identity.principal),
+            *model_only,
+            *held_updates,
+        );
+        return Ok(());
+    }
     let result = match operation.as_deref() {
         Some("role.describe") => Ok(tool_provider::describe()),
         Some("tool.views") => tool_views::answer(arguments),
@@ -9121,8 +9153,8 @@ async fn handle_project_free_request(
         }
         _ => Err(project_folder_refusal(
             PROJECT_REQUIRED_CODE,
-            workdir,
-            legacy_root,
+            workdir.as_deref(),
+            legacy_root.as_deref(),
             route_key(frame.header.channel, frame.header.epoch),
             frame.header.corr,
         )),

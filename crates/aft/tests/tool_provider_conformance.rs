@@ -2953,10 +2953,11 @@ async fn s2_settled_scoped_withdraw_is_identical_across_expiry_for_carrier_and_o
     );
     // The call's late entry was never acked, and the forced expiry above
     // turned it into an `expired` entry.
-    let page = late_results_page(&owner).await;
+    let page = late_results_page(&carrier).await;
     let entries = entries_for(&page, "settled");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["kind"], "expired");
+    assert!(entries_for(&late_results_page(&owner).await, "settled").is_empty());
 }
 
 #[tokio::test]
@@ -3010,7 +3011,7 @@ async fn s2_unobserved_scoped_row_answers_already_started_unknown() {
         .route(&process, &scoped_stamp("owner", "owner", "scope"))
         .await
         .unwrap();
-    let page = late_results_page(&owner).await;
+    let page = late_results_page(&route).await;
     let entries = entries_for(&page, "unobserved");
     assert_eq!(entries.len(), 1);
     assert_eq!(
@@ -3021,10 +3022,11 @@ async fn s2_unobserved_scoped_row_answers_already_started_unknown() {
         ),
         (&json!("result"), &json!(true), &json!("unknown"))
     );
+    assert!(entries_for(&late_results_page(&owner).await, "unobserved").is_empty());
 }
 
 #[tokio::test]
-async fn s2_completed_scoped_bash_reaches_only_its_owner_once_and_is_acked_once() {
+async fn s2_completed_scoped_bash_reaches_only_its_carrier_once_and_is_acked_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
     let process = Subject::head().spawn(&root).await.unwrap();
@@ -3044,22 +3046,106 @@ async fn s2_completed_scoped_bash_reaches_only_its_owner_once_and_is_acked_once(
         .route(&process, &scoped_stamp("owner", "owner", "scope"))
         .await
         .unwrap();
-    let page = late_results_page(&owner).await;
+    let page = late_results_page(&carrier).await;
     let entries = entries_for(&page, "completed");
     assert_eq!(entries.len(), 1, "{page}");
     assert_eq!(entries[0]["kind"], "result");
-    assert_eq!(entries[0]["custodian"], "reserved:owner");
+    assert_eq!(entries[0]["custodian"], "reserved:carrier");
     assert_eq!(entries[0]["result"], response_json(&completed));
-    // The carrier is not the custodian: it sees no entry.
-    assert_eq!(late_results_page(&carrier).await["entries"], json!([]));
+    // Owning the scope does not grant custody of the carrier's late result.
+    assert_eq!(late_results_page(&owner).await["entries"], json!([]));
     for _ in 0..2 {
-        let acked = owner
+        let acked = carrier
             .terminal(json!({"name":"late_results.ack","arguments":{"through": page["cursor"]}}))
             .await;
         assert_eq!(acked.header.ty, FrameType::Response);
         assert_eq!(response_json(&acked), json!({}));
-        assert!(entries_for(&late_results_page(&owner).await, "completed").is_empty());
+        assert!(entries_for(&late_results_page(&carrier).await, "completed").is_empty());
+        assert_eq!(late_results_page(&owner).await["entries"], json!([]));
     }
+}
+
+#[tokio::test]
+async fn s2_project_free_late_results_and_ack_are_carrier_isolated_but_tools_still_need_a_project()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let carrier = Subject::head()
+        .route(&process, &scoped_stamp("broca", "owner", "scope"))
+        .await
+        .unwrap();
+    let other = Subject::head()
+        .route(&process, &scoped_stamp("other", "owner", "other-scope"))
+        .await
+        .unwrap();
+    for (route, key) in [(&carrier, "own"), (&other, "foreign")] {
+        std::fs::write(
+            root.join(format!("project/{key}.txt")),
+            format!("{key} output\n"),
+        )
+        .unwrap();
+        let result = route.raw(json!({"name":"read", "arguments":{"filePath":format!("{key}.txt")}, "call_key":key}), false).await;
+        assert_eq!(
+            response_json(&result)["isError"],
+            false,
+            "{}",
+            String::from_utf8_lossy(&result.body)
+        );
+    }
+    let project_free = bind_route_stamped(
+        &process,
+        Path::new("/"),
+        "runner",
+        "late-results",
+        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        &RouteStamp {
+            principal: "reserved:broca".into(),
+            scope: None,
+        },
+    )
+    .await
+    .unwrap();
+    let project_page = carrier
+        .terminal(json!({"name":"late_results", "arguments":{}}))
+        .await;
+    let pulled = project_free
+        .terminal(json!({"name":"late_results", "arguments":{"custodian":"reserved:other"}}))
+        .await;
+    assert_eq!(
+        pulled.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&pulled.body)
+    );
+    assert_eq!(
+        pulled.body, project_page.body,
+        "rootless and project routes must apply the same recipient policy"
+    );
+    let page = response_json(&pulled);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(entries_for(&page, "own").len(), 1, "{page}");
+    assert!(entries_for(&page, "foreign").is_empty(), "{page}");
+    assert_eq!(page["entries"][0]["custodian"], "reserved:broca");
+    assert!(
+        page["entries"][0]["result"]
+            .get("structuredContent")
+            .is_none(),
+        "{page}"
+    );
+    for _ in 0..2 {
+        let ack = project_free.terminal(json!({"name":"late_results.ack", "arguments":{"through":page["cursor"], "custodian":"reserved:other"}})).await;
+        assert_eq!(ack.header.ty, FrameType::Response);
+        assert_eq!(response_json(&ack), json!({}));
+        assert_eq!(late_results_page(&project_free).await["entries"], json!([]));
+        assert_eq!(late_results_page(&carrier).await["entries"], json!([]));
+        let foreign = late_results_page(&other).await;
+        assert_eq!(foreign["entries"].as_array().unwrap().len(), 1, "{foreign}");
+        assert_eq!(entries_for(&foreign, "foreign").len(), 1);
+    }
+    let refusal = project_free.terminal(json!({"name":"read", "preset":"head", "arguments":{"filePath":root.join("project/own.txt")}})).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    assert_eq!(response_json(&refusal)["code"], "project_required");
 }
 
 /// Bind a tool-provider v1 route, the way a consumer that declared

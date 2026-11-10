@@ -2029,7 +2029,11 @@ enum Custody {
         /// finding no record of its own is then a refusal, not `unknown_call`.
         owner_as_carrier: bool,
     },
-    LateResults(cortexkit_role_tool_provider::late_results::LateResultsRequest),
+    Late(LateCustody),
+}
+
+enum LateCustody {
+    Read(cortexkit_role_tool_provider::late_results::LateResultsRequest),
     Ack(cortexkit_role_tool_provider::late_results::AckRequest),
 }
 
@@ -2056,9 +2060,8 @@ fn custody_request(
     body: &Value,
     identity: &super::RouteIdentity,
 ) -> Result<Custody, ErrorBody> {
-    use cortexkit_role_tool_provider::{
-        late_results::{AckRequest, LateResultsRequest},
-        withdraw::{parse_withdraw_request, resolve_carrier, CarrierResolution},
+    use cortexkit_role_tool_provider::withdraw::{
+        parse_withdraw_request, resolve_carrier, CarrierResolution,
     };
     let arguments = || body.get("arguments").cloned().unwrap_or_else(|| json!({}));
     match op {
@@ -2087,13 +2090,132 @@ fn custody_request(
                 owner_as_carrier,
             })
         }
-        "late_results" => serde_json::from_value::<LateResultsRequest>(arguments())
-            .map(Custody::LateResults)
-            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
-        _ => serde_json::from_value::<AckRequest>(arguments())
-            .map(Custody::Ack)
-            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
+        _ => late_custody_request(op, arguments()).map(Custody::Late),
     }
+}
+
+fn late_custody_request(op: &str, arguments: Value) -> Result<LateCustody, ErrorBody> {
+    use cortexkit_role_tool_provider::late_results::{AckRequest, LateResultsRequest};
+    match op {
+        "late_results" => {
+            serde_json::from_value::<LateResultsRequest>(arguments).map(LateCustody::Read)
+        }
+        _ => serde_json::from_value::<AckRequest>(arguments).map(LateCustody::Ack),
+    }
+    .map_err(|error| errors::invalid_request("arguments", error.to_string()))
+}
+
+fn run_late_custody(
+    conn: &rusqlite::Connection,
+    request: LateCustody,
+    custodian: &str,
+    held_updates: bool,
+) -> Result<Vec<u8>, ErrorBody> {
+    use crate::db::call_ledger as ledger;
+    let unavailable = |error: rusqlite::Error| {
+        ErrorBody::new("database_unavailable", error.to_string())
+            .with_detail(json!({"retryable":false}))
+    };
+    match request {
+        LateCustody::Read(request) => ledger::late_results_for_consumer(
+            conn,
+            custodian,
+            ledger::provider_incarnation(),
+            request.since.as_ref(),
+            request.limit,
+            ledger::now_ms(),
+            ROLE_REPLY_BODY_LIMIT,
+            held_updates,
+        )
+        .map_err(unavailable)?,
+        LateCustody::Ack(request) => ledger::ack_through(
+            conn,
+            custodian,
+            ledger::provider_incarnation(),
+            &request.through,
+        )
+        .map_err(unavailable)?
+        .map(|_| b"{}".to_vec()),
+    }
+}
+
+/// A project-free feed uses the same ledger and rules about which callers
+/// receive structured result data as a project route. Database work stays off
+/// the frame loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_free_custody(
+    writer: &super::WriterSender,
+    frame: &subc_protocol::Frame,
+    metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    app: std::sync::Arc<crate::context::App>,
+    database: std::path::PathBuf,
+    op: &str,
+    arguments: Value,
+    custodian: String,
+    model_only: bool,
+    held_updates: bool,
+) {
+    let request = frame.clone();
+    let writer = writer.clone();
+    let metrics = metrics.clone();
+    let decoded = late_custody_request(op, arguments);
+    let op = op.to_owned();
+    tokio::spawn(async move {
+        let result = match decoded {
+            Err(error) => Err(error),
+            Ok(decoded) => tokio::task::spawn_blocking(move || {
+                let unavailable = |message: String| {
+                    ErrorBody::new("database_unavailable", message)
+                        .with_detail(json!({"retryable":false}))
+                };
+                let db = app
+                    .open_db(&database)
+                    .map_err(|error| unavailable(error.to_string()))?;
+                let conn = db
+                    .lock()
+                    .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+                run_late_custody(&conn, decoded, &custodian, held_updates)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ErrorBody::new(
+                    "executor_failure",
+                    format!("{op} did not complete"),
+                ))
+            }),
+        };
+        let result = result.and_then(|body| {
+            let mut policy = super::wire::ToolResponsePolicy::for_retention();
+            policy.model_only = model_only;
+            policy.project_custody_body(body).map_err(|_| {
+                ErrorBody::new("internal_error", "retained tool reply could not be decoded")
+            })
+        });
+        match result {
+            Err(error) => {
+                let _ = super::send_provider_error(&writer, &metrics, &request, error).await;
+            }
+            Ok(body) => {
+                if let Ok(frame) = subc_protocol::Frame::build_with_version(
+                    request.header.ver,
+                    subc_protocol::FrameType::Response,
+                    request.header.flags,
+                    request.header.channel,
+                    request.header.epoch,
+                    request.header.corr,
+                    body,
+                ) {
+                    let _ = super::send_reliable_writer_frame(
+                        &writer,
+                        &metrics,
+                        frame,
+                        "custody reply",
+                    )
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 /// What a custody executor job produced: the reply body, and whether a held
@@ -2210,7 +2332,6 @@ fn run_custody(
     let db = ctx
         .db()
         .ok_or_else(|| unavailable("call ledger is unavailable".into()))?;
-    let incarnation = ledger::provider_incarnation();
     let now = crate::db::call_ledger::now_ms();
     match request {
         Custody::Withdraw {
@@ -2267,38 +2388,15 @@ fn run_custody(
                 }
             }
         }
-        Custody::LateResults(request) => {
+        Custody::Late(request) => {
             let conn = db
                 .lock()
                 .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::late_results_for_consumer(
-                &conn,
-                custodian,
-                incarnation,
-                request.since.as_ref(),
-                request.limit,
-                now,
-                ROLE_REPLY_BODY_LIMIT,
-                held_updates,
-            )
-            .map_err(|error| unavailable(error.to_string()))?
-            .map(|body| CustodyReply {
+            run_late_custody(&conn, request, custodian, held_updates).map(|body| CustodyReply {
                 body,
                 withdrawn_key: None,
                 kill_elsewhere: None,
             })
-        }
-        Custody::Ack(request) => {
-            let conn = db
-                .lock()
-                .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::ack_through(&conn, custodian, incarnation, &request.through)
-                .map_err(|error| unavailable(error.to_string()))?
-                .map(|_| CustodyReply {
-                    body: b"{}".to_vec(),
-                    withdrawn_key: None,
-                    kill_elsewhere: None,
-                })
         }
     }
 }

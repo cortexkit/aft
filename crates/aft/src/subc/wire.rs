@@ -1166,6 +1166,14 @@ pub(super) struct ToolResponsePolicy {
 }
 
 impl ToolResponsePolicy {
+    pub(super) fn model_only_for_bind(
+        principal: Option<&str>,
+        call_mode: subc_protocol::call_mode::CallMode,
+    ) -> bool {
+        call_mode == subc_protocol::call_mode::CallMode::Classic
+            && principal.is_some_and(|id| LLM_RUNNER_PRINCIPALS.contains(&id))
+    }
+
     /// Retain the complete native result when the original route is gone.
     /// Delivery must instead derive its policy from the receiving route.
     pub(super) fn for_retention() -> Self {
@@ -1218,17 +1226,18 @@ impl From<BindTrust> for ToolResponsePolicy {
 
 impl From<&super::RouteIdentity> for ToolResponsePolicy {
     fn from(identity: &super::RouteIdentity) -> Self {
-        let runner = matches!(
-            &identity.spawn_principal,
-            super::AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
-                if LLM_RUNNER_PRINCIPALS.contains(&id.as_str())
-        );
+        let principal = match &identity.spawn_principal {
+            super::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+                principal_id.as_deref()
+            }
+            super::AuthenticatedPrincipal::FirstParty => None,
+        };
         Self {
             trust: identity.trust,
             tool_result_body: identity.tool_result_body,
             // Programs read arbitrary fields. Only positively identified
             // ordinary calls lose structured data; flow and unknown modes keep it.
-            model_only: identity.call_mode == subc_protocol::call_mode::CallMode::Classic && runner,
+            model_only: Self::model_only_for_bind(principal, identity.call_mode),
             output_scope: identity.output_scope.get().cloned(),
         }
     }
