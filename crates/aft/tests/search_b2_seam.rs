@@ -4,7 +4,7 @@ fn readiness_disclosure_is_a_callback_but_never_a_retrieval_lane() {
         RawQuery, Readiness, RetainedReadinessSnapshots,
     };
     use aft::commands::semantic_search::plan_table::SearchLaneKind;
-    use aft::search_b2::install_defaults;
+    use aft::commands::semantic_search::planner::install_defaults;
 
     let raw_query = RawQuery::new("parse_header");
     let (shape, facts) = install_defaults().classify(&raw_query);
@@ -45,7 +45,7 @@ fn readiness_disclosure_is_a_callback_but_never_a_retrieval_lane() {
 fn every_retrieval_callback_has_a_legal_selecting_request() {
     use aft::commands::semantic_search::extensions::{RawQuery, Readiness};
     use aft::commands::semantic_search::plan_table::SearchLaneKind;
-    use aft::search_b2::install_defaults;
+    use aft::commands::semantic_search::planner::install_defaults;
 
     let extensions = install_defaults();
     let ready = Readiness::new(true, true, true);
@@ -80,7 +80,7 @@ fn every_retrieval_callback_has_a_legal_selecting_request() {
 fn natural_language_without_identifier_token_does_not_select_symbol() {
     use aft::commands::semantic_search::extensions::{RawQuery, Readiness};
     use aft::commands::semantic_search::plan_table::SearchLaneKind;
-    use aft::search_b2::install_defaults;
+    use aft::commands::semantic_search::planner::install_defaults;
 
     let extensions = install_defaults();
     let query = RawQuery::new("where does alpha beta gamma live in the service today");
